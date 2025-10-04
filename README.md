@@ -1,100 +1,54 @@
-# UniFi Network Optimizer 🚀# UniFi Network Optimizer 🚀```
+# UniFi Network Optimizer 🚀
 
+**Professional-grade network analysis and optimization for UniFi controllers**
 
-
-**Professional-grade network analysis and optimization for UniFi controllers**██╗   ██╗███╗   ██╗██╗███████╗██╗     █████╗ ██╗   ██╗██████╗ ██╗████████╗
-
-
-
-A comprehensive toolkit for analyzing and optimizing Ubiquiti UniFi networks. Provides expert-level insights, recommendations, and automated optimization for wireless networks with CloudKey Gen2/UDM support.**Professional-grade network analysis and optimization for UniFi controllers**██║   ██║████╗  ██║██║██╔════╝██║    ██╔══██╗██║   ██║██╔══██╗██║╚══██╔══╝
-
-
-
----██║   ██║██╔██╗ ██║██║█████╗  ██║    ███████║██║   ██║██║  ██║██║   ██║   
-
-
-
-## 📋 Table of Contents## Quick Start██║   ██║██║╚██╗██║██║██╔══╝  ██║    ██╔══██║██║   ██║██║  ██║██║   ██║   
-
-
-
-- [Features](#features)╚██████╔╝██║ ╚████║██║██║     ██║    ██║  ██║╚██████╔╝██████╔╝██║   ██║   
-
-- [Prerequisites](#prerequisites)
-
-- [Installation](#installation)### 1. Run the Optimizer ╚═════╝ ╚═╝  ╚═══╝╚═╝╚═╝     ╚═╝    ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝   ╚═╝   
-
-- [CloudKey User Setup](#cloudkey-user-setup)
-
-- [Quick Start](#quick-start)```bash```
-
-- [Usage Examples](#usage-examples)
-
-- [What Gets Analyzed](#what-gets-analyzed)python3 optimizer.py
-
-- [Reports](#reports)
-
-- [Best Practices](#best-practices)```# UniFi Audit Tool
-
-- [Troubleshooting](#troubleshooting)
-
-
+A comprehensive toolkit for analyzing and optimizing Ubiquiti UniFi networks. Provides expert-level insights, recommendations, and automated optimization for wireless networks with CloudKey Gen2/UDM support.
 
 ---
 
-### 2. Run TestsA comprehensive network analysis and optimization tool for Ubiquiti UniFi environments. UniFi Audit analyzes your wireless network, identifies issues, and provides actionable recommendations.
+## 📋 Table of Contents
+
+- [Features](#features)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [CloudKey User Setup](#cloudkey-user-setup)
+- [Quick Start](#quick-start)
+- [Usage Examples](#usage-examples)
+- [What Gets Analyzed](#what-gets-analyzed)
+- [Reports](#reports)
+- [Best Practices](#best-practices)
+- [Troubleshooting](#troubleshooting)
+
+---
 
 ## ✨ Features
 
-```bash
-
 ### Network Analysis
 
-- **📡 RF Optimization**: Channel overlap detection, transmit power analysis, interference identificationpython3 run_all_tests.py## Features
-
+- **📡 RF Optimization**: Channel overlap detection, transmit power analysis, interference identification
 - **🔌 Client Health**: RSSI histograms, signal quality tracking, disconnect analysis
-
-- **📊 Historical Analysis**: 3-7 day lookback for trend detection and data-driven recommendations```
-
+- **📊 Historical Analysis**: 3-7 day lookback for trend detection and data-driven recommendations
 - **🌐 Mesh AP Monitoring**: Uplink signal strength, reliability checks, DFS avoidance
+- **📱 Device Intelligence**: Manufacturer identification, IoT device categorization, VLAN recommendations
 
-- **📱 Device Intelligence**: Manufacturer identification, IoT device categorization, VLAN recommendations- **Network Analysis**: Detects configuration issues, suboptimal settings, and client connection problems
-
-
-
-### Interactive OptimizationThat's it! 🎉- **RF Optimization**: Recommends channel and transmit power settings to minimize interference
+### Interactive Optimization
 
 - **👀 Dry-Run Mode**: Preview all changes before applying
-
-- **✅ Interactive Approval**: Review and approve each change individually- **Client Distribution Analysis**: Identifies overloaded APs and suggests client balancing strategies
-
+- **✅ Interactive Approval**: Review and approve each change individually
 - **📈 Smart Recommendations**: Historical data prevents repeated suggestions
+- **🔄 Roaming Analysis**: Minimum RSSI threshold optimization for fast client roaming
 
-- **🔄 Roaming Analysis**: Minimum RSSI threshold optimization for fast client roaming---- **Interactive Reports**: Generates detailed HTML reports with actionable insights
+### Reporting & Safety
 
 - **📱 Mobile-Friendly Reports**: Responsive HTML reports viewable on any device
-
-- **Direct Optimization**: Can apply recommended changes directly to your controller
-
-### Safety Features
-
-- **🔒 Read-Only Analysis Mode**: Safe network assessment without changes## What This Does- **CloudKey Compatibility**: Works with both CloudKey Gen1 and Gen2/UDM devices
-
+- **🔒 Read-Only Analysis Mode**: Safe network assessment without changes
 - **💾 Profile Management**: Secure credential storage in macOS Keychain
-
 - **📝 Change Logging**: Complete audit trail of all modifications
-
 - **⏮️ Rollback Support**: Undo changes if needed
-
-The **optimizer.py** provides expert-level network analysis with:## Quick Start
 
 ---
 
-
-
 ## 📦 Prerequisites
-
-✅ **Client Health Diagnostics** - RSSI histograms, signal quality, disconnection tracking  1. **Installation**:
 
 ### 1. Python Installation
 
