@@ -386,17 +386,33 @@ class ClientHealthAnalyzer:
             'Critical (< -80)': 'red'
         }
         
-        for label, values in bins.items():
+        # Always show all categories in order
+        ordered_labels = [
+            'Excellent (> -50)',
+            'Good (-50 to -60)',
+            'Fair (-60 to -70)',
+            'Poor (-70 to -80)',
+            'Critical (< -80)'
+        ]
+        
+        for label in ordered_labels:
+            values = bins[label]
             count = len(values)
-            if count == 0:
-                continue
             
-            percentage = (count / len(rssi_values)) * 100
-            bar_width = int((count / max_count) * width)
+            if len(rssi_values) > 0:
+                percentage = (count / len(rssi_values)) * 100
+            else:
+                percentage = 0
+            
+            bar_width = int((count / max_count) * width) if max_count > 0 else 0
             color = colors.get(label, 'white')
             
-            bar = '█' * bar_width
-            histogram.append(f"[{color}]{label:20s} {bar} {count:3d} ({percentage:5.1f}%)[/{color}]")
+            # Show bar even if empty (with different style)
+            if count > 0:
+                bar = '█' * bar_width
+                histogram.append(f"[{color}]{label:20s} {bar} {count:3d} ({percentage:5.1f}%)[/{color}]")
+            else:
+                histogram.append(f"[dim]{label:20s} [/dim][dim]{count:3d} ({percentage:5.1f}%)[/dim]")
         
         return '\n'.join(histogram)
 
@@ -432,17 +448,32 @@ def display_client_health_report(analysis):
     console.print(table)
     
     # RSSI Distribution Histogram
-    console.print("\n[bold]Signal Strength Distribution[/bold]")
+    console.print("\n[bold cyan]📊 Signal Strength Distribution (Wireless Clients)[/bold cyan]")
+    console.print("[dim]Visual representation of client signal quality across your network[/dim]\n")
+    
     analyzer = ClientHealthAnalyzer()
     analyzer.clients = []  # Will use clients from analysis
     
     # Reconstruct clients from categories
     all_clients = []
     for category, clients in analysis['by_signal_quality'].items():
-        all_clients.extend(clients)
+        if category != 'wired':  # Exclude wired clients from RSSI histogram
+            all_clients.extend(clients)
     
-    histogram = analyzer.generate_rssi_histogram(all_clients)
-    console.print(histogram)
+    if all_clients:
+        histogram = analyzer.generate_rssi_histogram(all_clients)
+        console.print(histogram)
+        
+        # Add a summary bar
+        total_wireless = len(all_clients)
+        console.print(f"\n[dim]Total Wireless Clients: {total_wireless}[/dim]")
+    else:
+        console.print("[yellow]No wireless clients connected[/yellow]")
+    
+    # Show wired client count separately
+    wired_count = len(analysis['by_signal_quality'].get('wired', []))
+    if wired_count > 0:
+        console.print(f"[green]Wired Clients: {wired_count} (not shown in histogram)[/green]")
     
     # Weak Clients
     weak = analysis['weak_clients']

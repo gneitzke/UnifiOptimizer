@@ -1266,9 +1266,70 @@ def generate_client_health_html(client_health):
                 </tr>
 """
     
+    # Generate signal strength histogram from by_signal_quality data
+    by_signal = client_health.get('by_signal_quality', {})
+    signal_categories = {
+        'Excellent (> -50 dBm)': len(by_signal.get('excellent', [])),
+        'Good (-50 to -60 dBm)': len(by_signal.get('good', [])),
+        'Fair (-60 to -70 dBm)': len(by_signal.get('fair', [])),
+        'Poor (-70 to -80 dBm)': len(by_signal.get('poor', [])),
+        'Critical (< -80 dBm)': len(by_signal.get('critical', []))
+    }
+    
+    # Count total wireless clients (exclude wired)
+    total_wireless = sum(signal_categories.values())
+    wired_count = len(by_signal.get('wired', []))
+    
+    # Generate histogram bars
+    histogram_html = ""
+    colors = {
+        'Excellent (> -50 dBm)': '#10b981',  # green
+        'Good (-50 to -60 dBm)': '#3b82f6',  # blue
+        'Fair (-60 to -70 dBm)': '#f59e0b',  # amber
+        'Poor (-70 to -80 dBm)': '#a855f7',  # purple
+        'Critical (< -80 dBm)': '#ef4444'    # red
+    }
+    
+    max_count = max(signal_categories.values()) if signal_categories.values() else 1
+    
+    for label, count in signal_categories.items():
+        color = colors.get(label, '#6b7280')
+        percentage = (count / total_wireless * 100) if total_wireless > 0 else 0
+        bar_width = (count / max_count * 100) if max_count > 0 else 0
+        
+        histogram_html += f"""
+                <div style="margin-bottom: 12px;">
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 4px; font-size: 14px;">
+                        <span style="font-weight: 500;">{label}</span>
+                        <span style="color: #6b7280;">{count} clients ({percentage:.1f}%)</span>
+                    </div>
+                    <div style="background: #f3f4f6; border-radius: 4px; height: 24px; overflow: hidden;">
+                        <div style="background: {color}; height: 100%; width: {bar_width}%; transition: width 0.3s ease;"></div>
+                    </div>
+                </div>
+"""
+    
+    # Add wired client note if any
+    wired_note = ""
+    if wired_count > 0:
+        wired_note = f"""
+                <p style="margin-top: 16px; padding: 12px; background: #f0fdf4; border-left: 4px solid #10b981; border-radius: 4px; font-size: 14px;">
+                    <strong>✓ Wired Clients:</strong> {wired_count} (not included in signal strength histogram)
+                </p>
+"""
+    
     return f"""
             <div class="section">
-                <h2>👥 Client Health Summary</h2>
+                <h2>📊 Signal Strength Distribution</h2>
+                <p style="color: #6b7280; margin-bottom: 20px;">Visual representation of wireless client signal quality across your network</p>
+                <div style="max-width: 800px;">
+                    {histogram_html}
+                </div>
+                {wired_note}
+            </div>
+            
+            <div class="section">
+                <h2>👥 Client Health Grades</h2>
                 <table class="ap-table">
                     <thead>
                         <tr>
