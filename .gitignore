@@ -1,0 +1,109 @@
+# Sensitive data - credentials and personal info
+*.keychain
+*.credentials
+data/config.json
+.channel_recommendations.json
+
+# Generated reports
+reports/*.html
+reports/*.png
+*.html
+*_share.html
+
+# State and output files
+state.json
+audit-*.json
+plan-*.json
+report-*.html
+model-*.html
+apply-*.html
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+
+# Virtual environment
+venv/
+env/
+.env/
+.venv/
+ENV/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# MacOS files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Logs
+*.log
+
+# Test files
+test_output/
+.pytest_cache/
+
+# Archive directory - historical files and old versions
+Archive/
+docs/ANALYZE_MODE_ENHANCEMENT.md
+docs/API_COMPATIBILITY.md
+docs/API_DOCUMENTATION.md
+docs/ASCII_ART_SHOWCASE.md
+docs/BUG_FIXES_COMPLETE.md
+docs/CLIENT_HEALTH_GUIDE.md
+docs/CLIENT_HEALTH_INTEGRATION.md
+docs/CLOUDKEY_AUTH_ENHANCEMENT.md
+docs/CLOUDKEY_COMPATIBILITY.md
+docs/CLOUDKEY_DIAGNOSTICS.md
+docs/CLOUDKEY_GEN2_INTEGRATION_COMPLETE.md
+docs/CLOUDKEY_GEN2_OPTIMIZATION.md
+docs/CLOUDKEY_OPTIMIZATION_SUMMARY.md
+docs/CLOUDKEY_TEST_GUIDE.md
+docs/CLOUDKEY_TEST_README.md
+docs/COMPLETE_IMPLEMENTATION.md
+docs/CONNECTION_ANALYSIS_ENHANCEMENT.md
+docs/CONNECTION_ANALYSIS_SUMMARY.md
+docs/DEMO_OPTIMIZER_WITH_DIAGNOSTICS.md
+docs/ENHANCEMENT_COMPLETE.md
+docs/EXPERT_ANALYSIS_COMPLETE.md
+docs/EXPERT_NETWORK_ANALYSIS.md
+docs/FINAL_ENHANCEMENT_SUMMARY.md
+docs/FRIENDLY_NAME_VERIFICATION.md
+docs/HISTORICAL_ANALYSIS_ENHANCEMENT.md
+docs/IMPLEMENTATION_COMPLETE.md
+docs/OPTIMIZER_IMPLEMENTATION.md
+docs/OPTIMIZER_USER_GUIDE.md
+docs/PROJECT_REORGANIZATION.md
+docs/QUICK_REFERENCE.md
+docs/QUICK_START_EXPERT.md
+docs/QUICK_START_OPTIMIZER.md
+docs/README.md
+docs/README_UPDATE_VERIFICATION.md
+docs/RENAME_TO_OPTIMIZER.md
+docs/ROAMING_ANALYSIS_VERIFICATION.md
+docs/RUN_ALL_TESTS_STATUS.md
+docs/RUN_ALL_TESTS_WORKING.md
+docs/RunUnitTests_README.md
+docs/TEST_SAFETY_AND_IMPACT.md
+docs/TOOLS_COMPARISON.md
+docs/features/ADVANCED_ANALYSIS.md
+docs/features/AUTO_CREDENTIAL_LOADING.md
+docs/features/EXECUTIVE_SUMMARY_DISPLAY_ORDER.md
+docs/features/EXPERT_SUMMARY_IN_APPLY_MODE.md
+docs/features/HTML_REPORT_GENERATION.md
+docs/features/KEYCHAIN_CREDENTIALS.md
+docs/features/LOGIN_RETRY.md
+docs/features/RSSI_HISTOGRAM_AND_SUMMARY.md
+docs/features/SIMPLIFIED_MENU.md
+docs/fixes/CHANNEL_TYPE_COMPREHENSIVE_FIX.md
+docs/fixes/CHANNEL_TYPE_FIX.md
+docs/fixes/DEVICE_ID_FIX.md
+docs/fixes/RADIO_TABLE_API_FIX_AND_MENU.md

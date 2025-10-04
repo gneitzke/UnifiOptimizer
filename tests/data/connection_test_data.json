@@ -1,0 +1,117 @@
+{
+  "test_cases": {
+    "multiple_disconnects": {
+      "connections": [
+        {
+          "mac": "11:22:33:44:55:66",
+          "hostname": "test-device-1",
+          "ap_mac": "aa:bb:cc:dd:ee:ff",
+          "ap_name": "Office AP",
+          "signal": -65,
+          "event": "connected",
+          "timestamp": 1600000000
+        },
+        {
+          "mac": "11:22:33:44:55:66",
+          "hostname": "test-device-1",
+          "ap_mac": "aa:bb:cc:dd:ee:ff",
+          "ap_name": "Office AP",
+          "signal": -82,
+          "event": "disconnected",
+          "timestamp": 1600000100
+        },
+        {
+          "mac": "11:22:33:44:55:66",
+          "hostname": "test-device-1",
+          "ap_mac": "aa:bb:cc:dd:ee:ff",
+          "ap_name": "Office AP",
+          "signal": -66,
+          "event": "connected",
+          "timestamp": 1600000200
+        },
+        {
+          "mac": "11:22:33:44:55:66",
+          "hostname": "test-device-1",
+          "ap_mac": "aa:bb:cc:dd:ee:ff",
+          "ap_name": "Office AP",
+          "signal": -85,
+          "event": "disconnected",
+          "timestamp": 1600000300
+        }
+      ],
+      "expected": {
+        "issue_count": 1,
+        "issue_types": ["poor_connection_quality"]
+      }
+    },
+    "roaming_test": {
+      "connections": [
+        {
+          "mac": "22:33:44:55:66:77",
+          "hostname": "mobile-device",
+          "ap_mac": "aa:bb:cc:dd:ee:ff",
+          "ap_name": "Office AP",
+          "signal": -70,
+          "event": "connected",
+          "timestamp": 1600010000
+        },
+        {
+          "mac": "22:33:44:55:66:77",
+          "hostname": "mobile-device",
+          "ap_mac": "aa:bb:cc:dd:ee:ff",
+          "ap_name": "Office AP",
+          "signal": -75,
+          "event": "disconnected",
+          "timestamp": 1600010300
+        },
+        {
+          "mac": "22:33:44:55:66:77",
+          "hostname": "mobile-device",
+          "ap_mac": "ff:ee:dd:cc:bb:aa",
+          "ap_name": "Kitchen AP",
+          "signal": -68,
+          "event": "connected",
+          "timestamp": 1600010305
+        }
+      ],
+      "expected": {
+        "issue_count": 0
+      }
+    },
+    "weak_signal_test": {
+      "connections": [
+        {
+          "mac": "33:44:55:66:77:88",
+          "hostname": "weak-device",
+          "ap_mac": "aa:bb:cc:dd:ee:ff",
+          "ap_name": "Office AP",
+          "signal": -88,
+          "event": "connected",
+          "timestamp": 1600020000
+        },
+        {
+          "mac": "33:44:55:66:77:88",
+          "hostname": "weak-device",
+          "ap_mac": "aa:bb:cc:dd:ee:ff",
+          "ap_name": "Office AP",
+          "signal": -89,
+          "event": "connected",
+          "timestamp": 1600020300
+        },
+        {
+          "mac": "33:44:55:66:77:88",
+          "hostname": "weak-device",
+          "ap_mac": "aa:bb:cc:dd:ee:ff",
+          "ap_name": "Office AP",
+          "signal": -90,
+          "event": "connected",
+          "timestamp": 1600020600
+        }
+      ],
+      "expected": {
+        "issue_count": 1,
+        "issue_types": ["weak_signal"]
+      }
+    }
+  }
+}
