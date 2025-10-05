@@ -58,10 +58,91 @@ class NetworkHealthAnalyzer:
 
         return results
 
+    def _get_device_restart_events(self, device_mac, lookback_days=7):
+        """
+        Query event log to find restart events for a specific device
+
+        Returns:
+            dict with:
+            - restart_count: number of restarts found
+            - manual_restart: bool indicating if restart was user-initiated
+            - events: list of restart event details
+        """
+        result = {
+            "restart_count": 0,
+            "manual_restart": False,
+            "events": [],
+        }
+
+        try:
+            within_hours = lookback_days * 24
+            events_response = self.client.get(f"s/{self.site}/stat/event?within={within_hours}&_limit=1000")
+
+            if not events_response or "data" not in events_response:
+                return result
+
+            events = events_response.get("data", [])
+
+            # Look for restart-related events for this device
+            restart_keywords = [
+                "restarted", "rebooted", "restart", "reboot",
+                "upgrade", "powered off", "disconnected"
+            ]
+
+            manual_keywords = [
+                "user", "manually", "admin", "upgrade", "requested",
+                "firmware update", "configuration change"
+            ]
+
+            for event in events:
+                # Match by device MAC or name
+                event_device = event.get("device", "")
+                event_ap = event.get("ap", "")
+                event_msg = event.get("msg", "").lower()
+                event_key = event.get("key", "").lower()
+
+                # Check if this event is for our device
+                is_device_event = (
+                    event_device == device_mac or
+                    event_ap == device_mac or
+                    device_mac.lower() in event_msg
+                )
+
+                if is_device_event:
+                    # Check if it's a restart event
+                    is_restart = any(keyword in event_msg or keyword in event_key
+                                    for keyword in restart_keywords)
+
+                    if is_restart:
+                        result["restart_count"] += 1
+
+                        # Check if it was a manual/expected restart
+                        is_manual = any(keyword in event_msg or keyword in event_key
+                                       for keyword in manual_keywords)
+
+                        if is_manual:
+                            result["manual_restart"] = True
+
+                        result["events"].append({
+                            "timestamp": event.get("time"),
+                            "message": event.get("msg"),
+                            "key": event.get("key"),
+                            "is_manual": is_manual,
+                        })
+
+        except Exception:
+            # If event query fails, don't crash the analysis
+            pass
+
+        return result
+
     def _analyze_device_stability(self, devices):
         """
         Analyze device uptime and restart patterns
-        Catches recently crashed or rebooted devices
+        Intelligently detects:
+        - Manual/expected restarts (OK)
+        - Single unexpected restarts (low priority)
+        - Cyclic/repeated restarts (high priority - stability issue)
         """
         analysis = {
             "category": "Device Stability",
@@ -69,12 +150,13 @@ class NetworkHealthAnalyzer:
             "issues": [],
             "recommendations": [],
             "score_penalty": 0,
-            "devices": {"stable": [], "recent_restart": [], "critical_restart": []},
+            "devices": {"stable": [], "recent_restart": [], "critical_restart": [], "cyclic_restart": []},
         }
 
         for device in devices:
             device_name = device.get("name", "Unknown")
             device_type = device.get("type", "unknown")
+            device_mac = device.get("mac", "")
             uptime_seconds = device.get("uptime", 0)
             uptime_days = uptime_seconds / 86400
             uptime_hours = uptime_seconds / 3600
@@ -87,57 +169,108 @@ class NetworkHealthAnalyzer:
                 "uptime_hours": uptime_hours,
             }
 
-            # Critical: Device restarted in last 24 hours
-            if uptime_days < 1:
-                analysis["devices"]["critical_restart"].append(device_info)
-                analysis["status"] = "critical"
-                analysis["score_penalty"] += 10
+            # Check if device restarted recently
+            if uptime_days < 7:
+                # Query event log to determine restart cause and frequency
+                restart_info = self._get_device_restart_events(device_mac, lookback_days=7)
+                restart_count = restart_info["restart_count"]
+                is_manual = restart_info["manual_restart"]
 
-                analysis["issues"].append(
-                    {
-                        "severity": "high",
-                        "type": "recent_restart",
-                        "device": device_name,
-                        "device_type": device_type,
-                        "uptime_hours": uptime_hours,
-                        "message": f"{device_name} restarted {uptime_hours:.1f} hours ago",
-                        "impact": "Device crash or reboot caused service interruption",
-                        "recommendation": "Investigate restart cause - check device logs, power supply, overheating, or firmware issues",
-                    }
-                )
+                device_info["restart_count"] = restart_count
+                device_info["manual_restart"] = is_manual
 
-            # Warning: Device restarted in last 7 days
-            elif uptime_days < 7:
-                analysis["devices"]["recent_restart"].append(device_info)
-                if analysis["status"] == "healthy":
-                    analysis["status"] = "warning"
-                analysis["score_penalty"] += 3
+                # CYCLIC RESTARTS: Multiple restarts = stability issue (HIGH PRIORITY)
+                if restart_count >= 3:
+                    analysis["devices"]["cyclic_restart"].append(device_info)
+                    analysis["status"] = "critical"
+                    analysis["score_penalty"] += 15
 
-                analysis["issues"].append(
-                    {
-                        "severity": "medium",
-                        "type": "recent_restart",
-                        "device": device_name,
-                        "device_type": device_type,
-                        "uptime_days": uptime_days,
-                        "message": f"{device_name} restarted {uptime_days:.1f} days ago",
-                        "impact": "Recent restart may indicate instability",
-                        "recommendation": "Monitor device for additional restarts; review event logs",
-                    }
-                )
+                    analysis["issues"].append(
+                        {
+                            "severity": "high",
+                            "type": "cyclic_restart",
+                            "device": device_name,
+                            "device_type": device_type,
+                            "restart_count": restart_count,
+                            "uptime_hours": uptime_hours,
+                            "message": f"{device_name} has restarted {restart_count} times in 7 days - CYCLIC BEHAVIOR",
+                            "impact": "Repeated restarts indicate serious stability problem (power, hardware, firmware)",
+                            "recommendation": "URGENT: Check power supply, thermal issues, firmware bugs, or hardware failure",
+                        }
+                    )
+
+                # MANUAL RESTART: User-initiated or upgrade (OK - no issue)
+                elif is_manual and restart_count == 1:
+                    analysis["devices"]["stable"].append(device_info)
+                    # No issue - manual restarts are expected and OK
+
+                # SINGLE RESTART (last 24h): Could be crash, but not cyclic (LOW-MEDIUM PRIORITY)
+                elif uptime_days < 1:
+                    analysis["devices"]["critical_restart"].append(device_info)
+
+                    # Only flag if not manual - single unplanned restart warrants monitoring
+                    if not is_manual:
+                        if analysis["status"] == "healthy":
+                            analysis["status"] = "warning"
+                        analysis["score_penalty"] += 3
+
+                        analysis["issues"].append(
+                            {
+                                "severity": "medium",
+                                "type": "recent_restart",
+                                "device": device_name,
+                                "device_type": device_type,
+                                "uptime_hours": uptime_hours,
+                                "message": f"{device_name} restarted {uptime_hours:.1f} hours ago (single occurrence)",
+                                "impact": "Single restart may be temporary issue - not cyclic",
+                                "recommendation": "Monitor device - if restarts repeat, investigate power/hardware",
+                            }
+                        )
+
+                # SINGLE RESTART (1-7 days): Recent but not critical (LOW PRIORITY)
+                elif uptime_days < 7:
+                    analysis["devices"]["recent_restart"].append(device_info)
+
+                    # Only flag if not manual and appears to be isolated incident
+                    if not is_manual:
+                        analysis["score_penalty"] += 1
+
+                        analysis["issues"].append(
+                            {
+                                "severity": "low",
+                                "type": "recent_restart",
+                                "device": device_name,
+                                "device_type": device_type,
+                                "uptime_days": uptime_days,
+                                "message": f"{device_name} restarted {uptime_days:.1f} days ago (isolated incident)",
+                                "impact": "Single restart over week ago - likely not a concern",
+                                "recommendation": "No action needed unless restarts become frequent",
+                            }
+                        )
 
             # Stable device
             else:
                 analysis["devices"]["stable"].append(device_info)
 
-        # Summary recommendation
-        if analysis["devices"]["critical_restart"]:
+        # Summary recommendations
+        if analysis["devices"]["cyclic_restart"]:
             analysis["recommendations"].append(
                 {
                     "priority": "high",
                     "category": "stability",
-                    "message": f"{len(analysis['devices']['critical_restart'])} device(s) restarted in last 24 hours - immediate investigation needed",
-                    "action": "Check device logs, power supplies, and environmental conditions",
+                    "message": f"{len(analysis['devices']['cyclic_restart'])} device(s) with CYCLIC restart pattern - hardware/stability issue",
+                    "action": "URGENT: Check power supplies, temperature, firmware bugs, or failing hardware",
+                }
+            )
+
+        if analysis["devices"]["critical_restart"] and not analysis["devices"]["cyclic_restart"]:
+            # Only show this if no cyclic restarts (otherwise it's redundant)
+            analysis["recommendations"].append(
+                {
+                    "priority": "medium",
+                    "category": "stability",
+                    "message": f"{len(analysis['devices']['critical_restart'])} device(s) restarted recently - monitor for patterns",
+                    "action": "Monitor devices - single restarts are OK, repeated restarts indicate problems",
                 }
             )
 
