@@ -599,7 +599,10 @@ def _convert_expert_recommendations(expert_recs, all_devices=None):
 
         elif "band_steering" in issue or "band_steering" in rec_type or rec_type == "band_steering":
             # Band steering configuration change
-            current_mode = device.get("bandsteering_mode", "off")
+            # Check both possible field names for compatibility
+            current_mode = device.get("bandsteering_mode") or device.get(
+                "band_steering_mode", "off"
+            )
 
             converted.append(
                 {

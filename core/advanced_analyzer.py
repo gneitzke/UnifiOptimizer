@@ -184,18 +184,40 @@ class AdvancedNetworkAnalyzer:
                 ap_name = device.get("name", "Unnamed AP")
                 ap_id = device.get("_id")
 
-                # Check band steering setting
-                band_steering = device.get("bandsteering_mode", "off")
-                results["band_steering_enabled"][ap_name] = band_steering != "off"
+                # Check band steering setting - UniFi may use either field name
+                # Try both 'bandsteering_mode' (older) and 'band_steering_mode' (newer)
+                band_steering = device.get("bandsteering_mode") or device.get(
+                    "band_steering_mode", "off"
+                )
 
-                if band_steering == "off":
+                # Check if AP is tri-band (has 6GHz radio)
+                radio_table = device.get("radio_table", [])
+                has_6ghz = any(radio.get("radio") in ["6e", "ax", "6g"] for radio in radio_table)
+
+                # Band steering is considered enabled if mode is not "off"
+                # Valid modes: "prefer_5g", "equal", "prefer_2g", etc.
+                is_enabled = band_steering != "off"
+                results["band_steering_enabled"][ap_name] = is_enabled
+
+                if not is_enabled:
+                    # Determine recommendation message based on AP capabilities
+                    if has_6ghz:
+                        recommendation_msg = (
+                            "Enable band steering to move capable clients to 5GHz/6GHz"
+                        )
+                        ap_type = "tri-band"
+                    else:
+                        recommendation_msg = "Enable band steering to move capable clients to 5GHz"
+                        ap_type = "dual-band"
+
                     results["recommendations"].append(
                         {
                             "type": "band_steering",
                             "device": ap_name,
-                            "message": f"Band steering disabled on {ap_name}",
-                            "recommendation": "Enable band steering to move capable clients to 5GHz/6GHz",
+                            "message": f"Band steering disabled on {ap_name} ({ap_type} AP)",
+                            "recommendation": recommendation_msg,
                             "priority": "medium",
+                            "has_6ghz": has_6ghz,
                         }
                     )
 
