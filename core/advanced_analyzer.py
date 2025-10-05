@@ -299,6 +299,110 @@ class AdvancedNetworkAnalyzer:
         
         return results
     
+    def analyze_min_rssi(self, devices):
+        """
+        Analyze minimum RSSI configuration across APs
+        
+        Min RSSI forces weak clients to roam, preventing sticky client problems
+        and improving overall network performance
+        
+        Returns:
+            dict: Min RSSI analysis with recommendations
+        """
+        results = {
+            'radios_with_min_rssi': [],
+            'radios_without_min_rssi': [],
+            'total_radios': 0,
+            'enabled_count': 0,
+            'disabled_count': 0,
+            'recommendations': [],
+            'severity': 'ok'
+        }
+        
+        # Recommended thresholds based on industry best practices
+        # These values balance roaming aggressiveness with connection stability
+        # Sources: Cisco WLAN Design Guide, Aruba Best Practices, UniFi recommendations
+        RECOMMENDED_MIN_RSSI_24GHZ = -75  # 2.4GHz: -75 to -80 dBm typical range
+        RECOMMENDED_MIN_RSSI_5GHZ = -72   # 5GHz: -70 to -75 dBm typical range
+        
+        # Note: Values depend on environment:
+        # - High-density: -67 to -72 dBm (force aggressive roaming)
+        # - Standard office: -72 to -75 dBm (balanced)
+        # - Large coverage areas: -75 to -80 dBm (avoid premature disconnects)
+        
+        try:
+            for device in devices:
+                if device.get('type') != 'uap':
+                    continue
+                
+                ap_name = device.get('name', 'Unnamed AP')
+                ap_id = device.get('_id')
+                radio_table = device.get('radio_table', [])
+                
+                for radio in radio_table:
+                    radio_name = radio.get('radio', 'unknown')
+                    band = '2.4GHz' if radio_name == 'ng' else '5GHz' if radio_name == 'na' else '6GHz'
+                    
+                    min_rssi_enabled = radio.get('min_rssi_enabled', False)
+                    min_rssi_value = radio.get('min_rssi', None)
+                    
+                    results['total_radios'] += 1
+                    
+                    radio_info = {
+                        'device': ap_name,
+                        'device_id': ap_id,
+                        'radio': radio_name,
+                        'band': band,
+                        'enabled': min_rssi_enabled,
+                        'value': min_rssi_value
+                    }
+                    
+                    if min_rssi_enabled:
+                        results['enabled_count'] += 1
+                        results['radios_with_min_rssi'].append(radio_info)
+                        
+                        # Check if value is optimal
+                        recommended = RECOMMENDED_MIN_RSSI_24GHZ if radio_name == 'ng' else RECOMMENDED_MIN_RSSI_5GHZ
+                        if min_rssi_value and abs(min_rssi_value - recommended) > 10:
+                            results['recommendations'].append({
+                                'type': 'min_rssi_suboptimal',
+                                'device': ap_name,
+                                'radio': radio_name,
+                                'band': band,
+                                'message': f'{ap_name} {band} has min RSSI at {min_rssi_value} dBm',
+                                'recommendation': f'Consider adjusting to {recommended} dBm for optimal roaming',
+                                'priority': 'low',
+                                'current_value': min_rssi_value,
+                                'recommended_value': recommended
+                            })
+                    else:
+                        results['disabled_count'] += 1
+                        results['radios_without_min_rssi'].append(radio_info)
+                        
+                        recommended = RECOMMENDED_MIN_RSSI_24GHZ if radio_name == 'ng' else RECOMMENDED_MIN_RSSI_5GHZ
+                        
+                        results['recommendations'].append({
+                            'type': 'min_rssi_disabled',
+                            'device': ap_name,
+                            'radio': radio_name,
+                            'band': band,
+                            'message': f'Min RSSI disabled on {ap_name} {band}',
+                            'recommendation': f'Enable min RSSI at {recommended} dBm to improve roaming',
+                            'priority': 'medium',
+                            'recommended_value': recommended
+                        })
+            
+            # Set overall severity
+            if results['disabled_count'] > results['enabled_count']:
+                results['severity'] = 'high'
+            elif results['disabled_count'] > 0:
+                results['severity'] = 'medium'
+            
+        except Exception as e:
+            results['error'] = str(e)
+        
+        return results
+    
     def analyze_airtime_utilization(self, devices, lookback_hours=24):
         """
         Analyze airtime utilization per AP with time-series data
@@ -727,6 +831,7 @@ def run_advanced_analysis(client, site='default', devices=None, clients=None, lo
     results = {
         'dfs_analysis': analyzer.analyze_dfs_events(lookback_days),
         'band_steering_analysis': analyzer.analyze_band_steering(devices, clients),
+        'min_rssi_analysis': analyzer.analyze_min_rssi(devices),
         'fast_roaming_analysis': analyzer.analyze_fast_roaming(devices),
         'airtime_analysis': analyzer.analyze_airtime_utilization(devices),
         'client_capabilities': analyzer.analyze_client_capabilities(clients),
