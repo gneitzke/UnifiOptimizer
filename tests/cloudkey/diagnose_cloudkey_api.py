@@ -48,6 +48,7 @@ logging.basicConfig(
 logger = logging.getLogger("cloudkey_api_diagnostic")
 
 # API diagnostic tests to run
+# Note: {site} will be replaced with the actual site name
 DIAGNOSTIC_TESTS = [
     {
         "name": "System Info",
@@ -71,21 +72,21 @@ DIAGNOSTIC_TESTS = [
     },
     {
         "name": "Device List",
-        "endpoint": "/api/s/default/stat/device",
+        "endpoint": "/api/s/{site}/stat/device",
         "method": "GET",
         "auth_required": True,
         "expected_keys": ["data"]
     },
     {
         "name": "Client List",
-        "endpoint": "/api/s/default/stat/sta",
+        "endpoint": "/api/s/{site}/stat/sta",
         "method": "GET",
         "auth_required": True,
         "expected_keys": ["data"]
     },
     {
         "name": "WLAN Config",
-        "endpoint": "/api/s/default/rest/wlanconf",
+        "endpoint": "/api/s/{site}/rest/wlanconf",
         "method": "GET",
         "auth_required": True,
         "expected_keys": ["data"]
@@ -253,10 +254,10 @@ def run_diagnostic_test(session, url, test, username, password):
         logger.error(traceback.format_exc())
         return False, f"Test error: {str(e)}", None
 
-def run_diagnostics(url, username, password):
+def run_diagnostics(url, username, password, site="default"):
     """Run all diagnostic tests"""
     url = normalize_host_url(url)
-    logger.info(f"Starting diagnostics for {url}")
+    logger.info(f"Starting diagnostics for {url} (site: {site})")
     
     session = requests.Session()
     
@@ -267,11 +268,19 @@ def run_diagnostics(url, username, password):
     if not auth_success:
         return
     
+    # Replace {site} placeholder in test endpoints
+    diagnostic_tests = []
+    for test in DIAGNOSTIC_TESTS:
+        test_copy = test.copy()
+        if "endpoint" in test_copy:
+            test_copy["endpoint"] = test["endpoint"].replace("{site}", site)
+        diagnostic_tests.append(test_copy)
+    
     # Run each diagnostic test
     results = []
     all_passed = True
     
-    for test in DIAGNOSTIC_TESTS:
+    for test in diagnostic_tests:
         # Skip the login test since we've already tested authentication
         if test["name"] == "Login Check":
             continue
@@ -324,9 +333,10 @@ def main():
     url = input("Enter UniFi Controller URL (e.g. https://192.168.1.1:8443): ")
     username = input("Enter username: ")
     password = input("Enter password: ")
+    site = input("Enter site name [default]: ").strip() or "default"
     
     # Run diagnostics
-    run_diagnostics(url, username, password)
+    run_diagnostics(url, username, password, site)
 
 if __name__ == "__main__":
     main()
