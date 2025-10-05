@@ -35,6 +35,14 @@ class CloudKeyGen2Client:
             verify_ssl: Whether to verify SSL certificates
             verbose: Enable verbose error logging
         """
+        # Validate required parameters
+        if not host:
+            raise ValueError("Host parameter is required")
+        if not username:
+            raise ValueError("Username parameter is required")
+        if not password:
+            raise ValueError("Password parameter is required")
+
         self.host = host.rstrip("/")
         self.username = username
         self.password = password
@@ -413,6 +421,12 @@ class CloudKeyGen2Client:
         if self.logger:
             self.logger.info(f"GET {url}")
 
+        # Verbose mode: Log request details
+        if self.verbose:
+            console.print(f"\n[bold cyan]→ GET Request[/bold cyan]")
+            console.print(f"[cyan]URL:[/cyan] {url}")
+            console.print(f"[cyan]Path:[/cyan] {path}")
+
         try:
             response = self.session.get(url, verify=self.verify_ssl)
 
@@ -454,9 +468,11 @@ class CloudKeyGen2Client:
 
                 return None
 
+            # Parse response
+            json_data = response.json()
+
             # Log success
             if self.logger:
-                json_data = response.json()
                 data_info = ""
                 if isinstance(json_data, dict):
                     if "data" in json_data:
@@ -466,7 +482,35 @@ class CloudKeyGen2Client:
                         data_info = f" (returned {data_len} items)"
                 self.logger.info(f"✓ GET {path} successful{data_info}")
 
-            return response.json()
+            # Verbose mode: Log response details
+            if self.verbose:
+                import json as json_lib
+
+                console.print(f"[bold green]← Response ({response.status_code})[/bold green]")
+
+                # Pretty print JSON response
+                if isinstance(json_data, dict):
+                    if "data" in json_data:
+                        data_len = (
+                            len(json_data["data"]) if isinstance(json_data["data"], list) else 1
+                        )
+                        console.print(f"[green]Data items:[/green] {data_len}")
+
+                        # Show first item as sample if it's a list
+                        if isinstance(json_data["data"], list) and len(json_data["data"]) > 0:
+                            console.print(f"[green]Sample item (first of {data_len}):[/green]")
+                            console.print(
+                                json_lib.dumps(json_data["data"][0], indent=2, default=str)
+                            )
+                        elif isinstance(json_data["data"], dict):
+                            console.print(f"[green]Response data:[/green]")
+                            console.print(json_lib.dumps(json_data["data"], indent=2, default=str))
+                    else:
+                        console.print(f"[green]Response:[/green]")
+                        console.print(json_lib.dumps(json_data, indent=2, default=str))
+                console.print()  # Blank line for readability
+
+            return json_data
 
         except Exception as e:
             error_msg = f"GET error for {path}: {str(e)}"
@@ -490,11 +534,21 @@ class CloudKeyGen2Client:
 
                 self.logger.error(f"  Traceback:\n{traceback.format_exc()}")
 
+            # Verbose mode: Show detailed error
             if self.verbose:
-                console.print(f"[red]✗ {error_msg}[/red]")
+                import json as json_lib
                 import traceback
 
-                console.print(f"[dim]{traceback.format_exc()}[/dim]")
+                console.print(f"\n[bold red]✗ GET Request Failed[/bold red]")
+                console.print(f"[red]Path:[/red] {path}")
+                console.print(f"[red]Error:[/red] {str(e)}")
+                console.print(f"[red]Type:[/red] {type(e).__name__}")
+                console.print(f"[dim]Traceback:\n{traceback.format_exc()}[/dim]")
+
+                # Show error detail as JSON for debugging
+                console.print(f"[red]Error detail:[/red]")
+                console.print(json_lib.dumps(error_detail, indent=2, default=str))
+                console.print()
             else:
                 console.print(f"[red]⚠ {error_msg}[/red]")
 
@@ -533,10 +587,22 @@ class CloudKeyGen2Client:
             self.logger.info(f"PUT {url}")
             self.logger.debug(f"  Data: {data}")
 
+        # Verbose mode: Log request details
+        if self.verbose:
+            import json as json_lib
+
+            console.print(f"\n[bold yellow]→ PUT Request[/bold yellow]")
+            console.print(f"[yellow]URL:[/yellow] {url}")
+            console.print(f"[yellow]Path:[/yellow] {path}")
+            console.print(f"[yellow]Payload:[/yellow]")
+            console.print(json_lib.dumps(data, indent=2, default=str))
+
         # Prepare headers with CSRF token
         headers = {"Content-Type": "application/json"}
         if self.csrf_manager.token:
             headers["X-CSRF-Token"] = self.csrf_manager.token
+            if self.verbose:
+                console.print(f"[yellow]CSRF Token:[/yellow] {self.csrf_manager.token[:20]}...")
 
         try:
             response = self.session.put(url, json=data, headers=headers, verify=self.verify_ssl)
@@ -549,8 +615,24 @@ class CloudKeyGen2Client:
 
             if response.status_code != 200:
                 error_msg = f"PUT {path} returned {response.status_code}"
-                console.print(f"[yellow]{error_msg}[/yellow]")
-                console.print(f"Response: {response.text}")
+
+                if self.verbose:
+                    import json as json_lib
+
+                    console.print(f"\n[bold yellow]← Response (Non-200)[/bold yellow]")
+                    console.print(f"[yellow]Status:[/yellow] {response.status_code}")
+                    console.print(f"[yellow]Response:[/yellow]")
+                    try:
+                        # Try to parse as JSON
+                        error_data = response.json()
+                        console.print(json_lib.dumps(error_data, indent=2, default=str))
+                    except Exception:
+                        # Fall back to text
+                        console.print(response.text)
+                    console.print()
+                else:
+                    console.print(f"[yellow]{error_msg}[/yellow]")
+                    console.print(f"Response: {response.text}")
 
                 if self.logger:
                     self.logger.error(f"✗ {error_msg}")
@@ -558,20 +640,58 @@ class CloudKeyGen2Client:
 
                 return None
 
+            # Parse response
+            json_data = response.json()
+
             if self.logger:
                 self.logger.info(f"✓ PUT {path} successful")
 
-            return response.json()
+            # Verbose mode: Log response details
+            if self.verbose:
+                import json as json_lib
+
+                console.print(f"[bold green]← Response ({response.status_code})[/bold green]")
+                console.print(f"[green]Response data:[/green]")
+                console.print(json_lib.dumps(json_data, indent=2, default=str))
+                console.print()
+
+            return json_data
 
         except Exception as e:
             error_msg = f"PUT error for {path}: {str(e)}"
-            console.print(f"[red]{error_msg}[/red]")
+
+            # Track the error
+            error_detail = {
+                "method": "PUT",
+                "path": path,
+                "status_code": None,
+                "error": str(e),
+                "exception_type": type(e).__name__,
+            }
 
             if self.logger:
                 self.logger.error(f"✗ {error_msg}")
                 import traceback
 
                 self.logger.error(f"  Traceback:\n{traceback.format_exc()}")
+
+            # Verbose mode: Show detailed error
+            if self.verbose:
+                import json as json_lib
+                import traceback
+
+                console.print(f"\n[bold red]✗ PUT Request Failed[/bold red]")
+                console.print(f"[red]Path:[/red] {path}")
+                console.print(f"[red]Error:[/red] {str(e)}")
+                console.print(f"[red]Type:[/red] {type(e).__name__}")
+                console.print(f"[dim]Traceback:\n{traceback.format_exc()}[/dim]")
+
+                # Show error detail as JSON for debugging
+                console.print(f"[red]Error detail:[/red]")
+                console.print(json_lib.dumps(error_detail, indent=2, default=str))
+                console.print()
+            else:
+                console.print(f"[red]{error_msg}[/red]")
 
             return None
 
@@ -628,26 +748,116 @@ class CloudKeyGen2Client:
 
         url = self._get_api_url(path)
 
+        if self.logger:
+            self.logger.info(f"POST {url}")
+            self.logger.debug(f"  Data: {data}")
+
+        # Verbose mode: Log request details
+        if self.verbose:
+            import json as json_lib
+
+            console.print(f"\n[bold magenta]→ POST Request[/bold magenta]")
+            console.print(f"[magenta]URL:[/magenta] {url}")
+            console.print(f"[magenta]Path:[/magenta] {path}")
+            console.print(f"[magenta]Payload:[/magenta]")
+            console.print(json_lib.dumps(data, indent=2, default=str))
+
         # Prepare headers with CSRF token
         headers = {"Content-Type": "application/json"}
         if self.csrf_manager.token:
             headers["X-CSRF-Token"] = self.csrf_manager.token
+            if self.verbose:
+                console.print(f"[magenta]CSRF Token:[/magenta] {self.csrf_manager.token[:20]}...")
 
         try:
             response = self.session.post(url, json=data, headers=headers, verify=self.verify_ssl)
+
+            if self.logger:
+                self.logger.info(f"Response: {response.status_code}")
 
             # Update CSRF token from response if available
             self.csrf_manager.update_token(self.session, response)
 
             if response.status_code != 200:
-                console.print(f"[yellow]POST {path} returned {response.status_code}[/yellow]")
-                console.print(f"Response: {response.text}")
+                error_msg = f"POST {path} returned {response.status_code}"
+
+                if self.verbose:
+                    import json as json_lib
+
+                    console.print(f"\n[bold yellow]← Response (Non-200)[/bold yellow]")
+                    console.print(f"[yellow]Status:[/yellow] {response.status_code}")
+                    console.print(f"[yellow]Response:[/yellow]")
+                    try:
+                        # Try to parse as JSON
+                        error_data = response.json()
+                        console.print(json_lib.dumps(error_data, indent=2, default=str))
+                    except Exception:
+                        # Fall back to text
+                        console.print(response.text)
+                    console.print()
+                else:
+                    console.print(f"[yellow]{error_msg}[/yellow]")
+                    console.print(f"Response: {response.text}")
+
+                if self.logger:
+                    self.logger.error(f"✗ {error_msg}")
+                    self.logger.error(f"  Response: {response.text}")
+
                 return None
 
-            return response.json()
+            # Parse response
+            json_data = response.json()
+
+            if self.logger:
+                self.logger.info(f"✓ POST {path} successful")
+
+            # Verbose mode: Log response details
+            if self.verbose:
+                import json as json_lib
+
+                console.print(f"[bold green]← Response ({response.status_code})[/bold green]")
+                console.print(f"[green]Response data:[/green]")
+                console.print(json_lib.dumps(json_data, indent=2, default=str))
+                console.print()
+
+            return json_data
 
         except Exception as e:
-            console.print(f"[red]POST error for {path}: {str(e)}[/red]")
+            error_msg = f"POST error for {path}: {str(e)}"
+
+            # Track the error
+            error_detail = {
+                "method": "POST",
+                "path": path,
+                "status_code": None,
+                "error": str(e),
+                "exception_type": type(e).__name__,
+            }
+
+            if self.logger:
+                self.logger.error(f"✗ {error_msg}")
+                import traceback
+
+                self.logger.error(f"  Traceback:\n{traceback.format_exc()}")
+
+            # Verbose mode: Show detailed error
+            if self.verbose:
+                import json as json_lib
+                import traceback
+
+                console.print(f"\n[bold red]✗ POST Request Failed[/bold red]")
+                console.print(f"[red]Path:[/red] {path}")
+                console.print(f"[red]Error:[/red] {str(e)}")
+                console.print(f"[red]Type:[/red] {type(e).__name__}")
+                console.print(f"[dim]Traceback:\n{traceback.format_exc()}[/dim]")
+
+                # Show error detail as JSON for debugging
+                console.print(f"[red]Error detail:[/red]")
+                console.print(json_lib.dumps(error_detail, indent=2, default=str))
+                console.print()
+            else:
+                console.print(f"[red]{error_msg}[/red]")
+
             return None
 
 
