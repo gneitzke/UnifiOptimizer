@@ -578,6 +578,13 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
     if client_capabilities:
         html_content += generate_client_capabilities_html(client_capabilities)
 
+    # Client Security Section
+    client_security = analysis_data.get("client_security")
+    if client_security and (
+        client_security.get("blocked_clients") or client_security.get("isolated_clients")
+    ):
+        html_content += generate_client_security_html(client_security)
+
     # Manufacturer Analysis Section
     manufacturer_analysis = analysis_data.get("manufacturer_analysis")
     if manufacturer_analysis:
@@ -1743,10 +1750,12 @@ def generate_band_steering_html(band_steering):
     # Misplaced clients table
     clients_html = ""
     for client in misplaced_clients[:10]:  # Show top 10
+        last_seen = client.get("last_seen", "Unknown")
         clients_html += f"""
                     <tr>
                         <td>{client.get('hostname', 'Unknown')}</td>
                         <td>{client.get('ap', 'Unknown')}</td>
+                        <td style="color: #666; font-size: 0.9em;">{last_seen}</td>
                         <td>{client.get('rssi', 'N/A')} dBm</td>
                         <td>{client.get('radio_proto', 'N/A')}</td>
                     </tr>
@@ -1784,6 +1793,7 @@ def generate_band_steering_html(band_steering):
                         <tr>
                             <th>Client</th>
                             <th>Connected AP</th>
+                            <th>Last Seen</th>
                             <th>Signal</th>
                             <th>Capability</th>
                         </tr>
@@ -2317,6 +2327,115 @@ def generate_client_capabilities_html(capabilities):
                     </tbody>
                 </table>
                 ''' if problem_html else ''}
+            </div>
+"""
+
+
+def generate_client_security_html(security):
+    """Generate client security analysis section"""
+    blocked_clients = security.get("blocked_clients", [])
+    isolated_clients = security.get("isolated_clients", [])
+    severity = security.get("severity", "ok")
+
+    severity_colors = {
+        "high": "#ef4444",
+        "medium": "#f59e0b",
+        "ok": "#10b981",
+        "critical": "#dc2626",
+    }
+    severity_color = severity_colors.get(severity, "#6b7280")
+
+    # Blocked clients table
+    blocked_html = ""
+    for client in blocked_clients[:20]:  # Show top 20
+        connection_type = "🔌 Wired" if client.get("is_wired") else "📡 Wireless"
+        blocked_html += f"""
+                    <tr style="background: #fee2e2;">
+                        <td><strong>{client.get('hostname', 'Unknown')}</strong></td>
+                        <td><code style="font-size: 0.85em;">{client.get('mac', 'Unknown')}</code></td>
+                        <td>{connection_type}</td>
+                        <td style="color: #dc2626; font-weight: 500;">{client.get('reason', 'Blocked')}</td>
+                    </tr>
+"""
+
+    # Isolated clients table
+    isolated_html = ""
+    for client in isolated_clients[:20]:  # Show top 20
+        vlan_info = f"VLAN {client.get('vlan', 'Unknown')}"
+        isolated_html += f"""
+                    <tr style="background: #fef3c7;">
+                        <td><strong>{client.get('hostname', 'Unknown')}</strong></td>
+                        <td><code style="font-size: 0.85em;">{client.get('mac', 'Unknown')}</code></td>
+                        <td>{client.get('network', 'Unknown')}</td>
+                        <td>{vlan_info}</td>
+                        <td style="color: #92400e;">{client.get('note', 'Isolated')}</td>
+                    </tr>
+"""
+
+    blocked_count = len(blocked_clients)
+    isolated_count = len(isolated_clients)
+
+    return f"""
+            <div class="section">
+                <h2>🔒 Client Security Status</h2>
+
+                {f'''
+                <div style="background: {severity_color}15; padding: 20px; border-radius: 8px; border-left: 4px solid {severity_color}; margin-bottom: 20px;">
+                    <strong style="font-size: 1.2em; color: {severity_color};">⚠️ {blocked_count} Blocked Client(s) Detected</strong>
+                    <p style="margin-top: 10px; color: #666;">These clients are actively blocked - possible security threats or incorrectly blocked devices.</p>
+                </div>
+
+                <h3>Blocked Clients</h3>
+                <table class="ap-table">
+                    <thead>
+                        <tr>
+                            <th>Client Name</th>
+                            <th>MAC Address</th>
+                            <th>Connection</th>
+                            <th>Block Reason</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {blocked_html}
+                    </tbody>
+                </table>
+                ''' if blocked_count > 0 else ''}
+
+                {f'''
+                <h3 style="margin-top: 30px;">Isolated Clients</h3>
+                <div style="background: #fffbeb; padding: 15px; border-radius: 8px; border-left: 4px solid #f59e0b; margin-bottom: 15px;">
+                    <strong style="color: #92400e;">{isolated_count} Client(s) in Isolation/Guest Network</strong>
+                    <p style="margin-top: 8px; color: #78350f; font-size: 0.9em;">These clients are isolated from the main network, either in guest mode or restricted VLAN.</p>
+                </div>
+
+                <table class="ap-table">
+                    <thead>
+                        <tr>
+                            <th>Client Name</th>
+                            <th>MAC Address</th>
+                            <th>Network</th>
+                            <th>VLAN</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {isolated_html}
+                    </tbody>
+                </table>
+                ''' if isolated_count > 0 else ''}
+
+                <div style="margin-top: 20px; padding: 15px; background: #f3f4f6; border-radius: 8px;">
+                    <strong>About Client Security:</strong>
+                    <p style="margin-top: 8px; color: #666;">
+                        <strong>Blocked Clients:</strong> Devices that are actively prevented from connecting, usually due to security policies or manual blocking.
+                    </p>
+                    <p style="margin-top: 8px; color: #666;">
+                        <strong>Isolated Clients:</strong> Devices on guest networks or restricted VLANs with limited access to your main network resources.
+                    </p>
+                    <p style="margin-top: 10px; color: #ef4444; font-weight: 500;">
+                        ⚠️ Review blocked clients immediately - they may indicate security threats or configuration issues.
+                    </p>
+                </div>
             </div>
 """
 

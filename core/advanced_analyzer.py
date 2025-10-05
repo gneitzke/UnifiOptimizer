@@ -216,13 +216,44 @@ class AdvancedNetworkAnalyzer:
 
                         if is_dual_band:
                             results["dual_band_clients_on_2ghz"] += 1
+
+                            # Get AP name - use ap_name if available, otherwise lookup by ap_mac
+                            ap_display = client.get("ap_name", "")
+                            if not ap_display or ap_display == "Unknown":
+                                ap_mac = client.get("ap_mac", "")
+                                if ap_mac and devices:
+                                    for device in devices:
+                                        if device.get("mac") == ap_mac:
+                                            ap_display = device.get("name", ap_mac)
+                                            break
+                                if not ap_display:
+                                    ap_display = f"Unknown (MAC: {ap_mac})" if ap_mac else "Unknown"
+
+                            # Get last seen time
+                            last_seen = client.get("last_seen", client.get("_last_seen", 0))
+                            import time
+
+                            if last_seen:
+                                time_ago = int(time.time()) - last_seen
+                                if time_ago < 60:
+                                    last_seen_str = "Just now"
+                                elif time_ago < 3600:
+                                    last_seen_str = f"{time_ago // 60}m ago"
+                                elif time_ago < 86400:
+                                    last_seen_str = f"{time_ago // 3600}h ago"
+                                else:
+                                    last_seen_str = f"{time_ago // 86400}d ago"
+                            else:
+                                last_seen_str = "Unknown"
+
                             results["misplaced_clients"].append(
                                 {
                                     "hostname": client.get(
                                         "hostname", client.get("name", "Unknown")
                                     ),
                                     "mac": client.get("mac"),
-                                    "ap": client.get("ap_name", "Unknown"),
+                                    "ap": ap_display,
+                                    "last_seen": last_seen_str,
                                     "rssi": client.get("rssi"),
                                     "radio_proto": radio_proto,
                                     "tx_rate": tx_rate,
@@ -765,6 +796,105 @@ class AdvancedNetworkAnalyzer:
 
         return results
 
+    def analyze_client_security(self, clients):
+        """
+        Analyze client security status including isolation/blocking
+
+        Returns:
+            dict: Security analysis with isolated/blocked clients
+        """
+        results = {
+            "isolated_clients": [],
+            "blocked_clients": [],
+            "guest_clients": [],
+            "severity": "ok",
+            "recommendations": [],
+        }
+
+        try:
+            for client in clients:
+                # Check for blocked clients (various field names used)
+                is_blocked = (
+                    client.get("blocked", False)
+                    or client.get("is_blocked", False)
+                    or client.get("blocked_by_dpi", False)
+                )
+
+                # Check for isolated clients
+                is_guest = client.get("is_guest", False)
+                use_fixedip = client.get("use_fixedip", False)
+                note = client.get("note", "").lower()
+
+                # Client in isolation if marked as guest or has isolation in note
+                is_isolated = is_guest or "isolat" in note or "quarantine" in note
+
+                hostname = client.get("hostname", client.get("name", "Unknown"))
+                mac = client.get("mac", "Unknown")
+
+                if is_blocked:
+                    results["blocked_clients"].append(
+                        {
+                            "hostname": hostname,
+                            "mac": mac,
+                            "reason": note if note else "Unknown",
+                            "is_wired": client.get("is_wired", False),
+                        }
+                    )
+
+                if is_isolated and not is_blocked:
+                    results["isolated_clients"].append(
+                        {
+                            "hostname": hostname,
+                            "mac": mac,
+                            "is_guest": is_guest,
+                            "network": client.get("network", "Unknown"),
+                            "vlan": client.get("vlan", "Unknown"),
+                            "note": note if note else "Guest network",
+                        }
+                    )
+
+                if is_guest:
+                    results["guest_clients"].append(
+                        {
+                            "hostname": hostname,
+                            "mac": mac,
+                            "network": client.get("network", "Unknown"),
+                        }
+                    )
+
+            # Determine severity
+            blocked_count = len(results["blocked_clients"])
+            isolated_count = len(results["isolated_clients"])
+
+            if blocked_count > 0:
+                results["severity"] = "high"
+                results["recommendations"].append(
+                    {
+                        "type": "blocked_clients_critical",
+                        "message": f"{blocked_count} client(s) are blocked - possible security threat",
+                        "recommendation": "Review blocked clients immediately. These may be security threats or legitimate devices incorrectly blocked.",
+                        "priority": "critical",
+                        "affected_count": blocked_count,
+                    }
+                )
+
+            if isolated_count > 5:
+                results["severity"] = "high" if results["severity"] == "ok" else results["severity"]
+                results["recommendations"].append(
+                    {
+                        "type": "high_isolation",
+                        "message": f"{isolated_count} client(s) in isolation/guest network",
+                        "recommendation": "Verify isolation settings are intentional. Consider moving trusted devices to main network.",
+                        "priority": "medium",
+                        "affected_count": isolated_count,
+                    }
+                )
+
+        except Exception as e:
+            results["error"] = str(e)
+
+        return results
+
     def calculate_network_health_score(self, analysis_data):
         """
         Calculate overall network health score (0-100)
@@ -945,6 +1075,7 @@ def run_advanced_analysis(client, site="default", devices=None, clients=None, lo
         "fast_roaming_analysis": analyzer.analyze_fast_roaming(devices),
         "airtime_analysis": analyzer.analyze_airtime_utilization(devices),
         "client_capabilities": analyzer.analyze_client_capabilities(clients, devices),
+        "client_security": analyzer.analyze_client_security(clients),
         "switch_analysis": switch_analysis,
     }
 
