@@ -354,6 +354,12 @@ class ExpertNetworkAnalyzer:
             mac = client.get('mac')
             hostname = client.get('hostname', 'Unknown')
             rssi = client.get('rssi', -100)
+            
+            # FIX: Some UniFi controllers return positive RSSI values
+            # RSSI should always be negative in dBm for WiFi
+            if rssi > 0:
+                rssi = -rssi
+            
             ap_mac = client.get('ap_mac')
             channel = client.get('channel', 0)
             
@@ -419,6 +425,12 @@ class ExpertNetworkAnalyzer:
                 signal_distribution['wired'] += 1
             else:
                 rssi = client.get('rssi', -100)
+                
+                # FIX: Some UniFi controllers return positive RSSI values
+                # RSSI should always be negative in dBm for WiFi
+                if rssi > 0:
+                    rssi = -rssi
+                
                 if rssi > self.RSSI_EXCELLENT:
                     signal_distribution['excellent'] += 1
                 elif rssi > self.RSSI_GOOD:
