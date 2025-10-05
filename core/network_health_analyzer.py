@@ -13,7 +13,7 @@ class NetworkHealthAnalyzer:
     def __init__(self, client, site='default'):
         self.client = client
         self.site = site
-    
+
     def analyze_network_health(self, devices, clients):
         """
         Comprehensive health analysis covering all network aspects
@@ -32,18 +32,18 @@ class NetworkHealthAnalyzer:
             'issues': [],
             'recommendations': []
         }
-        
+
         # Aggregate issues and calculate overall score
         for category, analysis in results['categories'].items():
             if analysis.get('issues'):
                 results['issues'].extend(analysis['issues'])
             if analysis.get('recommendations'):
                 results['recommendations'].extend(analysis['recommendations'])
-            
+
             # Deduct from overall score based on severity
             score_penalty = analysis.get('score_penalty', 0)
             results['overall_score'] -= score_penalty
-        
+
         # Determine overall severity
         if results['overall_score'] < 50:
             results['severity'] = 'high'
@@ -51,12 +51,12 @@ class NetworkHealthAnalyzer:
             results['severity'] = 'medium'
         else:
             results['severity'] = 'low'
-        
+
         # Ensure score doesn't go below 0
         results['overall_score'] = max(0, results['overall_score'])
-        
+
         return results
-    
+
     def _analyze_device_stability(self, devices):
         """
         Analyze device uptime and restart patterns
@@ -74,14 +74,14 @@ class NetworkHealthAnalyzer:
                 'critical_restart': []
             }
         }
-        
+
         for device in devices:
             device_name = device.get('name', 'Unknown')
             device_type = device.get('type', 'unknown')
             uptime_seconds = device.get('uptime', 0)
             uptime_days = uptime_seconds / 86400
             uptime_hours = uptime_seconds / 3600
-            
+
             device_info = {
                 'name': device_name,
                 'type': device_type,
@@ -89,13 +89,13 @@ class NetworkHealthAnalyzer:
                 'uptime_days': uptime_days,
                 'uptime_hours': uptime_hours
             }
-            
+
             # Critical: Device restarted in last 24 hours
             if uptime_days < 1:
                 analysis['devices']['critical_restart'].append(device_info)
                 analysis['status'] = 'critical'
                 analysis['score_penalty'] += 10
-                
+
                 analysis['issues'].append({
                     'severity': 'high',
                     'type': 'recent_restart',
@@ -106,14 +106,14 @@ class NetworkHealthAnalyzer:
                     'impact': 'Device crash or reboot caused service interruption',
                     'recommendation': 'Investigate restart cause - check device logs, power supply, overheating, or firmware issues'
                 })
-            
+
             # Warning: Device restarted in last 7 days
             elif uptime_days < 7:
                 analysis['devices']['recent_restart'].append(device_info)
                 if analysis['status'] == 'healthy':
                     analysis['status'] = 'warning'
                 analysis['score_penalty'] += 3
-                
+
                 analysis['issues'].append({
                     'severity': 'medium',
                     'type': 'recent_restart',
@@ -124,11 +124,11 @@ class NetworkHealthAnalyzer:
                     'impact': 'Recent restart may indicate instability',
                     'recommendation': 'Monitor device for additional restarts; review event logs'
                 })
-            
+
             # Stable device
             else:
                 analysis['devices']['stable'].append(device_info)
-        
+
         # Summary recommendation
         if analysis['devices']['critical_restart']:
             analysis['recommendations'].append({
@@ -137,13 +137,13 @@ class NetworkHealthAnalyzer:
                 'message': f"{len(analysis['devices']['critical_restart'])} device(s) restarted in last 24 hours - immediate investigation needed",
                 'action': 'Check device logs, power supplies, and environmental conditions'
             })
-        
+
         return analysis
-    
+
     def _analyze_broadcast_traffic(self, devices):
         """
         Detect broadcast storms and excessive multicast traffic
-        
+
         Smart detection: If all ports have similar broadcast counts, it's normal switch behavior
         (broadcasts are forwarded to all ports). Only flag outliers or anomalies.
         """
@@ -155,30 +155,30 @@ class NetworkHealthAnalyzer:
             'score_penalty': 0,
             'ports_with_issues': []
         }
-        
+
         switches = [d for d in devices if d.get('type') == 'usw']
-        
+
         for switch in switches:
             switch_name = switch.get('name', 'Unknown Switch')
             port_table = switch.get('port_table', [])
-            
+
             # Collect broadcast counts from all active ports
             port_broadcasts = []
             port_data = {}
-            
+
             for port in port_table:
                 if not port.get('up'):
                     continue
-                
+
                 port_idx = port.get('port_idx')
                 rx_broadcast = port.get('rx_broadcast', 0)
                 tx_broadcast = port.get('tx_broadcast', 0)
                 rx_multicast = port.get('rx_multicast', 0)
                 tx_multicast = port.get('tx_multicast', 0)
-                
+
                 total_broadcast = rx_broadcast + tx_broadcast
                 total_multicast = rx_multicast + tx_multicast
-                
+
                 port_broadcasts.append(total_broadcast)
                 port_data[port_idx] = {
                     'broadcast': total_broadcast,
@@ -186,38 +186,38 @@ class NetworkHealthAnalyzer:
                     'rx_broadcast': rx_broadcast,
                     'tx_broadcast': tx_broadcast
                 }
-            
+
             if not port_broadcasts:
                 continue
-            
+
             # Calculate statistics
             avg_broadcast = sum(port_broadcasts) / len(port_broadcasts)
             max_broadcast = max(port_broadcasts)
             min_broadcast = min(port_broadcasts)
-            
+
             # Calculate standard deviation
             variance = sum((x - avg_broadcast) ** 2 for x in port_broadcasts) / len(port_broadcasts)
             std_dev = variance ** 0.5
-            
+
             # If all ports have similar counts (low variance), it's normal switch behavior
             # Only flag if there are significant outliers
             threshold_multiplier = 2.0  # Flag if >2x standard deviation from mean
-            
+
             for port_idx, data in port_data.items():
                 total_broadcast = data['broadcast']
                 total_multicast = data['multicast']
                 rx_broadcast = data['rx_broadcast']
                 tx_broadcast = data['tx_broadcast']
-                
+
                 # Calculate deviation from average
                 deviation = abs(total_broadcast - avg_broadcast)
                 is_outlier = deviation > (std_dev * threshold_multiplier) if std_dev > 0 else False
-                
+
                 # Only flag as storm if it's an outlier AND extremely high
                 if is_outlier and total_broadcast > 100000000:  # >100M broadcasts AND outlier
                     analysis['status'] = 'critical'
                     analysis['score_penalty'] += 5
-                    
+
                     analysis['issues'].append({
                         'severity': 'high',
                         'type': 'broadcast_storm',
@@ -228,7 +228,7 @@ class NetworkHealthAnalyzer:
                         'impact': 'Excessive broadcast traffic consuming bandwidth and CPU on all devices',
                         'recommendation': 'Identify device on this port; check for network loops, chatty IoT devices, or misconfigurations'
                     })
-                    
+
                     analysis['ports_with_issues'].append({
                         'switch': switch_name,
                         'port': port_idx,
@@ -236,13 +236,13 @@ class NetworkHealthAnalyzer:
                         'multicast': total_multicast,
                         'severity': 'high'
                     })
-                
+
                 # Flag significantly higher TX broadcasts (device generating broadcasts)
                 elif is_outlier and tx_broadcast > (rx_broadcast * 2) and tx_broadcast > 50000000:
                     if analysis['status'] == 'healthy':
                         analysis['status'] = 'warning'
                     analysis['score_penalty'] += 3
-                    
+
                     analysis['issues'].append({
                         'severity': 'medium',
                         'type': 'broadcast_source',
@@ -253,7 +253,7 @@ class NetworkHealthAnalyzer:
                         'impact': 'Device is source of broadcast traffic affecting network performance',
                         'recommendation': 'Identify device and check for misconfiguration or chatty protocol (mDNS, NetBIOS, etc.)'
                     })
-                    
+
                     analysis['ports_with_issues'].append({
                         'switch': switch_name,
                         'port': port_idx,
@@ -261,7 +261,7 @@ class NetworkHealthAnalyzer:
                         'multicast': total_multicast,
                         'severity': 'medium'
                     })
-                
+
                 # Info: High multicast (common for media devices)
                 if total_multicast > 100000000 and is_outlier:
                     analysis['issues'].append({
@@ -274,7 +274,7 @@ class NetworkHealthAnalyzer:
                         'impact': 'Normal for media devices (Sonos, Chromecast, Apple TV) but unusually high',
                         'recommendation': 'Monitor if causing performance issues; consider IGMP snooping optimization'
                     })
-            
+
             # Provide informational context if broadcast levels are uniformly high
             if avg_broadcast > 10000000 and std_dev / avg_broadcast < 0.1:  # High but uniform
                 analysis['recommendations'].append({
@@ -283,9 +283,9 @@ class NetworkHealthAnalyzer:
                     'message': f"Network has elevated broadcast traffic (~{avg_broadcast/1000000:.1f}M per port) but uniformly distributed",
                     'action': 'This is normal for networks with IoT devices. Consider VLAN segmentation to reduce broadcast domain size if performance issues occur.'
                 })
-        
+
         return analysis
-    
+
     def _analyze_channel_health(self, devices):
         """
         Analyze WiFi channel assignments, overlap, and optimization
@@ -302,44 +302,44 @@ class NetworkHealthAnalyzer:
                 'na': {}   # 5GHz
             }
         }
-        
+
         aps = [d for d in devices if d.get('type') == 'uap']
-        
+
         # Collect channel assignments
         for ap in aps:
             ap_name = ap.get('name', 'Unknown')
             radio_table = ap.get('radio_table', [])
-            
+
             for radio in radio_table:
                 radio_name = radio.get('radio', 'unknown')
                 channel = radio.get('channel')
-                
+
                 if not channel:
                     continue
-                
+
                 if radio_name not in analysis['channel_assignments']:
                     analysis['channel_assignments'][radio_name] = {}
-                
+
                 if channel not in analysis['channel_assignments'][radio_name]:
                     analysis['channel_assignments'][radio_name][channel] = []
-                
+
                 analysis['channel_assignments'][radio_name][channel].append({
                     'ap': ap_name,
                     'channel': channel,
                     'tx_power': radio.get('tx_power', 0),
                     'utilization': radio.get('channel_utilization', 0)
                 })
-        
+
         # Analyze 2.4GHz channel overlap (only channels 1, 6, 11 are non-overlapping)
         ng_channels = analysis['channel_assignments'].get('ng', {})
-        
+
         for channel, ap_list in ng_channels.items():
             if len(ap_list) > 1:
                 analysis['status'] = 'warning'
                 analysis['score_penalty'] += 5
-                
+
                 ap_names = [ap['ap'] for ap in ap_list]
-                
+
                 analysis['issues'].append({
                     'severity': 'medium',
                     'type': 'channel_overlap',
@@ -351,12 +351,12 @@ class NetworkHealthAnalyzer:
                     'impact': f"Reduced WiFi performance for {len(ap_list)} APs and their clients due to airtime contention",
                     'recommendation': f"Redistribute APs across channels 1, 6, 11 to minimize interference"
                 })
-        
+
         # Check for unused 2.4GHz channels
         used_24ghz = set(ng_channels.keys())
         optimal_24ghz = {1, 6, 11}
         available_24ghz = optimal_24ghz - used_24ghz
-        
+
         if available_24ghz and len(ng_channels) > 0:
             analysis['recommendations'].append({
                 'priority': 'medium',
@@ -364,17 +364,17 @@ class NetworkHealthAnalyzer:
                 'message': f"2.4GHz channels {available_24ghz} are unused",
                 'action': f"Redistribute APs to utilize unused channels and reduce co-channel interference. Optimal distribution: use only channels 1, 6, 11."
             })
-        
+
         # Analyze 5GHz channel utilization
         na_channels = analysis['channel_assignments'].get('na', {})
-        
+
         for channel, ap_list in na_channels.items():
             for ap_info in ap_list:
                 utilization = ap_info['utilization']
                 if utilization > 70:
                     analysis['status'] = 'warning'
                     analysis['score_penalty'] += 3
-                    
+
                     analysis['issues'].append({
                         'severity': 'medium',
                         'type': 'channel_congestion',
@@ -386,9 +386,9 @@ class NetworkHealthAnalyzer:
                         'impact': 'Congested channel reduces WiFi performance for all clients on this AP',
                         'recommendation': 'Consider changing channel, adjusting TX power, or adding additional AP coverage'
                     })
-        
+
         return analysis
-    
+
     def _analyze_radio_health(self, devices):
         """
         Analyze AP radio health including TX power, retries, and errors
@@ -401,26 +401,40 @@ class NetworkHealthAnalyzer:
             'score_penalty': 0,
             'radios': []
         }
-        
+
         aps = [d for d in devices if d.get('type') == 'uap']
-        
+
         for ap in aps:
             ap_name = ap.get('name', 'Unknown')
             uplink_type = ap.get('uplink', {}).get('type', 'unknown')
             is_mesh = (uplink_type == 'wireless')
             radio_table = ap.get('radio_table', [])
-            
+
             for radio in radio_table:
                 radio_name = radio.get('radio', 'unknown')
-                band = '2.4GHz' if radio_name == 'ng' else '5GHz'
+
+                # Determine band - handle 6GHz radios
+                if radio_name == 'ng':
+                    band = '2.4GHz'
+                elif radio_name == 'na':
+                    band = '5GHz'
+                elif radio_name in ['6e', 'ax', '6g']:  # 6GHz radio names
+                    band = '6GHz'
+                else:
+                    band = 'Unknown'
+
                 tx_power = radio.get('tx_power')
                 tx_power_mode = radio.get('tx_power_mode', 'unknown')
                 channel = radio.get('channel')
-                
-                # Handle None/null TX power from API (common on mesh APs)
+
+                # Check if radio is actually enabled/in-use
+                # A radio is considered active if it has a valid channel assigned
+                is_radio_enabled = channel is not None and channel > 0
+
+                # Handle None/null TX power from API (common on mesh APs or disabled radios)
                 if tx_power is None:
                     tx_power = 0
-                
+
                 radio_info = {
                     'ap': ap_name,
                     'band': band,
@@ -428,25 +442,31 @@ class NetworkHealthAnalyzer:
                     'tx_power': tx_power,
                     'tx_power_mode': tx_power_mode,
                     'channel': channel,
-                    'is_mesh': is_mesh
+                    'is_mesh': is_mesh,
+                    'is_enabled': is_radio_enabled
                 }
-                
+
                 analysis['radios'].append(radio_info)
-                
+
                 # Skip TX power checks for mesh APs (they report None/0 even when working)
                 if is_mesh:
                     continue
-                
+
+                # Skip TX power checks if radio is not enabled (no channel assigned)
+                # This is normal for APs with disabled radios or 6GHz radios not in use
+                if not is_radio_enabled:
+                    continue
+
                 # Skip TX power checks if in AUTO mode (controller is managing power intelligently)
                 if tx_power_mode == 'auto':
                     continue
-                
+
                 # Check for very low TX power (< 10dBm) - only for wired APs with manual power settings
                 if tx_power < 10 and tx_power > 0:
                     if analysis['status'] == 'healthy':
                         analysis['status'] = 'warning'
                     analysis['score_penalty'] += 2
-                    
+
                     analysis['issues'].append({
                         'severity': 'medium',
                         'type': 'low_tx_power',
@@ -458,27 +478,31 @@ class NetworkHealthAnalyzer:
                         'impact': 'Reduced coverage area and signal strength; clients at edge may have poor performance',
                         'recommendation': 'Review TX power settings; increase to medium or high, or enable auto mode for dynamic optimization'
                     })
-                
-                # Check for TX power = 0 (disabled or error) - only for wired APs
+
+                # Check for TX power = 0 (error state) - only for wired APs with enabled radios
+                # If we got here, the radio is enabled (has channel) but reports 0 power - that's unusual
                 elif tx_power == 0:
-                    analysis['status'] = 'critical'
-                    analysis['score_penalty'] += 10
-                    
+                    # Only flag as critical if the radio is actually in use (has channel and clients)
+                    # Otherwise it might just be an AP with disabled radio (like U7 Pro with 6GHz off)
+                    analysis['status'] = 'warning'
+                    analysis['score_penalty'] += 5
+
                     analysis['issues'].append({
-                        'severity': 'high',
-                        'type': 'radio_disabled',
+                        'severity': 'medium',
+                        'type': 'radio_low_power',
                         'ap': ap_name,
                         'band': band,
                         'tx_power': tx_power,
-                        'message': f"{ap_name} ({band}): Radio appears disabled or malfunctioning (0dBm)",
-                        'impact': 'Radio not functioning; no WiFi coverage on this band',
-                        'recommendation': 'Check radio settings; ensure radio is enabled; may indicate hardware failure'
+                        'channel': channel,
+                        'message': f"{ap_name} ({band} Ch {channel}): Very low TX power (0dBm) - check configuration",
+                        'impact': 'Minimal WiFi coverage; clients may have difficulty connecting',
+                        'recommendation': 'Review radio TX power settings; increase power level or enable auto mode'
                     })
-        
+
         # Check for TX power inconsistencies (only for wired APs)
         ng_powers = [r['tx_power'] for r in analysis['radios'] if r['radio'] == 'ng' and r['tx_power'] > 0 and not r.get('is_mesh')]
         na_powers = [r['tx_power'] for r in analysis['radios'] if r['radio'] == 'na' and r['tx_power'] > 0 and not r.get('is_mesh')]
-        
+
         if ng_powers and max(ng_powers) - min(ng_powers) > 10:
             analysis['recommendations'].append({
                 'priority': 'low',
@@ -486,7 +510,7 @@ class NetworkHealthAnalyzer:
                 'message': f"2.4GHz TX power varies significantly across APs ({min(ng_powers)}-{max(ng_powers)}dBm)",
                 'action': 'Consider normalizing TX power levels for consistent coverage, unless intentionally designed for specific coverage patterns'
             })
-        
+
         if na_powers and max(na_powers) - min(na_powers) > 10:
             analysis['recommendations'].append({
                 'priority': 'low',
@@ -494,9 +518,9 @@ class NetworkHealthAnalyzer:
                 'message': f"5GHz TX power varies significantly across APs ({min(na_powers)}-{max(na_powers)}dBm)",
                 'action': 'Consider normalizing TX power levels for consistent coverage'
             })
-        
+
         return analysis
-    
+
     def _analyze_vlan_segmentation(self, clients):
         """
         Analyze VLAN usage and network segmentation
@@ -509,31 +533,31 @@ class NetworkHealthAnalyzer:
             'score_penalty': 0,
             'vlans': {}
         }
-        
+
         # Collect VLAN usage
         for client in clients:
             vlan = client.get('vlan', 1)
-            
+
             if vlan not in analysis['vlans']:
                 analysis['vlans'][vlan] = {
                     'count': 0,
                     'clients': []
                 }
-            
+
             analysis['vlans'][vlan]['count'] += 1
             analysis['vlans'][vlan]['clients'].append({
                 'name': client.get('hostname', client.get('name', 'Unknown')),
                 'mac': client.get('mac')
             })
-        
+
         # Check for single VLAN usage
         if len(analysis['vlans']) == 1 and 1 in analysis['vlans']:
             total_clients = analysis['vlans'][1]['count']
-            
+
             if total_clients > 50:
                 analysis['status'] = 'warning'
                 analysis['score_penalty'] += 5
-                
+
                 analysis['issues'].append({
                     'severity': 'medium',
                     'type': 'no_segmentation',
@@ -543,18 +567,18 @@ class NetworkHealthAnalyzer:
                     'impact': 'Flat network increases security risk and broadcast domain size',
                     'recommendation': 'Implement VLANs to segment: IoT devices, guest devices, security cameras, and critical infrastructure'
                 })
-            
+
             analysis['recommendations'].append({
                 'priority': 'medium',
                 'category': 'segmentation',
                 'message': 'Network segmentation recommended for security and performance',
                 'action': 'Create separate VLANs for: IoT/Smart Home (Sonos, smart plugs), Guest WiFi, Security cameras, Management interfaces'
             })
-        
+
         # Check for proper segmentation
         elif len(analysis['vlans']) > 1:
             default_vlan_pct = (analysis['vlans'].get(1, {}).get('count', 0) / sum(v['count'] for v in analysis['vlans'].values())) * 100
-            
+
             if default_vlan_pct > 80:
                 analysis['recommendations'].append({
                     'priority': 'low',
@@ -562,9 +586,9 @@ class NetworkHealthAnalyzer:
                     'message': f"{default_vlan_pct:.0f}% of clients still on default VLAN",
                     'action': 'Consider moving more devices to dedicated VLANs for better segmentation'
                 })
-        
+
         return analysis
-    
+
     def _analyze_firmware_status(self, devices):
         """
         Check firmware update status across all devices
@@ -580,26 +604,26 @@ class NetworkHealthAnalyzer:
                 'updates_available': []
             }
         }
-        
+
         for device in devices:
             device_name = device.get('name', 'Unknown')
             device_type = device.get('type', 'unknown')
             current_version = device.get('version', 'Unknown')
             upgradable = device.get('upgradable', False)
             upgrade_to = device.get('upgrade_to_firmware', None)
-            
+
             device_info = {
                 'name': device_name,
                 'type': device_type,
                 'current_version': current_version,
                 'upgrade_to': upgrade_to
             }
-            
+
             if upgradable:
                 analysis['devices']['updates_available'].append(device_info)
                 analysis['status'] = 'warning'
                 analysis['score_penalty'] += 2
-                
+
                 analysis['issues'].append({
                     'severity': 'low',
                     'type': 'firmware_update',
@@ -613,7 +637,7 @@ class NetworkHealthAnalyzer:
                 })
             else:
                 analysis['devices']['up_to_date'].append(device_info)
-        
+
         # Summary recommendation
         if len(analysis['devices']['updates_available']) > 0:
             analysis['recommendations'].append({
@@ -622,5 +646,5 @@ class NetworkHealthAnalyzer:
                 'message': f"{len(analysis['devices']['updates_available'])} device(s) have firmware updates available",
                 'action': 'Schedule maintenance window to update devices; always backup configuration first'
             })
-        
+
         return analysis
