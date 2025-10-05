@@ -564,6 +564,19 @@ def _convert_expert_recommendations(expert_recs, all_devices=None):
                     new_channel = 11
                 else:
                     new_channel = 1
+            elif band == "6GHz":
+                # 6GHz channels (UNII-5 through UNII-8)
+                # Preferred channels: 37, 53, 69, 85, 101, 117, 133, 149, 165, 181, 197, 213
+                if current_channel < 37 or current_channel > 213:
+                    new_channel = 37  # Start of UNII-5
+                elif current_channel == 37:
+                    new_channel = 69  # UNII-5 alternative
+                elif current_channel in [53, 69]:
+                    new_channel = 101  # Move to UNII-6
+                elif current_channel in [85, 101]:
+                    new_channel = 133  # Move to UNII-7
+                else:
+                    new_channel = 37  # Return to start
             else:  # 5GHz
                 # Suggest non-DFS channel if currently on DFS
                 if 52 <= current_channel <= 144:
