@@ -1007,6 +1007,138 @@ def display_rssi_histogram(analysis):
     console.print()
 
 
+def display_quick_health_dashboard(analysis, recommendations):
+    """Display a quick, scannable health dashboard at the top"""
+    from rich.table import Table
+
+    # Get health score
+    health_score = analysis.get("health_score", {})
+    score = health_score.get("score", 0)
+    grade = health_score.get("grade", "N/A")
+
+    # Grade-based color
+    if grade == "A":
+        grade_color = "bold green"
+        grade_emoji = "🟢"
+    elif grade == "B":
+        grade_color = "bold blue"
+        grade_emoji = "🔵"
+    elif grade == "C":
+        grade_color = "bold yellow"
+        grade_emoji = "🟡"
+    elif grade == "D":
+        grade_color = "bold orange3"
+        grade_emoji = "🟠"
+    else:
+        grade_color = "bold red"
+        grade_emoji = "🔴"
+
+    # Count issues by severity
+    critical_count = len(
+        [r for r in recommendations if r.get("priority") == "high" or r.get("severity") == "high"]
+    )
+    warning_count = len(
+        [
+            r
+            for r in recommendations
+            if r.get("priority") == "medium" or r.get("severity") == "medium"
+        ]
+    )
+    info_count = len(
+        [r for r in recommendations if r.get("priority") == "low" or r.get("severity") == "low"]
+    )
+
+    # Get advanced analysis metrics
+    band_steering = analysis.get("band_steering_analysis", {})
+    wifi7_clients = band_steering.get("wifi7_clients_suboptimal", 0)
+    tri_band_clients = band_steering.get("tri_band_clients_suboptimal", 0)
+    misplaced_clients = band_steering.get("dual_band_clients_on_2ghz", 0)
+
+    airtime_analysis = analysis.get("airtime_analysis", {})
+    saturated_aps = len(airtime_analysis.get("saturated_aps", []))
+
+    dfs_analysis = analysis.get("dfs_analysis", {})
+    dfs_events = dfs_analysis.get("total_events", 0)
+
+    # Build dashboard
+    console.print("\n" + "=" * 80)
+    console.print(
+        Panel.fit(
+            f"[{grade_color}]NETWORK HEALTH: {grade_emoji} Grade {grade} ({score}/100)[/{grade_color}]",
+            style=grade_color,
+            border_style=grade_color,
+        )
+    )
+
+    # Create issues table
+    if critical_count > 0 or warning_count > 0 or info_count > 0:
+        issues_table = Table(show_header=False, box=None, padding=(0, 2))
+        issues_table.add_column("Icon", style="bold", width=4)
+        issues_table.add_column("Severity", width=15)
+        issues_table.add_column("Count", justify="right", width=8)
+
+        if critical_count > 0:
+            issues_table.add_row(
+                "🔴", "[bold red]Critical", f"[bold red]{critical_count}[/bold red]"
+            )
+        if warning_count > 0:
+            issues_table.add_row(
+                "🟡", "[bold yellow]Warning", f"[bold yellow]{warning_count}[/bold yellow]"
+            )
+        if info_count > 0:
+            issues_table.add_row("🔵", "[bold cyan]Info", f"[bold cyan]{info_count}[/bold cyan]")
+
+        console.print(issues_table)
+    else:
+        console.print("[bold green]✨ No issues found - network is optimized![/bold green]")
+
+    # Display key metrics if any issues exist
+    if wifi7_clients > 0 or tri_band_clients > 0 or saturated_aps > 0 or dfs_events > 0:
+        console.print("\n[bold]Key Findings:[/bold]")
+        metrics_table = Table(show_header=False, box=None, padding=(0, 2))
+        metrics_table.add_column("Icon", width=4)
+        metrics_table.add_column("Metric", width=45)
+        metrics_table.add_column("Value", justify="right")
+
+        if wifi7_clients > 0:
+            metrics_table.add_row(
+                "📡",
+                "[magenta]WiFi 7 clients on suboptimal bands",
+                f"[bold magenta]{wifi7_clients}[/bold magenta]",
+            )
+        elif tri_band_clients > 0:
+            metrics_table.add_row(
+                "📡",
+                "[blue]WiFi 6E clients on suboptimal bands",
+                f"[bold blue]{tri_band_clients}[/bold blue]",
+            )
+
+        if misplaced_clients > 0 and wifi7_clients == 0 and tri_band_clients == 0:
+            metrics_table.add_row(
+                "📡",
+                "[yellow]Clients on suboptimal bands",
+                f"[bold yellow]{misplaced_clients}[/bold yellow]",
+            )
+
+        if saturated_aps > 0:
+            metrics_table.add_row(
+                "📶",
+                "[red]APs with high airtime utilization",
+                f"[bold red]{saturated_aps}[/bold red]",
+            )
+
+        if dfs_events > 0:
+            metrics_table.add_row(
+                "⚠️ ",
+                "[orange3]DFS radar interference events",
+                f"[bold orange3]{dfs_events}[/bold orange3]",
+            )
+
+        console.print(metrics_table)
+
+    console.print("=" * 80 + "\n")
+
+
 def display_executive_summary(analysis, recommendations, lookback_days):
     """Display executive summary of findings and recommended actions"""
     console.print(Panel("[bold magenta]Executive Summary[/bold magenta]", style="magenta"))
@@ -1060,6 +1192,8 @@ def display_executive_summary(analysis, recommendations, lookback_days):
 
     band_steering = analysis.get("band_steering_analysis", {})
     misplaced_clients = band_steering.get("dual_band_clients_on_2ghz", 0)
+    wifi7_clients = band_steering.get("wifi7_clients_suboptimal", 0)
+    tri_band_clients = band_steering.get("tri_band_clients_suboptimal", 0)
 
     airtime_analysis = analysis.get("airtime_analysis", {})
     saturated_aps = len(airtime_analysis.get("saturated_aps", []))
@@ -1078,7 +1212,14 @@ def display_executive_summary(analysis, recommendations, lookback_days):
         overview += f"[yellow]Detected {dfs_events} DFS radar event(s)[/yellow] which may cause intermittent disconnects. "
 
     if misplaced_clients > 0:
-        overview += f"[yellow]{misplaced_clients} dual-band client(s) stuck on 2.4GHz[/yellow]. "
+        if wifi7_clients > 0:
+            overview += f"[yellow]{misplaced_clients} client(s) on suboptimal bands (including {wifi7_clients} WiFi 7 capable)[/yellow]. "
+        elif tri_band_clients > 0:
+            overview += f"[yellow]{misplaced_clients} client(s) on suboptimal bands (including {tri_band_clients} WiFi 6E capable)[/yellow]. "
+        else:
+            overview += (
+                f"[yellow]{misplaced_clients} dual-band client(s) stuck on 2.4GHz[/yellow]. "
+            )
 
     if saturated_aps > 0:
         overview += f"[red]{saturated_aps} AP(s) experiencing high airtime utilization[/red]. "
@@ -1403,7 +1544,11 @@ Examples:
     full_analysis = result.get("full_analysis")
 
     if args.command == "analyze":
-        # Show RSSI histogram first
+        # Show quick health dashboard FIRST for immediate visibility
+        if full_analysis:
+            display_quick_health_dashboard(full_analysis, recommendations)
+
+        # Show RSSI histogram
         if full_analysis:
             display_rssi_histogram(full_analysis)
 
@@ -1437,7 +1582,11 @@ Examples:
             console.print("[green]No changes needed - network is optimized![/green]")
             return 0
 
-        # Show RSSI histogram first
+        # Show quick health dashboard FIRST for immediate visibility
+        if full_analysis:
+            display_quick_health_dashboard(full_analysis, recommendations)
+
+        # Show RSSI histogram
         if full_analysis:
             display_rssi_histogram(full_analysis)
 

@@ -525,13 +525,12 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
     if api_errors:
         html_content += generate_api_error_warning_html(api_errors)
 
-    # Network Health Score Section (prominently at top)
-    health_score = analysis_data.get("health_score")
+    # Quick Health Dashboard (prominently at top)
     has_incomplete_data = analysis_data.get("has_incomplete_data", False)
-    if health_score and not has_incomplete_data:
-        html_content += generate_network_health_score_html(health_score)
-    elif has_incomplete_data:
-        # Don't show health score if data is incomplete
+    if not has_incomplete_data:
+        html_content += generate_quick_health_dashboard_html(analysis_data, recommendations)
+    else:
+        # Show warning if data is incomplete
         html_content += """
             <div class="section" style="background: #fef3c7; border-left: 4px solid #f59e0b; padding: 20px; margin-bottom: 30px;">
                 <h2 style="color: #f59e0b; margin-top: 0;">⚠️ Network Grade Unavailable</h2>
@@ -715,6 +714,154 @@ def generate_api_error_warning_html(api_errors):
                         <li>• <strong>Re-run Analysis:</strong> Once issues are resolved, generate a new report for complete data.</li>
                     </ul>
                 </div>
+            </div>
+"""
+
+
+def generate_quick_health_dashboard_html(analysis_data, recommendations):
+    """Generate a visual health dashboard with key metrics"""
+
+    # Get health score
+    health_score = analysis_data.get("health_score", {})
+    score = health_score.get("score", 0)
+    grade = health_score.get("grade", "N/A")
+
+    # Grade-based styling
+    if grade == "A":
+        grade_color = "#10b981"
+        grade_bg = "#d1fae5"
+        grade_emoji = "🟢"
+    elif grade == "B":
+        grade_color = "#3b82f6"
+        grade_bg = "#dbeafe"
+        grade_emoji = "🔵"
+    elif grade == "C":
+        grade_color = "#f59e0b"
+        grade_bg = "#fef3c7"
+        grade_emoji = "🟡"
+    elif grade == "D":
+        grade_color = "#f97316"
+        grade_bg = "#ffedd5"
+        grade_emoji = "🟠"
+    else:
+        grade_color = "#ef4444"
+        grade_bg = "#fee2e2"
+        grade_emoji = "🔴"
+
+    # Count issues by severity
+    critical_count = len(
+        [r for r in recommendations if r.get("priority") == "high" or r.get("severity") == "high"]
+    )
+    warning_count = len(
+        [
+            r
+            for r in recommendations
+            if r.get("priority") == "medium" or r.get("severity") == "medium"
+        ]
+    )
+    info_count = len(
+        [r for r in recommendations if r.get("priority") == "low" or r.get("severity") == "low"]
+    )
+
+    # Get advanced metrics
+    band_steering = analysis_data.get("band_steering_analysis", {})
+    wifi7_clients = band_steering.get("wifi7_clients_suboptimal", 0)
+    tri_band_clients = band_steering.get("tri_band_clients_suboptimal", 0)
+    misplaced_clients = band_steering.get("dual_band_clients_on_2ghz", 0)
+
+    airtime_analysis = analysis_data.get("airtime_analysis", {})
+    saturated_aps = len(airtime_analysis.get("saturated_aps", []))
+
+    dfs_analysis = analysis_data.get("dfs_analysis", {})
+    dfs_events = dfs_analysis.get("total_events", 0)
+
+    # Build key findings
+    key_findings_html = ""
+    if wifi7_clients > 0 or tri_band_clients > 0 or saturated_aps > 0 or dfs_events > 0:
+        key_findings_html = "<div style='margin-top: 20px;'><h3 style='margin-bottom: 10px; color: #374151;'>Key Findings:</h3>"
+
+        if wifi7_clients > 0:
+            key_findings_html += f"""
+                <div style='background: #f3e8ff; padding: 12px; border-radius: 6px; margin-bottom: 8px; border-left: 3px solid #a855f7;'>
+                    <span style='font-size: 1.2em;'>📡</span>
+                    <strong style='color: #7c3aed;'>{wifi7_clients} WiFi 7 capable clients</strong> on suboptimal bands
+                    <div style='font-size: 0.9em; color: #6b21a8; margin-top: 4px;'>Could benefit from 6GHz with 320MHz channels and MLO</div>
+                </div>
+            """
+        elif tri_band_clients > 0:
+            key_findings_html += f"""
+                <div style='background: #ede9fe; padding: 12px; border-radius: 6px; margin-bottom: 8px; border-left: 3px solid #8b5cf6;'>
+                    <span style='font-size: 1.2em;'>📡</span>
+                    <strong style='color: #7c3aed;'>{tri_band_clients} WiFi 6E capable clients</strong> on suboptimal bands
+                    <div style='font-size: 0.9em; color: #6b21a8; margin-top: 4px;'>Could benefit from less congested 6GHz band</div>
+                </div>
+            """
+
+        if saturated_aps > 0:
+            key_findings_html += f"""
+                <div style='background: #fee2e2; padding: 12px; border-radius: 6px; margin-bottom: 8px; border-left: 3px solid #ef4444;'>
+                    <span style='font-size: 1.2em;'>📶</span>
+                    <strong style='color: #dc2626;'>{saturated_aps} APs with high airtime utilization</strong>
+                    <div style='font-size: 0.9em; color: #991b1b; margin-top: 4px;'>May cause performance degradation</div>
+                </div>
+            """
+
+        if dfs_events > 0:
+            key_findings_html += f"""
+                <div style='background: #ffedd5; padding: 12px; border-radius: 6px; margin-bottom: 8px; border-left: 3px solid #f97316;'>
+                    <span style='font-size: 1.2em;'>⚠️</span>
+                    <strong style='color: #ea580c;'>{dfs_events} DFS radar interference events</strong>
+                    <div style='font-size: 0.9em; color: #9a3412; margin-top: 4px;'>May cause intermittent disconnections</div>
+                </div>
+            """
+
+        key_findings_html += "</div>"
+
+    return f"""
+            <div class="section" style="background: linear-gradient(135deg, {grade_bg} 0%, #ffffff 100%); padding: 30px; border-radius: 12px; margin-bottom: 30px; border: 2px solid {grade_color};">
+                <div style="text-align: center; margin-bottom: 25px;">
+                    <div style="display: inline-block; background: white; padding: 20px 40px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+                        <div style="font-size: 3em; margin-bottom: 10px;">{grade_emoji}</div>
+                        <div style="font-size: 2.5em; font-weight: bold; color: {grade_color};">Grade {grade}</div>
+                        <div style="font-size: 1.2em; color: #6b7280; margin-top: 5px;">{score}/100</div>
+                    </div>
+                </div>
+
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px;">
+                    {"" if critical_count == 0 else f'''
+                    <div style="background: #fee2e2; padding: 15px; border-radius: 8px; text-align: center; border-left: 4px solid #ef4444;">
+                        <div style="font-size: 2em; margin-bottom: 5px;">🔴</div>
+                        <div style="font-size: 2em; font-weight: bold; color: #dc2626;">{critical_count}</div>
+                        <div style="color: #991b1b; font-weight: 500;">Critical Issues</div>
+                    </div>
+                    '''}
+
+                    {"" if warning_count == 0 else f'''
+                    <div style="background: #fef3c7; padding: 15px; border-radius: 8px; text-align: center; border-left: 4px solid #f59e0b;">
+                        <div style="font-size: 2em; margin-bottom: 5px;">🟡</div>
+                        <div style="font-size: 2em; font-weight: bold; color: #d97706;">{warning_count}</div>
+                        <div style="color: #92400e; font-weight: 500;">Warnings</div>
+                    </div>
+                    '''}
+
+                    {"" if info_count == 0 else f'''
+                    <div style="background: #dbeafe; padding: 15px; border-radius: 8px; text-align: center; border-left: 4px solid #3b82f6;">
+                        <div style="font-size: 2em; margin-bottom: 5px;">🔵</div>
+                        <div style="font-size: 2em; font-weight: bold; color: #2563eb;">{info_count}</div>
+                        <div style="color: #1e3a8a; font-weight: 500;">Info</div>
+                    </div>
+                    '''}
+
+                    {"" if critical_count > 0 or warning_count > 0 or info_count > 0 else '''
+                    <div style="background: #d1fae5; padding: 15px; border-radius: 8px; text-align: center; border-left: 4px solid #10b981; grid-column: 1 / -1;">
+                        <div style="font-size: 2em; margin-bottom: 5px;">✨</div>
+                        <div style="font-size: 1.3em; font-weight: bold; color: #059669;">No Issues Found</div>
+                        <div style="color: #065f46;">Network is optimized!</div>
+                    </div>
+                    '''}
+                </div>
+
+                {key_findings_html}
             </div>
 """
 
@@ -1747,6 +1894,7 @@ def generate_band_steering_html(band_steering):
 
     misplaced_count = band_steering.get("dual_band_clients_on_2ghz", 0)
     tri_band_count = band_steering.get("tri_band_clients_suboptimal", 0)
+    wifi7_count = band_steering.get("wifi7_clients_suboptimal", 0)
     misplaced_clients = band_steering.get("misplaced_clients", [])
     band_steering_enabled = band_steering.get("band_steering_enabled", {})
     severity = band_steering.get("severity", "ok")
@@ -1771,10 +1919,12 @@ def generate_band_steering_html(band_steering):
         current_band = client.get("current_band", "Unknown")
         capability = client.get("capability", client.get("radio_proto", "N/A"))
         is_6ghz = client.get("is_6ghz_capable", False)
+        is_wifi7 = client.get("is_wifi7_capable", False)
 
         # Color-code based on band
         band_color = "#f59e0b" if current_band == "2.4GHz" else "#3b82f6"
-        capability_color = "#8b5cf6" if is_6ghz else "#10b981"
+        # WiFi 7 = purple, WiFi 6E = violet, WiFi 5/6 = green
+        capability_color = "#a855f7" if is_wifi7 else "#8b5cf6" if is_6ghz else "#10b981"
 
         clients_html += f"""
                     <tr>
@@ -1794,7 +1944,9 @@ def generate_band_steering_html(band_steering):
     # Build summary message
     summary_msg = f"{misplaced_count} Client(s) on Suboptimal Bands"
     detail_msg = "These clients could benefit from better band placement."
-    if tri_band_count > 0:
+    if wifi7_count > 0:
+        detail_msg = f"Includes {wifi7_count} WiFi 7 capable client(s) that could utilize the 6GHz band with 320MHz channels and Multi-Link Operation for maximum performance."
+    elif tri_band_count > 0:
         detail_msg = f"Includes {tri_band_count} WiFi 6E capable client(s) that could use the faster, less congested 6GHz band for optimal performance."
 
     return f"""
@@ -1839,7 +1991,7 @@ def generate_band_steering_html(band_steering):
 
                 <div style="margin-top: 20px; padding: 15px; background: #f3f4f6; border-radius: 8px;">
                     <strong>About Band Steering:</strong>
-                    <p style="margin-top: 8px; color: #666;">Band steering encourages capable clients to use less congested bands (5GHz/6GHz), improving overall network performance. WiFi 6E devices can use the new 6GHz band for maximum speed and minimum interference.</p>
+                    <p style="margin-top: 8px; color: #666;">Band steering encourages capable clients to use less congested bands (5GHz/6GHz), improving overall network performance. WiFi 6E devices can use the new 6GHz band for maximum speed and minimum interference, while WiFi 7 devices can benefit from 320MHz channels and Multi-Link Operation (MLO) for unprecedented performance.</p>
                     <p style="margin-top: 10px;">
                         <a href="https://help.ui.com/hc/en-us/articles/115012700547-UniFi-Understanding-and-Using-Band-Steering" target="_blank"
                            style="display: inline-block; padding: 6px 12px; background: #3b82f6; color: white;
