@@ -33,38 +33,39 @@ from api.csrf_token_manager import get_csrf_token
 from utils.helpers import normalize_host_url
 
 # Common CloudKey API endpoints to test
+# Note: Endpoints with {site} will be replaced with the actual site name
 ENDPOINTS = [
     # System Info
     {"path": "/api/system", "method": "GET", "description": "System Information"},
     {"path": "/api/system/info", "method": "GET", "description": "Detailed System Info"},
 
     # Network Configuration
-    {"path": "/api/s/default/rest/networkconf", "method": "GET", "description": "Network Configuration"},
-    {"path": "/api/s/default/rest/setting/mgmt", "method": "GET", "description": "Management Settings"},
+    {"path": "/api/s/{site}/rest/networkconf", "method": "GET", "description": "Network Configuration"},
+    {"path": "/api/s/{site}/rest/setting/mgmt", "method": "GET", "description": "Management Settings"},
 
     # Sites
     {"path": "/api/self/sites", "method": "GET", "description": "Available Sites"},
     {"path": "/api/stat/sites", "method": "GET", "description": "Site Statistics"},
 
     # Devices
-    {"path": "/api/s/default/stat/device", "method": "GET", "description": "Device List"},
-    {"path": "/api/s/default/stat/device-basic", "method": "GET", "description": "Basic Device Info"},
+    {"path": "/api/s/{site}/stat/device", "method": "GET", "description": "Device List"},
+    {"path": "/api/s/{site}/stat/device-basic", "method": "GET", "description": "Basic Device Info"},
 
     # Clients
-    {"path": "/api/s/default/stat/sta", "method": "GET", "description": "Client List"},
-    {"path": "/api/s/default/rest/user", "method": "GET", "description": "User List"},
+    {"path": "/api/s/{site}/stat/sta", "method": "GET", "description": "Client List"},
+    {"path": "/api/s/{site}/rest/user", "method": "GET", "description": "User List"},
 
     # Health
-    {"path": "/api/s/default/stat/health", "method": "GET", "description": "Health Stats"},
-    {"path": "/api/s/default/stat/rogueap", "method": "GET", "description": "Rogue AP Detection"},
+    {"path": "/api/s/{site}/stat/health", "method": "GET", "description": "Health Stats"},
+    {"path": "/api/s/{site}/stat/rogueap", "method": "GET", "description": "Rogue AP Detection"},
 
     # Dashboard
-    {"path": "/api/s/default/stat/dashboard", "method": "GET", "description": "Dashboard Stats"},
-    {"path": "/api/s/default/stat/report/daily.site", "method": "GET", "description": "Daily Site Report"},
+    {"path": "/api/s/{site}/stat/dashboard", "method": "GET", "description": "Dashboard Stats"},
+    {"path": "/api/s/{site}/stat/report/daily.site", "method": "GET", "description": "Daily Site Report"},
 
     # Configuration
-    {"path": "/api/s/default/rest/wlanconf", "method": "GET", "description": "WLAN Configuration"},
-    {"path": "/api/s/default/rest/firewallgroup", "method": "GET", "description": "Firewall Groups"},
+    {"path": "/api/s/{site}/rest/wlanconf", "method": "GET", "description": "WLAN Configuration"},
+    {"path": "/api/s/{site}/rest/firewallgroup", "method": "GET", "description": "Firewall Groups"},
 ]
 
 def print_header():
@@ -168,7 +169,7 @@ def test_endpoint(session, url, endpoint):
             "message": str(e)
         }
 
-def run_tests(url, username, password):
+def run_tests(url, username, password, site="default"):
     """Run tests on all endpoints"""
     url = normalize_host_url(url)
 
@@ -177,9 +178,16 @@ def run_tests(url, username, password):
     if not session:
         return
 
+    # Replace {site} placeholder in endpoint paths
+    endpoints = []
+    for endpoint in ENDPOINTS:
+        endpoint_copy = endpoint.copy()
+        endpoint_copy["path"] = endpoint["path"].replace("{site}", site)
+        endpoints.append(endpoint_copy)
+
     # Create results table
     if HAS_RICH:
-        table = Table(title="API Endpoint Test Results")
+        table = Table(title=f"API Endpoint Test Results - Site: {site}")
         table.add_column("Endpoint", style="cyan")
         table.add_column("Method", style="magenta")
         table.add_column("Description", style="blue")
@@ -192,9 +200,9 @@ def run_tests(url, username, password):
     # Run tests with progress bar
     if HAS_RICH:
         with Progress() as progress:
-            task = progress.add_task("[green]Testing endpoints...", total=len(ENDPOINTS))
+            task = progress.add_task("[green]Testing endpoints...", total=len(endpoints))
 
-            for endpoint in ENDPOINTS:
+            for endpoint in endpoints:
                 result = test_endpoint(session, url, endpoint)
 
                 # Add to table
@@ -219,8 +227,8 @@ def run_tests(url, username, password):
                 time.sleep(0.2)  # Slight delay to avoid rate limiting
     else:
         print("\nTesting endpoints...")
-        for i, endpoint in enumerate(ENDPOINTS):
-            print(f"  [{i+1}/{len(ENDPOINTS)}] {endpoint['path']}...", end="", flush=True)
+        for i, endpoint in enumerate(endpoints):
+            print(f"  [{i+1}/{len(endpoints)}] {endpoint['path']}...", end="", flush=True)
             result = test_endpoint(session, url, endpoint)
             status_text = "✅ OK" if result["status"] == "success" else f"❌ {result['message']}"
             print(f" {status_text}")
@@ -239,13 +247,13 @@ def run_tests(url, username, password):
 
     # Calculate success rate
     success_count = sum(1 for r in results if r["result"]["status"] == "success")
-    success_rate = (success_count / len(ENDPOINTS)) * 100
+    success_rate = (success_count / len(endpoints)) * 100
 
     if HAS_RICH:
         color = "green" if success_rate > 80 else "yellow" if success_rate > 50 else "red"
-        console.print(f"\n[bold {color}]Success Rate: {success_rate:.1f}% ({success_count}/{len(ENDPOINTS)} endpoints)[/bold {color}]")
+        console.print(f"\n[bold {color}]Success Rate: {success_rate:.1f}% ({success_count}/{len(endpoints)} endpoints)[/bold {color}]")
     else:
-        print(f"\nSuccess Rate: {success_rate:.1f}% ({success_count}/{len(ENDPOINTS)} endpoints)")
+        print(f"\nSuccess Rate: {success_rate:.1f}% ({success_count}/{len(endpoints)} endpoints)")
 
     # Ask if user wants to save detailed results
     save = input("\nSave detailed results to file? (y/n): ").lower().strip() == "y"
@@ -274,9 +282,10 @@ def main():
     url = input("Enter UniFi Controller URL (e.g. https://192.168.1.1:8443): ")
     username = input("Enter username: ")
     password = input("Enter password: ")
+    site = input("Enter site name [default]: ").strip() or "default"
 
     # Run the tests
-    run_tests(url, username, password)
+    run_tests(url, username, password, site)
 
 if __name__ == "__main__":
     main()
