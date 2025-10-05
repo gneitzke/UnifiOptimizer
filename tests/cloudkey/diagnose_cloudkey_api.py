@@ -35,12 +35,17 @@ import logging
 # Disable SSL warnings for self-signed certificates
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Create Logging directory if it doesn't exist
+import os
+log_dir = "Logging"
+os.makedirs(log_dir, exist_ok=True)
+
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("cloudkey_api_debug.log"),
+        logging.FileHandler(os.path.join(log_dir, "cloudkey_api_debug.log")),
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -320,10 +325,11 @@ def run_diagnostics(url, username, password, site="default"):
 
     # Save log file location
     logger.info("Diagnostic complete")
+    log_file_path = os.path.join(log_dir, "cloudkey_api_debug.log")
     if HAS_RICH:
-        console.print(f"\nDetailed logs written to [blue]cloudkey_api_debug.log[/blue]")
+        console.print(f"\nDetailed logs written to [blue]{log_file_path}[/blue]")
     else:
-        print("\nDetailed logs written to cloudkey_api_debug.log")
+        print(f"\nDetailed logs written to {log_file_path}")
 
 def main():
     """Main entry point"""

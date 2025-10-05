@@ -46,6 +46,7 @@ ENV/
 
 # Logs
 *.log
+Logging/
 
 # Test files
 test_output/

@@ -209,11 +209,12 @@ python3 optimizer.py analyze --host https://YOUR_CONTROLLER_IP --username admin
 ```bash
 python3 optimizer.py analyze --host https://YOUR_CONTROLLER_IP --username admin --verbose
 ```
-**Creates:** `verbose_YYYYMMDD_HHMMSS.log` with complete API call history:
+**Creates:** `Logging/verbose_YYYYMMDD_HHMMSS.log` with complete API call history:
 - All GET/POST/PUT requests with timestamps
 - Response codes and error details
 - Full stack traces for debugging
 - Safe to share (passwords redacted)
+- Logs saved to `Logging/` directory (auto-created)
 
 ### Preview Changes (Dry-Run)
 ```bash

@@ -69,9 +69,15 @@ class CloudKeyGen2Client:
         # Clear any existing handlers
         self.logger.handlers = []
 
+        # Create Logging directory if it doesn't exist
+        import os
+
+        log_dir = "Logging"
+        os.makedirs(log_dir, exist_ok=True)
+
         # Create file handler
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_filename = f"verbose_{timestamp}.log"
+        log_filename = os.path.join(log_dir, f"verbose_{timestamp}.log")
         file_handler = logging.FileHandler(log_filename, mode="w")
         file_handler.setLevel(logging.DEBUG)
 
