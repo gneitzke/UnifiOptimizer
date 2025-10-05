@@ -7,6 +7,7 @@ Comprehensive network optimization tool with multiple analysis and apply modes.
 
 import sys
 import subprocess
+import argparse
 # from getpass import getpass  # Disabled - showing password for easier input
 from rich.console import Console
 from rich.panel import Panel
@@ -201,6 +202,14 @@ def run_analyze_and_apply(host, username, password, site):
 
 def main():
     """Main interactive loop"""
+    # Check if command-line arguments were provided
+    # If so, bypass interactive menu and call optimize_network.py directly
+    if len(sys.argv) > 1:
+        # Forward all arguments to core/optimize_network.py
+        cmd = ['python3', 'core/optimize_network.py'] + sys.argv[1:]
+        sys.exit(subprocess.run(cmd).returncode)
+    
+    # No command-line args - show interactive menu
     console.print("\n[bold]UniFi Network Optimizer[/bold]\n")
     
     # Get connection details

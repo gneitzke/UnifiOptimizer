@@ -175,8 +175,27 @@ def analyze_network(client, site='default', lookback_days=3):
         health_score = adv_health_analyzer.calculate_network_health_score(analysis)
         analysis['health_score'] = health_score
         
+        # Check for API errors and add to analysis
+        error_summary = client.get_error_summary()
+        analysis['api_errors'] = error_summary
+        analysis['has_incomplete_data'] = error_summary is not None
+        
+        # Display warning if there were API errors
+        if error_summary:
+            console.print(f"\n[yellow]⚠ Warning: {error_summary['total_errors']} API call(s) failed[/yellow]")
+            console.print(f"[yellow]  Some analysis features may be incomplete[/yellow]")
+            
+            if client.has_critical_errors():
+                console.print(f"[red]  ✗ Critical errors detected (authentication/permissions)[/red]")
+                console.print(f"[red]  Network grade will not be assigned[/red]")
+            
+            if client.verbose:
+                console.print(f"\n[dim]Failed endpoints:[/dim]")
+                for endpoint in error_summary['failed_endpoints']:
+                    console.print(f"[dim]  • {endpoint}[/dim]")
+        
         # Display detailed summary of advanced findings
-        console.print(f"[green]✓[/green] Advanced analysis complete\n")
+        console.print(f"\n[green]✓[/green] Advanced analysis complete\n")
         
         # Display Client Capability Matrix
         client_caps = advanced_analysis.get('client_capabilities', {})
@@ -1092,6 +1111,8 @@ Examples:
                        help='Prompt for approval before each change (default)')
     parser.add_argument('--yes', action='store_true',
                        help='Apply all changes automatically without prompts (dangerous!)')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                       help='Show detailed error messages and debugging information')
     
     args = parser.parse_args()
     
@@ -1181,7 +1202,7 @@ Examples:
                 console.print(f"\n[yellow]Attempt {attempt}/{max_attempts}[/yellow]")
                 password = getpass('Password: ')
             
-            client = CloudKeyGen2Client(args.host, args.username, password, args.site)
+            client = CloudKeyGen2Client(args.host, args.username, password, args.site, verbose=args.verbose)
             
             if client.login():
                 # Login successful - save/update credentials appropriately

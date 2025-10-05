@@ -1,8 +1,10 @@
-# UniFi Network Optimizer 🚀
+# UnifiOptimizer 🚀
 
 **Professional-grade network analysis and optimization for UniFi controllers**
 
 A comprehensive toolkit for analyzing and optimizing Ubiquiti UniFi networks. Provides expert-level insights, recommendations, and automated optimization for wireless networks with CloudKey Gen2/UDM support.
+
+**GitHub:** https://github.com/gneitzke/UnifiOptimizer
 
 ---
 
@@ -80,8 +82,8 @@ sudo yum install python3 python3-pip
 
 1. **Clone or download this repository:**
    ```bash
-   git clone https://github.com/gneitzke/unifi-network-optimizer.git
-   cd unifi-network-optimizer
+   git clone https://github.com/gneitzke/UnifiOptimizer.git
+   cd UnifiOptimizer
    ```
 
 2. **Install required Python packages:**
@@ -98,18 +100,31 @@ sudo yum install python3 python3-pip
 
 ## 👤 CloudKey User Setup
 
-For security, create a dedicated admin user for this tool:
+### ⚠️ IMPORTANT: Use a Local-Only Account
 
-### Option 1: Via UniFi Web Interface (Recommended)
+For security reasons, **always use a local-only administrator account** (not a Ubiquiti cloud account) with this tool.
+
+**Why Local-Only?**
+- ✅ No cloud access = reduced attack surface
+- ✅ Credentials stay on your network only
+- ✅ No risk of cloud account compromise
+- ✅ Better security for automation
+
+**The tool will warn you if you're using a cloud account.**
+
+### Creating a Local-Only Account
+
+Follow these steps to create a secure local-only administrator account:
 
 1. **Log into your UniFi Controller** (e.g., `https://192.168.1.1`)
 2. **Navigate to Settings → Admins**
 3. **Click "Add New Admin"**
 4. **Create the user with these settings:**
    - **Name**: `audit` (or your preferred username)
-   - **Email**: Your email address
+   - **Email**: Your email address (for local use only)
    - **Role**: **Admin** (required for API access)
    - **Password**: Create a strong password
+   - **Important**: Do NOT check "Enable Cloud Access"
    - **Enable Two-Factor Authentication**: Optional but recommended
 5. **Click "Add" to save**
 
@@ -179,22 +194,27 @@ Available Modes:
 
 ### Analyze Network (Safe, Read-Only)
 ```bash
-python3 core/optimize_network.py analyze --host https://YOUR_CONTROLLER_IP --username admin
+python3 optimizer.py analyze --host https://YOUR_CONTROLLER_IP --username admin
 ```
+
+### Verbose Mode (Detailed Logging)
+```bash
+python3 optimizer.py analyze --host https://YOUR_CONTROLLER_IP --username admin --verbose
+```
+**Creates:** `verbose_YYYYMMDD_HHMMSS.log` with complete API call history:
+- All GET/POST/PUT requests with timestamps
+- Response codes and error details
+- Full stack traces for debugging
+- Safe to share (passwords redacted)
 
 ### Preview Changes (Dry-Run)
 ```bash
-python3 core/optimize_network.py apply --host https://YOUR_CONTROLLER_IP --username admin --dry-run
+python3 optimizer.py apply --host https://YOUR_CONTROLLER_IP --username admin --dry-run
 ```
 
 ### Apply Changes Interactively
 ```bash
-python3 core/optimize_network.py apply --host https://YOUR_CONTROLLER_IP --username admin
-```
-
-### Client Health Diagnostics
-```bash
-python3 core/diagnose_clients.py --host https://YOUR_CONTROLLER_IP --username admin
+python3 optimizer.py apply --host https://YOUR_CONTROLLER_IP --username admin
 ```
 
 ### Using Saved Profiles
@@ -354,7 +374,7 @@ Contributions are welcome! Please feel free to submit issues or pull requests.
 
 ## 📄 License
 
-This project is open source and available for personal and commercial use.
+This project is open source, MIT License, and available for personal and commercial use.
 
 ---
 
@@ -362,6 +382,3 @@ This project is open source and available for personal and commercial use.
 
 Built for the UniFi community to help optimize wireless networks and improve client experience.
 
----
-
-**Made with ❤️ for UniFi network administrators**

@@ -700,7 +700,40 @@ class AdvancedNetworkAnalyzer:
         - Client distribution (20%)
         - Mesh reliability (15%)
         - Disconnect/roaming issues (15%)
+        
+        Returns None if critical data is missing due to API errors
         """
+        # Check if we have incomplete data from API errors
+        api_errors = analysis_data.get('api_errors')
+        if api_errors:
+            critical_errors = api_errors.get('critical_errors', [])
+            if critical_errors:
+                # Don't calculate score if we have auth/permission errors
+                return {
+                    'score': None,
+                    'grade': 'N/A',
+                    'summary': 'Unable to calculate due to incomplete data',
+                    'incomplete_data': True,
+                    'reason': 'Critical API errors (authentication/permissions) prevented data collection'
+                }
+            
+            # Check if critical endpoints failed
+            failed_endpoints = api_errors.get('failed_endpoints', [])
+            critical_endpoint_patterns = ['stat/device', 'stat/sta', 'stat/health']
+            has_critical_failure = any(
+                any(pattern in endpoint for pattern in critical_endpoint_patterns)
+                for endpoint in failed_endpoints
+            )
+            
+            if has_critical_failure:
+                return {
+                    'score': None,
+                    'grade': 'N/A',
+                    'summary': 'Unable to calculate due to missing critical data',
+                    'incomplete_data': True,
+                    'reason': 'Failed to retrieve devices, clients, or health metrics'
+                }
+        
         score = 100
         details = {}
         
