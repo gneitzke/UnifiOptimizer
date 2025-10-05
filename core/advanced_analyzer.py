@@ -127,6 +127,7 @@ class AdvancedNetworkAnalyzer:
             "misplaced_clients": [],
             "dual_band_clients_on_2ghz": 0,
             "tri_band_clients_suboptimal": 0,  # 6GHz-capable clients not on 6GHz
+            "wifi7_clients_suboptimal": 0,  # WiFi 7 capable clients not on 6GHz
             "recommendations": [],
             "severity": "ok",
         }
@@ -175,10 +176,18 @@ class AdvancedNetworkAnalyzer:
                         # Detect dual-band (5GHz) and tri-band (6GHz) capability
                         is_dual_band = False
                         is_6ghz_capable = False
+                        is_wifi7_capable = False
                         detection_reason = None
 
-                        # Method 1: WiFi 6E (802.11ax-6E) detection - 6GHz capable
-                        if (
+                        # Method 1: WiFi 7 (802.11be) detection - Latest standard, 6GHz + MLO
+                        if "be" in radio_proto or "11be" in radio_proto or client.get("is_11be"):
+                            is_dual_band = True
+                            is_6ghz_capable = True
+                            is_wifi7_capable = True
+                            detection_reason = f"WiFi 7 capable ({radio_proto})"
+
+                        # Method 2: WiFi 6E (802.11ax-6E) detection - 6GHz capable
+                        elif (
                             "ax-6e" in radio_proto
                             or "6e" in radio_proto
                             or client.get("is_11ax_6e")
@@ -187,7 +196,7 @@ class AdvancedNetworkAnalyzer:
                             is_6ghz_capable = True
                             detection_reason = f"WiFi 6E capable ({radio_proto})"
 
-                        # Method 2: WiFi 6 (802.11ax) or WiFi 5 (802.11ac) - at least dual-band
+                        # Method 3: WiFi 6 (802.11ax) or WiFi 5 (802.11ac) - at least dual-band
                         elif (
                             "ac" in radio_proto
                             or "ax" in radio_proto
@@ -207,15 +216,30 @@ class AdvancedNetworkAnalyzer:
                             is_dual_band = True
                             detection_reason = f"Multiple spatial streams (nss={nss})"
 
-                        # Method 5: Known device patterns for 6GHz capability
-                        # Modern devices (2021+) often support 6GHz
+                        # Method 5: Known device patterns for WiFi 7 capability
+                        # Latest devices (2024+) support WiFi 7
+                        # Normalize hostname for flexible matching (remove hyphens, multiple spaces)
+                        elif any(
+                            pattern in hostname.replace("-", " ").replace("  ", " ")
+                            for pattern in [
+                                "iphone 16",  # WiFi 7
+                                "galaxy s24 ultra",  # WiFi 7
+                                "galaxy s25",  # WiFi 7 (expected)
+                            ]
+                        ):
+                            is_dual_band = True
+                            is_6ghz_capable = True
+                            is_wifi7_capable = True
+                            detection_reason = f"Known WiFi 7 device: {hostname}"
+
+                        # Method 6: Known device patterns for 6GHz (WiFi 6E) capability
+                        # Modern devices (2021-2023) often support WiFi 6E
                         elif any(
                             pattern in hostname
                             for pattern in [
                                 "iphone 13",
                                 "iphone 14",
                                 "iphone 15",
-                                "iphone 16",
                                 "ipad pro",
                                 "macbook pro 2021",
                                 "macbook pro 2022",
@@ -235,7 +259,7 @@ class AdvancedNetworkAnalyzer:
                             is_6ghz_capable = True
                             detection_reason = f"Known WiFi 6E device: {hostname}"
 
-                        # Method 6: Known dual-band device names (legacy, at least 5GHz capable)
+                        # Method 7: Known dual-band device names (legacy, at least 5GHz capable)
                         elif any(
                             pattern in hostname
                             for pattern in [
@@ -263,6 +287,8 @@ class AdvancedNetworkAnalyzer:
                             results["dual_band_clients_on_2ghz"] += 1
                             if is_6ghz_capable:
                                 results["tri_band_clients_suboptimal"] += 1
+                            if is_wifi7_capable:
+                                results["wifi7_clients_suboptimal"] += 1
 
                             # Get AP name - use ap_name if available, otherwise lookup by ap_mac
                             ap_display = client.get("ap_name", "")
@@ -294,7 +320,12 @@ class AdvancedNetworkAnalyzer:
                                 last_seen_str = "Unknown"
 
                             # Determine band capability label
-                            capability = "6GHz capable" if is_6ghz_capable else "5GHz capable"
+                            if is_wifi7_capable:
+                                capability = "WiFi 7 capable"
+                            elif is_6ghz_capable:
+                                capability = "6GHz capable"
+                            else:
+                                capability = "5GHz capable"
 
                             results["misplaced_clients"].append(
                                 {
@@ -311,6 +342,7 @@ class AdvancedNetworkAnalyzer:
                                     "current_band": "2.4GHz",
                                     "capability": capability,
                                     "is_6ghz_capable": is_6ghz_capable,
+                                    "is_wifi7_capable": is_wifi7_capable,
                                 }
                             )
 
@@ -321,10 +353,17 @@ class AdvancedNetworkAnalyzer:
                         tx_rate = client.get("tx_rate", 0)
 
                         is_6ghz_capable = False
+                        is_wifi7_capable = False
                         detection_reason = None
 
+                        # WiFi 7 detection (includes 6GHz capability)
+                        if "be" in radio_proto or "11be" in radio_proto or client.get("is_11be"):
+                            is_wifi7_capable = True
+                            is_6ghz_capable = True
+                            detection_reason = f"WiFi 7 capable ({radio_proto})"
+
                         # WiFi 6E detection
-                        if (
+                        elif (
                             "ax-6e" in radio_proto
                             or "6e" in radio_proto
                             or client.get("is_11ax_6e")
@@ -332,14 +371,27 @@ class AdvancedNetworkAnalyzer:
                             is_6ghz_capable = True
                             detection_reason = f"WiFi 6E capable ({radio_proto})"
 
-                        # Known 6GHz device patterns
+                        # Known WiFi 7 device patterns
+                        # Normalize hostname for flexible matching
+                        elif any(
+                            pattern in hostname.replace("-", " ").replace("  ", " ")
+                            for pattern in [
+                                "iphone 16",
+                                "galaxy s24 ultra",
+                                "galaxy s25",
+                            ]
+                        ):
+                            is_wifi7_capable = True
+                            is_6ghz_capable = True
+                            detection_reason = f"Known WiFi 7 device: {hostname}"
+
+                        # Known 6GHz (WiFi 6E) device patterns
                         elif any(
                             pattern in hostname
                             for pattern in [
                                 "iphone 13",
                                 "iphone 14",
                                 "iphone 15",
-                                "iphone 16",
                                 "ipad pro",
                                 "macbook pro 2021",
                                 "macbook pro 2022",
@@ -360,6 +412,8 @@ class AdvancedNetworkAnalyzer:
 
                         if is_6ghz_capable:
                             results["tri_band_clients_suboptimal"] += 1
+                            if is_wifi7_capable:
+                                results["wifi7_clients_suboptimal"] += 1
 
                             # Get AP name
                             ap_display = client.get("ap_name", "")
@@ -390,6 +444,12 @@ class AdvancedNetworkAnalyzer:
                             else:
                                 last_seen_str = "Unknown"
 
+                            # Determine band capability label
+                            if is_wifi7_capable:
+                                capability = "WiFi 7 capable"
+                            else:
+                                capability = "6GHz capable"
+
                             results["misplaced_clients"].append(
                                 {
                                     "hostname": client.get(
@@ -403,20 +463,24 @@ class AdvancedNetworkAnalyzer:
                                     "tx_rate": tx_rate,
                                     "detection_reason": detection_reason,
                                     "current_band": "5GHz",
-                                    "capability": "6GHz capable",
-                                    "is_6ghz_capable": True,
+                                    "capability": capability,
+                                    "is_6ghz_capable": is_6ghz_capable,
+                                    "is_wifi7_capable": is_wifi7_capable,
                                 }
                             )
 
             # Generate recommendations
             total_misplaced = results["dual_band_clients_on_2ghz"]
             has_6ghz_clients = results["tri_band_clients_suboptimal"] > 0
+            has_wifi7_clients = results["wifi7_clients_suboptimal"] > 0
 
             if total_misplaced > 5:
                 results["severity"] = "high"
                 message = f"{total_misplaced} capable clients on suboptimal bands"
-                if has_6ghz_clients:
-                    message += f" ({results['tri_band_clients_suboptimal']} support 6GHz)"
+                if has_wifi7_clients:
+                    message += f" ({results['wifi7_clients_suboptimal']} WiFi 7)"
+                elif has_6ghz_clients:
+                    message += f" ({results['tri_band_clients_suboptimal']} WiFi 6E)"
                 results["recommendations"].append(
                     {
                         "type": "band_steering_critical",
@@ -429,8 +493,10 @@ class AdvancedNetworkAnalyzer:
             elif total_misplaced > 0:
                 results["severity"] = "medium"
                 message = f"{total_misplaced} clients on suboptimal bands"
-                if has_6ghz_clients:
-                    message += f" ({results['tri_band_clients_suboptimal']} support 6GHz)"
+                if has_wifi7_clients:
+                    message += f" ({results['wifi7_clients_suboptimal']} WiFi 7)"
+                elif has_6ghz_clients:
+                    message += f" ({results['tri_band_clients_suboptimal']} WiFi 6E)"
                 results["recommendations"].append(
                     {
                         "type": "band_steering_warning",
@@ -443,11 +509,22 @@ class AdvancedNetworkAnalyzer:
 
             # Separate recommendation for 6GHz-specific optimization
             if has_6ghz_clients and results["tri_band_clients_suboptimal"] >= 3:
+                if has_wifi7_clients:
+                    message = (
+                        f"{results['wifi7_clients_suboptimal']} WiFi 7 clients not using 6GHz band"
+                    )
+                    recommendation = "Enable and optimize 6GHz band on compatible APs - WiFi 7 clients can utilize 320MHz channels and MLO for maximum performance"
+                else:
+                    message = f"{results['tri_band_clients_suboptimal']} WiFi 6E clients not using 6GHz band"
+                    recommendation = (
+                        "Enable and optimize 6GHz band on compatible APs for best performance"
+                    )
+
                 results["recommendations"].append(
                     {
                         "type": "6ghz_optimization",
-                        "message": f"{results['tri_band_clients_suboptimal']} WiFi 6E clients not using 6GHz band",
-                        "recommendation": "Enable and optimize 6GHz band on compatible APs for best performance",
+                        "message": message,
+                        "recommendation": recommendation,
                         "priority": "medium",
                         "affected_clients": results["tri_band_clients_suboptimal"],
                     }
