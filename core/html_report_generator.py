@@ -550,6 +550,11 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir='
     if band_steering:
         html_content += generate_band_steering_html(band_steering)
     
+    # Min RSSI Analysis Section
+    min_rssi = analysis_data.get('min_rssi_analysis')
+    if min_rssi:
+        html_content += generate_min_rssi_html(min_rssi)
+    
     # Airtime Analysis Section
     airtime_analysis = analysis_data.get('airtime_analysis')
     if airtime_analysis:
@@ -1628,6 +1633,93 @@ def generate_band_steering_html(band_steering):
                            style="display: inline-block; padding: 6px 12px; background: #3b82f6; color: white; 
                                   text-decoration: none; border-radius: 4px; font-size: 0.9em; font-weight: 500;">
                             📚 Learn More About Band Steering
+                        </a>
+                    </p>
+                </div>
+            </div>
+"""
+
+
+def generate_min_rssi_html(min_rssi):
+    """Generate minimum RSSI analysis section"""
+    if not min_rssi:
+        return ""
+    
+    enabled_count = min_rssi.get('enabled_count', 0)
+    disabled_count = min_rssi.get('disabled_count', 0)
+    total_radios = min_rssi.get('total_radios', 0)
+    radios_with = min_rssi.get('radios_with_min_rssi', [])
+    radios_without = min_rssi.get('radios_without_min_rssi', [])
+    severity = min_rssi.get('severity', 'ok')
+    recommendations = min_rssi.get('recommendations', [])
+    
+    # Radio configuration table
+    radio_config_html = ""
+    
+    # Add enabled radios first
+    for radio_info in radios_with:
+        device = radio_info.get('device', 'Unknown')
+        band = radio_info.get('band', 'Unknown')
+        value = radio_info.get('value', 'N/A')
+        radio_config_html += f"""
+                    <tr>
+                        <td>{device}</td>
+                        <td>{band}</td>
+                        <td style="color: #10b981; font-weight: bold;">Enabled</td>
+                        <td>{value} dBm</td>
+                    </tr>
+"""
+    
+    # Add disabled radios
+    for radio_info in radios_without:
+        device = radio_info.get('device', 'Unknown')
+        band = radio_info.get('band', 'Unknown')
+        value = radio_info.get('value', 'N/A')
+        radio_config_html += f"""
+                    <tr>
+                        <td>{device}</td>
+                        <td>{band}</td>
+                        <td style="color: #ef4444; font-weight: bold;">Disabled</td>
+                        <td style="color: #999;">{value} dBm</td>
+                    </tr>
+"""
+    
+    severity_color = {'high': '#ef4444', 'medium': '#f59e0b', 'ok': '#10b981'}.get(severity, '#6b7280')
+    
+    pct_disabled = (disabled_count / total_radios * 100) if total_radios > 0 else 0
+    
+    return f"""
+            <div class="section">
+                <h2>📡 Minimum RSSI Configuration</h2>
+                <div style="background: {severity_color}15; padding: 20px; border-radius: 8px; border-left: 4px solid {severity_color}; margin-bottom: 20px;">
+                    <strong style="font-size: 1.2em; color: {severity_color};">{disabled_count} of {total_radios} Radios ({pct_disabled:.0f}%) Without Min RSSI</strong>
+                    <p style="margin-top: 10px; color: #666;">Minimum RSSI forces weak clients to roam before signal degrades too much, preventing sticky client problems and improving network performance.</p>
+                </div>
+                
+                <h3>Minimum RSSI Configuration by Radio</h3>
+                <table class="ap-table">
+                    <thead>
+                        <tr>
+                            <th>Access Point</th>
+                            <th>Band</th>
+                            <th>Status</th>
+                            <th>Threshold</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {radio_config_html if radio_config_html else '<tr><td colspan="4">No radios found</td></tr>'}
+                    </tbody>
+                </table>
+                
+                <div style="margin-top: 20px; padding: 15px; background: #f3f4f6; border-radius: 8px;">
+                    <strong>About Minimum RSSI:</strong>
+                    <p style="margin-top: 8px; color: #666;">Minimum RSSI disconnects clients whose signal falls below a threshold, forcing them to roam to a closer AP. This prevents "sticky client" syndrome where devices stay connected to distant APs.</p>
+                    <p style="margin-top: 8px; color: #666;"><strong>Recommended values:</strong> 2.4GHz: -75 to -80 dBm, 5GHz: -70 to -75 dBm</p>
+                    <p style="margin-top: 10px;">
+                        <a href="https://help.ui.com/hc/en-us/articles/221321728-UniFi-Understanding-Minimum-RSSI" target="_blank" 
+                           style="display: inline-block; padding: 6px 12px; background: #3b82f6; color: white; 
+                                  text-decoration: none; border-radius: 4px; font-size: 0.9em; font-weight: 500;">
+                            📚 Learn More About Minimum RSSI
                         </a>
                     </p>
                 </div>

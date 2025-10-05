@@ -386,6 +386,122 @@ class ChangeApplier:
                                f'{old_mode} → {new_mode}')
                 return False
     
+    def apply_min_rssi(self, device, radio_name, new_enabled=True, new_value=-75):
+        """
+        Apply minimum RSSI configuration change
+        
+        Minimum RSSI forces weak clients to roam, preventing sticky client problems
+        
+        Args:
+            device: Device dict from API
+            radio_name: Radio identifier ('ng' for 2.4GHz, 'na' for 5GHz)
+            new_enabled: Whether to enable min RSSI
+            new_value: Min RSSI threshold in dBm (e.g., -75)
+        
+        Returns:
+            bool: True if change was applied (or would be in dry-run)
+        """
+        device_id = device['_id']
+        device_name = device.get('name', 'Unnamed AP')
+        band = '2.4GHz' if radio_name == 'ng' else '5GHz' if radio_name == 'na' else '6GHz'
+        
+        # Get current radio settings
+        radio_table = device.get('radio_table', [])
+        current_enabled = False
+        current_value = None
+        
+        for radio in radio_table:
+            if radio.get('radio') == radio_name:
+                current_enabled = radio.get('min_rssi_enabled', False)
+                current_value = radio.get('min_rssi', None)
+                break
+        
+        # Skip if already configured correctly
+        if current_enabled == new_enabled and current_value == new_value:
+            console.print(f"[dim]{device_name} {band} already has min RSSI configured[/dim]")
+            return True
+        
+        # Create impact analysis
+        impact = {
+            'type': 'Minimum RSSI Configuration',
+            'severity': 'LOW',
+            'client_impact': 'Weak clients will be forced to roam',
+            'benefits': [],
+            'risks': [],
+            'estimated_downtime': 'None'
+        }
+        
+        if new_enabled:
+            impact['benefits'].append(f'Clients below {new_value} dBm will be forced to roam')
+            impact['benefits'].append('Prevents sticky client problems')
+            impact['benefits'].append('Improves overall network performance')
+            impact['benefits'].append('Reduces airtime consumed by weak clients')
+            impact['benefits'].append('Better VoIP and video quality')
+            impact['client_impact'] = f'Clients with signal below {new_value} dBm will be disconnected and forced to find a better AP. Strong clients unaffected.'
+        else:
+            impact['risks'].append('Weak clients may stay connected with poor signal')
+            impact['risks'].append('Reduced network performance')
+        
+        # Display change details
+        old_display = f"{'enabled' if current_enabled else 'disabled'}"
+        if current_value:
+            old_display += f" ({current_value} dBm)"
+        new_display = f"{'enabled' if new_enabled else 'disabled'}"
+        if new_enabled:
+            new_display += f" ({new_value} dBm)"
+        
+        self._display_change_details(
+            device_name=f"{device_name} {band}",
+            change_type='Minimum RSSI',
+            old_value=old_display,
+            new_value=new_display,
+            impact=impact
+        )
+        
+        # Get approval if interactive
+        if self.interactive and not self.dry_run:
+            if not Confirm.ask("Apply this change?", default=False):
+                console.print("[yellow]Change skipped[/yellow]")
+                self._log_change(f"{device_name} {band}", 'Min RSSI', 'SKIPPED', 
+                               f'{old_display} → {new_display}')
+                return False
+        
+        # Apply or simulate
+        if self.dry_run:
+            console.print(f"[cyan]DRY RUN: Would configure min RSSI to {new_display}[/cyan]")
+            self._log_change(f"{device_name} {band}", 'Min RSSI', 'DRY-RUN', 
+                           f'{old_display} → {new_display}')
+            return True
+        else:
+            console.print(f"[yellow]Applying min RSSI change...[/yellow]")
+            
+            # Update radio_table with new min RSSI settings
+            updated_radio_table = []
+            for radio in radio_table:
+                radio_copy = radio.copy()
+                if radio.get('radio') == radio_name:
+                    radio_copy['min_rssi_enabled'] = new_enabled
+                    if new_enabled:
+                        radio_copy['min_rssi'] = new_value
+                updated_radio_table.append(radio_copy)
+            
+            update_data = {
+                'radio_table': updated_radio_table
+            }
+            
+            result = self.client.put(f's/{self.client.site}/rest/device/{device_id}', update_data)
+            
+            if result:
+                console.print(f"[green]✓ Min RSSI configured successfully![/green]")
+                self._log_change(f"{device_name} {band}", 'Min RSSI', 'SUCCESS', 
+                               f'{old_display} → {new_display}')
+                return True
+            else:
+                console.print(f"[red]✗ Failed to configure min RSSI[/red]")
+                self._log_change(f"{device_name} {band}", 'Min RSSI', 'FAILED', 
+                               f'{old_display} → {new_display}')
+                return False
+    
     def _display_change_details(self, device_name, change_type, old_value, new_value, impact):
         """Display detailed change information"""
         console.print("\n")

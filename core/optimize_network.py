@@ -116,6 +116,7 @@ def analyze_network(client, site='default', lookback_days=3):
         # Add advanced analysis to full analysis
         analysis['dfs_analysis'] = advanced_analysis['dfs_analysis']
         analysis['band_steering_analysis'] = advanced_analysis['band_steering_analysis']
+        analysis['min_rssi_analysis'] = advanced_analysis['min_rssi_analysis']
         analysis['fast_roaming_analysis'] = advanced_analysis['fast_roaming_analysis']
         analysis['airtime_analysis'] = advanced_analysis['airtime_analysis']
         analysis['client_capabilities'] = advanced_analysis['client_capabilities']
@@ -130,6 +131,27 @@ def analyze_network(client, site='default', lookback_days=3):
             # Add band steering recommendations with proper device info
             for rec in band_steering_recs:
                 # Band steering recs have 'device' as name string, need to find full device object
+                device_name = rec.get('device', '')
+                device_obj = next((d for d in devices if d.get('name') == device_name), None)
+                if device_obj:
+                    # Add device object to recommendation
+                    rec_with_device = rec.copy()
+                    rec_with_device['ap'] = {
+                        'name': device_obj.get('name', 'Unknown'),
+                        'mac': device_obj.get('mac', ''),
+                        'is_mesh': device_obj.get('adopted', False) and device_obj.get('uplink', {}).get('type') == 'wireless'
+                    }
+                    analysis['recommendations'].append(rec_with_device)
+        
+        # Merge min RSSI recommendations into main recommendations list
+        min_rssi_recs = advanced_analysis['min_rssi_analysis'].get('recommendations', [])
+        if min_rssi_recs:
+            # Ensure recommendations list exists
+            if 'recommendations' not in analysis:
+                analysis['recommendations'] = []
+            # Add min RSSI recommendations with proper device info
+            for rec in min_rssi_recs:
+                # Min RSSI recs have 'device' as name string, need to find full device object
                 device_name = rec.get('device', '')
                 device_obj = next((d for d in devices if d.get('name') == device_name), None)
                 if device_obj:
@@ -473,6 +495,36 @@ def _convert_expert_recommendations(expert_recs, all_devices=None):
                 'affected_clients': rec.get('affected_clients', 0)
             })
         
+        elif 'min_rssi' in issue or 'min_rssi' in rec_type or rec_type == 'min_rssi_disabled':
+            # Min RSSI configuration change
+            radio_name = rec.get('radio', 'ng')
+            band = rec.get('band', '2.4GHz')
+            current_enabled = False
+            current_value = None
+            
+            # Find current radio settings
+            radio_table = device.get('radio_table', [])
+            for radio in radio_table:
+                if radio.get('radio') == radio_name:
+                    current_enabled = radio.get('min_rssi_enabled', False)
+                    current_value = radio.get('min_rssi', None)
+                    break
+            
+            recommended_value = rec.get('recommended_value', -75 if radio_name == 'ng' else -72)
+            
+            converted.append({
+                'device': device,
+                'action': 'min_rssi',
+                'radio': radio_name,
+                'band': band,
+                'current_enabled': current_enabled,
+                'current_value': current_value,
+                'new_enabled': True,
+                'new_value': recommended_value,
+                'reason': rec.get('message', '') + '. ' + rec.get('recommendation', ''),
+                'priority': priority
+            })
+        
         else:
             # For other issues, create informational recommendation
             # These won't be auto-applied but will be shown to user
@@ -742,6 +794,17 @@ def display_recommendations(recommendations):
             if affected_clients > 0:
                 console.print(f"   [dim]Will help {affected_clients} dual-band client(s)[/dim]")
         
+        elif action == 'min_rssi':
+            band = rec.get('band', '2.4GHz')
+            current_display = f"{'enabled' if rec['current_enabled'] else 'disabled'}"
+            if rec['current_value']:
+                current_display += f" ({rec['current_value']} dBm)"
+            new_display = f"{'enabled' if rec['new_enabled'] else 'disabled'}"
+            if rec['new_enabled']:
+                new_display += f" ({rec['new_value']} dBm)"
+            console.print(f"   Configure Min RSSI ({band}): {current_display} → {new_display}")
+            console.print(f"   Reason: {rec['reason']}")
+        
         console.print()
 
 
@@ -976,6 +1039,14 @@ def apply_recommendations(client, recommendations, dry_run=False, interactive=Tr
             applier.apply_band_steering(
                 rec['device'],
                 rec['new_mode']
+            )
+        
+        elif action == 'min_rssi':
+            applier.apply_min_rssi(
+                rec['device'],
+                rec['radio'],
+                rec['new_enabled'],
+                rec['new_value']
             )
     
     # Generate report
