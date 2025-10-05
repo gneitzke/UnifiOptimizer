@@ -1,0 +1,28 @@
+[flake8]
+# Maximum line length
+max-line-length = 100
+
+# Ignore certain errors
+ignore = 
+    E203,  # whitespace before ':' (conflicts with Black)
+    E501,  # line too long (Black handles this)
+    W503,  # line break before binary operator (conflicts with Black)
+    E402,  # module level import not at top of file (sometimes needed)
+
+# Exclude certain directories
+exclude =
+    .git,
+    __pycache__,
+    .venv,
+    venv,
+    env,
+    build,
+    dist,
+    *.egg-info,
+    Archive,
+    OldFiles,
+    deleteme
+
+# Per-file ignores
+per-file-ignores =
+    __init__.py:F401  # Allow unused imports in __init__.py files
