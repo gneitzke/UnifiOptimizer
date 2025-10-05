@@ -163,6 +163,10 @@ class CloudKeyGen2Client:
             # Check if account is local-only (recommended for security)
             self._check_account_type()
             
+            # Verify API access by testing a basic endpoint
+            if not self._verify_api_access():
+                return False
+            
             return True
             
         except Exception as e:
@@ -210,6 +214,142 @@ class CloudKeyGen2Client:
             # Don't fail login if we can't check account type
             if self.verbose:
                 console.print(f"[dim]Note: Could not verify account type: {e}[/dim]")
+    
+    def _verify_api_access(self):
+        """
+        Verify that the user has API access by testing a basic UniFi endpoint
+        This catches read-only users or users without proper permissions early
+        
+        Returns:
+            bool: True if API access is available, False otherwise
+        """
+        try:
+            # Test with a simple endpoint that all admins should have access to
+            test_url = self._get_api_url(f"s/{self.site}/self")
+            
+            if self.logger:
+                self.logger.info("Verifying API access...")
+                self.logger.info(f"Testing: {test_url}")
+            
+            response = self.session.get(test_url, verify=self.verify_ssl)
+            
+            if self.logger:
+                self.logger.info(f"API access test response: {response.status_code}")
+            
+            # Check for common "no access" scenarios
+            if response.status_code == 401:
+                console.print()
+                console.print("[red]✗ API Access Denied: Authentication failed[/red]")
+                console.print("[yellow]Your credentials were accepted for login, but API access was denied.[/yellow]")
+                console.print()
+                console.print("[dim]Possible causes:[/dim]")
+                console.print("[dim]  • Session expired immediately after login[/dim]")
+                console.print("[dim]  • Controller authentication system issue[/dim]")
+                console.print("[dim]  • Try logging in again[/dim]")
+                console.print()
+                
+                if self.logger:
+                    self.logger.error("API access test failed: 401 Unauthorized")
+                    self.logger.error(f"Response: {response.text}")
+                
+                return False
+            
+            elif response.status_code == 403:
+                console.print()
+                console.print("[red]✗ API Access Denied: Insufficient Permissions[/red]")
+                console.print("[yellow]Your account does not have the required permissions.[/yellow]")
+                console.print()
+                console.print("[dim]Required: Administrator or Full Management role[/dim]")
+                console.print()
+                console.print("[bold]To fix this:[/bold]")
+                console.print("  1. Log into the UniFi Controller as an administrator")
+                console.print("  2. Go to Settings → Admins")
+                console.print(f"  3. Find user '{self.username}'")
+                console.print("  4. Change role to 'Administrator' or 'Full Management'")
+                console.print()
+                console.print("[dim]Read-only accounts cannot use this tool.[/dim]")
+                console.print()
+                
+                if self.logger:
+                    self.logger.error("API access test failed: 403 Forbidden")
+                    self.logger.error(f"Response: {response.text}")
+                
+                return False
+            
+            elif response.status_code == 404:
+                # 404 on /self might just mean site doesn't exist or different API version
+                # Try an alternative endpoint
+                alt_test_url = self._get_api_url(f"s/{self.site}/stat/device")
+                
+                if self.logger:
+                    self.logger.info(f"Testing alternative endpoint: {alt_test_url}")
+                
+                alt_response = self.session.get(alt_test_url, verify=self.verify_ssl)
+                
+                if self.logger:
+                    self.logger.info(f"Alternative test response: {alt_response.status_code}")
+                
+                if alt_response.status_code == 403:
+                    # Same 403 handling as above
+                    console.print()
+                    console.print("[red]✗ API Access Denied: Insufficient Permissions[/red]")
+                    console.print("[yellow]Your account does not have the required permissions.[/yellow]")
+                    console.print()
+                    console.print("[dim]Required: Administrator or Full Management role[/dim]")
+                    console.print()
+                    console.print("[bold]To fix this:[/bold]")
+                    console.print("  1. Log into the UniFi Controller as an administrator")
+                    console.print("  2. Go to Settings → Admins")
+                    console.print(f"  3. Find user '{self.username}'")
+                    console.print("  4. Change role to 'Administrator' or 'Full Management'")
+                    console.print()
+                    console.print("[dim]Read-only accounts cannot use this tool.[/dim]")
+                    console.print()
+                    
+                    if self.logger:
+                        self.logger.error("API access test failed: 403 Forbidden (alternative endpoint)")
+                    
+                    return False
+                
+                elif alt_response.status_code in [200, 404]:
+                    # 200 = success, 404 = endpoint exists but no data (still means we have access)
+                    if self.verbose:
+                        console.print("[dim]✓ API access verified[/dim]")
+                    
+                    if self.logger:
+                        self.logger.info("✓ API access verified (alternative endpoint)")
+                    
+                    return True
+            
+            elif response.status_code == 200:
+                # Success - user has API access
+                if self.verbose:
+                    console.print("[dim]✓ API access verified[/dim]")
+                
+                if self.logger:
+                    self.logger.info("✓ API access verified")
+                
+                return True
+            
+            else:
+                # Other error codes - log but don't fail (might be controller-specific)
+                if self.verbose:
+                    console.print(f"[dim]Note: API access test returned {response.status_code} (continuing anyway)[/dim]")
+                
+                if self.logger:
+                    self.logger.warning(f"API access test returned unexpected code: {response.status_code}")
+                
+                return True  # Proceed anyway, will fail later if really no access
+        
+        except Exception as e:
+            # Don't fail on network errors during verification
+            if self.verbose:
+                console.print(f"[dim]Note: Could not verify API access: {e}[/dim]")
+            
+            if self.logger:
+                self.logger.warning(f"Could not verify API access: {e}")
+            
+            return True  # Proceed anyway, will fail later if really no access
     
     def _get_api_url(self, path):
         """

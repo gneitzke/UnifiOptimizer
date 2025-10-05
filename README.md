@@ -139,10 +139,12 @@ Follow these steps to create a secure local-only administrator account:
 
 ### Why Admin Access?
 
-The UniFi API requires **Admin** role for:
+The UniFi API requires **Admin** or **Full Management** role for:
 - Reading device configurations (APs, switches, clients)
 - Accessing historical statistics and events
 - Applying optimization changes (if you choose to use optimization mode)
+
+**⚠️ Read-only accounts will not work** - The tool automatically checks for API access after login and will show a clear error message if you don't have sufficient permissions.
 
 **Note**: The tool defaults to **read-only analysis mode**, so your network is safe even with admin credentials.
 
