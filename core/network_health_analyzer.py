@@ -429,7 +429,13 @@ class NetworkHealthAnalyzer:
 
                 # Check if radio is actually enabled/in-use
                 # A radio is considered active if it has a valid channel assigned
-                is_radio_enabled = channel is not None and channel > 0
+                # Convert channel to int safely (may be string or None)
+                try:
+                    channel_num = int(channel) if channel is not None else 0
+                except (ValueError, TypeError):
+                    channel_num = 0
+
+                is_radio_enabled = channel_num > 0
 
                 # Handle None/null TX power from API (common on mesh APs or disabled radios)
                 if tx_power is None:
