@@ -687,7 +687,17 @@ class AdvancedNetworkAnalyzer:
 
                 for radio_stat in radio_table_stats:
                     radio_name = radio_stat.get("name", "unknown")
-                    band = "2.4GHz" if radio_stat.get("radio") == "ng" else "5GHz"
+                    radio = radio_stat.get("radio", "unknown")
+
+                    # Determine band including 6GHz support
+                    if radio == "ng":
+                        band = "2.4GHz"
+                    elif radio == "na":
+                        band = "5GHz"
+                    elif radio in ["6e", "ax", "6g"]:
+                        band = "6GHz"
+                    else:
+                        band = "Unknown"
 
                     # Channel utilization
                     cu_total = radio_stat.get("cu_total", 0)
@@ -788,8 +798,17 @@ class AdvancedNetworkAnalyzer:
                     continue
 
                 # Process time-series data
-                for radio_idx, radio_stats in enumerate(["ng", "na"]):  # 2.4GHz and 5GHz
-                    band = "2.4GHz" if radio_stats == "ng" else "5GHz"
+                # Support all radio types: 2.4GHz (ng), 5GHz (na), 6GHz (6e/ax/6g)
+                for radio_idx, radio_stats in enumerate(["ng", "na", "6e"]):
+                    if radio_stats == "ng":
+                        band = "2.4GHz"
+                    elif radio_stats == "na":
+                        band = "5GHz"
+                    elif radio_stats in ["6e", "ax", "6g"]:
+                        band = "6GHz"
+                    else:
+                        band = "Unknown"
+
                     key = f"{ap_name} ({band})"
 
                     time_series_data = []
