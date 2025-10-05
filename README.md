@@ -27,7 +27,7 @@ A comprehensive toolkit for analyzing and optimizing Ubiquiti UniFi networks. Pr
 
 ### Network Analysis
 - **📡 RF Optimization**: Channel overlap detection, transmit power analysis, interference identification
-- **🔌 Client Health**: RSSI histograms, signal quality tracking, disconnect analysis  
+- **🔌 Client Health**: RSSI histograms, signal quality tracking, disconnect analysis
 - **📊 Historical Analysis**: 3-7 day lookback for trend detection and data-driven recommendations
 - **🌐 Mesh AP Monitoring**: Uplink signal strength, reliability checks, DFS avoidance
 - **📱 Device Intelligence**: Manufacturer identification, IoT device categorization, VLAN recommendations
@@ -91,7 +91,13 @@ sudo yum install python3 python3-pip
    pip3 install -r requirements.txt
    ```
 
-3. **Verify installation:**
+3. **(Optional) Install development tools for code quality:**
+   ```bash
+   pip3 install -r requirements-dev.txt
+   ```
+   Includes: Black (formatter), Flake8 (linter), isort (import organizer)
+
+4. **Verify installation:**
    ```bash
    python3 optimizer.py --help
    ```
@@ -368,9 +374,125 @@ unifi-network-optimizer/
 
 ---
 
+## 🛠️ Developer Setup
+
+**Contributing to UnifiOptimizer?** Follow these steps to set up your development environment:
+
+### 1. Clone & Install
+
+```bash
+git clone https://github.com/gneitzke/UnifiOptimizer.git
+cd UnifiOptimizer
+
+# Install runtime dependencies
+pip3 install -r requirements.txt
+
+# Install development tools (REQUIRED)
+pip3 install -r requirements-dev.txt
+```
+
+### 2. VS Code Setup (Recommended)
+
+Open project in VS Code:
+```bash
+code .
+```
+
+Install recommended extensions when prompted (or manually):
+- **Python** (ms-python.python)
+- **Black Formatter** (ms-python.black-formatter)
+- **isort** (ms-python.isort)
+- **Flake8** (ms-python.flake8)
+
+**Auto-format on save is already configured!** ✨
+
+### 3. Development Workflow
+
+**Before every commit, run these commands:**
+
+```bash
+./format_code.sh   # Auto-format all code
+./check_code.sh    # Verify code quality
+```
+
+Expected output:
+```
+✅ All checks passed!
+```
+
+### 4. What Gets Auto-Formatted
+
+When you save a file in VS Code:
+- ✅ Code formatted with **Black**
+- ✅ Imports organized with **isort**
+- ✅ Trailing whitespace removed
+- ✅ Final newline added
+
+**Example:**
+```python
+# Before save (messy)
+from rich.console import Console
+import sys
+def test(  x,y,   z  ):
+    return x+y+z
+
+# After save (clean)
+import sys
+
+from rich.console import Console
+
+
+def test(x, y, z):
+    return x + y + z
+```
+
+### 5. Code Quality Tools
+
+| Tool | Purpose | When It Runs |
+|------|---------|--------------|
+| **Black** | Code formatter | On save in VS Code |
+| **isort** | Import organizer | On save in VS Code |
+| **Flake8** | Linter (finds bugs) | Live in VS Code |
+
+**Manual commands:**
+```bash
+black api/                    # Format specific directory
+isort core/                   # Sort imports
+flake8 utils/                 # Check for issues
+```
+
+### 6. Pre-Commit Checklist
+
+Before committing:
+
+- [ ] Run `./format_code.sh`
+- [ ] Run `./check_code.sh` → Should see `✅ All checks passed!`
+- [ ] Test your changes manually
+- [ ] Update documentation if needed
+
+### 📚 Developer Documentation
+
+- **[Developer Setup Guide](docs/DEVELOPER_SETUP.md)** - Complete setup instructions
+- **[Code Quality Guide](docs/CODE_QUALITY.md)** - Detailed formatting/linting info
+- **[Quick Reference](CODE_QUALITY_QUICKREF.md)** - Common commands
+
+---
+
 ## 🤝 Contributing
 
-Contributions are welcome! Please feel free to submit issues or pull requests.
+Contributions are welcome! Please:
+
+1. Fork the repository
+2. Create a feature branch: `git checkout -b feature/amazing-feature`
+3. Follow the developer setup guide above
+4. Make your changes
+5. Run formatting: `./format_code.sh`
+6. Run checks: `./check_code.sh`
+7. Commit: `git commit -m "feat: Add amazing feature"`
+8. Push: `git push origin feature/amazing-feature`
+9. Open a Pull Request
+
+**All contributions must pass code quality checks.**
 
 ---
 

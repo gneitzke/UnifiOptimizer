@@ -1,0 +1,4 @@
+# Development Tools (optional, for code quality)
+black>=23.0.0
+flake8>=6.0.0
+isort>=5.12.0

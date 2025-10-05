@@ -1,0 +1,25 @@
+[tool.black]
+line-length = 100
+target-version = ['py37', 'py38', 'py39', 'py310']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.git
+  | __pycache__
+  | \.venv
+  | venv
+  | env
+  | build
+  | dist
+  | Archive
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 100
+skip_gitignore = true
+extend_skip = ["Archive"]
+known_first_party = ["api", "core", "utils"]
+sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
