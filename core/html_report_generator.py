@@ -1367,13 +1367,29 @@ def generate_recommendations_html(recommendations):
                 current = rec.get("current_channel", "N/A")
                 new = rec.get("new_channel", "N/A")
                 radio = rec.get("radio", "unknown")
-                band = "2.4GHz" if radio == "ng" else "5GHz"
+                band = (
+                    "2.4GHz"
+                    if radio == "ng"
+                    else (
+                        "5GHz"
+                        if radio == "na"
+                        else "6GHz" if radio in ["6e", "ax", "6g"] else "Unknown"
+                    )
+                )
                 recommendation = f"Change {band} channel from {current} to {new}"
             elif action == "power_change":
                 current = rec.get("current_power", "N/A")
                 new = rec.get("new_power", "N/A")
                 radio = rec.get("radio", "unknown")
-                band = "2.4GHz" if radio == "ng" else "5GHz"
+                band = (
+                    "2.4GHz"
+                    if radio == "ng"
+                    else (
+                        "5GHz"
+                        if radio == "na"
+                        else "6GHz" if radio in ["6e", "ax", "6g"] else "Unknown"
+                    )
+                )
                 recommendation = f"Change {band} transmit power from {current} to {new}"
 
         # Get appropriate learn more URL
@@ -1730,6 +1746,7 @@ def generate_band_steering_html(band_steering):
         return ""
 
     misplaced_count = band_steering.get("dual_band_clients_on_2ghz", 0)
+    tri_band_count = band_steering.get("tri_band_clients_suboptimal", 0)
     misplaced_clients = band_steering.get("misplaced_clients", [])
     band_steering_enabled = band_steering.get("band_steering_enabled", {})
     severity = band_steering.get("severity", "ok")
@@ -1749,15 +1766,24 @@ def generate_band_steering_html(band_steering):
 
     # Misplaced clients table
     clients_html = ""
-    for client in misplaced_clients[:10]:  # Show top 10
+    for client in misplaced_clients[:15]:  # Show top 15 to include 6GHz clients
         last_seen = client.get("last_seen", "Unknown")
+        current_band = client.get("current_band", "Unknown")
+        capability = client.get("capability", client.get("radio_proto", "N/A"))
+        is_6ghz = client.get("is_6ghz_capable", False)
+
+        # Color-code based on band
+        band_color = "#f59e0b" if current_band == "2.4GHz" else "#3b82f6"
+        capability_color = "#8b5cf6" if is_6ghz else "#10b981"
+
         clients_html += f"""
                     <tr>
                         <td>{client.get('hostname', 'Unknown')}</td>
                         <td>{client.get('ap', 'Unknown')}</td>
                         <td style="color: #666; font-size: 0.9em;">{last_seen}</td>
+                        <td style="color: {band_color}; font-weight: 500;">{current_band}</td>
                         <td>{client.get('rssi', 'N/A')} dBm</td>
-                        <td>{client.get('radio_proto', 'N/A')}</td>
+                        <td style="color: {capability_color}; font-weight: 500;">{capability}</td>
                     </tr>
 """
 
@@ -1765,12 +1791,18 @@ def generate_band_steering_html(band_steering):
         severity, "#6b7280"
     )
 
+    # Build summary message
+    summary_msg = f"{misplaced_count} Client(s) on Suboptimal Bands"
+    detail_msg = "These clients could benefit from better band placement."
+    if tri_band_count > 0:
+        detail_msg = f"Includes {tri_band_count} WiFi 6E capable client(s) that could use the faster, less congested 6GHz band for optimal performance."
+
     return f"""
             <div class="section">
                 <h2>🔄 Band Steering Analysis</h2>
                 <div style="background: {severity_color}15; padding: 20px; border-radius: 8px; border-left: 4px solid {severity_color}; margin-bottom: 20px;">
-                    <strong style="font-size: 1.2em; color: {severity_color};">{misplaced_count} Dual-Band Client(s) on 2.4GHz</strong>
-                    <p style="margin-top: 10px; color: #666;">These clients support 5GHz but are connected to 2.4GHz, likely due to disabled band steering or poor 5GHz coverage.</p>
+                    <strong style="font-size: 1.2em; color: {severity_color};">{summary_msg}</strong>
+                    <p style="margin-top: 10px; color: #666;">{detail_msg}</p>
                 </div>
 
                 <h3>Band Steering Configuration by AP</h3>
@@ -1787,13 +1819,14 @@ def generate_band_steering_html(band_steering):
                 </table>
 
                 {f'''
-                <h3 style="margin-top: 30px;">Misplaced Clients</h3>
+                <h3 style="margin-top: 30px;">Clients on Suboptimal Bands</h3>
                 <table class="ap-table">
                     <thead>
                         <tr>
                             <th>Client</th>
                             <th>Connected AP</th>
                             <th>Last Seen</th>
+                            <th>Current Band</th>
                             <th>Signal</th>
                             <th>Capability</th>
                         </tr>
@@ -1806,7 +1839,7 @@ def generate_band_steering_html(band_steering):
 
                 <div style="margin-top: 20px; padding: 15px; background: #f3f4f6; border-radius: 8px;">
                     <strong>About Band Steering:</strong>
-                    <p style="margin-top: 8px; color: #666;">Band steering encourages dual-band capable clients to use the less congested 5GHz band, improving overall network performance.</p>
+                    <p style="margin-top: 8px; color: #666;">Band steering encourages capable clients to use less congested bands (5GHz/6GHz), improving overall network performance. WiFi 6E devices can use the new 6GHz band for maximum speed and minimum interference.</p>
                     <p style="margin-top: 10px;">
                         <a href="https://help.ui.com/hc/en-us/articles/115012700547-UniFi-Understanding-and-Using-Band-Steering" target="_blank"
                            style="display: inline-block; padding: 6px 12px; background: #3b82f6; color: white;
@@ -1895,7 +1928,7 @@ def generate_min_rssi_html(min_rssi):
                 <div style="margin-top: 20px; padding: 15px; background: #f3f4f6; border-radius: 8px;">
                     <strong>About Minimum RSSI:</strong>
                     <p style="margin-top: 8px; color: #666;">Minimum RSSI disconnects clients whose signal falls below a threshold, forcing them to roam to a closer AP. This prevents "sticky client" syndrome where devices stay connected to distant APs.</p>
-                    <p style="margin-top: 8px; color: #666;"><strong>Recommended values:</strong> 2.4GHz: -75 to -80 dBm, 5GHz: -70 to -75 dBm</p>
+                    <p style="margin-top: 8px; color: #666;"><strong>Recommended values:</strong> 2.4GHz: -75 to -80 dBm, 5GHz: -70 to -75 dBm, 6GHz: -68 to -72 dBm</p>
                     <p style="margin-top: 10px;">
                         <a href="https://help.ui.com/hc/en-us/articles/221321728-UniFi-Understanding-Minimum-RSSI" target="_blank"
                            style="display: inline-block; padding: 6px 12px; background: #3b82f6; color: white;
@@ -1978,7 +2011,7 @@ def generate_airtime_analysis_html(airtime_analysis):
             """
 
             # Add each band's data
-            for band in ["2.4GHz", "5GHz"]:
+            for band in ["2.4GHz", "5GHz", "6GHz"]:
                 if band in bands_data:
                     band_info = bands_data[band]
                     avg_util = band_info["avg"]
