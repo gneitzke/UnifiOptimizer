@@ -420,8 +420,13 @@ class CloudKeyGen2Client:
 
         if self.logger:
             self.logger.info(f"GET {url}")
+            # Log verbose details to file
+            if self.verbose:
+                self.logger.debug(f"→ GET Request")
+                self.logger.debug(f"  URL: {url}")
+                self.logger.debug(f"  Path: {path}")
 
-        # Verbose mode: Log request details
+        # Verbose mode: Log request details to console
         if self.verbose:
             console.print(f"\n[bold cyan]→ GET Request[/bold cyan]")
             console.print(f"[cyan]URL:[/cyan] {url}")
@@ -481,8 +486,33 @@ class CloudKeyGen2Client:
                         )
                         data_info = f" (returned {data_len} items)"
                 self.logger.info(f"✓ GET {path} successful{data_info}")
+                # Log verbose response details to file
+                if self.verbose:
+                    import json as json_lib
 
-            # Verbose mode: Log response details
+                    self.logger.debug(f"← Response ({response.status_code})")
+                    if isinstance(json_data, dict):
+                        if "data" in json_data:
+                            data_len = (
+                                len(json_data["data"]) if isinstance(json_data["data"], list) else 1
+                            )
+                            self.logger.debug(f"  Data items: {data_len}")
+                            # Log first item for lists, full data for single objects
+                            if isinstance(json_data["data"], list) and len(json_data["data"]) > 0:
+                                self.logger.debug(f"  Sample item (first of {data_len}):")
+                                self.logger.debug(
+                                    json_lib.dumps(json_data["data"][0], indent=2, default=str)
+                                )
+                            elif isinstance(json_data["data"], dict):
+                                self.logger.debug(f"  Response data:")
+                                self.logger.debug(
+                                    json_lib.dumps(json_data["data"], indent=2, default=str)
+                                )
+                        else:
+                            self.logger.debug(f"  Response:")
+                            self.logger.debug(json_lib.dumps(json_data, indent=2, default=str))
+
+            # Verbose mode: Log response details to console
             if self.verbose:
                 import json as json_lib
 
@@ -586,8 +616,17 @@ class CloudKeyGen2Client:
         if self.logger:
             self.logger.info(f"PUT {url}")
             self.logger.debug(f"  Data: {data}")
+            # Log verbose details to file
+            if self.verbose:
+                import json as json_lib
 
-        # Verbose mode: Log request details
+                self.logger.debug(f"→ PUT Request")
+                self.logger.debug(f"  URL: {url}")
+                self.logger.debug(f"  Path: {path}")
+                self.logger.debug(f"  Payload:")
+                self.logger.debug(json_lib.dumps(data, indent=2, default=str))
+
+        # Verbose mode: Log request details to console
         if self.verbose:
             import json as json_lib
 
@@ -603,6 +642,8 @@ class CloudKeyGen2Client:
             headers["X-CSRF-Token"] = self.csrf_manager.token
             if self.verbose:
                 console.print(f"[yellow]CSRF Token:[/yellow] {self.csrf_manager.token[:20]}...")
+                if self.logger:
+                    self.logger.debug(f"  CSRF Token: {self.csrf_manager.token[:20]}...")
 
         try:
             response = self.session.put(url, json=data, headers=headers, verify=self.verify_ssl)
@@ -645,8 +686,15 @@ class CloudKeyGen2Client:
 
             if self.logger:
                 self.logger.info(f"✓ PUT {path} successful")
+                # Log verbose response details to file
+                if self.verbose:
+                    import json as json_lib
 
-            # Verbose mode: Log response details
+                    self.logger.debug(f"← Response ({response.status_code})")
+                    self.logger.debug(f"  Response data:")
+                    self.logger.debug(json_lib.dumps(json_data, indent=2, default=str))
+
+            # Verbose mode: Log response details to console
             if self.verbose:
                 import json as json_lib
 
@@ -751,8 +799,17 @@ class CloudKeyGen2Client:
         if self.logger:
             self.logger.info(f"POST {url}")
             self.logger.debug(f"  Data: {data}")
+            # Log verbose details to file
+            if self.verbose:
+                import json as json_lib
 
-        # Verbose mode: Log request details
+                self.logger.debug(f"→ POST Request")
+                self.logger.debug(f"  URL: {url}")
+                self.logger.debug(f"  Path: {path}")
+                self.logger.debug(f"  Payload:")
+                self.logger.debug(json_lib.dumps(data, indent=2, default=str))
+
+        # Verbose mode: Log request details to console
         if self.verbose:
             import json as json_lib
 
@@ -768,6 +825,8 @@ class CloudKeyGen2Client:
             headers["X-CSRF-Token"] = self.csrf_manager.token
             if self.verbose:
                 console.print(f"[magenta]CSRF Token:[/magenta] {self.csrf_manager.token[:20]}...")
+                if self.logger:
+                    self.logger.debug(f"  CSRF Token: {self.csrf_manager.token[:20]}...")
 
         try:
             response = self.session.post(url, json=data, headers=headers, verify=self.verify_ssl)
@@ -810,8 +869,15 @@ class CloudKeyGen2Client:
 
             if self.logger:
                 self.logger.info(f"✓ POST {path} successful")
+                # Log verbose response details to file
+                if self.verbose:
+                    import json as json_lib
 
-            # Verbose mode: Log response details
+                    self.logger.debug(f"← Response ({response.status_code})")
+                    self.logger.debug(f"  Response data:")
+                    self.logger.debug(json_lib.dumps(json_data, indent=2, default=str))
+
+            # Verbose mode: Log response details to console
             if self.verbose:
                 import json as json_lib
 
