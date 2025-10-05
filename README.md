@@ -44,6 +44,14 @@ A comprehensive toolkit for analyzing and optimizing Ubiquiti UniFi networks. Pr
 - **💾 Profile Management**: Secure credential storage in macOS Keychain
 - **📝 Change Logging**: Complete audit trail of all modifications
 
+### WiFi 7 & 6E Support
+- **📡 WiFi 7 Detection**: Identifies 802.11be capable devices (iPhone 16, Galaxy S25, etc.)
+- **🔮 WiFi 6E Support**: Detects 6GHz capable devices for optimal band placement
+- **📊 Executive Dashboard**: Quick health overview with visual severity indicators
+- **🗄️ External Device Database**: Easy-to-update JSON file for device capabilities
+  - **No code changes needed** to add new devices
+  - See [`docs/DEVICE_DATABASE.md`](docs/DEVICE_DATABASE.md) for details
+
 ---
 
 ## 📦 Prerequisites
