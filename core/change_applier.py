@@ -294,6 +294,98 @@ class ChangeApplier:
                                f'{old_power_mode} → {new_power_mode}')
                 return False
     
+    def apply_band_steering(self, device, new_mode='prefer_5g'):
+        """
+        Apply band steering configuration change
+        
+        Args:
+            device: Device dict from API
+            new_mode: Band steering mode ('off', 'prefer_5g', 'equal')
+                     'prefer_5g' (recommended): Steers dual-band clients to 5GHz
+                     'equal': Balances clients between bands
+                     'off': Disables band steering
+        
+        Returns:
+            bool: True if change was applied (or would be in dry-run)
+        """
+        device_id = device['_id']
+        device_name = device.get('name', 'Unnamed AP')
+        
+        # Get current band steering mode
+        old_mode = device.get('bandsteering_mode', 'off')
+        
+        # Skip if already set to desired mode
+        if old_mode == new_mode:
+            console.print(f"[dim]{device_name} already has band steering set to '{new_mode}'[/dim]")
+            return True
+        
+        # Create impact analysis
+        impact = {
+            'type': 'Band Steering Configuration',
+            'severity': 'LOW',
+            'client_impact': 'No immediate disconnection - affects future connections',
+            'benefits': [],
+            'risks': [],
+            'estimated_downtime': 'None'
+        }
+        
+        if new_mode == 'prefer_5g':
+            impact['benefits'].append('Dual-band clients will prefer 5GHz band')
+            impact['benefits'].append('Reduces 2.4GHz congestion')
+            impact['benefits'].append('Improves throughput for capable devices')
+            impact['benefits'].append('Better airtime utilization')
+            impact['client_impact'] = 'Currently connected clients stay on current band. New connections and roaming events will prefer 5GHz.'
+        elif new_mode == 'equal':
+            impact['benefits'].append('Balances clients between 2.4GHz and 5GHz')
+            impact['benefits'].append('Prevents band overload')
+        elif new_mode == 'off':
+            impact['risks'].append('Dual-band clients may stay on 2.4GHz')
+            impact['risks'].append('Reduced network performance')
+        
+        # Display change details
+        self._display_change_details(
+            device_name=device_name,
+            change_type='Band Steering Configuration',
+            old_value=old_mode if old_mode else 'off',
+            new_value=new_mode,
+            impact=impact
+        )
+        
+        # Get approval if interactive
+        if self.interactive and not self.dry_run:
+            if not Confirm.ask("Apply this change?", default=False):
+                console.print("[yellow]Change skipped[/yellow]")
+                self._log_change(device_name, 'Band Steering', 'SKIPPED', 
+                               f'{old_mode} → {new_mode}')
+                return False
+        
+        # Apply or simulate
+        if self.dry_run:
+            console.print(f"[cyan]DRY RUN: Would enable band steering mode '{new_mode}'[/cyan]")
+            self._log_change(device_name, 'Band Steering', 'DRY-RUN', 
+                           f'{old_mode} → {new_mode}')
+            return True
+        else:
+            console.print(f"[yellow]Applying band steering change...[/yellow]")
+            
+            # Update band steering mode
+            update_data = {
+                'bandsteering_mode': new_mode
+            }
+            
+            result = self.client.put(f's/{self.client.site}/rest/device/{device_id}', update_data)
+            
+            if result:
+                console.print(f"[green]✓ Band steering configured successfully![/green]")
+                self._log_change(device_name, 'Band Steering', 'SUCCESS', 
+                               f'{old_mode} → {new_mode}')
+                return True
+            else:
+                console.print(f"[red]✗ Failed to configure band steering[/red]")
+                self._log_change(device_name, 'Band Steering', 'FAILED', 
+                               f'{old_mode} → {new_mode}')
+                return False
+    
     def _display_change_details(self, device_name, change_type, old_value, new_value, impact):
         """Display detailed change information"""
         console.print("\n")
