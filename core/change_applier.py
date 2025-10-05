@@ -321,8 +321,9 @@ class ChangeApplier:
         device_id = device["_id"]
         device_name = device.get("name", "Unnamed AP")
 
-        # Get current band steering mode
-        old_mode = device.get("bandsteering_mode", "off")
+        # Get current band steering mode - check both possible field names
+        # UniFi may use 'bandsteering_mode' (older) or 'band_steering_mode' (newer)
+        old_mode = device.get("bandsteering_mode") or device.get("band_steering_mode", "off")
 
         # Skip if already set to desired mode
         if old_mode == new_mode:
@@ -380,8 +381,9 @@ class ChangeApplier:
         else:
             console.print(f"[yellow]Applying band steering change...[/yellow]")
 
-            # Update band steering mode
-            update_data = {"bandsteering_mode": new_mode}
+            # Update band steering mode - use both field names to ensure compatibility
+            # with different UniFi controller versions
+            update_data = {"bandsteering_mode": new_mode, "band_steering_mode": new_mode}
 
             result = self.client.put(f"s/{self.client.site}/rest/device/{device_id}", update_data)
 
