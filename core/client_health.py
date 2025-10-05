@@ -87,6 +87,11 @@ class ClientHealthAnalyzer:
                 
             rssi = client.get('rssi', -100)
             
+            # FIX: Some UniFi controllers return positive RSSI values
+            # RSSI should always be negative in dBm for WiFi
+            if rssi > 0:
+                rssi = -rssi
+            
             if rssi > self.RSSI_EXCELLENT:
                 categories['excellent'].append(client)
             elif rssi > self.RSSI_GOOD:
@@ -133,6 +138,10 @@ class ClientHealthAnalyzer:
                 continue
                 
             rssi = client.get('rssi', 0)
+            
+            # FIX: Some UniFi controllers return positive RSSI values
+            if rssi > 0:
+                rssi = -rssi
             
             if rssi < self.RSSI_FAIR:
                 client_info = {
@@ -232,6 +241,11 @@ class ClientHealthAnalyzer:
                 continue
                 
             rssi = client.get('rssi', -100)
+            
+            # FIX: Some UniFi controllers return positive RSSI values
+            if rssi > 0:
+                rssi = -rssi
+            
             rssi_values.append(rssi)
             
             if rssi > self.RSSI_EXCELLENT:
@@ -261,6 +275,10 @@ class ClientHealthAnalyzer:
             mac = client.get('mac', '')
             rssi = client.get('rssi', 0)
             is_wired = client.get('is_wired', False)
+            
+            # FIX: Some UniFi controllers return positive RSSI values
+            if rssi > 0:
+                rssi = -rssi
             
             # Wired clients get perfect signal score (no wireless)
             if is_wired:
@@ -350,8 +368,14 @@ class ClientHealthAnalyzer:
         if not clients:
             return "[yellow]No clients connected[/yellow]"
         
-        # Collect RSSI values
-        rssi_values = [c.get('rssi', -100) for c in clients]
+        # Collect RSSI values and fix positive values
+        rssi_values = []
+        for c in clients:
+            rssi = c.get('rssi', -100)
+            # FIX: Some UniFi controllers return positive RSSI values
+            if rssi > 0:
+                rssi = -rssi
+            rssi_values.append(rssi)
         
         # Create bins
         bins = {
