@@ -121,6 +121,27 @@ def analyze_network(client, site='default', lookback_days=3):
         analysis['client_capabilities'] = advanced_analysis['client_capabilities']
         analysis['switch_analysis'] = advanced_analysis['switch_analysis']
         
+        # Merge band steering recommendations into main recommendations list
+        band_steering_recs = advanced_analysis['band_steering_analysis'].get('recommendations', [])
+        if band_steering_recs:
+            # Ensure recommendations list exists
+            if 'recommendations' not in analysis:
+                analysis['recommendations'] = []
+            # Add band steering recommendations with proper device info
+            for rec in band_steering_recs:
+                # Band steering recs have 'device' as name string, need to find full device object
+                device_name = rec.get('device', '')
+                device_obj = next((d for d in devices if d.get('name') == device_name), None)
+                if device_obj:
+                    # Add device object to recommendation
+                    rec_with_device = rec.copy()
+                    rec_with_device['ap'] = {
+                        'name': device_obj.get('name', 'Unknown'),
+                        'mac': device_obj.get('mac', ''),
+                        'is_mesh': device_obj.get('adopted', False) and device_obj.get('uplink', {}).get('type') == 'wireless'
+                    }
+                    analysis['recommendations'].append(rec_with_device)
+        
         # Run comprehensive network health analysis
         console.print("[bold cyan]Analyzing network health...[/bold cyan]")
         health_analyzer = NetworkHealthAnalyzer(client, site)
@@ -438,6 +459,20 @@ def _convert_expert_recommendations(expert_recs, all_devices=None):
                 'affected_clients': rec.get('affected_clients', 0)
             })
         
+        elif 'band_steering' in issue or 'band_steering' in rec_type or rec_type == 'band_steering':
+            # Band steering configuration change
+            current_mode = device.get('bandsteering_mode', 'off')
+            
+            converted.append({
+                'device': device,
+                'action': 'band_steering',
+                'current_mode': current_mode,
+                'new_mode': 'prefer_5g',  # Enable band steering with 5GHz preference
+                'reason': rec.get('message', '') + '. ' + rec.get('recommendation', ''),
+                'priority': priority,
+                'affected_clients': rec.get('affected_clients', 0)
+            })
+        
         else:
             # For other issues, create informational recommendation
             # These won't be auto-applied but will be shown to user
@@ -701,6 +736,12 @@ def display_recommendations(recommendations):
             if affected_clients > 0:
                 console.print(f"   [dim]Affects {affected_clients} client(s)[/dim]")
         
+        elif action == 'band_steering':
+            console.print(f"   Enable band steering: {rec['current_mode']} → {rec['new_mode']}")
+            console.print(f"   Reason: {rec['reason']}")
+            if affected_clients > 0:
+                console.print(f"   [dim]Will help {affected_clients} dual-band client(s)[/dim]")
+        
         console.print()
 
 
@@ -929,6 +970,12 @@ def apply_recommendations(client, recommendations, dry_run=False, interactive=Tr
                 rec['device'],
                 rec['radio'],
                 rec['new_power']
+            )
+        
+        elif action == 'band_steering':
+            applier.apply_band_steering(
+                rec['device'],
+                rec['new_mode']
             )
     
     # Generate report

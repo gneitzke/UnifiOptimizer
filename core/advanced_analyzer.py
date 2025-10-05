@@ -152,15 +152,52 @@ class AdvancedNetworkAnalyzer:
                     
                     # Check if client is on 2.4GHz but supports 5GHz
                     if radio == 'ng':  # 2.4GHz
-                        # Look for 5GHz capability indicators
-                        if 'ac' in radio_proto or 'ax' in radio_proto or client.get('is_11ac'):
+                        hostname = client.get('hostname', client.get('name', '')).lower()
+                        tx_rate = client.get('tx_rate', 0)
+                        rx_rate = client.get('rx_rate', 0)
+                        nss = client.get('nss', 1)  # Number of spatial streams
+                        
+                        # Multi-indicator 5GHz capability detection
+                        is_dual_band = False
+                        detection_reason = None
+                        
+                        # Method 1: API capability fields (rarely populated)
+                        if 'ac' in radio_proto or 'ax' in radio_proto or client.get('is_11ac') or client.get('is_11ax'):
+                            is_dual_band = True
+                            detection_reason = f'API indicates {radio_proto}'
+                        
+                        # Method 2: High data rates (>72 Mbps suggests 802.11n+ dual-band capable)
+                        elif tx_rate > 72000 or rx_rate > 72000:
+                            is_dual_band = True
+                            detection_reason = f'High data rate: TX={tx_rate/1000:.0f}Mbps RX={rx_rate/1000:.0f}Mbps'
+                        
+                        # Method 3: Multiple spatial streams (>1 suggests modern dual-band device)
+                        elif nss >= 2:
+                            is_dual_band = True
+                            detection_reason = f'Multiple spatial streams (nss={nss})'
+                        
+                        # Method 4: Known dual-band device names
+                        elif any(pattern in hostname for pattern in [
+                            'iphone', 'ipad', 'ipod', 'mac', 'macbook', 'imac',  # Apple (all dual-band since 2013)
+                            'galaxy', 'samsung',  # Modern Samsung
+                            'pixel',              # Google Pixel
+                            'oneplus',            # OnePlus phones
+                            'surface',            # Microsoft Surface
+                            'thinkpad', 'latitude', 'pavilion', 'inspiron',  # Modern laptops
+                        ]):
+                            is_dual_band = True
+                            detection_reason = f'Known dual-band device: {hostname}'
+                        
+                        if is_dual_band:
                             results['dual_band_clients_on_2ghz'] += 1
                             results['misplaced_clients'].append({
                                 'hostname': client.get('hostname', client.get('name', 'Unknown')),
                                 'mac': client.get('mac'),
                                 'ap': client.get('ap_name', 'Unknown'),
                                 'rssi': client.get('rssi'),
-                                'radio_proto': radio_proto
+                                'radio_proto': radio_proto,
+                                'tx_rate': tx_rate,
+                                'detection_reason': detection_reason
                             })
             
             # Generate recommendations
