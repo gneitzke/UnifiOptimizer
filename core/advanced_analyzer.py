@@ -11,7 +11,10 @@ Implements enterprise-grade analysis:
 - Network health scoring
 """
 
+import json
+import os
 from datetime import datetime, timedelta
+from pathlib import Path
 
 
 class AdvancedNetworkAnalyzer:
@@ -20,6 +23,47 @@ class AdvancedNetworkAnalyzer:
     def __init__(self, client, site="default"):
         self.client = client
         self.site = site
+        self.device_capabilities = self._load_device_capabilities()
+
+    def _load_device_capabilities(self):
+        """Load WiFi device capability database from JSON file"""
+        try:
+            # Try loading from data/ directory relative to this file
+            config_path = Path(__file__).parent.parent / "data" / "wifi_device_capabilities.json"
+
+            if not config_path.exists():
+                # Fallback to looking in current directory
+                config_path = Path("data/wifi_device_capabilities.json")
+
+            if config_path.exists():
+                with open(config_path, "r") as f:
+                    return json.load(f)
+            else:
+                # Return empty config if file not found (fail gracefully)
+                return {
+                    "wifi7_devices": {"patterns": []},
+                    "wifi6e_devices": {"patterns": []},
+                    "dual_band_devices": {"patterns": []},
+                    "known_2.4ghz_only": {"patterns": []},
+                }
+        except Exception as e:
+            # Log error but don't crash - return empty patterns
+            print(f"Warning: Could not load device capabilities: {e}")
+            return {
+                "wifi7_devices": {"patterns": []},
+                "wifi6e_devices": {"patterns": []},
+                "dual_band_devices": {"patterns": []},
+                "known_2.4ghz_only": {"patterns": []},
+            }
+
+    def _normalize_hostname(self, hostname):
+        """Normalize hostname for flexible pattern matching"""
+        return hostname.lower().replace("-", " ").replace("_", " ").replace("  ", " ").strip()
+
+    def _check_device_pattern(self, hostname, pattern_list):
+        """Check if normalized hostname matches any pattern in the list"""
+        normalized_hostname = self._normalize_hostname(hostname)
+        return any(pattern.lower() in normalized_hostname for pattern in pattern_list)
 
     def analyze_dfs_events(self, lookback_days=3):
         """
@@ -217,15 +261,9 @@ class AdvancedNetworkAnalyzer:
                             detection_reason = f"Multiple spatial streams (nss={nss})"
 
                         # Method 5: Known device patterns for WiFi 7 capability
-                        # Latest devices (2024+) support WiFi 7
-                        # Normalize hostname for flexible matching (remove hyphens, multiple spaces)
-                        elif any(
-                            pattern in hostname.replace("-", " ").replace("  ", " ")
-                            for pattern in [
-                                "iphone 16",  # WiFi 7
-                                "galaxy s24 ultra",  # WiFi 7
-                                "galaxy s25",  # WiFi 7 (expected)
-                            ]
+                        # Check against external device database
+                        elif self._check_device_pattern(
+                            hostname, self.device_capabilities["wifi7_devices"]["patterns"]
                         ):
                             is_dual_band = True
                             is_6ghz_capable = True
@@ -233,52 +271,18 @@ class AdvancedNetworkAnalyzer:
                             detection_reason = f"Known WiFi 7 device: {hostname}"
 
                         # Method 6: Known device patterns for 6GHz (WiFi 6E) capability
-                        # Modern devices (2021-2023) often support WiFi 6E
-                        elif any(
-                            pattern in hostname
-                            for pattern in [
-                                "iphone 13",
-                                "iphone 14",
-                                "iphone 15",
-                                "ipad pro",
-                                "macbook pro 2021",
-                                "macbook pro 2022",
-                                "macbook pro 2023",
-                                "macbook pro 2024",
-                                "galaxy s21",
-                                "galaxy s22",
-                                "galaxy s23",
-                                "galaxy s24",
-                                "pixel 6",
-                                "pixel 7",
-                                "pixel 8",
-                                "pixel 9",
-                            ]
+                        # Check against external device database
+                        elif self._check_device_pattern(
+                            hostname, self.device_capabilities["wifi6e_devices"]["patterns"]
                         ):
                             is_dual_band = True
                             is_6ghz_capable = True
                             detection_reason = f"Known WiFi 6E device: {hostname}"
 
-                        # Method 7: Known dual-band device names (legacy, at least 5GHz capable)
-                        elif any(
-                            pattern in hostname
-                            for pattern in [
-                                "iphone",
-                                "ipad",
-                                "ipod",
-                                "mac",
-                                "macbook",
-                                "imac",  # Apple (all dual-band since 2013)
-                                "galaxy",
-                                "samsung",  # Modern Samsung
-                                "pixel",  # Google Pixel
-                                "oneplus",  # OnePlus phones
-                                "surface",  # Microsoft Surface
-                                "thinkpad",
-                                "latitude",
-                                "pavilion",
-                                "inspiron",  # Modern laptops
-                            ]
+                        # Method 7: Known dual-band device names (generic patterns)
+                        # Check against external device database
+                        elif self._check_device_pattern(
+                            hostname, self.device_capabilities["dual_band_devices"]["patterns"]
                         ):
                             is_dual_band = True
                             detection_reason = f"Known dual-band device: {hostname}"
@@ -372,40 +376,18 @@ class AdvancedNetworkAnalyzer:
                             detection_reason = f"WiFi 6E capable ({radio_proto})"
 
                         # Known WiFi 7 device patterns
-                        # Normalize hostname for flexible matching
-                        elif any(
-                            pattern in hostname.replace("-", " ").replace("  ", " ")
-                            for pattern in [
-                                "iphone 16",
-                                "galaxy s24 ultra",
-                                "galaxy s25",
-                            ]
+                        # Check against external device database
+                        elif self._check_device_pattern(
+                            hostname, self.device_capabilities["wifi7_devices"]["patterns"]
                         ):
                             is_wifi7_capable = True
                             is_6ghz_capable = True
                             detection_reason = f"Known WiFi 7 device: {hostname}"
 
                         # Known 6GHz (WiFi 6E) device patterns
-                        elif any(
-                            pattern in hostname
-                            for pattern in [
-                                "iphone 13",
-                                "iphone 14",
-                                "iphone 15",
-                                "ipad pro",
-                                "macbook pro 2021",
-                                "macbook pro 2022",
-                                "macbook pro 2023",
-                                "macbook pro 2024",
-                                "galaxy s21",
-                                "galaxy s22",
-                                "galaxy s23",
-                                "galaxy s24",
-                                "pixel 6",
-                                "pixel 7",
-                                "pixel 8",
-                                "pixel 9",
-                            ]
+                        # Check against external device database
+                        elif self._check_device_pattern(
+                            hostname, self.device_capabilities["wifi6e_devices"]["patterns"]
                         ):
                             is_6ghz_capable = True
                             detection_reason = f"Known WiFi 6E device: {hostname}"

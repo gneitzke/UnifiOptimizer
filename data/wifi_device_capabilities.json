@@ -1,0 +1,175 @@
+{
+    "_comment": "WiFi device capability database - defines which devices support which WiFi standards",
+    "_last_updated": "2025-01-05",
+    "_instructions": "Add device name patterns (case-insensitive, partial match). Patterns are checked in order, most specific first.",
+    "wifi7_devices": {
+        "_description": "WiFi 7 (802.11be) capable devices - support 2.4/5/6 GHz with 320MHz channels and MLO",
+        "_standards": [
+            "802.11be"
+        ],
+        "_features": [
+            "6GHz",
+            "320MHz channels",
+            "Multi-Link Operation (MLO)",
+            "4096-QAM"
+        ],
+        "patterns": [
+            "iphone 16",
+            "iphone 17",
+            "galaxy s24 ultra",
+            "galaxy s25",
+            "galaxy s26",
+            "pixel 9 pro",
+            "pixel 10",
+            "macbook pro 2024",
+            "macbook air 2024",
+            "macbook pro 2025",
+            "macbook air 2025",
+            "surface laptop 7",
+            "surface pro 11",
+            "asus rog phone 8",
+            "oneplus 12",
+            "xiaomi 14 ultra",
+            "oppo find x7"
+        ]
+    },
+    "wifi6e_devices": {
+        "_description": "WiFi 6E (802.11ax-6E) capable devices - support 2.4/5/6 GHz with 160MHz channels",
+        "_standards": [
+            "802.11ax-6e"
+        ],
+        "_features": [
+            "6GHz",
+            "160MHz channels",
+            "OFDMA",
+            "1024-QAM"
+        ],
+        "patterns": [
+            "iphone 13",
+            "iphone 14",
+            "iphone 15",
+            "ipad pro 2021",
+            "ipad pro 2022",
+            "ipad pro 2023",
+            "ipad pro 2024",
+            "macbook pro 2021",
+            "macbook pro 2022",
+            "macbook pro 2023",
+            "macbook air 2022",
+            "macbook air 2023",
+            "galaxy s21 ultra",
+            "galaxy s21 plus",
+            "galaxy s22",
+            "galaxy s23",
+            "galaxy s24",
+            "galaxy z fold 3",
+            "galaxy z fold 4",
+            "galaxy z fold 5",
+            "galaxy z flip 3",
+            "galaxy z flip 4",
+            "galaxy z flip 5",
+            "pixel 6",
+            "pixel 6 pro",
+            "pixel 7",
+            "pixel 7 pro",
+            "pixel 8",
+            "pixel 8 pro",
+            "pixel 9",
+            "surface laptop 5",
+            "surface laptop 6",
+            "surface pro 9",
+            "surface pro 10",
+            "asus rog phone 6",
+            "asus rog phone 7",
+            "oneplus 9 pro",
+            "oneplus 10 pro",
+            "oneplus 11",
+            "xiaomi 12",
+            "xiaomi 13",
+            "xiaomi 14",
+            "oppo find x5",
+            "oppo find x6"
+        ]
+    },
+    "dual_band_devices": {
+        "_description": "Dual-band (2.4/5 GHz) capable devices - generic patterns for older WiFi 5/6 devices",
+        "_standards": [
+            "802.11ac",
+            "802.11ax",
+            "802.11n"
+        ],
+        "_features": [
+            "5GHz"
+        ],
+        "patterns": [
+            "iphone",
+            "ipad",
+            "ipod",
+            "macbook",
+            "imac",
+            "mac mini",
+            "mac pro",
+            "mac studio",
+            "galaxy",
+            "samsung",
+            "pixel",
+            "oneplus",
+            "surface",
+            "thinkpad",
+            "latitude",
+            "pavilion",
+            "inspiron",
+            "elitebook",
+            "probook",
+            "chromebook",
+            "asus",
+            "acer",
+            "lenovo",
+            "dell",
+            "hp laptop",
+            "microsoft surface"
+        ]
+    },
+    "known_2.4ghz_only": {
+        "_description": "Known 2.4GHz-only devices (IoT, smart home, legacy) - do not flag as misplaced",
+        "_standards": [
+            "802.11b/g/n"
+        ],
+        "_features": [
+            "2.4GHz only"
+        ],
+        "patterns": [
+            "ring doorbell",
+            "ring camera",
+            "nest thermostat",
+            "ecobee",
+            "smart plug",
+            "smart bulb",
+            "philips hue",
+            "wemo",
+            "tp-link smart",
+            "chromecast",
+            "roku",
+            "fire tv stick",
+            "echo dot",
+            "echo show",
+            "google home mini",
+            "homepod mini",
+            "nintendo switch",
+            "wii",
+            "ps3",
+            "xbox 360",
+            "esp8266",
+            "esp32",
+            "raspberry pi zero"
+        ]
+    },
+    "_version": "1.0.0",
+    "_schema_notes": {
+        "pattern_matching": "All patterns are converted to lowercase and spaces/hyphens are normalized for flexible matching",
+        "priority_order": "Patterns are checked in order: WiFi 7 → WiFi 6E → Dual-band → 2.4GHz-only",
+        "partial_match": "Patterns use substring matching, so 'iphone 16' matches 'iPhone-16-Pro', 'Johns-iPhone-16', etc.",
+        "updating": "To add new devices, simply append to the appropriate patterns array. No code changes needed.",
+        "testing": "After updates, run: python tests/test_wifi7_validation.py"
+    }
+}
