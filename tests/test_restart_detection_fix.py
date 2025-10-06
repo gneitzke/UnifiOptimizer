@@ -3,8 +3,8 @@ Test suite for restart detection logic fix
 Verifies that client disconnect events are NOT counted as device restarts
 """
 
-import sys
 import os
+import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -27,7 +27,7 @@ class MockClient:
 def test_client_disconnects_not_counted_as_restarts():
     """
     Test: Client disconnect events should NOT be counted as device restarts
-    
+
     Scenario: AP "Front yard" has 40 client disconnections but only 1 actual restart
     Expected: restart_count = 1, not 44
     """
@@ -37,7 +37,7 @@ def test_client_disconnects_not_counted_as_restarts():
 
     # Simulate 40 client disconnect events + 1 actual AP restart
     mock_events = []
-    
+
     # Add 40 client disconnect events (should be IGNORED)
     for i in range(40):
         mock_events.append({
@@ -46,7 +46,7 @@ def test_client_disconnects_not_counted_as_restarts():
             "msg": f"User[11:22:33:44:55:{i:02x}] disconnected from Front yard",
             "key": "EVT_WU_Disconnected",
         })
-    
+
     # Add 1 actual AP restart event (should be COUNTED)
     mock_events.append({
         "time": 1696550000,
@@ -57,23 +57,23 @@ def test_client_disconnects_not_counted_as_restarts():
 
     mock_client = MockClient(mock_events)
     analyzer = NetworkHealthAnalyzer(mock_client, site="default")
-    
+
     result = analyzer._get_device_restart_events("aa:bb:cc:dd:ee:ff", lookback_days=7)
-    
+
     print(f"\n📊 Event Log Summary:")
     print(f"   Total events in log: {len(mock_events)}")
     print(f"   Client disconnects: 40")
     print(f"   Actual AP restarts: 1")
-    
+
     print(f"\n🔍 Restart Detection Result:")
     print(f"   Detected restart count: {result['restart_count']}")
     print(f"   Expected restart count: 1")
-    
+
     assert result["restart_count"] == 1, (
         f"Expected 1 restart, got {result['restart_count']}. "
         "Client disconnects are being counted as device restarts!"
     )
-    
+
     print(f"\n✅ PASS: Client disconnects correctly ignored")
     print(f"   Only actual device restarts are counted")
 
@@ -109,20 +109,20 @@ def test_actual_device_restart_detected():
 
     mock_client = MockClient(mock_events)
     analyzer = NetworkHealthAnalyzer(mock_client, site="default")
-    
+
     result = analyzer._get_device_restart_events("aa:bb:cc:dd:ee:ff", lookback_days=7)
-    
+
     print(f"\n📊 Events:")
     for event in mock_events:
         print(f"   - {event['key']}: {event['msg']}")
-    
+
     print(f"\n🔍 Detection Result:")
     print(f"   Restart count: {result['restart_count']}")
     print(f"   Manual restart: {result['manual_restart']}")
-    
+
     assert result["restart_count"] == 3, f"Expected 3 restarts, got {result['restart_count']}"
     assert result["manual_restart"] is True, "Upgrade should be detected as manual restart"
-    
+
     print(f"\n✅ PASS: All device restart events detected correctly")
     print(f"   Upgrade correctly identified as manual restart")
 
@@ -167,22 +167,22 @@ def test_mixed_events():
 
     mock_client = MockClient(mock_events)
     analyzer = NetworkHealthAnalyzer(mock_client, site="default")
-    
+
     result = analyzer._get_device_restart_events("aa:bb:cc:dd:ee:ff", lookback_days=7)
-    
+
     print(f"\n📊 Event Breakdown:")
     print(f"   Client disconnects: 2")
     print(f"   Client connects: 1")
     print(f"   Device restarts: 1")
-    
+
     print(f"\n🔍 Detection Result:")
     print(f"   Restart count: {result['restart_count']}")
-    
+
     assert result["restart_count"] == 1, (
         f"Expected 1 restart, got {result['restart_count']}. "
         "Client events are being counted!"
     )
-    
+
     print(f"\n✅ PASS: Only device restart counted, client events ignored")
 
 
@@ -191,7 +191,7 @@ if __name__ == "__main__":
         test_client_disconnects_not_counted_as_restarts()
         test_actual_device_restart_detected()
         test_mixed_events()
-        
+
         print("\n" + "=" * 70)
         print("🎉 ALL TESTS PASSED!")
         print("=" * 70)
@@ -200,7 +200,7 @@ if __name__ == "__main__":
         print("   - Actual device restart events ARE detected properly")
         print("   - Manual/upgrade restarts are identified correctly")
         print("\n")
-        
+
     except AssertionError as e:
         print(f"\n❌ TEST FAILED: {e}\n")
         sys.exit(1)
