@@ -572,6 +572,11 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
     if airtime_analysis:
         html_content += generate_airtime_analysis_html(airtime_analysis)
 
+    # Firmware Analysis Section
+    firmware_analysis = analysis_data.get("firmware_analysis")
+    if firmware_analysis and firmware_analysis.get("total_aps") > 0:
+        html_content += generate_firmware_analysis_html(firmware_analysis)
+
     # Client Capabilities Section
     client_capabilities = analysis_data.get("client_capabilities")
     if client_capabilities:
@@ -1450,6 +1455,213 @@ def generate_ap_overview_html(ap_analysis, mesh_aps):
                 </div>
             </div>
 """
+
+
+def generate_firmware_analysis_html(firmware_analysis):
+    """Generate firmware consistency analysis section"""
+    total_aps = firmware_analysis.get("total_aps", 0)
+    inconsistencies = firmware_analysis.get("inconsistencies", [])
+    recommendations = firmware_analysis.get("recommendations", [])
+    severity = firmware_analysis.get("severity", "ok")
+
+    # Determine status color and icon
+    if severity == "warning":
+        status_color = "#f59e0b"
+        status_icon = "⚠️"
+        status_text = "Issues Detected"
+    elif severity == "info":
+        status_color = "#3b82f6"
+        status_icon = "ℹ️"
+        status_text = "Minor Issues"
+    else:
+        status_color = "#10b981"
+        status_icon = "✅"
+        status_text = "All Consistent"
+
+    html = f"""
+        <div class="section">
+            <h2>🔧 Firmware Consistency Analysis</h2>
+            <div class="health-score" style="background: {status_color}15; border-left: 4px solid {status_color}; padding: 20px; border-radius: 8px; margin: 20px 0;">
+                <div style="display: flex; align-items: center; gap: 15px;">
+                    <div style="font-size: 3em;">{status_icon}</div>
+                    <div>
+                        <div style="font-size: 1.5em; font-weight: bold; color: {status_color};">{status_text}</div>
+                        <div style="color: #666; margin-top: 5px;">{total_aps} AP(s) analyzed</div>
+                    </div>
+                </div>
+            </div>
+"""
+
+    if not inconsistencies:
+        html += """
+            <div style="background: #f0fdf4; padding: 20px; border-radius: 8px; border-left: 4px solid #10b981;">
+                <p style="color: #059669; font-size: 1.1em; margin: 0;">
+                    <strong>✅ All APs are running consistent firmware versions within their models</strong>
+                </p>
+                <p style="color: #6b7280; margin-top: 10px;">
+                    Uniform firmware improves network stability, ensures feature consistency, and simplifies troubleshooting.
+                </p>
+            </div>
+        </div>
+"""
+        return html
+
+    # Display inconsistencies
+    html += """
+        <h3 style="color: #f59e0b; margin-top: 20px;">Firmware Version Inconsistencies</h3>
+        <p style="color: #666; margin-bottom: 20px;">
+            Mixed firmware versions can cause subtle compatibility issues, inconsistent behavior, and make troubleshooting more difficult.
+        </p>
+"""
+
+    for inc in inconsistencies:
+        model = inc.get("model", "Unknown")
+        versions_found = inc.get("versions_found", [])
+        newest_version = inc.get("newest_version", "Unknown")
+        outdated_count = inc.get("outdated_count", 0)
+        total_count = inc.get("total_count", 0)
+        details = inc.get("details", {})
+
+        html += f"""
+        <div style="background: white; padding: 20px; border-radius: 8px; margin: 15px 0; border: 1px solid #e5e7eb;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                <h4 style="color: #374151; margin: 0; font-size: 1.2em;">{model}</h4>
+                <span style="background: #fef3c7; color: #d97706; padding: 5px 15px; border-radius: 20px; font-weight: 500; font-size: 0.9em;">
+                    {outdated_count}/{total_count} outdated
+                </span>
+            </div>
+            <div style="margin-bottom: 15px;">
+                <strong style="color: #10b981;">Latest Version:</strong> {newest_version}
+            </div>
+"""
+
+        for version, version_info in details.items():
+            status = version_info.get("status", "unknown")
+            aps = version_info.get("aps", [])
+            count = version_info.get("count", 0)
+
+            if status == "current":
+                badge_color = "#10b981"
+                badge_bg = "#d1fae5"
+                badge_text = "✓ Current"
+            else:
+                badge_color = "#ef4444"
+                badge_bg = "#fee2e2"
+                badge_text = "⚠ Outdated"
+
+            html += f"""
+            <div style="padding: 10px; background: #f9fafb; border-radius: 6px; margin: 10px 0;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <span style="font-family: monospace; font-size: 0.95em; color: #374151;">{version}</span>
+                    <span style="background: {badge_bg}; color: {badge_color}; padding: 3px 10px; border-radius: 12px; font-size: 0.85em; font-weight: 500;">
+                        {badge_text}
+                    </span>
+                </div>
+                <div style="margin-top: 8px; color: #6b7280; font-size: 0.9em;">
+                    <strong>{count} AP(s):</strong> {", ".join(aps)}
+                </div>
+            </div>
+"""
+
+        html += """
+        </div>
+"""
+
+    # Display recommendations
+    if recommendations:
+        html += """
+        <h3 style="color: #374151; margin-top: 30px;">Recommended Actions</h3>
+"""
+
+        for rec in recommendations:
+            rec_type = rec.get("type", "unknown")
+            severity_level = rec.get("severity", "medium")
+            action = rec.get("action", "")
+            current_state = rec.get("current_state", "")
+            target_state = rec.get("target_state", "")
+            rationale = rec.get("rationale", [])
+            aps_to_upgrade = rec.get("aps_to_upgrade", [])
+
+            # Severity styling
+            if severity_level == "high":
+                sev_color = "#ef4444"
+                sev_bg = "#fee2e2"
+                sev_icon = "🔴"
+            elif severity_level == "medium":
+                sev_color = "#f59e0b"
+                sev_bg = "#fed7aa"
+                sev_icon = "🟡"
+            else:
+                sev_color = "#3b82f6"
+                sev_bg = "#dbeafe"
+                sev_icon = "🔵"
+
+            html += f"""
+        <div style="background: white; padding: 20px; border-radius: 8px; margin: 15px 0; border-left: 4px solid {sev_color}; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+            <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 15px;">
+                <span style="font-size: 1.5em;">{sev_icon}</span>
+                <div>
+                    <div style="font-weight: 600; color: #111827; font-size: 1.1em;">{action}</div>
+                    <div style="background: {sev_bg}; color: {sev_color}; display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.85em; font-weight: 500; margin-top: 5px;">
+                        {severity_level.upper()} PRIORITY
+                    </div>
+                </div>
+            </div>
+
+            <div style="margin: 15px 0; padding: 15px; background: #f9fafb; border-radius: 6px;">
+                <div style="margin-bottom: 10px;">
+                    <strong style="color: #6b7280;">Current State:</strong>
+                    <div style="color: #374151; margin-top: 5px;">{current_state}</div>
+                </div>
+                <div>
+                    <strong style="color: #6b7280;">Target State:</strong>
+                    <div style="color: #10b981; margin-top: 5px;">{target_state}</div>
+                </div>
+            </div>
+"""
+
+            if rationale:
+                html += """
+            <div style="margin: 15px 0;">
+                <strong style="color: #374151;">Why This Matters:</strong>
+                <ul style="margin: 10px 0 0 20px; color: #6b7280;">
+"""
+                for reason in rationale:
+                    html += f"                    <li>{reason}</li>\n"
+                html += """
+                </ul>
+            </div>
+"""
+
+            if aps_to_upgrade and rec_type == "firmware_upgrade":
+                html += """
+            <div style="margin: 15px 0;">
+                <strong style="color: #374151;">APs to Upgrade:</strong>
+                <div style="margin-top: 10px;">
+"""
+                for ap_info in aps_to_upgrade:
+                    ap_name = ap_info.get("name", "Unknown")
+                    current_ver = ap_info.get("current_version", "Unknown")
+                    html += f"""
+                    <div style="padding: 8px 12px; background: #fef3c7; border-left: 3px solid #f59e0b; border-radius: 4px; margin: 5px 0; font-size: 0.95em;">
+                        <span style="font-weight: 500; color: #92400e;">{ap_name}</span>
+                        <span style="color: #78350f; margin-left: 10px;">→ {current_ver}</span>
+                    </div>
+"""
+                html += """
+                </div>
+            </div>
+"""
+
+            html += """
+        </div>
+"""
+
+    html += """
+        </div>
+"""
+
+    return html
 
 
 def generate_recommendations_html(recommendations):

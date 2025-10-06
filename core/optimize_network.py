@@ -713,13 +713,19 @@ def _generate_health_based_recommendations(aps, health_analysis):
                     client_channels = [c.get("channel", 0) for c in clients]
 
                     if any(ch in band_channels for ch in client_channels):
-                        # SKIP power recommendations for mesh APs - they need max power!
-                        is_mesh = (
-                            ap.get("adopted", False)
-                            and ap.get("uplink", {}).get("type") == "wireless"
-                        )
+                        # CRITICAL: SKIP power recommendations for mesh APs - they need max power!
+                        # Enhanced mesh detection with uplink RSSI check
+                        uplink_type = ap.get("uplink", {}).get("type", "")
+                        uplink_rssi = ap.get("uplink", {}).get("rssi")
+                        is_wireless_uplink = uplink_type == "wireless"
 
-                        if power == "high" and not is_mesh:
+                        is_mesh = (ap.get("adopted", False) and
+                                   (is_wireless_uplink or (uplink_rssi and uplink_rssi < -70)))
+
+                        # Additional safety: Never reduce power if uplink RSSI is weak
+                        has_weak_uplink = uplink_rssi and uplink_rssi < -65
+
+                        if power == "high" and not is_mesh and not has_weak_uplink:
                             recommendations.append(
                                 {
                                     "device": ap,
@@ -805,12 +811,20 @@ def _generate_health_based_recommendations(aps, health_analysis):
                 power = radio.get("tx_power_mode", "auto")
                 radio_name = radio.get("radio")
 
-                # SKIP power recommendations for mesh APs - they need max power for uplink!
-                is_mesh = (
-                    ap.get("adopted", False) and ap.get("uplink", {}).get("type") == "wireless"
-                )
+                # CRITICAL: SKIP power recommendations for mesh APs - they need max power for uplink!
+                # Enhanced mesh detection with uplink RSSI check
+                uplink_type = ap.get("uplink", {}).get("type", "")
+                uplink_rssi = ap.get("uplink", {}).get("rssi")
+                is_wireless_uplink = uplink_type == "wireless"
 
-                if power in ["high", "medium"] and not is_mesh:
+                is_mesh = (ap.get("adopted", False) and
+                          (is_wireless_uplink or
+                           (uplink_rssi and uplink_rssi < -70)))
+
+                # Additional safety: Never reduce power if uplink RSSI is weak
+                has_weak_uplink = uplink_rssi and uplink_rssi < -65
+
+                if power in ["high", "medium"] and not is_mesh and not has_weak_uplink:
                     new_power = "medium" if power == "high" else "low"
                     recommendations.append(
                         {
@@ -866,10 +880,28 @@ def _generate_basic_recommendations(aps):
         radio_table = ap.get("radio_table", [])
 
         # Check if this is a mesh AP - DO NOT recommend power changes for mesh!
-        is_mesh = ap.get("adopted", False) and ap.get("uplink", {}).get("type") == "wireless"
+        # Check multiple indicators for mesh AP detection
+        uplink_type = ap.get("uplink", {}).get("type", "")
+        is_wireless_uplink = uplink_type == "wireless"
+        uplink_rssi = ap.get("uplink", {}).get("rssi")
+
+        # Enhanced mesh detection: wireless uplink is PRIMARY indicator
+        # Only use RSSI as secondary check for very weak uplinks (< -70 dBm suggests wireless)
+        is_mesh = (ap.get("adopted", False) and
+                   (is_wireless_uplink or (uplink_rssi and uplink_rssi < -70)))
+
         mesh_label = " [MESH]" if is_mesh else ""
+        if is_mesh and uplink_rssi:
+            mesh_label = f" [MESH - Uplink: {uplink_rssi} dBm]"
 
         console.print(f"[cyan]Analyzing: {ap_name}{mesh_label}[/cyan]")
+
+        # If mesh AP, show warning about power requirements
+        if is_mesh:
+            if uplink_rssi and uplink_rssi < -70:
+                console.print(f"  [yellow]⚠️  Weak mesh uplink ({uplink_rssi} dBm) - needs HIGH power![/yellow]")
+            elif uplink_rssi:
+                console.print(f"  [dim]Mesh uplink: {uplink_rssi} dBm - maintaining power settings[/dim]")
 
         for radio in radio_table:
             radio_name = radio.get("radio")
@@ -881,7 +913,7 @@ def _generate_basic_recommendations(aps):
             console.print(f"  {band}: Channel {channel}, Power {power}, Width {ht}MHz")
 
             # Basic recommendations
-            # SKIP power recommendations for mesh APs - they need max power for uplink!
+            # CRITICAL: NEVER reduce power on mesh APs - they need max power for uplink!
             if power == "high" and not is_mesh:
                 recommendations.append(
                     {
