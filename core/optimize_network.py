@@ -522,15 +522,40 @@ def _convert_expert_recommendations(expert_recs, all_devices=None):
 
         # Convert based on issue type
         if "power" in issue or "power" in rec_type:
+            # CRITICAL: NEVER reduce power on mesh APs or mesh parents!
+            # Check if this is a mesh AP (child or parent)
+            is_mesh_child = ap_info.get("is_mesh", False) or ap_info.get("is_mesh_child", False)
+            is_mesh_parent = ap_info.get("is_mesh_parent", False)
+
+            # Also check the device itself for mesh indicators
+            uplink_type = device.get("uplink", {}).get("type", "")
+            if uplink_type == "wireless":
+                is_mesh_child = True
+
+            # Check if this AP is a parent to any mesh nodes
+            if all_devices:
+                aps = [d for d in all_devices if d.get("type") == "uap"]
+                for other_ap in aps:
+                    other_uplink = other_ap.get("uplink", {})
+                    if (other_uplink.get("type") == "wireless" and (
+                            other_uplink.get("uplink_remote_mac") == ap_mac)):
+                        is_mesh_parent = True
+                        break            # Skip power reduction for ANY mesh-involved AP
+            if is_mesh_child or is_mesh_parent:
+                console.print(
+                    f"[yellow]⚠ Skipping power reduction for {ap_info['name']} - "
+                    f"{'mesh child' if is_mesh_child else ''}"
+                    f"{' + ' if is_mesh_child and is_mesh_parent else ''}"
+                    f"{'mesh parent' if is_mesh_parent else ''}[/yellow]"
+                )
+                continue  # Skip this recommendation entirely
+
             radio = rec.get("radio", {})
             band = rec.get("band", "")
             current_power = radio.get("tx_power_mode", "high")
 
             # Determine new power based on recommendation
-            if "mesh" in issue or ap_info.get("is_mesh"):
-                new_power = "medium" if current_power == "high" else "low"
-            else:
-                new_power = "medium" if current_power == "high" else "low"
+            new_power = "medium" if current_power == "high" else "low"
 
             converted.append(
                 {
