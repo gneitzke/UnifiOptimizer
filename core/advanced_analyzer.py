@@ -681,7 +681,7 @@ class AdvancedNetworkAnalyzer:
         # iOS-friendly thresholds (when iOS devices detected)
         # iPhone/iPad devices disconnect more frequently with aggressive thresholds
         IOS_FRIENDLY_MIN_RSSI_24GHZ = -78  # 2.4GHz: More tolerant for iOS
-        IOS_FRIENDLY_MIN_RSSI_5GHZ = -75   # 5GHz: More tolerant for iOS
+        IOS_FRIENDLY_MIN_RSSI_5GHZ = -75  # 5GHz: More tolerant for iOS
 
         # Select thresholds based on client mix
         # If >20% of clients are iOS, use iOS-friendly thresholds
@@ -790,7 +790,9 @@ class AdvancedNetworkAnalyzer:
                         # Build recommendation message
                         rec_msg = f"Enable min RSSI at {recommended} dBm to improve roaming"
                         if use_ios_friendly:
-                            rec_msg += f" ({threshold_type} - optimized for {ios_count} iOS devices)"
+                            rec_msg += (
+                                f" ({threshold_type} - optimized for {ios_count} iOS devices)"
+                            )
 
                         results["recommendations"].append(
                             {
