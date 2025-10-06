@@ -2367,6 +2367,150 @@ class AdvancedNetworkAnalyzer:
 
         return {"score": score, "grade": grade, "status": status, "details": details}
 
+    def analyze_firmware_consistency(self, devices):
+        """
+        Analyze firmware version consistency across APs
+
+        Detects:
+        - Mixed firmware versions within same model
+        - Outdated firmware (based on newest version present)
+        - Different firmware across different models
+
+        Returns recommendations for uniform deployment
+        """
+        results = {
+            "total_aps": 0,
+            "firmware_by_model": {},
+            "inconsistencies": [],
+            "recommendations": [],
+            "severity": "ok"
+        }
+
+        # Collect firmware versions by model
+        for device in devices:
+            if device.get("type") not in ["uap", "ubb"]:
+                continue
+
+            model = device.get("model", "Unknown")
+            firmware = device.get("version", "Unknown")
+            name = device.get("name", device.get("mac", "Unknown"))
+
+            results["total_aps"] += 1
+
+            if model not in results["firmware_by_model"]:
+                results["firmware_by_model"][model] = {
+                    "versions": {},
+                    "aps": []
+                }
+
+            if firmware not in results["firmware_by_model"][model]["versions"]:
+                results["firmware_by_model"][model]["versions"][firmware] = []
+
+            results["firmware_by_model"][model]["versions"][firmware].append(name)
+            results["firmware_by_model"][model]["aps"].append({
+                "name": name,
+                "firmware": firmware
+            })
+
+        # Analyze each model for inconsistencies
+        for model, data in results["firmware_by_model"].items():
+            versions = data["versions"]
+
+            if len(versions) > 1:
+                # Mixed firmware versions detected
+                version_list = list(versions.keys())
+                version_list.sort(reverse=True)  # Newest first
+
+                newest_version = version_list[0]
+                outdated_count = sum(len(aps) for ver, aps in versions.items() if ver != newest_version)
+
+                inconsistency = {
+                    "model": model,
+                    "issue": "mixed_versions",
+                    "versions_found": version_list,
+                    "newest_version": newest_version,
+                    "outdated_count": outdated_count,
+                    "total_count": len(data["aps"]),
+                    "details": {}
+                }
+
+                # Detail which APs have which versions
+                for version, ap_list in versions.items():
+                    inconsistency["details"][version] = {
+                        "aps": ap_list,
+                        "count": len(ap_list),
+                        "status": "current" if version == newest_version else "outdated"
+                    }
+
+                results["inconsistencies"].append(inconsistency)
+
+                # Generate recommendation
+                severity = "high" if outdated_count > 1 else "medium"
+                results["recommendations"].append({
+                    "type": "firmware_upgrade",
+                    "severity": severity,
+                    "model": model,
+                    "action": f"Upgrade {outdated_count} AP(s) to version {newest_version}",
+                    "current_state": f"{outdated_count}/{len(data['aps'])} APs on older firmware",
+                    "target_state": f"All {len(data['aps'])} APs on {newest_version}",
+                    "aps_to_upgrade": [
+                        {"name": ap, "current_version": ver}
+                        for ver, aps in versions.items() if ver != newest_version
+                        for ap in aps
+                    ],
+                    "rationale": [
+                        "Uniform firmware improves stability",
+                        "Prevents subtle compatibility issues",
+                        "Ensures consistent feature set",
+                        "Simplifies troubleshooting"
+                    ]
+                })
+
+        # Determine overall severity
+        if results["inconsistencies"]:
+            high_severity_count = sum(1 for r in results["recommendations"] if r.get("severity") == "high")
+            medium_severity_count = sum(1 for r in results["recommendations"] if r.get("severity") == "medium")
+
+            if high_severity_count > 0 or medium_severity_count > 0:
+                results["severity"] = "warning"
+            else:
+                results["severity"] = "info"
+
+        # Add WiFi 6E/7 feature compatibility check
+        wifi6e_models = ["U6-Enterprise", "U6-Mesh", "U6-Extender", "U7-Pro"]
+        wifi7_models = ["U7-Pro"]
+
+        for model, data in results["firmware_by_model"].items():
+            if any(w6e in model for w6e in wifi6e_models):
+                for version in data["versions"].keys():
+                    # Check if firmware is old enough to lack 6GHz features
+                    # Version format: X.Y.Z.buildnum
+                    try:
+                        major_minor = ".".join(version.split(".")[:2])
+                        major, minor = map(int, major_minor.split("."))
+
+                        # Example: Versions < 6.0 may lack full 6GHz support
+                        if major < 6:
+                            results["recommendations"].append({
+                                "type": "feature_compatibility",
+                                "severity": "high",
+                                "model": model,
+                                "action": f"Upgrade firmware to enable full 6GHz features",
+                                "current_state": f"Firmware {version} may lack WiFi 6E optimizations",
+                                "target_state": "Firmware 6.0+ for full 6GHz support",
+                                "rationale": [
+                                    "Enables PSC channel optimization",
+                                    "Unlocks AFC/Standard Power modes",
+                                    "Improves 6GHz client compatibility",
+                                    "Required for MLO (WiFi 7) if applicable"
+                                ]
+                            })
+                    except (ValueError, IndexError):
+                        # Can't parse version number, skip
+                        pass
+
+        return results
+
 
 def run_advanced_analysis(client, site="default", devices=None, clients=None, lookback_days=3):
     """
@@ -2399,6 +2543,7 @@ def run_advanced_analysis(client, site="default", devices=None, clients=None, lo
         "radio_performance_analysis": analyzer.analyze_radio_performance(devices, clients),
         "psc_channel_analysis": analyzer.analyze_6ghz_psc_channels(devices),
         "power_mode_analysis": analyzer.analyze_6ghz_power_modes(devices),
+        "firmware_analysis": analyzer.analyze_firmware_consistency(devices),
         "client_capabilities": analyzer.analyze_client_capabilities(clients, devices),
         "client_security": analyzer.analyze_client_security(clients),
         "switch_analysis": switch_analysis,
