@@ -950,7 +950,23 @@ class AdvancedNetworkAnalyzer:
                 # Mesh APs must maintain connection under all conditions
                 # Min RSSI can cause mesh uplinks to drop
                 uplink_type = device.get("uplink", {}).get("type", "wire")
-                is_mesh = uplink_type == "wireless"
+                is_mesh_child = uplink_type == "wireless"
+
+                # **CRITICAL: Detect mesh PARENT APs (have mesh children connecting to them)**
+                # Mesh parent APs with min RSSI could KICK OFF their mesh children!
+                # This is SUPER CRITICAL - breaks the entire mesh network downstream
+                ap_mac = device.get("mac")
+                is_mesh_parent = False
+                mesh_children_count = 0
+                if ap_mac:
+                    for other_device in devices:
+                        if other_device.get("type") == "uap":
+                            other_uplink = other_device.get("uplink", {})
+                            if (other_uplink.get("type") == "wireless" and (
+                                    other_uplink.get("uplink_remote_mac") == ap_mac)):
+                                is_mesh_parent = True
+                                mesh_children_count += 1                # Any mesh involvement = protection
+                is_mesh = is_mesh_child or is_mesh_parent
 
                 # **COVERAGE EXTENSION DETECTION**
                 # Mesh nodes with many weak-signal clients are extending coverage
@@ -959,12 +975,22 @@ class AdvancedNetworkAnalyzer:
                 weak_client_count = 0
                 mesh_client_count = 0
                 avg_client_rssi = None
+                clients_with_no_alternative = 0
 
+                # Check coverage extension for ANY mesh AP (child or parent)
                 if is_mesh and clients:
                     # Find clients connected to this mesh AP
                     ap_mac = device.get("mac")
                     ap_clients = [c for c in clients if c.get("ap_mac") == ap_mac]
                     mesh_client_count = len(ap_clients)
+
+                    # Build list of all other AP MACs (potential alternatives)
+                    other_ap_macs = set()
+                    for other_device in devices:
+                        if other_device.get("type") == "uap":
+                            other_mac = other_device.get("mac")
+                            if other_mac and other_mac != ap_mac:
+                                other_ap_macs.add(other_mac)
 
                     if ap_clients:
                         # Analyze client signal strength
@@ -977,15 +1003,43 @@ class AdvancedNetworkAnalyzer:
                                 if rssi < -75:
                                     weak_client_count += 1
 
+                            # Check if client has ever seen any other AP
+                            # If client has no radio_table_stats or only sees this AP, they have no alternative
+                            radio_table = client.get("radio_table_stats", [])
+                            if not radio_table:
+                                # Client has never reported seeing any other AP
+                                clients_with_no_alternative += 1
+                            else:
+                                # Check if client has ever seen another AP with decent signal
+                                has_alternative = False
+                                for radio_entry in radio_table:
+                                    radio_ap_mac = radio_entry.get("ap_mac")
+                                    radio_rssi = radio_entry.get("signal")
+                                    # Alternative AP must have at least -80 dBm (barely usable)
+                                    if radio_ap_mac in other_ap_macs and radio_rssi and radio_rssi > -80:
+                                        has_alternative = True
+                                        break
+
+                                if not has_alternative:
+                                    clients_with_no_alternative += 1
+
                         if client_rssi_values:
                             avg_client_rssi = sum(client_rssi_values) / len(client_rssi_values)
 
-                        # Coverage extender criteria:
+                        # Coverage extender criteria (more comprehensive):
                         # - >50% of clients have weak signal, OR
-                        # - Average client RSSI < -70 dBm
+                        # - Average client RSSI < -70 dBm, OR
+                        # - >30% of clients have no alternative AP
                         if mesh_client_count > 0:
                             weak_percentage = (weak_client_count / mesh_client_count) * 100
-                            if weak_percentage > 50 or (avg_client_rssi and avg_client_rssi < -70):
+                            no_alternative_percentage = (clients_with_no_alternative / mesh_client_count) * 100
+
+                            # Check if this is a coverage extender
+                            is_weak_signals = weak_percentage > 50
+                            is_low_avg_rssi = avg_client_rssi and avg_client_rssi < -70
+                            is_no_alternatives = no_alternative_percentage > 30
+
+                            if is_weak_signals or is_low_avg_rssi or is_no_alternatives:
                                 is_coverage_extender = True
 
                 if is_mesh:
@@ -993,11 +1047,15 @@ class AdvancedNetworkAnalyzer:
                     results["mesh_aps_detected"].append(
                         {
                             "name": ap_name,
+                            "is_mesh_child": is_mesh_child,
+                            "is_mesh_parent": is_mesh_parent,
+                            "mesh_children_count": mesh_children_count,
                             "uplink_rssi": uplink_rssi,
                             "is_coverage_extender": is_coverage_extender,
                             "weak_client_count": weak_client_count,
                             "total_client_count": mesh_client_count,
                             "avg_client_rssi": avg_client_rssi,
+                            "clients_with_no_alternative": clients_with_no_alternative,
                         }
                     )
 
@@ -1034,22 +1092,56 @@ class AdvancedNetworkAnalyzer:
 
                             # Enhanced messaging for coverage extender nodes
                             if is_coverage_extender:
+                                # Build detailed warning about clients
+                                client_warning = []
+                                if weak_client_count > 0:
+                                    client_warning.append(f"{weak_client_count}/{mesh_client_count} clients with weak signal")
+                                if clients_with_no_alternative > 0:
+                                    client_warning.append(f"{clients_with_no_alternative}/{mesh_client_count} clients with NO alternative AP")
+
+                                client_detail = ", ".join(client_warning) if client_warning else f"{mesh_client_count} clients"
+
                                 message = (
                                     f"🚨 COVERAGE EXTENDER {ap_name} {band} has min RSSI enabled ({min_rssi_value} dBm)\n"
-                                    f"   This mesh node serves {weak_client_count}/{mesh_client_count} weak-signal clients"
+                                    f"   This mesh node serves: {client_detail}"
                                 )
                                 recommendation = (
                                     f"DISABLE min RSSI immediately! This mesh node is extending coverage to a remote area "
-                                    f"(avg client RSSI: {avg_client_rssi:.0f} dBm). Min RSSI will disconnect weak clients AND "
-                                    f"can break the mesh uplink (current: {uplink_rssi} dBm). Coverage extension requires "
-                                    f"MAXIMUM connectivity tolerance."
+                                    f"(avg client RSSI: {avg_client_rssi:.0f} dBm). Min RSSI will disconnect clients who have "
+                                    f"NOWHERE ELSE TO GO and can break the mesh uplink (current: {uplink_rssi} dBm). "
+                                    f"Coverage extension requires MAXIMUM connectivity tolerance."
                                 )
                                 priority = "critical"
                             else:
-                                message = f"🚨 MESH AP {ap_name} {band} has min RSSI enabled ({min_rssi_value} dBm)"
+                                # Build role-specific warning
+                                role_parts = []
+                                if is_mesh_child:
+                                    role_parts.append("MESH CHILD")
+                                if is_mesh_parent:
+                                    role_parts.append(f"MESH PARENT (has {mesh_children_count} mesh children)")
+
+                                role_text = " + ".join(role_parts) if role_parts else "MESH AP"
+
+                                message = f"🚨 {role_text} {ap_name} {band} has min RSSI enabled ({min_rssi_value} dBm)"
+                                if mesh_client_count > 0:
+                                    message += f"\n   Serves {mesh_client_count} client{'s' if mesh_client_count != 1 else ''}"
+                                    if clients_with_no_alternative > 0:
+                                        message += f" ({clients_with_no_alternative} with NO alternative AP)"
+
+                                # Build role-specific recommendation
+                                danger_parts = []
+                                if is_mesh_child:
+                                    danger_parts.append(f"break THIS AP's wireless uplink (current: {uplink_rssi} dBm)")
+                                if is_mesh_parent:
+                                    danger_parts.append(f"KICK OFF {mesh_children_count} mesh children connecting to this AP")
+                                if mesh_client_count > 0 and clients_with_no_alternative > 0:
+                                    danger_parts.append(f"disconnect {clients_with_no_alternative} clients with NO alternative AP")
+
+                                danger_text = ", ".join(danger_parts) if danger_parts else "break mesh connectivity"
+
                                 recommendation = (
-                                    f"DISABLE min RSSI on mesh APs! Min RSSI can break wireless uplink "
-                                    f"(current uplink: {uplink_rssi} dBm). Mesh uplinks need to work under all conditions."
+                                    f"DISABLE min RSSI immediately! This AP is critical to mesh network. "
+                                    f"Min RSSI will {danger_text}. Mesh networks require MAXIMUM connectivity tolerance."
                                 )
                                 priority = "critical"
 
@@ -1122,20 +1214,55 @@ class AdvancedNetworkAnalyzer:
                         results["radios_without_min_rssi"].append(radio_info)
 
                         # **Skip recommendation to enable min RSSI on mesh APs**
-                        # Mesh APs should NEVER have min RSSI enabled
+                        # Mesh APs should NEVER have min RSSI enabled (child OR parent!)
                         if is_mesh:
                             # Good! Mesh AP has min RSSI disabled (as it should be)
-                            # Add positive confirmation for coverage extenders
-                            if is_coverage_extender:
+                            # Add positive confirmation for coverage extenders or mesh parents
+                            if is_coverage_extender or is_mesh_parent:
+                                # Build role description
+                                role_parts = []
+                                if is_mesh_child:
+                                    role_parts.append("MESH CHILD")
+                                if is_mesh_parent:
+                                    role_parts.append(f"MESH PARENT ({mesh_children_count} children)")
+
+                                role_text = " + ".join(role_parts) if role_parts else "MESH AP"
+
+                                # Build detail about clients
+                                client_detail = []
+                                if weak_client_count > 0:
+                                    client_detail.append(f"{weak_client_count}/{mesh_client_count} weak-signal clients")
+                                if clients_with_no_alternative > 0:
+                                    client_detail.append(f"{clients_with_no_alternative} with NO alternative AP")
+
+                                detail_text = ", ".join(client_detail) if client_detail else f"{mesh_client_count} clients"
+                                avg_text = f" (avg RSSI: {avg_client_rssi:.0f} dBm)" if avg_client_rssi else ""
+
+                                # Build protection reason
+                                protection_reason = []
+                                if is_mesh_child:
+                                    protection_reason.append("protect wireless uplink")
+                                if is_mesh_parent:
+                                    protection_reason.append(f"prevent kicking off {mesh_children_count} mesh children")
+                                if clients_with_no_alternative > 0:
+                                    protection_reason.append(f"maintain connectivity for {clients_with_no_alternative} clients with no alternative AP")
+
+                                reason_text = ", ".join(protection_reason) if protection_reason else "protect mesh connectivity"
+
+                                display_type = "COVERAGE EXTENDER" if is_coverage_extender else role_text
+
                                 results["recommendations"].append(
                                     {
-                                        "type": "coverage_extender_config_good",
+                                        "type": "mesh_config_good",
                                         "device": ap_name,
                                         "radio": radio_name,
                                         "band": band,
-                                        "message": f"✅ COVERAGE EXTENDER {ap_name} {band} correctly has min RSSI disabled",
-                                        "recommendation": f"KEEP DISABLED! This mesh node serves {weak_client_count}/{mesh_client_count} weak-signal clients (avg RSSI: {avg_client_rssi:.0f} dBm). Min RSSI must remain disabled to maintain connectivity for remote clients and protect the mesh uplink.",
+                                        "message": f"✅ {display_type} {ap_name} {band} correctly has min RSSI disabled",
+                                        "recommendation": f"KEEP DISABLED! This AP serves {detail_text}{avg_text}. Min RSSI must remain disabled to {reason_text}.",
                                         "priority": "info",
+                                        "is_mesh_child": is_mesh_child,
+                                        "is_mesh_parent": is_mesh_parent,
+                                        "mesh_children_count": mesh_children_count,
                                     }
                                 )
                             continue

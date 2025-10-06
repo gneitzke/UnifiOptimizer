@@ -888,7 +888,17 @@ def generate_executive_summary_html(analysis_data, recommendations):
     # Get mesh topology counts
     mesh_aps = []
     mesh_parent_macs = set()
+    ap_macs = {}  # Build MAC to device lookup for APs only
+    all_device_macs = {}  # Build MAC lookup for all devices
+
+    # First pass: identify mesh children and collect device MACs
     for device in devices:
+        mac = device.get("mac")
+        if mac:
+            all_device_macs[mac] = device
+            if device.get("type") == "uap":
+                ap_macs[mac] = device
+
         if device.get("type") == "uap":
             uplink_type = device.get("uplink", {}).get("type", "")
             uplink_rssi = device.get("uplink", {}).get("rssi")
@@ -900,8 +910,14 @@ def generate_executive_summary_html(analysis_data, recommendations):
                 if parent_mac:
                     mesh_parent_macs.add(parent_mac)
 
+    # Second pass: count parent devices (could be APs or gateways)
+    # Only count as "parent AP" if it's actually an AP type device
+    mesh_parent_count = len([mac for mac in mesh_parent_macs if mac in ap_macs])
+
+    # If parent is a gateway (UDM, UDM Pro, etc), we still protect it but call it differently
+    mesh_parent_gateways = len([mac for mac in mesh_parent_macs if mac in all_device_macs and mac not in ap_macs])
+
     mesh_child_count = len(mesh_aps)
-    mesh_parent_count = len(mesh_parent_macs)
     total_mesh_protected = mesh_child_count + mesh_parent_count
 
     # Get switch issues
@@ -982,11 +998,24 @@ def generate_executive_summary_html(analysis_data, recommendations):
     # Build mesh protection note if applicable
     mesh_note = ""
     if total_mesh_protected > 0:
+        # Build parent description
+        total_parents = mesh_parent_count + mesh_parent_gateways
+
+        if mesh_parent_count > 0 and mesh_parent_gateways > 0:
+            parent_desc = f"{mesh_parent_count} parent AP{'s' if mesh_parent_count != 1 else ''} and {mesh_parent_gateways} parent gateway{'s' if mesh_parent_gateways != 1 else ''}"
+        elif mesh_parent_count > 0:
+            parent_desc = f"{mesh_parent_count} parent AP{'s' if mesh_parent_count != 1 else ''}"
+        elif mesh_parent_gateways > 0:
+            parent_desc = f"{mesh_parent_gateways} parent gateway{'s' if mesh_parent_gateways != 1 else ''}"
+        else:
+            parent_desc = "parent devices"
+
+        # Total protected includes mesh children + parent APs (but not parent gateways, as we don't reduce their power anyway)
+        total_aps_protected = mesh_child_count + mesh_parent_count
+
         mesh_note = f"""
-                <p style="background: #ecfdf5; border-left: 4px solid #10b981; padding: 12px; margin-top: 12px; border-radius: 4px;">
-                    <strong>🛡️ Mesh Network Protection:</strong> Your network includes a mesh topology with {mesh_child_count} wireless node{'s' if mesh_child_count != 1 else ''}
-                    and {mesh_parent_count} parent AP{'s' if mesh_parent_count != 1 else ''}. All {total_mesh_protected} mesh-related APs are protected from
-                    power reduction to maintain reliable wireless backhaul (both TX and RX directions).
+                <p style="background: #ecfdf5; border-left: 4px solid #10b981; padding: 12px; margin-top: 12px; border-radius: 4px; color: #065f46;">
+                    <strong style="color: #047857;">🛡️ Mesh Network Protection:</strong> Your network includes a mesh topology with {mesh_child_count} mesh child node{'s' if mesh_child_count != 1 else ''} connecting to {parent_desc}. All {total_aps_protected} mesh-related AP{'s' if total_aps_protected != 1 else ''} are protected from power reduction to maintain reliable wireless backhaul.
                 </p>
 """
 
