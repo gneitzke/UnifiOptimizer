@@ -86,14 +86,36 @@ class NetworkHealthAnalyzer:
             events = events_response.get("data", [])
 
             # Look for restart-related events for this device
+            # NOTE: "disconnected" is NOT included - that's for client disconnections, not device restarts
             restart_keywords = [
                 "restarted",
                 "rebooted",
                 "restart",
                 "reboot",
-                "upgrade",
-                "powered off",
-                "disconnected",
+            ]
+
+            # Event keys that specifically indicate device restart (not client activity)
+            # NOTE: EVT_AP_Disconnected = AP device lost connection to controller (restart-related)
+            #       EVT_WU_Disconnected = Wireless User disconnected (client activity - NOT restart)
+            device_restart_keys = [
+                "EVT_AP_RestartedUnknown",
+                "EVT_AP_Restarted",
+                "EVT_AP_RestartedUser",
+                "EVT_AP_Rebooted",
+                "EVT_AP_Disconnected",  # Device (AP) disconnected from controller
+                "EVT_AP_PoweredOff",
+                "EVT_SW_RestartedUnknown",
+                "EVT_SW_Restarted",
+                "EVT_SW_Rebooted",
+                "EVT_SW_Disconnected",  # Device (Switch) disconnected from controller
+                "EVT_SW_PoweredOff",
+                "EVT_GW_RestartedUnknown",
+                "EVT_GW_Restarted",
+                "EVT_GW_Rebooted",
+                "EVT_GW_PoweredOff",
+                "EVT_AP_Upgraded",
+                "EVT_SW_Upgraded",
+                "EVT_GW_Upgraded",
             ]
 
             manual_keywords = [
@@ -111,7 +133,7 @@ class NetworkHealthAnalyzer:
                 event_device = event.get("device", "")
                 event_ap = event.get("ap", "")
                 event_msg = event.get("msg", "").lower()
-                event_key = event.get("key", "").lower()
+                event_key = event.get("key", "")
 
                 # Check if this event is for our device
                 is_device_event = (
@@ -122,17 +144,21 @@ class NetworkHealthAnalyzer:
 
                 if is_device_event:
                     # Check if it's a restart event
-                    is_restart = any(
-                        keyword in event_msg or keyword in event_key for keyword in restart_keywords
+                    # Must match restart keywords OR be a known device restart event key
+                    is_restart = (
+                        any(keyword in event_msg for keyword in restart_keywords)
+                        or event_key in device_restart_keys
                     )
 
                     if is_restart:
                         result["restart_count"] += 1
 
                         # Check if it was a manual/expected restart
-                        is_manual = any(
-                            keyword in event_msg or keyword in event_key
-                            for keyword in manual_keywords
+                        # Look for upgrade events or manual restart keywords
+                        is_manual = (
+                            any(keyword in event_msg for keyword in manual_keywords)
+                            or any(keyword in event_key.lower() for keyword in manual_keywords)
+                            or "Upgraded" in event_key
                         )
 
                         if is_manual:
