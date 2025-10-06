@@ -76,7 +76,9 @@ class NetworkHealthAnalyzer:
 
         try:
             within_hours = lookback_days * 24
-            events_response = self.client.get(f"s/{self.site}/stat/event?within={within_hours}&_limit=1000")
+            events_response = self.client.get(
+                f"s/{self.site}/stat/event?within={within_hours}&_limit=1000"
+            )
 
             if not events_response or "data" not in events_response:
                 return result
@@ -85,13 +87,23 @@ class NetworkHealthAnalyzer:
 
             # Look for restart-related events for this device
             restart_keywords = [
-                "restarted", "rebooted", "restart", "reboot",
-                "upgrade", "powered off", "disconnected"
+                "restarted",
+                "rebooted",
+                "restart",
+                "reboot",
+                "upgrade",
+                "powered off",
+                "disconnected",
             ]
 
             manual_keywords = [
-                "user", "manually", "admin", "upgrade", "requested",
-                "firmware update", "configuration change"
+                "user",
+                "manually",
+                "admin",
+                "upgrade",
+                "requested",
+                "firmware update",
+                "configuration change",
             ]
 
             for event in events:
@@ -103,32 +115,37 @@ class NetworkHealthAnalyzer:
 
                 # Check if this event is for our device
                 is_device_event = (
-                    event_device == device_mac or
-                    event_ap == device_mac or
-                    device_mac.lower() in event_msg
+                    event_device == device_mac
+                    or event_ap == device_mac
+                    or device_mac.lower() in event_msg
                 )
 
                 if is_device_event:
                     # Check if it's a restart event
-                    is_restart = any(keyword in event_msg or keyword in event_key
-                                    for keyword in restart_keywords)
+                    is_restart = any(
+                        keyword in event_msg or keyword in event_key for keyword in restart_keywords
+                    )
 
                     if is_restart:
                         result["restart_count"] += 1
 
                         # Check if it was a manual/expected restart
-                        is_manual = any(keyword in event_msg or keyword in event_key
-                                       for keyword in manual_keywords)
+                        is_manual = any(
+                            keyword in event_msg or keyword in event_key
+                            for keyword in manual_keywords
+                        )
 
                         if is_manual:
                             result["manual_restart"] = True
 
-                        result["events"].append({
-                            "timestamp": event.get("time"),
-                            "message": event.get("msg"),
-                            "key": event.get("key"),
-                            "is_manual": is_manual,
-                        })
+                        result["events"].append(
+                            {
+                                "timestamp": event.get("time"),
+                                "message": event.get("msg"),
+                                "key": event.get("key"),
+                                "is_manual": is_manual,
+                            }
+                        )
 
         except Exception:
             # If event query fails, don't crash the analysis
@@ -150,7 +167,12 @@ class NetworkHealthAnalyzer:
             "issues": [],
             "recommendations": [],
             "score_penalty": 0,
-            "devices": {"stable": [], "recent_restart": [], "critical_restart": [], "cyclic_restart": []},
+            "devices": {
+                "stable": [],
+                "recent_restart": [],
+                "critical_restart": [],
+                "cyclic_restart": [],
+            },
         }
 
         for device in devices:

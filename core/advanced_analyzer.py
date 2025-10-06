@@ -616,12 +616,21 @@ class AdvancedNetworkAnalyzer:
 
         return results
 
-    def analyze_min_rssi(self, devices):
+    def analyze_min_rssi(self, devices, clients=None):
         """
         Analyze minimum RSSI configuration across APs
 
         Min RSSI forces weak clients to roam, preventing sticky client problems
         and improving overall network performance
+
+        **iPhone/iOS Consideration:**
+        iPhones are known to disconnect more frequently with aggressive min RSSI
+        thresholds. iOS devices tend to hold onto APs longer than Android and may
+        experience higher disconnect rates at -75/-72 dBm thresholds.
+
+        Args:
+            devices: List of AP device dicts
+            clients: Optional list of client dicts (for iOS detection)
 
         Returns:
             dict: Min RSSI analysis with recommendations
@@ -634,17 +643,69 @@ class AdvancedNetworkAnalyzer:
             "disabled_count": 0,
             "recommendations": [],
             "severity": "ok",
+            "ios_devices_detected": False,
+            "ios_device_count": 0,
         }
+
+        # Detect iOS/iPhone devices on network
+        ios_count = 0
+        if clients:
+            for client in clients:
+                hostname = client.get("hostname", "").lower()
+                name = client.get("name", "").lower()
+                oui = client.get("oui", "").lower()
+
+                # Check for iPhone/iPad/iOS indicators
+                is_ios = (
+                    "iphone" in hostname
+                    or "ipad" in hostname
+                    or "iphone" in name
+                    or "ipad" in name
+                    or "apple" in oui
+                )
+
+                if is_ios:
+                    ios_count += 1
+
+        results["ios_devices_detected"] = ios_count > 0
+        results["ios_device_count"] = ios_count
 
         # Recommended thresholds based on industry best practices
         # These values balance roaming aggressiveness with connection stability
         # Sources: Cisco WLAN Design Guide, Aruba Best Practices, UniFi recommendations
+
+        # Standard thresholds (no iOS devices or very few)
         RECOMMENDED_MIN_RSSI_24GHZ = -75  # 2.4GHz: -75 to -80 dBm typical range
         RECOMMENDED_MIN_RSSI_5GHZ = -72  # 5GHz: -70 to -75 dBm typical range
 
+        # iOS-friendly thresholds (when iOS devices detected)
+        # iPhone/iPad devices disconnect more frequently with aggressive thresholds
+        IOS_FRIENDLY_MIN_RSSI_24GHZ = -78  # 2.4GHz: More tolerant for iOS
+        IOS_FRIENDLY_MIN_RSSI_5GHZ = -75   # 5GHz: More tolerant for iOS
+
+        # Select thresholds based on client mix
+        # If >20% of clients are iOS, use iOS-friendly thresholds
+        total_clients = len(clients) if clients else 0
+        ios_percentage = (ios_count / total_clients * 100) if total_clients > 0 else 0
+        use_ios_friendly = ios_percentage > 20
+
+        # Choose thresholds
+        if use_ios_friendly:
+            recommended_24 = IOS_FRIENDLY_MIN_RSSI_24GHZ
+            recommended_5 = IOS_FRIENDLY_MIN_RSSI_5GHZ
+            threshold_type = "iOS-friendly"
+        else:
+            recommended_24 = RECOMMENDED_MIN_RSSI_24GHZ
+            recommended_5 = RECOMMENDED_MIN_RSSI_5GHZ
+            threshold_type = "standard"
+
+        results["threshold_type"] = threshold_type
+        results["ios_percentage"] = ios_percentage
+
         # Note: Values depend on environment:
         # - High-density: -67 to -72 dBm (force aggressive roaming)
-        # - Standard office: -72 to -75 dBm (balanced)
+        # - Standard office: -72 to -75 dBm (balanced, good for Android/Windows)
+        # - iOS-heavy networks: -75 to -78 dBm (prevents iPhone disconnect issues)
         # - Large coverage areas: -75 to -80 dBm (avoid premature disconnects)
 
         try:
@@ -680,13 +741,15 @@ class AdvancedNetworkAnalyzer:
                         results["enabled_count"] += 1
                         results["radios_with_min_rssi"].append(radio_info)
 
-                        # Check if value is optimal
-                        recommended = (
-                            RECOMMENDED_MIN_RSSI_24GHZ
-                            if radio_name == "ng"
-                            else RECOMMENDED_MIN_RSSI_5GHZ
-                        )
+                        # Check if value is optimal (using adaptive thresholds)
+                        recommended = recommended_24 if radio_name == "ng" else recommended_5
+
                         if min_rssi_value and abs(min_rssi_value - recommended) > 10:
+                            # Build recommendation message
+                            rec_msg = f"Consider adjusting to {recommended} dBm"
+                            if use_ios_friendly:
+                                rec_msg += f" ({threshold_type} - {ios_count} iOS devices detected)"
+
                             results["recommendations"].append(
                                 {
                                     "type": "min_rssi_suboptimal",
@@ -694,21 +757,40 @@ class AdvancedNetworkAnalyzer:
                                     "radio": radio_name,
                                     "band": band,
                                     "message": f"{ap_name} {band} has min RSSI at {min_rssi_value} dBm",
-                                    "recommendation": f"Consider adjusting to {recommended} dBm for optimal roaming",
+                                    "recommendation": rec_msg,
                                     "priority": "low",
                                     "current_value": min_rssi_value,
                                     "recommended_value": recommended,
+                                    "ios_friendly": use_ios_friendly,
+                                }
+                            )
+
+                        # Warn if using aggressive threshold with iOS devices
+                        elif use_ios_friendly and min_rssi_value and min_rssi_value >= -72:
+                            results["recommendations"].append(
+                                {
+                                    "type": "min_rssi_ios_warning",
+                                    "device": ap_name,
+                                    "radio": radio_name,
+                                    "band": band,
+                                    "message": f"{ap_name} {band} has aggressive min RSSI ({min_rssi_value} dBm) with {ios_count} iOS devices",
+                                    "recommendation": f"iOS devices may disconnect frequently at {min_rssi_value} dBm. Consider relaxing to {recommended} dBm to reduce disconnects.",
+                                    "priority": "medium",
+                                    "current_value": min_rssi_value,
+                                    "recommended_value": recommended,
+                                    "ios_friendly": True,
                                 }
                             )
                     else:
                         results["disabled_count"] += 1
                         results["radios_without_min_rssi"].append(radio_info)
 
-                        recommended = (
-                            RECOMMENDED_MIN_RSSI_24GHZ
-                            if radio_name == "ng"
-                            else RECOMMENDED_MIN_RSSI_5GHZ
-                        )
+                        recommended = recommended_24 if radio_name == "ng" else recommended_5
+
+                        # Build recommendation message
+                        rec_msg = f"Enable min RSSI at {recommended} dBm to improve roaming"
+                        if use_ios_friendly:
+                            rec_msg += f" ({threshold_type} - optimized for {ios_count} iOS devices)"
 
                         results["recommendations"].append(
                             {
@@ -717,9 +799,10 @@ class AdvancedNetworkAnalyzer:
                                 "radio": radio_name,
                                 "band": band,
                                 "message": f"Min RSSI disabled on {ap_name} {band}",
-                                "recommendation": f"Enable min RSSI at {recommended} dBm to improve roaming",
+                                "recommendation": rec_msg,
                                 "priority": "medium",
                                 "recommended_value": recommended,
+                                "ios_friendly": use_ios_friendly,
                             }
                         )
 
@@ -1338,7 +1421,7 @@ def run_advanced_analysis(client, site="default", devices=None, clients=None, lo
     results = {
         "dfs_analysis": analyzer.analyze_dfs_events(lookback_days),
         "band_steering_analysis": analyzer.analyze_band_steering(devices, clients),
-        "min_rssi_analysis": analyzer.analyze_min_rssi(devices),
+        "min_rssi_analysis": analyzer.analyze_min_rssi(devices, clients),
         "fast_roaming_analysis": analyzer.analyze_fast_roaming(devices),
         "airtime_analysis": analyzer.analyze_airtime_utilization(devices),
         "client_capabilities": analyzer.analyze_client_capabilities(clients, devices),
