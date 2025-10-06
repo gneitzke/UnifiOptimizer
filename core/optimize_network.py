@@ -617,7 +617,14 @@ def _convert_expert_recommendations(expert_recs, all_devices=None):
             )
 
         elif "min_rssi" in issue or "min_rssi" in rec_type or rec_type == "min_rssi_disabled":
-            # Min RSSI configuration change
+            # **DO NOT convert mesh AP min RSSI warnings to actions!**
+            # These are warnings to DISABLE min RSSI, not enable it
+            if rec.get("is_mesh") or rec_type == "mesh_min_rssi_danger":
+                # This is a warning about mesh AP, not an actionable recommendation
+                # User needs to manually disable min RSSI on mesh APs
+                continue
+
+            # Min RSSI configuration change (wired APs only)
             radio_name = rec.get("radio", "ng")
             band = rec.get("band", "2.4GHz")
             current_enabled = False
@@ -706,7 +713,10 @@ def _generate_health_based_recommendations(aps, health_analysis):
                     client_channels = [c.get("channel", 0) for c in clients]
 
                     if any(ch in band_channels for ch in client_channels):
-                        if power == "high":
+                        # SKIP power recommendations for mesh APs - they need max power!
+                        is_mesh = ap.get("adopted", False) and ap.get("uplink", {}).get("type") == "wireless"
+
+                        if power == "high" and not is_mesh:
                             recommendations.append(
                                 {
                                     "device": ap,
@@ -792,7 +802,10 @@ def _generate_health_based_recommendations(aps, health_analysis):
                 power = radio.get("tx_power_mode", "auto")
                 radio_name = radio.get("radio")
 
-                if power in ["high", "medium"]:
+                # SKIP power recommendations for mesh APs - they need max power for uplink!
+                is_mesh = ap.get("adopted", False) and ap.get("uplink", {}).get("type") == "wireless"
+
+                if power in ["high", "medium"] and not is_mesh:
                     new_power = "medium" if power == "high" else "low"
                     recommendations.append(
                         {
@@ -847,7 +860,11 @@ def _generate_basic_recommendations(aps):
         ap_name = ap.get("name", "Unnamed AP")
         radio_table = ap.get("radio_table", [])
 
-        console.print(f"[cyan]Analyzing: {ap_name}[/cyan]")
+        # Check if this is a mesh AP - DO NOT recommend power changes for mesh!
+        is_mesh = ap.get("adopted", False) and ap.get("uplink", {}).get("type") == "wireless"
+        mesh_label = " [MESH]" if is_mesh else ""
+
+        console.print(f"[cyan]Analyzing: {ap_name}{mesh_label}[/cyan]")
 
         for radio in radio_table:
             radio_name = radio.get("radio")
@@ -859,7 +876,8 @@ def _generate_basic_recommendations(aps):
             console.print(f"  {band}: Channel {channel}, Power {power}, Width {ht}MHz")
 
             # Basic recommendations
-            if power == "high":
+            # SKIP power recommendations for mesh APs - they need max power for uplink!
+            if power == "high" and not is_mesh:
                 recommendations.append(
                     {
                         "device": ap,

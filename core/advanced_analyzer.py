@@ -919,7 +919,7 @@ class AdvancedNetworkAnalyzer:
                 # Min RSSI can cause mesh uplinks to drop
                 uplink_type = device.get("uplink", {}).get("type", "wire")
                 is_mesh = uplink_type == "wireless"
-                
+
                 # **COVERAGE EXTENSION DETECTION**
                 # Mesh nodes with many weak-signal clients are extending coverage
                 # to remote areas. These need MAXIMUM connectivity tolerance.
@@ -927,13 +927,13 @@ class AdvancedNetworkAnalyzer:
                 weak_client_count = 0
                 mesh_client_count = 0
                 avg_client_rssi = None
-                
+
                 if is_mesh and clients:
                     # Find clients connected to this mesh AP
                     ap_mac = device.get("mac")
                     ap_clients = [c for c in clients if c.get("ap_mac") == ap_mac]
                     mesh_client_count = len(ap_clients)
-                    
+
                     if ap_clients:
                         # Analyze client signal strength
                         client_rssi_values = []
@@ -944,10 +944,10 @@ class AdvancedNetworkAnalyzer:
                                 # Weak signal: worse than -75 dBm
                                 if rssi < -75:
                                     weak_client_count += 1
-                        
+
                         if client_rssi_values:
                             avg_client_rssi = sum(client_rssi_values) / len(client_rssi_values)
-                        
+
                         # Coverage extender criteria:
                         # - >50% of clients have weak signal, OR
                         # - Average client RSSI < -70 dBm
@@ -997,7 +997,7 @@ class AdvancedNetworkAnalyzer:
                         if is_mesh:
                             results["mesh_aps_with_min_rssi"].append(radio_info)
                             uplink_rssi = device.get("uplink", {}).get("rssi", "Unknown")
-                            
+
                             # Enhanced messaging for coverage extender nodes
                             if is_coverage_extender:
                                 message = (
@@ -1018,7 +1018,7 @@ class AdvancedNetworkAnalyzer:
                                     f"(current uplink: {uplink_rssi} dBm). Mesh uplinks need to work under all conditions."
                                 )
                                 priority = "critical"
-                            
+
                             results["recommendations"].append(
                                 {
                                     "type": "mesh_min_rssi_danger",
