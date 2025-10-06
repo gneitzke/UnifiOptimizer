@@ -714,7 +714,10 @@ def _generate_health_based_recommendations(aps, health_analysis):
 
                     if any(ch in band_channels for ch in client_channels):
                         # SKIP power recommendations for mesh APs - they need max power!
-                        is_mesh = ap.get("adopted", False) and ap.get("uplink", {}).get("type") == "wireless"
+                        is_mesh = (
+                            ap.get("adopted", False)
+                            and ap.get("uplink", {}).get("type") == "wireless"
+                        )
 
                         if power == "high" and not is_mesh:
                             recommendations.append(
@@ -803,7 +806,9 @@ def _generate_health_based_recommendations(aps, health_analysis):
                 radio_name = radio.get("radio")
 
                 # SKIP power recommendations for mesh APs - they need max power for uplink!
-                is_mesh = ap.get("adopted", False) and ap.get("uplink", {}).get("type") == "wireless"
+                is_mesh = (
+                    ap.get("adopted", False) and ap.get("uplink", {}).get("type") == "wireless"
+                )
 
                 if power in ["high", "medium"] and not is_mesh:
                     new_power = "medium" if power == "high" else "low"
