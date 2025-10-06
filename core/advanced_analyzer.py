@@ -1360,6 +1360,217 @@ class AdvancedNetworkAnalyzer:
                 "Historical data simulated from current readings (API endpoint unavailable)"
             )
 
+    def analyze_radio_performance(self, devices, clients=None):
+        """
+        Analyze radio performance metrics with focus on TX retry rates
+        
+        Critical for 6GHz networks where high retry rates (>15%) indicate:
+        - Too-wide channels (320MHz → 160MHz)
+        - LPI power limitations (recommend AFC/Standard Power)
+        - Coverage/range issues
+        
+        Thresholds:
+        - <5%: Excellent
+        - 5-10%: Good
+        - 10-15%: Warning
+        - >15%: Critical (especially on 6GHz)
+        
+        Args:
+            devices: List of AP devices with radio_table_stats
+            clients: Optional list of clients for coverage analysis
+            
+        Returns:
+            dict: Radio performance analysis with retry rate warnings
+        """
+        results = {
+            "radios_analyzed": 0,
+            "high_retry_radios": [],
+            "excellent_radios": [],
+            "recommendations": [],
+            "severity": "ok",
+            "retry_rate_distribution": {
+                "excellent": 0,  # <5%
+                "good": 0,       # 5-10%
+                "warning": 0,    # 10-15%
+                "critical": 0    # >15%
+            }
+        }
+        
+        try:
+            aps = [d for d in devices if d.get("type") == "uap"]
+            
+            for device in aps:
+                ap_name = device.get("name", "Unnamed AP")
+                ap_mac = device.get("mac")
+                radio_table_stats = device.get("radio_table_stats", [])
+                
+                for radio_stat in radio_table_stats:
+                    radio_name = radio_stat.get("radio", "unknown")
+                    radio_label = radio_stat.get("name", "unknown")
+                    
+                    # Determine band (including 6GHz support)
+                    if radio_name == "ng":
+                        band = "2.4GHz"
+                    elif radio_name == "na":
+                        band = "5GHz"
+                    elif radio_name in ["6e", "ax", "6g"]:
+                        band = "6GHz"
+                    else:
+                        band = "Unknown"
+                    
+                    # Get retry rate
+                    tx_retries_pct = radio_stat.get("tx_retries_pct", 0)
+                    tx_packets = radio_stat.get("tx_packets", 0)
+                    tx_retries = radio_stat.get("tx_retries", 0)
+                    num_clients = radio_stat.get("num_sta", 0)
+                    channel = radio_stat.get("channel", 0)
+                    tx_power = radio_stat.get("tx_power", 0)
+                    
+                    results["radios_analyzed"] += 1
+                    
+                    # Classify retry rate
+                    if tx_retries_pct < 5:
+                        results["retry_rate_distribution"]["excellent"] += 1
+                        results["excellent_radios"].append({
+                            "ap": ap_name,
+                            "band": band,
+                            "retry_pct": tx_retries_pct
+                        })
+                    elif tx_retries_pct < 10:
+                        results["retry_rate_distribution"]["good"] += 1
+                    elif tx_retries_pct < 15:
+                        results["retry_rate_distribution"]["warning"] += 1
+                    else:
+                        results["retry_rate_distribution"]["critical"] += 1
+                    
+                    # Flag high retry rates (WARNING: >10%, CRITICAL: >15%)
+                    if tx_retries_pct > 10:
+                        # Get additional radio details for root cause analysis
+                        radio_table = device.get("radio_table", [])
+                        radio_config = next((r for r in radio_table if r.get("radio") == radio_name), {})
+                        
+                        channel_width = radio_config.get("ht", 20)
+                        power_mode = radio_config.get("ap_pwr_type", "Unknown")  # LPI/VLP/SP for 6GHz
+                        
+                        # Build issue description
+                        priority = "critical" if tx_retries_pct > 15 else "medium"
+                        
+                        issue_data = {
+                            "ap": ap_name,
+                            "band": band,
+                            "radio": radio_name,
+                            "retry_pct": tx_retries_pct,
+                            "tx_packets": tx_packets,
+                            "tx_retries": tx_retries,
+                            "clients": num_clients,
+                            "channel": channel,
+                            "channel_width": channel_width,
+                            "tx_power": tx_power,
+                            "priority": priority
+                        }
+                        
+                        results["high_retry_radios"].append(issue_data)
+                        
+                        # Update severity
+                        if priority == "critical":
+                            results["severity"] = "high"
+                        elif priority == "medium" and results["severity"] == "ok":
+                            results["severity"] = "medium"
+                        
+                        # Generate recommendations based on band and root cause
+                        if band == "6GHz":
+                            # 6GHz-specific analysis
+                            issue_data["power_mode"] = power_mode
+                            
+                            message = f"🚨 {ap_name} {band} has HIGH TX retry rate: {tx_retries_pct:.1f}%"
+                            if tx_retries_pct > 20:
+                                message = f"🔴 {ap_name} {band} has CRITICAL TX retry rate: {tx_retries_pct:.1f}%"
+                            
+                            # Build root cause analysis
+                            causes = []
+                            recommendations_list = []
+                            
+                            # Check channel width
+                            if channel_width >= 320:
+                                causes.append(f"320MHz channel width requires very clean spectrum")
+                                recommendations_list.append("Try reducing to 160MHz for better reliability")
+                            elif channel_width >= 160:
+                                causes.append(f"160MHz channel width may be too aggressive")
+                                recommendations_list.append("Consider 80MHz if retry rate persists")
+                            
+                            # Check power mode
+                            if power_mode == "LPI":
+                                causes.append("LPI power mode limited to low power (+24dBm)")
+                                recommendations_list.append("Enable AFC to use Standard Power mode for better range")
+                            
+                            # Check client count vs retry rate
+                            if num_clients > 0:
+                                # Get client RSSI data if available
+                                if clients:
+                                    ap_clients = [c for c in clients if c.get("ap_mac") == ap_mac and c.get("radio") == radio_name]
+                                    if ap_clients:
+                                        avg_rssi = sum(c.get("rssi", 0) for c in ap_clients) / len(ap_clients)
+                                        if avg_rssi < -70:
+                                            causes.append(f"Weak client signals (avg RSSI: {avg_rssi:.0f} dBm)")
+                                            recommendations_list.append("Clients may be at edge of 6GHz coverage - consider adding AP")
+                            
+                            if not causes:
+                                causes.append("High interference or signal quality issues")
+                                recommendations_list.append("Check for interference sources, verify antenna connections")
+                            
+                            recommendation = "ROOT CAUSE: " + "; ".join(causes) + ". " + " | ".join(recommendations_list)
+                            
+                            results["recommendations"].append({
+                                "type": "6ghz_high_retry",
+                                "device": ap_name,
+                                "band": band,
+                                "message": message,
+                                "recommendation": recommendation,
+                                "priority": priority,
+                                "retry_pct": tx_retries_pct,
+                                "channel_width": channel_width,
+                                "power_mode": power_mode,
+                                "clients": num_clients
+                            })
+                        
+                        else:
+                            # 2.4GHz / 5GHz analysis
+                            message = f"⚠️ {ap_name} {band} has elevated TX retry rate: {tx_retries_pct:.1f}%"
+                            
+                            causes = []
+                            recommendations_list = []
+                            
+                            if band == "2.4GHz":
+                                causes.append("2.4GHz band congestion/interference likely")
+                                recommendations_list.append("Check for channel overlap with neighbors")
+                                recommendations_list.append("Move clients to 5GHz/6GHz if possible")
+                            else:  # 5GHz
+                                if channel_width >= 80:
+                                    causes.append(f"{channel_width}MHz width may cause contention")
+                                    recommendations_list.append("Consider 40MHz in dense environments")
+                                else:
+                                    causes.append("Interference or signal quality issues")
+                                    recommendations_list.append("Check for DFS events, non-WiFi interference")
+                            
+                            recommendation = "LIKELY CAUSE: " + "; ".join(causes) + ". " + " | ".join(recommendations_list)
+                            
+                            results["recommendations"].append({
+                                "type": "high_retry_rate",
+                                "device": ap_name,
+                                "band": band,
+                                "message": message,
+                                "recommendation": recommendation,
+                                "priority": priority,
+                                "retry_pct": tx_retries_pct,
+                                "channel_width": channel_width,
+                                "clients": num_clients
+                            })
+        
+        except Exception as e:
+            results["error"] = str(e)
+        
+        return results
+
     def analyze_client_capabilities(self, clients, devices=None):
         """
         Analyze client device capabilities
@@ -1742,6 +1953,7 @@ def run_advanced_analysis(client, site="default", devices=None, clients=None, lo
         "min_rssi_analysis": analyzer.analyze_min_rssi(devices, clients),
         "fast_roaming_analysis": analyzer.analyze_fast_roaming(devices),
         "airtime_analysis": analyzer.analyze_airtime_utilization(devices),
+        "radio_performance_analysis": analyzer.analyze_radio_performance(devices, clients),
         "client_capabilities": analyzer.analyze_client_capabilities(clients, devices),
         "client_security": analyzer.analyze_client_security(clients),
         "switch_analysis": switch_analysis,
