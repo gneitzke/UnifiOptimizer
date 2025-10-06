@@ -479,7 +479,7 @@ def analyze_network(client, site="default", lookback_days=3):
         # Fallback to basic analysis
         devices = get_devices(client)
         aps = [d for d in devices if d.get("type") == "uap"]
-        return {"recommendations": _generate_basic_recommendations(aps), "full_analysis": None}
+        return {"recommendations": _generate_basic_recommendations(aps, devices), "full_analysis": None}
 
 
 def _convert_expert_recommendations(expert_recs, all_devices=None):
@@ -955,26 +955,32 @@ def _get_parent_ap_info(mesh_ap, all_aps):
     return parent_ap, parent_name, parent_power_status
 
 
-def _generate_basic_recommendations(aps):
+def _generate_basic_recommendations(aps, all_devices=None):
     """
     Generate basic recommendations without client health data
 
     Args:
         aps: List of access point devices
+        all_devices: List of all devices (APs, switches, gateways, etc.) for mesh parent detection
 
     Returns:
         list: Basic recommendations
     """
     recommendations = []
 
+    if all_devices is None:
+        all_devices = aps
+
     console.print("[dim]Using basic analysis mode (client health data not available)[/dim]\n")
 
-    # Build AP lookup for parent checking
+    # Build AP and device lookups for parent checking
     ap_by_mac = {ap.get("mac"): ap for ap in aps if ap.get("mac")}
+    device_by_mac = {d.get("mac"): d for d in all_devices if d.get("mac")}
+    ap_macs = set(ap_by_mac.keys())
 
     # Build mesh topology summary
     mesh_aps = []
-    mesh_parent_aps = set()
+    mesh_parent_macs = set()
     for ap in aps:
         uplink_type = ap.get("uplink", {}).get("type", "")
         uplink_rssi = ap.get("uplink", {}).get("rssi")
@@ -984,17 +990,32 @@ def _generate_basic_recommendations(aps):
             mesh_aps.append(ap)
             parent_mac = ap.get("uplink", {}).get("uplink_remote_mac")
             if parent_mac:
-                mesh_parent_aps.add(parent_mac)
+                mesh_parent_macs.add(parent_mac)
+
+    # Count parent APs vs parent gateways
+    mesh_parent_aps = len([mac for mac in mesh_parent_macs if mac in ap_macs])
+    mesh_parent_gateways = len([mac for mac in mesh_parent_macs if mac not in ap_macs])
 
     # Display mesh topology summary if any mesh APs exist
     if mesh_aps:
         from rich.panel import Panel
+
+        # Build parent description
+        if mesh_parent_aps > 0 and mesh_parent_gateways > 0:
+            parent_line = f"[blue]📡 Parent APs: {mesh_parent_aps} | Parent Gateways: {mesh_parent_gateways}[/blue]"
+        elif mesh_parent_aps > 0:
+            parent_line = f"[blue]📡 Parent APs: {mesh_parent_aps}[/blue]"
+        elif mesh_parent_gateways > 0:
+            parent_line = f"[blue]📡 Parent Gateways: {mesh_parent_gateways}[/blue]"
+        else:
+            parent_line = f"[blue]📡 Parent Devices: {len(mesh_parent_macs)}[/blue]"
+
         mesh_summary_lines = [
             f"[bold]Mesh Network Detected[/bold]",
             f"",
             f"[cyan]🔗 Mesh Child APs: {len(mesh_aps)}[/cyan]",
-            f"[blue]📡 Mesh Parent APs: {len(mesh_parent_aps)}[/blue]",
-            f"[green]🛡️  Protected APs: {len(mesh_aps) + len(mesh_parent_aps)}[/green]",
+            parent_line,
+            f"[green]🛡️  Protected APs: {len(mesh_aps) + mesh_parent_aps}[/green]",
             f"",
             f"[dim]All mesh nodes maintain HIGH power for reliable wireless backhaul[/dim]"
         ]
