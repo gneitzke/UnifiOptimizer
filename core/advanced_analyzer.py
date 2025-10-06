@@ -919,12 +919,52 @@ class AdvancedNetworkAnalyzer:
                 # Min RSSI can cause mesh uplinks to drop
                 uplink_type = device.get("uplink", {}).get("type", "wire")
                 is_mesh = uplink_type == "wireless"
+                
+                # **COVERAGE EXTENSION DETECTION**
+                # Mesh nodes with many weak-signal clients are extending coverage
+                # to remote areas. These need MAXIMUM connectivity tolerance.
+                is_coverage_extender = False
+                weak_client_count = 0
+                mesh_client_count = 0
+                avg_client_rssi = None
+                
+                if is_mesh and clients:
+                    # Find clients connected to this mesh AP
+                    ap_mac = device.get("mac")
+                    ap_clients = [c for c in clients if c.get("ap_mac") == ap_mac]
+                    mesh_client_count = len(ap_clients)
+                    
+                    if ap_clients:
+                        # Analyze client signal strength
+                        client_rssi_values = []
+                        for client in ap_clients:
+                            rssi = client.get("rssi")
+                            if rssi:
+                                client_rssi_values.append(rssi)
+                                # Weak signal: worse than -75 dBm
+                                if rssi < -75:
+                                    weak_client_count += 1
+                        
+                        if client_rssi_values:
+                            avg_client_rssi = sum(client_rssi_values) / len(client_rssi_values)
+                        
+                        # Coverage extender criteria:
+                        # - >50% of clients have weak signal, OR
+                        # - Average client RSSI < -70 dBm
+                        if mesh_client_count > 0:
+                            weak_percentage = (weak_client_count / mesh_client_count) * 100
+                            if weak_percentage > 50 or (avg_client_rssi and avg_client_rssi < -70):
+                                is_coverage_extender = True
 
                 if is_mesh:
                     uplink_rssi = device.get("uplink", {}).get("rssi")
                     results["mesh_aps_detected"].append({
                         "name": ap_name,
                         "uplink_rssi": uplink_rssi,
+                        "is_coverage_extender": is_coverage_extender,
+                        "weak_client_count": weak_client_count,
+                        "total_client_count": mesh_client_count,
+                        "avg_client_rssi": avg_client_rssi,
                     })
 
                 for radio in radio_table:
@@ -957,18 +997,43 @@ class AdvancedNetworkAnalyzer:
                         if is_mesh:
                             results["mesh_aps_with_min_rssi"].append(radio_info)
                             uplink_rssi = device.get("uplink", {}).get("rssi", "Unknown")
+                            
+                            # Enhanced messaging for coverage extender nodes
+                            if is_coverage_extender:
+                                message = (
+                                    f"🚨 COVERAGE EXTENDER {ap_name} {band} has min RSSI enabled ({min_rssi_value} dBm)\n"
+                                    f"   This mesh node serves {weak_client_count}/{mesh_client_count} weak-signal clients"
+                                )
+                                recommendation = (
+                                    f"DISABLE min RSSI immediately! This mesh node is extending coverage to a remote area "
+                                    f"(avg client RSSI: {avg_client_rssi:.0f} dBm). Min RSSI will disconnect weak clients AND "
+                                    f"can break the mesh uplink (current: {uplink_rssi} dBm). Coverage extension requires "
+                                    f"MAXIMUM connectivity tolerance."
+                                )
+                                priority = "critical"
+                            else:
+                                message = f"🚨 MESH AP {ap_name} {band} has min RSSI enabled ({min_rssi_value} dBm)"
+                                recommendation = (
+                                    f"DISABLE min RSSI on mesh APs! Min RSSI can break wireless uplink "
+                                    f"(current uplink: {uplink_rssi} dBm). Mesh uplinks need to work under all conditions."
+                                )
+                                priority = "critical"
+                            
                             results["recommendations"].append(
                                 {
                                     "type": "mesh_min_rssi_danger",
                                     "device": ap_name,
                                     "radio": radio_name,
                                     "band": band,
-                                    "message": f"🚨 MESH AP {ap_name} {band} has min RSSI enabled ({min_rssi_value} dBm)",
-                                    "recommendation": f"DISABLE min RSSI on mesh APs! Min RSSI can break wireless uplink (current uplink: {uplink_rssi} dBm). Mesh uplinks need to work under all conditions.",
-                                    "priority": "critical",
+                                    "message": message,
+                                    "recommendation": recommendation,
+                                    "priority": priority,
                                     "current_value": min_rssi_value,
                                     "is_mesh": True,
+                                    "is_coverage_extender": is_coverage_extender,
                                     "uplink_rssi": uplink_rssi,
+                                    "weak_clients": weak_client_count,
+                                    "total_clients": mesh_client_count,
                                 }
                             )
                             continue  # Skip other recommendations for this radio
@@ -1021,6 +1086,19 @@ class AdvancedNetworkAnalyzer:
                         # Mesh APs should NEVER have min RSSI enabled
                         if is_mesh:
                             # Good! Mesh AP has min RSSI disabled (as it should be)
+                            # Add positive confirmation for coverage extenders
+                            if is_coverage_extender:
+                                results["recommendations"].append(
+                                    {
+                                        "type": "coverage_extender_config_good",
+                                        "device": ap_name,
+                                        "radio": radio_name,
+                                        "band": band,
+                                        "message": f"✅ COVERAGE EXTENDER {ap_name} {band} correctly has min RSSI disabled",
+                                        "recommendation": f"KEEP DISABLED! This mesh node serves {weak_client_count}/{mesh_client_count} weak-signal clients (avg RSSI: {avg_client_rssi:.0f} dBm). Min RSSI must remain disabled to maintain connectivity for remote clients and protect the mesh uplink.",
+                                        "priority": "info",
+                                    }
+                                )
                             continue
 
                         recommended = recommended_24 if radio_name == "ng" else recommended_5
