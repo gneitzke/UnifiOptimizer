@@ -155,6 +155,160 @@ class AdvancedNetworkAnalyzer:
         results["affected_channels"] = list(results["affected_channels"])
         return results
 
+    def analyze_client_population(self, clients):
+        """
+        Analyze the actual client device population on the network
+
+        Provides data-driven insights about:
+        - iOS/iPhone percentage (important for min RSSI thresholds)
+        - Android percentage
+        - Device capabilities (WiFi 5/6/6E/7)
+        - Common device patterns
+
+        This helps tailor recommendations to the actual network environment
+        instead of using generic assumptions.
+
+        Returns:
+            dict: Client population statistics and recommendations
+        """
+        results = {
+            "total_clients": 0,
+            "ios_count": 0,
+            "android_count": 0,
+            "windows_count": 0,
+            "mac_count": 0,
+            "linux_count": 0,
+            "iot_count": 0,
+            "unknown_count": 0,
+            "wifi_generations": {
+                "wifi7": 0,
+                "wifi6e": 0,
+                "wifi6": 0,
+                "wifi5": 0,
+                "wifi4_and_older": 0,
+            },
+            "device_distribution": {
+                "ios_percentage": 0,
+                "android_percentage": 0,
+                "desktop_percentage": 0,
+                "iot_percentage": 0,
+            },
+            "recommendations": [],
+        }
+
+        if not clients:
+            return results
+
+        results["total_clients"] = len(clients)
+
+        # Categorize each client
+        for client in clients:
+            hostname = client.get("hostname", "").lower()
+            name = client.get("name", "").lower()
+            oui = client.get("oui", "").lower()
+            radio_proto = client.get("radio_proto", "").lower()
+
+            # Detect OS/Device Type
+            is_ios = (
+                "iphone" in hostname or "ipad" in hostname
+                or "iphone" in name or "ipad" in name
+            )
+            is_mac = "macbook" in hostname or "imac" in hostname or "mac" in hostname
+            is_android = (
+                "android" in hostname or "samsung" in hostname
+                or "galaxy" in hostname or "pixel" in hostname
+                or "oneplus" in hostname
+            )
+            is_windows = (
+                "windows" in hostname or "desktop" in hostname
+                or "laptop" in hostname or "pc-" in hostname
+            )
+            is_linux = "ubuntu" in hostname or "linux" in hostname
+            is_iot = (
+                "nest" in hostname or "ring" in hostname
+                or "alexa" in hostname or "echo" in hostname
+                or "chromecast" in hostname or "roku" in hostname
+                or "firetv" in hostname or "apple-tv" in hostname
+                or "smart" in hostname or "tv" in hostname
+                or "printer" in hostname or "camera" in hostname
+            )
+
+            # Count by OS/Device Type
+            if is_ios:
+                results["ios_count"] += 1
+            elif is_mac:
+                results["mac_count"] += 1
+            elif is_android:
+                results["android_count"] += 1
+            elif is_windows:
+                results["windows_count"] += 1
+            elif is_linux:
+                results["linux_count"] += 1
+            elif is_iot:
+                results["iot_count"] += 1
+            else:
+                results["unknown_count"] += 1
+
+            # Detect WiFi generation
+            if "be" in radio_proto or "11be" in radio_proto:
+                results["wifi_generations"]["wifi7"] += 1
+            elif "ax-6e" in radio_proto or "6e" in radio_proto:
+                results["wifi_generations"]["wifi6e"] += 1
+            elif "ax" in radio_proto or "11ax" in radio_proto:
+                results["wifi_generations"]["wifi6"] += 1
+            elif "ac" in radio_proto or "11ac" in radio_proto:
+                results["wifi_generations"]["wifi5"] += 1
+            else:
+                results["wifi_generations"]["wifi4_and_older"] += 1
+
+        # Calculate percentages
+        total = results["total_clients"]
+        if total > 0:
+            results["device_distribution"]["ios_percentage"] = round(
+                (results["ios_count"] / total) * 100, 1
+            )
+            results["device_distribution"]["android_percentage"] = round(
+                (results["android_count"] / total) * 100, 1
+            )
+            results["device_distribution"]["desktop_percentage"] = round(
+                ((results["mac_count"] + results["windows_count"] + results["linux_count"]) / total) * 100, 1
+            )
+            results["device_distribution"]["iot_percentage"] = round(
+                (results["iot_count"] / total) * 100, 1
+            )
+
+        # Generate recommendations based on population
+        ios_pct = results["device_distribution"]["ios_percentage"]
+
+        if ios_pct > 50:
+            results["recommendations"].append({
+                "type": "ios_dominant",
+                "message": f"Network is {ios_pct}% iOS devices",
+                "recommendation": "Use iOS-friendly min RSSI thresholds (-78/-75 dBm) to prevent frequent iPhone disconnects",
+                "priority": "high",
+            })
+        elif ios_pct > 20:
+            results["recommendations"].append({
+                "type": "ios_significant",
+                "message": f"Network has {ios_pct}% iOS devices",
+                "recommendation": "Consider iOS-friendly min RSSI thresholds (-78/-75 dBm) to reduce iPhone disconnect rates",
+                "priority": "medium",
+            })
+
+        # WiFi 6E/7 recommendations
+        modern_wifi_count = results["wifi_generations"]["wifi6e"] + results["wifi_generations"]["wifi7"]
+        if modern_wifi_count > 0 and total > 0:
+            modern_pct = round((modern_wifi_count / total) * 100, 1)
+            if modern_pct > 30:
+                results["recommendations"].append({
+                    "type": "modern_wifi",
+                    "message": f"{modern_pct}% of clients support WiFi 6E/7",
+                    "recommendation": "Ensure 6GHz radios are enabled to take advantage of modern client capabilities",
+                    "priority": "medium",
+                })
+
+        return results
+
     def analyze_band_steering(self, devices, clients):
         """
         Analyze band steering configuration and effectiveness
@@ -168,6 +322,8 @@ class AdvancedNetworkAnalyzer:
         results = {
             "band_steering_enabled": {},
             "misplaced_clients": [],
+            "mesh_aps_detected": [],
+            "mesh_aps_with_band_steering": [],
             "dual_band_clients_on_2ghz": 0,
             "tri_band_clients_suboptimal": 0,  # 6GHz-capable clients not on 6GHz
             "wifi7_clients_suboptimal": 0,  # WiFi 7 capable clients not on 6GHz
@@ -184,6 +340,18 @@ class AdvancedNetworkAnalyzer:
                 ap_name = device.get("name", "Unnamed AP")
                 ap_id = device.get("_id")
 
+                # **CRITICAL: Detect mesh APs (wireless uplink)**
+                # Band steering can interfere with mesh uplink stability
+                uplink_type = device.get("uplink", {}).get("type", "wire")
+                is_mesh = uplink_type == "wireless"
+
+                if is_mesh:
+                    uplink_rssi = device.get("uplink", {}).get("rssi")
+                    results["mesh_aps_detected"].append({
+                        "name": ap_name,
+                        "uplink_rssi": uplink_rssi,
+                    })
+
                 # Check band steering setting - UniFi may use either field name
                 # Try both 'bandsteering_mode' (older) and 'band_steering_mode' (newer)
                 band_steering = device.get("bandsteering_mode") or device.get(
@@ -199,7 +367,29 @@ class AdvancedNetworkAnalyzer:
                 is_enabled = band_steering != "off"
                 results["band_steering_enabled"][ap_name] = is_enabled
 
-                if not is_enabled:
+                # **Warn if mesh AP has band steering enabled**
+                if is_mesh and is_enabled:
+                    uplink_rssi = device.get("uplink", {}).get("rssi", "Unknown")
+                    results["mesh_aps_with_band_steering"].append({
+                        "name": ap_name,
+                        "mode": band_steering,
+                        "uplink_rssi": uplink_rssi,
+                    })
+                    results["recommendations"].append(
+                        {
+                            "type": "mesh_band_steering_warning",
+                            "device": ap_name,
+                            "message": f"⚠️  MESH AP {ap_name} has band steering enabled ({band_steering})",
+                            "recommendation": f"Consider disabling band steering on mesh APs if uplink stability issues occur (current uplink: {uplink_rssi} dBm). Band steering can interfere with mesh uplink connections.",
+                            "priority": "medium",
+                            "is_mesh": True,
+                            "band_steering_mode": band_steering,
+                            "uplink_rssi": uplink_rssi,
+                        }
+                    )
+
+                if not is_enabled and not is_mesh:
+                    # Only recommend enabling band steering on NON-mesh APs
                     # Determine recommendation message based on AP capabilities
                     if has_6ghz:
                         recommendation_msg = (
@@ -623,6 +813,11 @@ class AdvancedNetworkAnalyzer:
         Min RSSI forces weak clients to roam, preventing sticky client problems
         and improving overall network performance
 
+        **CRITICAL: Mesh AP Protection**
+        Mesh APs with wireless uplinks are EXCLUDED from min RSSI recommendations.
+        Aggressive min RSSI can break mesh uplink connections, causing AP drops.
+        Mesh uplinks need to maintain connection under all conditions.
+
         **iPhone/iOS Consideration:**
         iPhones are known to disconnect more frequently with aggressive min RSSI
         thresholds. iOS devices tend to hold onto APs longer than Android and may
@@ -638,6 +833,8 @@ class AdvancedNetworkAnalyzer:
         results = {
             "radios_with_min_rssi": [],
             "radios_without_min_rssi": [],
+            "mesh_aps_with_min_rssi": [],  # Track mesh APs with min RSSI (warning!)
+            "mesh_aps_detected": [],
             "total_radios": 0,
             "enabled_count": 0,
             "disabled_count": 0,
@@ -717,6 +914,19 @@ class AdvancedNetworkAnalyzer:
                 ap_id = device.get("_id")
                 radio_table = device.get("radio_table", [])
 
+                # **CRITICAL: Detect mesh APs (wireless uplink)**
+                # Mesh APs must maintain connection under all conditions
+                # Min RSSI can cause mesh uplinks to drop
+                uplink_type = device.get("uplink", {}).get("type", "wire")
+                is_mesh = uplink_type == "wireless"
+
+                if is_mesh:
+                    uplink_rssi = device.get("uplink", {}).get("rssi")
+                    results["mesh_aps_detected"].append({
+                        "name": ap_name,
+                        "uplink_rssi": uplink_rssi,
+                    })
+
                 for radio in radio_table:
                     radio_name = radio.get("radio", "unknown")
                     band = (
@@ -735,11 +945,33 @@ class AdvancedNetworkAnalyzer:
                         "band": band,
                         "enabled": min_rssi_enabled,
                         "value": min_rssi_value,
+                        "is_mesh": is_mesh,
                     }
 
                     if min_rssi_enabled:
                         results["enabled_count"] += 1
                         results["radios_with_min_rssi"].append(radio_info)
+
+                        # **CRITICAL: Warn if mesh AP has min RSSI enabled**
+                        # This can break the mesh uplink connection!
+                        if is_mesh:
+                            results["mesh_aps_with_min_rssi"].append(radio_info)
+                            uplink_rssi = device.get("uplink", {}).get("rssi", "Unknown")
+                            results["recommendations"].append(
+                                {
+                                    "type": "mesh_min_rssi_danger",
+                                    "device": ap_name,
+                                    "radio": radio_name,
+                                    "band": band,
+                                    "message": f"🚨 MESH AP {ap_name} {band} has min RSSI enabled ({min_rssi_value} dBm)",
+                                    "recommendation": f"DISABLE min RSSI on mesh APs! Min RSSI can break wireless uplink (current uplink: {uplink_rssi} dBm). Mesh uplinks need to work under all conditions.",
+                                    "priority": "critical",
+                                    "current_value": min_rssi_value,
+                                    "is_mesh": True,
+                                    "uplink_rssi": uplink_rssi,
+                                }
+                            )
+                            continue  # Skip other recommendations for this radio
 
                         # Check if value is optimal (using adaptive thresholds)
                         recommended = recommended_24 if radio_name == "ng" else recommended_5
@@ -784,6 +1016,12 @@ class AdvancedNetworkAnalyzer:
                     else:
                         results["disabled_count"] += 1
                         results["radios_without_min_rssi"].append(radio_info)
+
+                        # **Skip recommendation to enable min RSSI on mesh APs**
+                        # Mesh APs should NEVER have min RSSI enabled
+                        if is_mesh:
+                            # Good! Mesh AP has min RSSI disabled (as it should be)
+                            continue
 
                         recommended = recommended_24 if radio_name == "ng" else recommended_5
 
