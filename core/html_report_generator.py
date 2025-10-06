@@ -602,7 +602,11 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
         html_content += generate_switch_analysis_html(switch_analysis)
 
     # Access Points Section
-    html_content += generate_ap_overview_html(ap_analysis, mesh_aps)
+    html_content += generate_ap_overview_html(ap_analysis, mesh_aps, analysis_data.get("devices", []))
+
+    # Mesh Topology Section (if mesh APs exist)
+    if mesh_aps and mesh_aps.get("mesh_aps"):
+        html_content += generate_mesh_topology_html(mesh_aps, analysis_data.get("devices", []))
 
     # Recommendations Section
     html_content += generate_recommendations_html(recommendations)
@@ -881,6 +885,25 @@ def generate_executive_summary_html(analysis_data, recommendations):
     ap_count = len([d for d in devices if d.get("type") == "uap"])
     switch_count = len([d for d in devices if d.get("type") == "usw"])
 
+    # Get mesh topology counts
+    mesh_aps = []
+    mesh_parent_macs = set()
+    for device in devices:
+        if device.get("type") == "uap":
+            uplink_type = device.get("uplink", {}).get("type", "")
+            uplink_rssi = device.get("uplink", {}).get("rssi")
+            is_mesh = (device.get("adopted", False) and (
+                uplink_type == "wireless" or (uplink_rssi and uplink_rssi < -70)))
+            if is_mesh:
+                mesh_aps.append(device)
+                parent_mac = device.get("uplink", {}).get("uplink_remote_mac")
+                if parent_mac:
+                    mesh_parent_macs.add(parent_mac)
+
+    mesh_child_count = len(mesh_aps)
+    mesh_parent_count = len(mesh_parent_macs)
+    total_mesh_protected = mesh_child_count + mesh_parent_count
+
     # Get switch issues
     switch_analysis = analysis_data.get("switch_analysis", {})
     switch_issues = len(switch_analysis.get("issues", []))
@@ -894,6 +917,8 @@ def generate_executive_summary_html(analysis_data, recommendations):
 
     # Build infrastructure summary
     infra_summary = f"{ap_count} access point{'s' if ap_count != 1 else ''}"
+    if mesh_child_count > 0:
+        infra_summary += f" (including {mesh_child_count} mesh node{'s' if mesh_child_count != 1 else ''})"
     if switch_count > 0:
         infra_summary += f" and {switch_count} managed switch{'es' if switch_count != 1 else ''}"
 
@@ -929,7 +954,8 @@ def generate_executive_summary_html(analysis_data, recommendations):
     # Wireless improvements
     if findings_count > 0 or saturated_aps > 0:
         impact_parts.append("reduce wireless interference")
-        impact_parts.append("improve mesh reliability")
+        if mesh_child_count > 0:
+            impact_parts.append("maintain reliable mesh backhaul")
         impact_parts.append("optimize coverage patterns")
 
     # Physical infrastructure improvements
@@ -953,6 +979,17 @@ def generate_executive_summary_html(analysis_data, recommendations):
         else impact_parts[0] if impact_parts else "improve network performance"
     )
 
+    # Build mesh protection note if applicable
+    mesh_note = ""
+    if total_mesh_protected > 0:
+        mesh_note = f"""
+                <p style="background: #ecfdf5; border-left: 4px solid #10b981; padding: 12px; margin-top: 12px; border-radius: 4px;">
+                    <strong>🛡️ Mesh Network Protection:</strong> Your network includes a mesh topology with {mesh_child_count} wireless node{'s' if mesh_child_count != 1 else ''}
+                    and {mesh_parent_count} parent AP{'s' if mesh_parent_count != 1 else ''}. All {total_mesh_protected} mesh-related APs are protected from
+                    power reduction to maintain reliable wireless backhaul (both TX and RX directions).
+                </p>
+"""
+
     return f"""
             <div class="executive-summary">
                 <h2>📊 Executive Summary</h2>
@@ -968,6 +1005,7 @@ def generate_executive_summary_html(analysis_data, recommendations):
                 <p>
                     <strong>Expected Impact:</strong> Implementing these recommendations will {impact_statement}.{critical_text}
                 </p>
+                {mesh_note}
             </div>
 """
 
@@ -1044,7 +1082,14 @@ def generate_key_metrics_html(analysis_data, client_health):
                     </div>
 """
 
-    if switch_count > 0:
+    if mesh_count > 0:
+        stats_cards += f"""
+                    <div class="stat-card" style="background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%); border-left: 4px solid #f59e0b;">
+                        <div class="value">🔗 {mesh_count}</div>
+                        <div class="label">Mesh Nodes</div>
+                    </div>
+"""
+    elif switch_count > 0:
         stats_cards += f"""
                     <div class="stat-card">
                         <div class="value">{total_switch_ports}</div>
@@ -1054,7 +1099,7 @@ def generate_key_metrics_html(analysis_data, client_health):
     else:
         stats_cards += f"""
                     <div class="stat-card">
-                        <div class="value">{mesh_count}</div>
+                        <div class="value">0</div>
                         <div class="label">Mesh APs</div>
                     </div>
 """
@@ -1362,17 +1407,201 @@ def generate_rssi_distribution_html(signal_distribution):
 """
 
 
-def generate_ap_overview_html(ap_analysis, mesh_aps):
+def generate_mesh_topology_html(mesh_aps, all_devices):
+    """
+    Generate beautiful mesh topology visualization showing parent-child relationships
+    """
+    mesh_ap_list = mesh_aps.get("mesh_aps", [])
+    if not mesh_ap_list:
+        return ""
+
+    # Build device lookup for parent identification
+    device_by_mac = {d.get("mac"): d for d in all_devices if d.get("mac")}
+
+    # Identify parent-child relationships
+    topology_data = []
+    parent_aps = set()
+
+    for mesh_ap in mesh_ap_list:
+        uplink_remote_mac = mesh_ap.get("uplink_remote_mac")
+        uplink_rssi = mesh_ap.get("uplink_rssi")
+        ap_name = mesh_ap.get("name", "Unknown")
+
+        parent_ap = None
+        parent_name = "Unknown"
+        if uplink_remote_mac and uplink_remote_mac in device_by_mac:
+            parent_ap = device_by_mac[uplink_remote_mac]
+            parent_name = parent_ap.get("name", "Unknown Parent")
+            parent_aps.add(uplink_remote_mac)
+
+        topology_data.append({
+            "child_name": ap_name,
+            "parent_name": parent_name,
+            "uplink_rssi": uplink_rssi,
+            "parent_mac": uplink_remote_mac,
+            "is_mesh": True
+        })
+
+    # Generate HTML
+    html = """
+        <div class="section" style="background: linear-gradient(135deg, #667eea15 0%, #764ba215 100%); border-left: 4px solid #667eea;">
+            <h2 style="display: flex; align-items: center; gap: 10px;">
+                <span style="font-size: 1.8em;">🔗</span>
+                <span>Mesh Network Topology</span>
+            </h2>
+            <p style="color: #666; margin-bottom: 25px; font-size: 1.05em;">
+                Visualizing wireless mesh connections between access points. Both parent and child APs maintain HIGH power for optimal bidirectional communication.
+            </p>
+"""
+
+    # Create topology cards
+    for topo in topology_data:
+        child_name = topo["child_name"]
+        parent_name = topo["parent_name"]
+        uplink_rssi = topo["uplink_rssi"]
+
+        # Determine signal quality and color
+        if uplink_rssi and uplink_rssi > -65:
+            signal_quality = "Excellent"
+            signal_color = "#10b981"
+            signal_icon = "🟢"
+            signal_bg = "#d1fae5"
+        elif uplink_rssi and uplink_rssi > -70:
+            signal_quality = "Good"
+            signal_color = "#3b82f6"
+            signal_icon = "🔵"
+            signal_bg = "#dbeafe"
+        elif uplink_rssi and uplink_rssi > -75:
+            signal_quality = "Fair"
+            signal_color = "#f59e0b"
+            signal_icon = "🟡"
+            signal_bg = "#fef3c7"
+        else:
+            signal_quality = "Weak"
+            signal_color = "#ef4444"
+            signal_icon = "🔴"
+            signal_bg = "#fee2e2"
+
+        rssi_display = f"{uplink_rssi} dBm" if uplink_rssi else "Unknown"
+
+        html += f"""
+            <div style="background: white; padding: 25px; border-radius: 12px; margin: 20px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.08); border: 1px solid #e5e7eb;">
+                <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 20px;">
+                    <!-- Parent AP -->
+                    <div style="flex: 1; min-width: 200px;">
+                        <div style="background: #f0f9ff; padding: 15px; border-radius: 8px; border-left: 4px solid #3b82f6;">
+                            <div style="color: #6b7280; font-size: 0.85em; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 5px; font-weight: 600;">
+                                📡 Parent AP
+                            </div>
+                            <div style="font-size: 1.3em; font-weight: 700; color: #1e40af; margin-bottom: 8px;">
+                                {parent_name}
+                            </div>
+                            <div style="background: #3b82f614; color: #1e40af; padding: 6px 12px; border-radius: 20px; display: inline-block; font-size: 0.85em; font-weight: 600;">
+                                🔋 HIGH Power (TX → Child)
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Connection Arrow -->
+                    <div style="flex: 0 0 auto; text-align: center; padding: 0 15px;">
+                        <div style="font-size: 2.5em; line-height: 1;">→</div>
+                        <div style="margin-top: 8px; background: {signal_bg}; color: {signal_color}; padding: 8px 16px; border-radius: 20px; white-space: nowrap; font-weight: 600; font-size: 0.9em;">
+                            {signal_icon} {rssi_display}
+                        </div>
+                        <div style="margin-top: 5px; color: {signal_color}; font-size: 0.85em; font-weight: 600;">
+                            {signal_quality}
+                        </div>
+                    </div>
+
+                    <!-- Child AP (Mesh) -->
+                    <div style="flex: 1; min-width: 200px;">
+                        <div style="background: #fef3c7; padding: 15px; border-radius: 8px; border-left: 4px solid #f59e0b;">
+                            <div style="color: #6b7280; font-size: 0.85em; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 5px; font-weight: 600;">
+                                🔗 Mesh AP (Child)
+                            </div>
+                            <div style="font-size: 1.3em; font-weight: 700; color: #92400e; margin-bottom: 8px;">
+                                {child_name}
+                            </div>
+                            <div style="background: #f59e0b14; color: #92400e; padding: 6px 12px; border-radius: 20px; display: inline-block; font-size: 0.85em; font-weight: 600;">
+                                🔋 HIGH Power (TX → Parent)
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Connection Info -->
+                <div style="margin-top: 20px; padding: 15px; background: #f9fafb; border-radius: 8px; border-left: 3px solid {signal_color};">
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px;">
+                        <div>
+                            <div style="color: #6b7280; font-size: 0.85em; margin-bottom: 4px;">📶 Uplink Signal</div>
+                            <div style="font-weight: 600; color: {signal_color};">{rssi_display} ({signal_quality})</div>
+                        </div>
+                        <div>
+                            <div style="color: #6b7280; font-size: 0.85em; margin-bottom: 4px;">⚡ Connection Type</div>
+                            <div style="font-weight: 600; color: #374151;">Wireless Mesh</div>
+                        </div>
+                        <div>
+                            <div style="color: #6b7280; font-size: 0.85em; margin-bottom: 4px;">🛡️ Power Protection</div>
+                            <div style="font-weight: 600; color: #10b981;">Both APs Protected</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+"""
+
+    # Add protection summary
+    total_protected = len(topology_data) + len(parent_aps)
+    html += f"""
+            <div style="background: #ecfdf5; padding: 20px; border-radius: 10px; border-left: 4px solid #10b981; margin-top: 25px;">
+                <div style="display: flex; align-items: center; gap: 12px;">
+                    <div style="font-size: 2.5em;">🛡️</div>
+                    <div>
+                        <div style="font-size: 1.2em; font-weight: 700; color: #047857; margin-bottom: 5px;">
+                            Comprehensive Mesh Protection Active
+                        </div>
+                        <div style="color: #065f46; font-size: 0.95em; line-height: 1.6;">
+                            <strong>{total_protected} APs protected</strong> from power reduction:
+                            • {len(topology_data)} mesh child APs need HIGH power for TX back to parent<br>
+                            • {len(parent_aps)} parent APs need HIGH power for TX to mesh children<br>
+                            • Bidirectional signal strength (TX + RX) ensures reliable mesh connections
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+"""
+
+    return html
+
+
+def generate_ap_overview_html(ap_analysis, mesh_aps, all_devices=None):
     """Generate access points overview table with channel and power details"""
     aps = ap_analysis.get("access_points", [])
     if not aps:
         return ""
 
+    # Build device lookup for mesh parent detection
+    device_by_mac = {}
+    if all_devices:
+        device_by_mac = {d.get("mac"): d for d in all_devices if d.get("mac")}
+
+    # Identify which APs are mesh parents
+    mesh_parent_macs = set()
+    if all_devices:
+        for device in all_devices:
+            uplink = device.get("uplink", {})
+            if uplink.get("type") == "wireless":
+                parent_mac = uplink.get("uplink_remote_mac")
+                if parent_mac:
+                    mesh_parent_macs.add(parent_mac)
+
     rows = ""
     for ap in aps:
         name = ap.get("name", "Unknown")
         model = ap.get("model", "Unknown")
+        ap_mac = ap.get("mac")
         is_mesh = ap.get("_id") in [m.get("_id") for m in mesh_aps.get("mesh_aps", [])]
+        is_mesh_parent = ap_mac in mesh_parent_macs
         clients_ng = ap.get("num_sta", {}).get("ng", 0)
         clients_na = ap.get("num_sta", {}).get("na", 0)
         total_clients = clients_ng + clients_na
@@ -1401,25 +1630,42 @@ def generate_ap_overview_html(ap_analysis, mesh_aps):
                 na_power = power.capitalize() if power else "Auto"
                 na_width = f"{ht}MHz"
 
-        mesh_badge = '<span class="badge mesh">Mesh</span>' if is_mesh else ""
+        # Enhanced badges with styling
+        badges = ""
+        if is_mesh:
+            badges += '<span style="background: #fef3c7; color: #92400e; padding: 4px 12px; border-radius: 12px; font-size: 0.85em; font-weight: 600; margin-left: 8px;">🔗 Mesh Child</span>'
+        if is_mesh_parent:
+            badges += '<span style="background: #dbeafe; color: #1e40af; padding: 4px 12px; border-radius: 12px; font-size: 0.85em; font-weight: 600; margin-left: 8px;">📡 Mesh Parent</span>'
 
-        # Build 2.4GHz details
+        # Power protection indicator
+        power_protection = ""
+        if is_mesh or is_mesh_parent:
+            power_protection = '<div style="margin-top: 6px; color: #10b981; font-size: 0.85em;">🛡️ Power Protected</div>'
+
+        # Build 2.4GHz details with power highlighting
         ng_details = f"{ng_channel}" if ng_channel else "-"
         if ng_power or ng_width:
+            power_color = "#10b981" if ng_power == "High" else "#f59e0b" if ng_power == "Medium" else "#6b7280"
             ng_details += (
-                f"<br><span style='font-size: 0.85em; color: #666;'>{ng_power}, {ng_width}</span>"
+                f"<br><span style='font-size: 0.85em; color: {power_color}; font-weight: 600;'>{ng_power}</span>"
+                f"<span style='font-size: 0.85em; color: #666;'>, {ng_width}</span>"
             )
 
-        # Build 5GHz details
+        # Build 5GHz details with power highlighting
         na_details = f"{na_channel}" if na_channel else "-"
         if na_power or na_width:
+            power_color = "#10b981" if na_power == "High" else "#f59e0b" if na_power == "Medium" else "#6b7280"
             na_details += (
-                f"<br><span style='font-size: 0.85em; color: #666;'>{na_power}, {na_width}</span>"
+                f"<br><span style='font-size: 0.85em; color: {power_color}; font-weight: 600;'>{na_power}</span>"
+                f"<span style='font-size: 0.85em; color: #666;'>, {na_width}</span>"
             )
 
         rows += f"""
                     <tr>
-                        <td><strong>{name}</strong> {mesh_badge}</td>
+                        <td>
+                            <strong>{name}</strong>{badges}
+                            {power_protection}
+                        </td>
                         <td>{model}</td>
                         <td style="text-align: center;">{total_clients}</td>
                         <td>

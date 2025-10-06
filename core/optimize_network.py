@@ -719,8 +719,8 @@ def _generate_health_based_recommendations(aps, health_analysis):
                         uplink_rssi = ap.get("uplink", {}).get("rssi")
                         is_wireless_uplink = uplink_type == "wireless"
 
-                        is_mesh = (ap.get("adopted", False) and
-                                   (is_wireless_uplink or (uplink_rssi and uplink_rssi < -70)))
+                        is_mesh = (ap.get("adopted", False) and (
+                                   is_wireless_uplink or (uplink_rssi and uplink_rssi < -70)))
 
                         # Additional safety: Never reduce power if uplink RSSI is weak
                         has_weak_uplink = uplink_rssi and uplink_rssi < -65
@@ -820,9 +820,8 @@ def _generate_health_based_recommendations(aps, health_analysis):
                 uplink_rssi = ap.get("uplink", {}).get("rssi")
                 is_wireless_uplink = uplink_type == "wireless"
 
-                is_mesh = (ap.get("adopted", False) and
-                          (is_wireless_uplink or
-                           (uplink_rssi and uplink_rssi < -70)))
+                is_mesh = (ap.get("adopted", False) and (
+                    is_wireless_uplink or (uplink_rssi and uplink_rssi < -70)))
 
                 # Additional safety: Never reduce power if uplink RSSI is weak
                 has_weak_uplink = uplink_rssi and uplink_rssi < -65
@@ -973,6 +972,40 @@ def _generate_basic_recommendations(aps):
     # Build AP lookup for parent checking
     ap_by_mac = {ap.get("mac"): ap for ap in aps if ap.get("mac")}
 
+    # Build mesh topology summary
+    mesh_aps = []
+    mesh_parent_aps = set()
+    for ap in aps:
+        uplink_type = ap.get("uplink", {}).get("type", "")
+        uplink_rssi = ap.get("uplink", {}).get("rssi")
+        is_mesh = (ap.get("adopted", False) and (
+                   uplink_type == "wireless" or (uplink_rssi and uplink_rssi < -70)))
+        if is_mesh:
+            mesh_aps.append(ap)
+            parent_mac = ap.get("uplink", {}).get("uplink_remote_mac")
+            if parent_mac:
+                mesh_parent_aps.add(parent_mac)
+
+    # Display mesh topology summary if any mesh APs exist
+    if mesh_aps:
+        from rich.panel import Panel
+        mesh_summary_lines = [
+            f"[bold]Mesh Network Detected[/bold]",
+            f"",
+            f"[cyan]🔗 Mesh Child APs: {len(mesh_aps)}[/cyan]",
+            f"[blue]📡 Mesh Parent APs: {len(mesh_parent_aps)}[/blue]",
+            f"[green]🛡️  Protected APs: {len(mesh_aps) + len(mesh_parent_aps)}[/green]",
+            f"",
+            f"[dim]All mesh nodes maintain HIGH power for reliable wireless backhaul[/dim]"
+        ]
+        console.print(Panel(
+            "\n".join(mesh_summary_lines),
+            title="🔗 Mesh Topology",
+            border_style="cyan",
+            padding=(1, 2)
+        ))
+        console.print()
+
     # Analyze each AP
     for ap in aps:
         ap_name = ap.get("name", "Unnamed AP")
@@ -987,8 +1020,8 @@ def _generate_basic_recommendations(aps):
 
         # Enhanced mesh detection: wireless uplink is PRIMARY indicator
         # Only use RSSI as secondary check for very weak uplinks (< -70 dBm suggests wireless)
-        is_mesh = (ap.get("adopted", False) and
-                   (is_wireless_uplink or (uplink_rssi and uplink_rssi < -70)))
+        is_mesh = (ap.get("adopted", False) and (
+                   is_wireless_uplink or (uplink_rssi and uplink_rssi < -70)))
 
         mesh_label = " [MESH]" if is_mesh else ""
 
@@ -1011,17 +1044,50 @@ def _generate_basic_recommendations(aps):
         elif is_mesh and uplink_rssi:
             mesh_label = f" [MESH - Uplink: {uplink_rssi} dBm]"
 
-        console.print(f"[cyan]Analyzing: {ap_name}{mesh_label}[/cyan]")
-
-        # If mesh AP, show warning about power requirements (both sides of connection)
+        # Enhanced header with role indicators
+        is_mesh_parent = _is_mesh_parent(ap, aps)
+        role_badges = ""
         if is_mesh:
-            # Child side (RX): Weak RSSI means child isn't hearing parent well
-            if uplink_rssi and uplink_rssi < -70:
-                console.print(f"  [yellow]⚠️  Weak mesh uplink RSSI ({uplink_rssi} dBm)[/yellow]")
-                console.print(f"  [yellow]   → This AP needs HIGH power for TX (this → parent)[/yellow]")
-                console.print(f"  [yellow]   → Parent needs HIGH power for TX (parent → this)[/yellow]")
-            elif uplink_rssi:
-                console.print(f"  [dim]Mesh uplink: {uplink_rssi} dBm - maintaining power settings[/dim]")
+            role_badges += " [yellow]🔗 MESH-CHILD[/yellow]"
+        if is_mesh_parent:
+            role_badges += " [blue]📡 MESH-PARENT[/blue]"
+
+        console.print(f"\n[bold cyan]━━━ {ap_name} {role_badges} ━━━[/bold cyan]")
+        if mesh_label and "[MESH" in mesh_label:
+            console.print(f"[dim]{mesh_label}[/dim]")
+
+        # If mesh AP, show enhanced warning about power requirements (both sides of connection)
+        if is_mesh:
+            # Determine signal quality for visual feedback
+            if uplink_rssi:
+                if uplink_rssi > -65:
+                    signal_emoji = "🟢"
+                    signal_text = "Excellent"
+                    signal_color = "green"
+                elif uplink_rssi > -70:
+                    signal_emoji = "🔵"
+                    signal_text = "Good"
+                    signal_color = "cyan"
+                elif uplink_rssi > -75:
+                    signal_emoji = "🟡"
+                    signal_text = "Fair"
+                    signal_color = "yellow"
+                else:
+                    signal_emoji = "🔴"
+                    signal_text = "Weak"
+                    signal_color = "red"
+
+                console.print(f"  [{signal_color}]{signal_emoji} Uplink: {uplink_rssi} dBm ({signal_text})[/{signal_color}]")
+
+                # Enhanced bidirectional power requirements
+                if uplink_rssi < -70:
+                    console.print(f"  [yellow]⚠️  Bidirectional Power Requirements:[/yellow]")
+                    console.print(f"  [yellow]   ← RX: Child receiving weak signal from parent[/yellow]")
+                    console.print(f"  [yellow]   → TX: Child needs HIGH power to reach parent[/yellow]")
+                    console.print(f"  [yellow]   → TX: Parent needs HIGH power to reach child[/yellow]")
+                    console.print(f"  [green]   🛡️  Both APs protected from power reduction[/green]")
+                else:
+                    console.print(f"  [green]🛡️  Power Protected - Maintaining HIGH power for reliable mesh[/green]")
 
             # Parent side (TX): Show if parent has low power
             if parent_warning:
@@ -1054,7 +1120,7 @@ def _generate_basic_recommendations(aps):
                     }
                 )
             elif is_mesh_parent:
-                console.print(f"  [dim]→ This AP is a parent to mesh node(s) - maintaining HIGH power[/dim]")
+                console.print(f"  [green]🛡️  Mesh Parent - Maintaining HIGH power (TX → children)[/green]")
 
         console.print()
 
