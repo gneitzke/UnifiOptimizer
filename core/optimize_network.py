@@ -401,26 +401,36 @@ def analyze_network(client, site="default", lookback_days=3):
 
         console.print()
 
-        # Display Network Health Analysis
+        # Display Network Health Analysis - use the Grade-based scoring for consistency
+        health_score = analysis.get("health_score", {})
         health_analysis = analysis.get("health_analysis", {})
-        if health_analysis:
-            overall_score = health_analysis.get("overall_score", 100)
-            severity = health_analysis.get("severity", "low")
 
-            # Color code the score
-            if overall_score >= 90:
+        # Use the comprehensive health score with Grade
+        overall_score = health_score.get("score", 0)
+        grade = health_score.get("grade", "N/A")
+        status = health_score.get("status", "Unknown")
+
+        if overall_score and health_analysis:
+            # Color code based on grade for consistency
+            if grade == "A":
                 score_color = "green"
                 score_emoji = "✅"
-            elif overall_score >= 75:
+            elif grade == "B":
+                score_color = "blue"
+                score_emoji = "🔵"
+            elif grade == "C":
                 score_color = "yellow"
                 score_emoji = "⚠️"
-            else:
+            elif grade == "D":
+                score_color = "orange3"
+                score_emoji = "🟠"
+            else:  # F or N/A
                 score_color = "red"
                 score_emoji = "🔴"
 
             console.print(f"[bold cyan]🏥 Network Health Analysis[/bold cyan]")
             console.print(
-                f"  Overall Health Score: [{score_color}]{score_emoji} {overall_score}/100[/{score_color}]\n"
+                f"  Overall Health: [{score_color}]{score_emoji} Grade {grade} ({overall_score}/100) - {status}[/{score_color}]\n"
             )
 
             categories = health_analysis.get("categories", {})
@@ -1306,6 +1316,114 @@ def display_rssi_histogram(analysis):
     console.print()
 
 
+def display_airtime_trends(analysis):
+    """Display AP airtime utilization trends with sparklines"""
+    airtime_analysis = analysis.get("airtime_analysis", {})
+    time_series = airtime_analysis.get("time_series", {})
+
+    if not time_series:
+        return
+
+    from rich.table import Table
+
+    console.print("\n")
+    console.print(
+        Panel(
+            "[bold cyan]📊 Airtime Utilization Trends (24h)[/bold cyan]\n"
+            "Shows historical patterns - helps distinguish spikes from sustained high utilization",
+            style="cyan",
+        )
+    )
+    console.print()
+
+    # Create sparkline function
+    def create_sparkline(data_points, width=40):
+        """Create a simple ASCII sparkline"""
+        if not data_points or len(data_points) < 2:
+            return "No data"
+
+        values = [p["airtime_pct"] for p in data_points]
+        min_val = min(values)
+        max_val = max(values)
+
+        if max_val == min_val:
+            return "█" * width  # Flat line
+
+        # Map to spark characters
+        spark_chars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']
+
+        # Sample values to fit width
+        step = max(1, len(values) // width)
+        sampled = values[::step][:width]
+
+        sparkline = ""
+        for val in sampled:
+            normalized = (val - min_val) / (max_val - min_val)
+            idx = min(7, int(normalized * 8))
+            sparkline += spark_chars[idx]
+
+        return sparkline
+
+    # Display trends for each AP
+    table = Table(show_header=True, header_style="bold cyan", box=None)
+    table.add_column("AP", style="cyan", width=30)
+    table.add_column("Current", justify="right", width=8)
+    table.add_column("Avg", justify="right", width=6)
+    table.add_column("Peak", justify="right", width=6)
+    table.add_column("24h Trend", width=45)
+
+    for ap_key, data_points in sorted(time_series.items()):
+        if not data_points:
+            continue
+
+        # Calculate stats
+        airtime_values = [p["airtime_pct"] for p in data_points]
+        current = airtime_values[-1] if airtime_values else 0
+        avg = sum(airtime_values) / len(airtime_values) if airtime_values else 0
+        peak = max(airtime_values) if airtime_values else 0
+
+        # Color code based on current utilization
+        if current > 70:
+            current_color = "red"
+            status = "🔴"
+        elif current > 50:
+            current_color = "yellow"
+            status = "⚠️ "
+        else:
+            current_color = "green"
+            status = "✅"
+
+        # Create sparkline
+        sparkline = create_sparkline(data_points, width=40)
+
+        # Color the sparkline based on average
+        if avg > 70:
+            sparkline_display = f"[red]{sparkline}[/red]"
+        elif avg > 50:
+            sparkline_display = f"[yellow]{sparkline}[/yellow]"
+        else:
+            sparkline_display = f"[green]{sparkline}[/green]"
+
+        table.add_row(
+            ap_key,
+            f"[{current_color}]{status}{current:.0f}%[/{current_color}]",
+            f"{avg:.0f}%",
+            f"{peak:.0f}%",
+            sparkline_display
+        )
+
+    console.print(table)
+
+    # Add legend
+    console.print("\n[dim]Legend: ▁▂▃▄▅▆▇█ = airtime level  |  ✅ <50%  ⚠️  50-70%  🔴 >70%[/dim]")
+
+    # Show note if data is simulated
+    if airtime_analysis.get("time_series_note"):
+        console.print(f"\n[dim italic]{airtime_analysis['time_series_note']}[/dim italic]")
+
+    console.print()
+
+
 def display_quick_health_dashboard(analysis, recommendations):
     """Display a quick, scannable health dashboard at the top"""
     from rich.table import Table
@@ -1851,6 +1969,10 @@ Examples:
         if full_analysis:
             display_rssi_histogram(full_analysis)
 
+        # Show airtime trends
+        if full_analysis:
+            display_airtime_trends(full_analysis)
+
         # Show recommendations
         display_recommendations(recommendations)
 
@@ -1888,6 +2010,10 @@ Examples:
         # Show RSSI histogram
         if full_analysis:
             display_rssi_histogram(full_analysis)
+
+        # Show airtime trends
+        if full_analysis:
+            display_airtime_trends(full_analysis)
 
         # Show recommendations
         display_recommendations(recommendations)
