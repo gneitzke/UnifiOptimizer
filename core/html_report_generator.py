@@ -543,8 +543,9 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
 
     # Network Health Analysis Section
     health_analysis = analysis_data.get("health_analysis")
+    health_score = analysis_data.get("health_score")  # Get Grade-based score
     if health_analysis:
-        html_content += generate_network_health_html(health_analysis)
+        html_content += generate_network_health_html(health_analysis, health_score)
 
     # Key Metrics Section
     html_content += generate_key_metrics_html(analysis_data, client_health)
@@ -1150,38 +1151,75 @@ def generate_key_metrics_html(analysis_data, client_health):
 """
 
 
-def generate_network_health_html(health_analysis):
-    """Generate comprehensive network health analysis section"""
+def generate_network_health_html(health_analysis, health_score=None):
+    """Generate comprehensive network health analysis section
+
+    Args:
+        health_analysis: Issue-based health analysis
+        health_score: Grade-based health score (A-F) for consistency
+    """
     if not health_analysis:
         return ""
 
-    overall_score = health_analysis.get("overall_score", 100)
-    severity = health_analysis.get("severity", "low")
     categories = health_analysis.get("categories", {})
     issues = health_analysis.get("issues", [])
     recommendations = health_analysis.get("recommendations", [])
 
-    # Determine score color and status
-    if overall_score >= 90:
-        score_color = "#10b981"
-        score_bg = "#d1fae5"
-        status_text = "Excellent"
-        status_emoji = "✅"
-    elif overall_score >= 75:
-        score_color = "#f59e0b"
-        score_bg = "#fef3c7"
-        status_text = "Good"
-        status_emoji = "⚠️"
-    elif overall_score >= 50:
-        score_color = "#ef4444"
-        score_bg = "#fee2e2"
-        status_text = "Fair"
-        status_emoji = "🔴"
+    # Use Grade-based scoring for consistency if available
+    if health_score and health_score.get("score") is not None:
+        overall_score = health_score.get("score", 0)
+        grade = health_score.get("grade", "N/A")
+        status_text = health_score.get("status", "Unknown")
+
+        # Color code based on Grade for consistency
+        if grade == "A":
+            score_color = "#10b981"
+            score_bg = "#d1fae5"
+            status_emoji = "✅"
+        elif grade == "B":
+            score_color = "#3b82f6"
+            score_bg = "#dbeafe"
+            status_emoji = "🔵"
+        elif grade == "C":
+            score_color = "#f59e0b"
+            score_bg = "#fef3c7"
+            status_emoji = "⚠️"
+        elif grade == "D":
+            score_color = "#f97316"
+            score_bg = "#ffedd5"
+            status_emoji = "🟠"
+        else:  # F or N/A
+            score_color = "#ef4444"
+            score_bg = "#fee2e2"
+            status_emoji = "🔴"
+
+        grade_display = f" (Grade {grade})"
     else:
-        score_color = "#dc2626"
-        score_bg = "#fecaca"
-        status_text = "Poor"
-        status_emoji = "🔴"
+        # Fallback to old simple scoring if Grade not available
+        overall_score = health_analysis.get("overall_score", 100)
+        status_text = "Unknown"
+        grade_display = ""
+
+        if overall_score >= 90:
+            score_color = "#10b981"
+            score_bg = "#d1fae5"
+            status_text = "Excellent"
+            status_emoji = "✅"
+        elif overall_score >= 75:
+            score_color = "#f59e0b"
+            score_bg = "#fef3c7"
+            status_text = "Good"
+            status_emoji = "⚠️"
+        elif overall_score >= 50:
+            score_color = "#ef4444"
+            score_bg = "#fee2e2"
+            status_text = "Fair"
+            status_emoji = "🔴"
+        else:
+            score_color = "#dc2626"
+            score_bg = "#fecaca"
+            status_text = "Poor"
+            status_emoji = "🔴"
 
     # Build HTML
     html = f"""
@@ -1193,7 +1231,7 @@ def generate_network_health_html(health_analysis):
                     <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 20px;">
                         <div>
                             <div style="font-size: 3em; font-weight: bold; color: {score_color}; margin-bottom: 10px;">
-                                {status_emoji} {overall_score}/100
+                                {status_emoji} {overall_score}/100{grade_display}
                             </div>
                             <div style="font-size: 1.3em; color: {score_color}; font-weight: 600;">
                                 Overall Network Health: {status_text}
