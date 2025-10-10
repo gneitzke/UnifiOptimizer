@@ -84,18 +84,7 @@ jobs:
         grep -q "hourly_data_cache" core/switch_analyzer.py && echo "✅ Cache still implemented" || (echo "❌ Cache removed!" && exit 1)
 
         # Check execution order
-        python -c "
-import re
-with open('core/advanced_analyzer.py') as f:
-    content = f.read()
-    history_pos = content.find('analyze_switch_port_history')
-    switches_pos = content.find('analyze_switches()')
-    if history_pos < switches_pos and history_pos > 0:
-        print('✅ Execution order still correct')
-    else:
-        print('❌ Execution order broken!')
-        exit(1)
-        " || exit 1
+        python -c "import re; content = open('core/advanced_analyzer.py').read(); history_pos = content.find('analyze_switch_port_history'); switches_pos = content.find('analyze_switches()'); exit(0 if (history_pos < switches_pos and history_pos > 0) else 1); print('✅ Execution order still correct' if (history_pos < switches_pos and history_pos > 0) else '❌ Execution order broken')" || exit 1
 
     - name: Comment PR Summary
       if: always()

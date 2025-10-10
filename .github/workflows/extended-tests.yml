@@ -83,20 +83,7 @@ jobs:
 
     - name: Check Module Load Times
       run: |
-        python -c "
-import time
-start = time.time()
-from core.advanced_analyzer import ExpertNetworkAnalyzer
-from core.switch_analyzer import SwitchAnalyzer
-from core.html_report_generator import generate_html_report
-end = time.time()
-load_time = end - start
-print(f'Module load time: {load_time:.3f}s')
-if load_time > 2.0:
-    print('⚠️ Module load time is slow')
-else:
-    print('✅ Module load time is acceptable')
-        "
+        python -c "import time; start = time.time(); from core.advanced_analyzer import ExpertNetworkAnalyzer; from core.switch_analyzer import SwitchAnalyzer; from core.html_report_generator import generate_html_report; end = time.time(); load_time = end - start; print(f'Module load time: {load_time:.3f}s'); print('⚠️ Module load time is slow' if load_time > 2.0 else '✅ Module load time is acceptable')"
 
   documentation-check:
     name: Documentation Validation
