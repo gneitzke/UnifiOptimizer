@@ -78,7 +78,7 @@ jobs:
     - name: Check for Mesh RSSI Protection
       run: |
         echo "Verifying mesh RSSI protection is intact..."
-        grep -r "Skip.*mesh.*min.*rssi\|EXCLUDED.*mesh" core/advanced_analyzer.py && echo "✅ Mesh protection found" || exit 1
+        grep -E "Skip.*recommendation.*mesh|Mesh.*EXCLUDED.*min.*RSSI" core/advanced_analyzer.py && echo "✅ Mesh protection found" || exit 1
 
     - name: Validate Configuration Templates
       run: |
