@@ -3974,13 +3974,17 @@ def generate_switch_analysis_html(switch_analysis, switch_port_history=None):
                         unit = "packets/day"
                     else:
                         # Hourly data: show time labels and packet loss percentage
-                        labels = [h["datetime"].split("T")[1].split(":")[0] + ":00" for h in history]
+                        labels = [
+                            h["datetime"].split("T")[1].split(":")[0] + ":00" for h in history
+                        ]
                         packet_loss_data = [h["packet_loss_pct"] for h in history]
                         error_rate_data = [h["error_rate"] for h in history]
                         timeframe_label = "24-Hour History"
                         max_val = max(packet_loss_data) if packet_loss_data else 0
                         min_val = min(packet_loss_data) if packet_loss_data else 0
-                        avg_val = sum(packet_loss_data) / len(packet_loss_data) if packet_loss_data else 0
+                        avg_val = (
+                            sum(packet_loss_data) / len(packet_loss_data) if packet_loss_data else 0
+                        )
                         unit = "%"
 
                     # Build dataset configuration based on data type
@@ -4039,7 +4043,9 @@ def generate_switch_analysis_html(switch_analysis, switch_port_history=None):
                                     pointHoverRadius: 5
                                 }});
 """
-                        tooltip_format = "context.dataset.label + ': ' + context.parsed.y.toFixed(3) + '%'"
+                        tooltip_format = (
+                            "context.dataset.label + ': ' + context.parsed.y.toFixed(3) + '%'"
+                        )
                         x_axis_label = "Time (24h)"
                         y_axis_label = "Percentage (%)"
 

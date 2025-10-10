@@ -24,6 +24,9 @@ jobs:
       run: |
         pip install -r requirements.txt
 
+    - name: Add to PYTHONPATH
+      run: echo "PYTHONPATH=$PYTHONPATH:$PWD" >> $GITHUB_ENV
+
     - name: Run Full Test Suite
       run: |
         python -m py_compile optimizer.py

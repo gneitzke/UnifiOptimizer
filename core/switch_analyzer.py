@@ -494,16 +494,19 @@ class SwitchAnalyzer:
             # If aggregate_by_day is True, group by day and sum the dropped packets
             if aggregate_by_day:
                 from collections import defaultdict
-                daily_data = defaultdict(lambda: {
-                    "rx_dropped": 0,
-                    "tx_dropped": 0,
-                    "total_dropped": 0,
-                    "rx_errors": 0,
-                    "tx_errors": 0,
-                    "packet_loss_pct_sum": 0,
-                    "error_rate_sum": 0,
-                    "count": 0
-                })
+
+                daily_data = defaultdict(
+                    lambda: {
+                        "rx_dropped": 0,
+                        "tx_dropped": 0,
+                        "total_dropped": 0,
+                        "rx_errors": 0,
+                        "tx_errors": 0,
+                        "packet_loss_pct_sum": 0,
+                        "error_rate_sum": 0,
+                        "count": 0,
+                    }
+                )
 
                 # Group by date (YYYY-MM-DD)
                 for entry in port_data:
@@ -520,18 +523,28 @@ class SwitchAnalyzer:
                 # Convert to list with averaged percentages
                 port_data = []
                 for date_str, data in sorted(daily_data.items()):
-                    port_data.append({
-                        "date": date_str,
-                        "datetime": date_str,
-                        "rx_dropped": data["rx_dropped"],
-                        "tx_dropped": data["tx_dropped"],
-                        "total_dropped": data["total_dropped"],
-                        "rx_errors": data["rx_errors"],
-                        "tx_errors": data["tx_errors"],
-                        "packet_loss_pct": round(data["packet_loss_pct_sum"] / data["count"], 3) if data["count"] > 0 else 0,
-                        "error_rate": round(data["error_rate_sum"] / data["count"], 3) if data["count"] > 0 else 0,
-                        "hours_counted": data["count"]
-                    })
+                    port_data.append(
+                        {
+                            "date": date_str,
+                            "datetime": date_str,
+                            "rx_dropped": data["rx_dropped"],
+                            "tx_dropped": data["tx_dropped"],
+                            "total_dropped": data["total_dropped"],
+                            "rx_errors": data["rx_errors"],
+                            "tx_errors": data["tx_errors"],
+                            "packet_loss_pct": (
+                                round(data["packet_loss_pct_sum"] / data["count"], 3)
+                                if data["count"] > 0
+                                else 0
+                            ),
+                            "error_rate": (
+                                round(data["error_rate_sum"] / data["count"], 3)
+                                if data["count"] > 0
+                                else 0
+                            ),
+                            "hours_counted": data["count"],
+                        }
+                    )
 
             return port_data
 

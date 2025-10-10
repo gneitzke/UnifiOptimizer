@@ -1845,7 +1845,9 @@ def display_executive_summary(analysis, recommendations, lookback_days):
     console.print()
 
 
-def apply_recommendations(client, recommendations, dry_run=False, interactive=True, analysis_data=None):
+def apply_recommendations(
+    client, recommendations, dry_run=False, interactive=True, analysis_data=None
+):
     """Apply recommendations with approval"""
 
     if dry_run:
@@ -1919,7 +1921,9 @@ def apply_recommendations(client, recommendations, dry_run=False, interactive=Tr
                 # Apply to all radios (recommended approach)
                 values = rec.get("values")  # Optional: per-band values
                 strategy = rec.get("strategy")  # May be None, will prompt if interactive
-                if applier.apply_min_rssi_all_bands(device, rec["new_enabled"], values, strategy, ios_device_count):
+                if applier.apply_min_rssi_all_bands(
+                    device, rec["new_enabled"], values, strategy, ios_device_count
+                ):
                     devices_to_restart.add(device_id)
 
     # Restart APs that had configuration changes
@@ -2204,7 +2208,11 @@ Examples:
 
         # Apply recommendations (dry-run or real)
         apply_recommendations(
-            client, recommendations, dry_run=args.dry_run, interactive=interactive, analysis_data=full_analysis
+            client,
+            recommendations,
+            dry_run=args.dry_run,
+            interactive=interactive,
+            analysis_data=full_analysis,
         )
 
         # Show executive summary LAST so it stays on screen with apply results

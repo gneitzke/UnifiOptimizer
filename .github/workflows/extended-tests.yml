@@ -25,6 +25,9 @@ jobs:
         pip install -r requirements.txt
         pip install pytest pytest-cov pytest-mock
 
+    - name: Add to PYTHONPATH
+      run: echo "PYTHONPATH=$PYTHONPATH:$PWD" >> $GITHUB_ENV
+
     - name: Run Advanced Tests
       run: |
         echo "Running advanced feature tests..."
@@ -58,9 +61,12 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
+    - name: Add to PYTHONPATH
+      run: echo "PYTHONPATH=$PYTHONPATH:$PWD" >> $GITHUB_ENV
+
     - name: Test Core Imports
       run: |
-        python -c "from core.advanced_analyzer import ExpertNetworkAnalyzer"
+        python -c "from core.advanced_analyzer import AdvancedNetworkAnalyzer"
         python -c "from core.switch_analyzer import SwitchAnalyzer"
         python -c "from api.cloudkey_gen2_client import CloudKeyGen2Client"
 
@@ -81,9 +87,12 @@ jobs:
         pip install -r requirements.txt
         pip install memory_profiler line_profiler
 
+    - name: Add to PYTHONPATH
+      run: echo "PYTHONPATH=$PYTHONPATH:$PWD" >> $GITHUB_ENV
+
     - name: Check Module Load Times
       run: |
-        python -c "import time; start = time.time(); from core.advanced_analyzer import ExpertNetworkAnalyzer; from core.switch_analyzer import SwitchAnalyzer; from core.html_report_generator import generate_html_report; end = time.time(); load_time = end - start; print(f'Module load time: {load_time:.3f}s'); print('⚠️ Module load time is slow' if load_time > 2.0 else '✅ Module load time is acceptable')"
+        python -c "import time; start = time.time(); from core.advanced_analyzer import AdvancedNetworkAnalyzer; from core.switch_analyzer import SwitchAnalyzer; from core.html_report_generator import generate_html_report; end = time.time(); load_time = end - start; print(f'Module load time: {load_time:.3f}s'); print('⚠️ Module load time is slow' if load_time > 2.0 else '✅ Module load time is acceptable')"
 
   documentation-check:
     name: Documentation Validation

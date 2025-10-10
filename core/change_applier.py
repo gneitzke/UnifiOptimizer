@@ -146,12 +146,14 @@ class ChangeApplier:
             return self.min_rssi_strategy_selected
 
         console.print("\n")
-        console.print(Panel(
-            "[bold yellow]MIN RSSI STRATEGY SELECTION[/bold yellow]\n\n"
-            "Choose how aggressively clients should be forced to roam to better APs.\n"
-            f"{'[bold red]⚠️  ' + str(ios_device_count) + ' iOS devices detected on your network[/bold red]' if ios_device_count > 0 else ''}",
-            style="yellow"
-        ))
+        console.print(
+            Panel(
+                "[bold yellow]MIN RSSI STRATEGY SELECTION[/bold yellow]\n\n"
+                "Choose how aggressively clients should be forced to roam to better APs.\n"
+                f"{'[bold red]⚠️  ' + str(ios_device_count) + ' iOS devices detected on your network[/bold red]' if ios_device_count > 0 else ''}",
+                style="yellow",
+            )
+        )
 
         # Build comparison table
         table = Table(show_header=True, header_style="bold cyan", show_lines=True)
@@ -162,50 +164,50 @@ class ChangeApplier:
         table.add_row(
             "[bold]Description[/bold]",
             "Forces clients to move to better APs early for best performance",
-            "Lets clients stay connected longer for maximum reliability"
+            "Lets clients stay connected longer for maximum reliability",
         )
 
         table.add_row(
             "[bold]Typical Values[/bold]",
             "2.4GHz: -75 dBm\n5GHz: -72 dBm\n6GHz: -70 dBm",
-            "2.4GHz: -80 dBm\n5GHz: -77 dBm\n6GHz: -75 dBm"
+            "2.4GHz: -80 dBm\n5GHz: -77 dBm\n6GHz: -75 dBm",
         )
 
         table.add_row(
             "[green]✅ PROS[/green]",
             "• Better performance\n• Faster roaming\n• Less congestion\n• Optimal for dense APs",
-            "• Fewer disconnects\n• Better for iOS devices\n• Works with sparse coverage\n• More stable overall"
+            "• Fewer disconnects\n• Better for iOS devices\n• Works with sparse coverage\n• More stable overall",
         )
 
         table.add_row(
             "[red]⚠️  CONS[/red]",
             "• More disconnects at edges\n• iOS devices may struggle\n• Needs good coverage",
-            "• Clients stay on distant APs\n• Lower throughput potential\n• More 'sticky client' issues"
+            "• Clients stay on distant APs\n• Lower throughput potential\n• More 'sticky client' issues",
         )
 
         table.add_row(
             "[bold]Best For[/bold]",
             "Dense AP deployment\nAndroid/Windows-heavy\nPerformance priority",
-            "Sparse AP coverage\niOS/iPhone-heavy networks\nStability priority"
+            "Sparse AP coverage\niOS/iPhone-heavy networks\nStability priority",
         )
 
         console.print(table)
         console.print()
 
         if ios_device_count > 0:
-            console.print(Panel(
-                f"[yellow]🍎 Recommendation:[/yellow] With {ios_device_count} iOS devices detected, "
-                "[bold yellow]Max Connectivity[/bold yellow] may provide better stability.\n"
-                "However, [bold green]Optimal[/bold green] can work if you have good AP coverage.",
-                style="yellow"
-            ))
+            console.print(
+                Panel(
+                    f"[yellow]🍎 Recommendation:[/yellow] With {ios_device_count} iOS devices detected, "
+                    "[bold yellow]Max Connectivity[/bold yellow] may provide better stability.\n"
+                    "However, [bold green]Optimal[/bold green] can work if you have good AP coverage.",
+                    style="yellow",
+                )
+            )
             console.print()
 
         # Prompt for choice
         choice = Prompt.ask(
-            "Select strategy",
-            choices=["1", "2"],
-            default="1" if ios_device_count == 0 else "2"
+            "Select strategy", choices=["1", "2"], default="1" if ios_device_count == 0 else "2"
         )
 
         if choice == "1":
@@ -607,7 +609,9 @@ class ChangeApplier:
                 )
                 return False
 
-    def apply_min_rssi_all_bands(self, device, new_enabled=True, values=None, strategy=None, ios_device_count=0):
+    def apply_min_rssi_all_bands(
+        self, device, new_enabled=True, values=None, strategy=None, ios_device_count=0
+    ):
         """
         Apply minimum RSSI configuration to ALL radios/bands on an AP
 
