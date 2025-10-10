@@ -34,10 +34,7 @@ jobs:
     - name: Test Report Generation
       run: |
         echo "Testing report generation..."
-        python -c "
-from core.html_report_generator import generate_html_report
-print('✅ HTML generator can be imported')
-        "
+        python -c "from core.html_report_generator import generate_html_report; print('✅ HTML generator can be imported')"
 
   compatibility-check:
     name: Python Compatibility Check
