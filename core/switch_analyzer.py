@@ -886,9 +886,17 @@ class SwitchAnalyzer:
                     avg_loss = sum(loss_values) / len(loss_values) if loss_values else 0
                     max_loss = max(loss_values) if loss_values else 0
                     min_loss = min(loss_values) if loss_values else 0
+                    
+                    # Calculate total dropped packets over the period
+                    total_dropped_values = [h["total_dropped"] for h in hourly_data]
+                    total_dropped_sum = sum(total_dropped_values) if total_dropped_values else 0
+                    avg_dropped_per_hour = total_dropped_sum / len(total_dropped_values) if total_dropped_values else 0
 
-                    # Only track ports with significant packet loss (>0.1%)
-                    if avg_loss < 0.1:
+                    # Track ports with significant packet loss:
+                    # - High percentage (>0.1% average loss), OR
+                    # - High absolute count (>1000 drops per hour average)
+                    # This catches both low-traffic ports with high % and high-traffic ports with many drops
+                    if avg_loss < 0.1 and avg_dropped_per_hour < 1000:
                         continue
 
                     results["summary"]["total_ports_analyzed"] += 1
