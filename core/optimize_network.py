@@ -404,7 +404,7 @@ def analyze_network(client, site="default", lookback_days=3):
         switch_port_history = advanced_analysis.get("switch_port_history", {})
         if switch_port_history:
             summary = switch_port_history.get("summary", {})
-            
+
             # Always show the section header if we have summary data
             if summary.get("ports_with_loss", 0) > 0:
                 trends = switch_port_history.get("trends", {})
