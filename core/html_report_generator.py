@@ -508,6 +508,7 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
             }}
         }}
     </style>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
 <body>
     <div class="container">
