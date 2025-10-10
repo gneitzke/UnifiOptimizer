@@ -540,11 +540,11 @@ class ChangeApplier:
 
         # Default recommended values per band
         default_values = {
-            'ng': -75,   # 2.4GHz
-            'na': -72,   # 5GHz
-            '6e': -70,   # 6GHz
-            'ax': -70,   # 6GHz (alternate name)
-            '6g': -70,   # 6GHz (alternate name)
+            "ng": -75,  # 2.4GHz
+            "na": -72,  # 5GHz
+            "6e": -70,  # 6GHz
+            "ax": -70,  # 6GHz (alternate name)
+            "6g": -70,  # 6GHz (alternate name)
         }
 
         if values is None:
@@ -567,7 +567,9 @@ class ChangeApplier:
             console.print(f"[green]✓ Min RSSI configured on all {total_radios} radios![/green]")
             return True
         elif success_count > 0:
-            console.print(f"[yellow]⚠ Min RSSI configured on {success_count}/{total_radios} radios[/yellow]")
+            console.print(
+                f"[yellow]⚠ Min RSSI configured on {success_count}/{total_radios} radios[/yellow]"
+            )
             return False
         else:
             console.print(f"[red]✗ Failed to configure Min RSSI on any radio[/red]")
@@ -627,17 +629,11 @@ class ChangeApplier:
                 if soft_restart:
                     # Soft restart: POST to restart endpoint
                     cmd_data = {"mac": device_mac, "cmd": "restart"}
-                    result = self.client.post(
-                        f"s/{self.client.site}/cmd/devmgr",
-                        cmd_data
-                    )
+                    result = self.client.post(f"s/{self.client.site}/cmd/devmgr", cmd_data)
                 else:
                     # Hard restart: POST to power-cycle endpoint
                     cmd_data = {"mac": device_mac, "cmd": "power-cycle"}
-                    result = self.client.post(
-                        f"s/{self.client.site}/cmd/devmgr",
-                        cmd_data
-                    )
+                    result = self.client.post(f"s/{self.client.site}/cmd/devmgr", cmd_data)
 
                 if result:
                     console.print(f"[green]✓ Restart command sent to {device_name}![/green]")
