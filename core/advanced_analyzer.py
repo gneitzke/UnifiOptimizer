@@ -829,6 +829,112 @@ class AdvancedNetworkAnalyzer:
 
         return results
 
+    def analyze_mesh_necessity(self, devices):
+        """
+        Analyze if mesh configuration is needed or can be optimized
+
+        Checks:
+        - Are any APs actually using wireless mesh?
+        - Are all APs wired (PoE)?
+        - Should mesh be disabled for performance?
+
+        Benefits of disabling mesh when not needed:
+        - Reduced radio overhead (no mesh beaconing)
+        - Better client performance (less airtime used for mesh)
+        - Simplified network management
+        - Lower power consumption
+
+        Trade-offs:
+        - Flexibility: Can't quickly add wireless mesh APs without re-enabling
+        - Redundancy: Mesh can provide backup if wired uplink fails (if supported by model)
+
+        Args:
+            devices: List of AP device dicts
+
+        Returns:
+            dict: Analysis results with recommendations
+        """
+        results = {
+            "mesh_enabled_site_wide": None,  # Cannot determine from device API alone
+            "mesh_aps_count": 0,
+            "wired_aps_count": 0,
+            "mesh_aps": [],
+            "wired_aps": [],
+            "recommendations": [],
+            "severity": "ok",
+        }
+
+        try:
+            aps = [d for d in devices if d.get("type") == "uap"]
+
+            for ap in aps:
+                ap_name = ap.get("name", "Unnamed AP")
+                uplink_type = ap.get("uplink", {}).get("type", "wire")
+                is_mesh = uplink_type == "wireless"
+                uplink_rssi = ap.get("uplink", {}).get("rssi")
+
+                if is_mesh:
+                    results["mesh_aps_count"] += 1
+                    results["mesh_aps"].append(
+                        {
+                            "name": ap_name,
+                            "uplink_rssi": uplink_rssi,
+                            "mac": ap.get("mac"),
+                        }
+                    )
+                else:
+                    results["wired_aps_count"] += 1
+                    results["wired_aps"].append(
+                        {
+                            "name": ap_name,
+                            "mac": ap.get("mac"),
+                        }
+                    )
+
+            # If NO mesh APs are detected, recommend disabling mesh
+            if results["mesh_aps_count"] == 0 and results["wired_aps_count"] > 0:
+                results["recommendations"].append(
+                    {
+                        "type": "disable_unused_mesh",
+                        "message": f"All {results['wired_aps_count']} APs are wired (PoE) - mesh not in use",
+                        "recommendation": (
+                            "Consider disabling mesh/wireless uplink in site settings to reduce radio overhead and improve client performance. "
+                            "This frees up airtime currently used for mesh beaconing."
+                        ),
+                        "priority": "low",
+                        "benefits": [
+                            "Reduced radio overhead (no mesh beaconing)",
+                            "More airtime for client traffic",
+                            "Simplified network management",
+                            "Slightly lower power consumption",
+                        ],
+                        "tradeoffs": [
+                            "Cannot quickly deploy wireless mesh APs without re-enabling",
+                            "Loss of potential wired uplink failover (model-dependent)",
+                        ],
+                        "best_for": "Networks where all APs are hardwired via PoE and mesh won't be needed",
+                        "not_recommended_if": "Planning to add mesh APs or want failover flexibility",
+                    }
+                )
+                results["severity"] = "info"
+            elif results["mesh_aps_count"] > 0:
+                # Mesh is actively used - note this in results
+                results["recommendations"].append(
+                    {
+                        "type": "mesh_in_use",
+                        "message": f"{results['mesh_aps_count']} AP(s) using wireless mesh - mesh configuration is needed",
+                        "recommendation": "Mesh is actively used and should remain enabled. Ensure mesh APs have optimal uplink signal.",
+                        "priority": "info",
+                        "mesh_aps": results["mesh_aps"],
+                    }
+                )
+                results["severity"] = "ok"
+
+        except Exception as e:
+            results["error"] = str(e)
+
+        return results
+
     def analyze_min_rssi(self, devices, clients=None, strategy="optimal"):
         """
         Analyze minimum RSSI configuration across APs
@@ -895,34 +1001,38 @@ class AdvancedNetworkAnalyzer:
         # These values balance roaming aggressiveness with connection stability
         # Sources: Cisco WLAN Design Guide, Aruba Best Practices, UniFi recommendations
 
-        # Standard thresholds (no iOS devices or very few)
-        RECOMMENDED_MIN_RSSI_24GHZ = -75  # 2.4GHz: -75 to -80 dBm typical range
-        RECOMMENDED_MIN_RSSI_5GHZ = -72  # 5GHz: -70 to -75 dBm typical range
-        RECOMMENDED_MIN_RSSI_6GHZ = -70  # 6GHz: -68 to -72 dBm (worse propagation than 5GHz)
+        # AGGRESSIVE thresholds (Optimal strategy - forces early roaming for performance)
+        OPTIMAL_MIN_RSSI_24GHZ = -75  # 2.4GHz: Aggressive roaming
+        OPTIMAL_MIN_RSSI_5GHZ = -72  # 5GHz: Aggressive roaming
+        OPTIMAL_MIN_RSSI_6GHZ = (
+            -70
+        )  # 6GHz: Aggressive roaming (6GHz needs stronger signal due to poor propagation, line-of-sight sensitive)
 
-        # iOS-friendly thresholds (when iOS devices detected)
-        # iPhone/iPad devices disconnect more frequently with aggressive thresholds
-        IOS_FRIENDLY_MIN_RSSI_24GHZ = -78  # 2.4GHz: More tolerant for iOS
-        IOS_FRIENDLY_MIN_RSSI_5GHZ = -75  # 5GHz: More tolerant for iOS
-        IOS_FRIENDLY_MIN_RSSI_6GHZ = -72  # 6GHz: More tolerant (poor penetration + iOS sensitivity)
+        # CONSERVATIVE thresholds (Max Connectivity strategy - stays connected longer)
+        # These are MORE NEGATIVE (weaker signal) = client can stay connected longer
+        CONSERVATIVE_MIN_RSSI_24GHZ = -80  # 2.4GHz: Maximum connectivity
+        CONSERVATIVE_MIN_RSSI_5GHZ = -77  # 5GHz: Maximum connectivity
+        CONSERVATIVE_MIN_RSSI_6GHZ = (
+            -75
+        )  # 6GHz: Maximum connectivity (6GHz degrades quickly below -75, line-of-sight critical)
 
-        # Select thresholds based on client mix
-        # If >20% of clients are iOS, use iOS-friendly thresholds
+        # Calculate iOS percentage for recommendations
         total_clients = len(clients) if clients else 0
         ios_percentage = (ios_count / total_clients * 100) if total_clients > 0 else 0
-        use_ios_friendly = ios_percentage > 20
 
-        # Choose thresholds
-        if use_ios_friendly:
-            recommended_24 = IOS_FRIENDLY_MIN_RSSI_24GHZ
-            recommended_5 = IOS_FRIENDLY_MIN_RSSI_5GHZ
-            recommended_6 = IOS_FRIENDLY_MIN_RSSI_6GHZ
-            threshold_type = "iOS-friendly"
-        else:
-            recommended_24 = RECOMMENDED_MIN_RSSI_24GHZ
-            recommended_5 = RECOMMENDED_MIN_RSSI_5GHZ
-            recommended_6 = RECOMMENDED_MIN_RSSI_6GHZ
-            threshold_type = "standard"
+        # Choose thresholds based on STRATEGY parameter (user's choice)
+        if strategy == "max_connectivity":
+            # CONSERVATIVE: Stay connected as long as possible
+            recommended_24 = CONSERVATIVE_MIN_RSSI_24GHZ
+            recommended_5 = CONSERVATIVE_MIN_RSSI_5GHZ
+            recommended_6 = CONSERVATIVE_MIN_RSSI_6GHZ
+            threshold_type = "conservative"
+        else:  # strategy == "optimal" (default)
+            # AGGRESSIVE: Force early roaming for better performance
+            recommended_24 = OPTIMAL_MIN_RSSI_24GHZ
+            recommended_5 = OPTIMAL_MIN_RSSI_5GHZ
+            recommended_6 = OPTIMAL_MIN_RSSI_6GHZ
+            threshold_type = "optimal"
 
         results["threshold_type"] = threshold_type
         results["ios_percentage"] = ios_percentage
@@ -933,9 +1043,12 @@ class AdvancedNetworkAnalyzer:
         # - iOS-heavy networks: -75 to -78 dBm (prevents iPhone disconnect issues)
         # - Large coverage areas: -75 to -80 dBm (avoid premature disconnects)
         #
-        # 6GHz-specific considerations:
-        # - Worse propagation than 5GHz (less wall penetration)
-        # - Requires gentler thresholds: -70 dBm standard, -72 dBm iOS-friendly
+        # 6GHz-specific considerations (CRITICAL - line-of-sight sensitive!):
+        # - MUCH worse propagation than 5GHz (~30-50% less range)
+        # - Poor wall penetration - highly line-of-sight dependent
+        # - Optimal: -68 dBm (ensures good throughput before roaming)
+        # - Conservative: -72 dBm (realistic limit for usable performance)
+        # - Beyond -72 dBm, 6GHz throughput degrades rapidly
         # - Monitor client RSSI carefully (< -70 dBm = edge of coverage)
 
         try:
@@ -1203,8 +1316,11 @@ class AdvancedNetworkAnalyzer:
                         if min_rssi_value and abs(min_rssi_value - recommended) > 10:
                             # Build recommendation message
                             rec_msg = f"Consider adjusting to {recommended} dBm"
-                            if use_ios_friendly:
-                                rec_msg += f" ({threshold_type} - {ios_count} iOS devices detected)"
+                            if ios_count > 0 or strategy == "max_connectivity":
+                                rec_msg += f" ({threshold_type} strategy"
+                                if ios_count > 0:
+                                    rec_msg += f" - {ios_count} iOS devices detected"
+                                rec_msg += ")"
 
                             results["recommendations"].append(
                                 {
@@ -1217,12 +1333,17 @@ class AdvancedNetworkAnalyzer:
                                     "priority": "low",
                                     "current_value": min_rssi_value,
                                     "recommended_value": recommended,
-                                    "ios_friendly": use_ios_friendly,
+                                    "strategy": strategy,
                                 }
                             )
 
                         # Warn if using aggressive threshold with iOS devices
-                        elif use_ios_friendly and min_rssi_value and min_rssi_value >= -72:
+                        elif (
+                            strategy == "optimal"
+                            and ios_percentage > 20
+                            and min_rssi_value
+                            and min_rssi_value >= -72
+                        ):
                             results["recommendations"].append(
                                 {
                                     "type": "min_rssi_ios_warning",
@@ -1328,10 +1449,11 @@ class AdvancedNetworkAnalyzer:
 
                         # Build recommendation message
                         rec_msg = f"Enable min RSSI at {recommended} dBm to improve roaming"
-                        if use_ios_friendly:
-                            rec_msg += (
-                                f" ({threshold_type} - optimized for {ios_count} iOS devices)"
-                            )
+                        if ios_count > 0 or strategy == "max_connectivity":
+                            rec_msg += f" ({threshold_type} strategy"
+                            if ios_count > 0:
+                                rec_msg += f" - optimized for {ios_count} iOS devices"
+                            rec_msg += ")"
 
                         results["recommendations"].append(
                             {
@@ -1343,7 +1465,7 @@ class AdvancedNetworkAnalyzer:
                                 "recommendation": rec_msg,
                                 "priority": "medium",
                                 "recommended_value": recommended,
-                                "ios_friendly": use_ios_friendly,
+                                "strategy": strategy,
                             }
                         )
 
@@ -1411,12 +1533,18 @@ class AdvancedNetworkAnalyzer:
                     # Calculate airtime percentage
                     airtime_pct = cu_total
 
+                    # Get channel information
+                    channel = radio_stat.get("channel", device.get("channel", "Unknown"))
+
                     key = f"{ap_name} ({band})"
                     results["ap_utilization"][key] = {
                         "airtime_pct": airtime_pct,
                         "tx_pct": cu_self_tx,
                         "rx_pct": cu_self_rx,
                         "clients": radio_stat.get("num_sta", 0),
+                        "channel": channel,
+                        "ap_name": ap_name,
+                        "band": band,
                     }
 
                     # Flag saturated APs (>70% airtime)
@@ -2732,6 +2860,7 @@ def run_advanced_analysis(
     results = {
         "dfs_analysis": analyzer.analyze_dfs_events(lookback_days),
         "band_steering_analysis": analyzer.analyze_band_steering(devices, clients),
+        "mesh_necessity_analysis": analyzer.analyze_mesh_necessity(devices),
         "min_rssi_analysis": analyzer.analyze_min_rssi(devices, clients, min_rssi_strategy),
         "fast_roaming_analysis": analyzer.analyze_fast_roaming(devices),
         "airtime_analysis": analyzer.analyze_airtime_utilization(devices),
