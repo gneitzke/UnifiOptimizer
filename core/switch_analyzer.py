@@ -890,7 +890,9 @@ class SwitchAnalyzer:
                     # Calculate total dropped packets over the period
                     total_dropped_values = [h["total_dropped"] for h in hourly_data]
                     total_dropped_sum = sum(total_dropped_values) if total_dropped_values else 0
-                    avg_dropped_per_hour = total_dropped_sum / len(total_dropped_values) if total_dropped_values else 0
+                    avg_dropped_per_hour = (
+                        total_dropped_sum / len(total_dropped_values) if total_dropped_values else 0
+                    )
 
                     # Track ports with significant packet loss:
                     # - High percentage (>0.1% average loss), OR
