@@ -134,12 +134,40 @@ def analyze_network(client, site="default", lookback_days=3, min_rssi_strategy="
         # Add advanced analysis to full analysis
         analysis["dfs_analysis"] = advanced_analysis["dfs_analysis"]
         analysis["band_steering_analysis"] = advanced_analysis["band_steering_analysis"]
+        analysis["mesh_necessity_analysis"] = advanced_analysis["mesh_necessity_analysis"]
         analysis["min_rssi_analysis"] = advanced_analysis["min_rssi_analysis"]
         analysis["fast_roaming_analysis"] = advanced_analysis["fast_roaming_analysis"]
         analysis["airtime_analysis"] = advanced_analysis["airtime_analysis"]
         analysis["client_capabilities"] = advanced_analysis["client_capabilities"]
         analysis["switch_analysis"] = advanced_analysis["switch_analysis"]
         analysis["switch_port_history"] = advanced_analysis["switch_port_history"]
+
+        # Merge mesh necessity recommendations into informational display
+        mesh_necessity_recs = advanced_analysis["mesh_necessity_analysis"].get(
+            "recommendations", []
+        )
+        if mesh_necessity_recs:
+            # Display mesh recommendation in CLI
+            for rec in mesh_necessity_recs:
+                if rec.get("type") == "disable_unused_mesh":
+                    console.print("\n[bold cyan]🔗 Wireless Mesh Configuration[/bold cyan]")
+                    console.print(f"[blue]ℹ️  {rec.get('message', '')}[/blue]")
+                    console.print(f"\n[dim]💡 Recommendation:[/dim]")
+                    console.print(f"[white]{rec.get('recommendation', '')}[/white]\n")
+
+                    # Show benefits and tradeoffs
+                    console.print("[green]Benefits:[/green]")
+                    for benefit in rec.get("benefits", []):
+                        console.print(f"  [green]✓[/green] {benefit}")
+
+                    console.print("\n[yellow]Trade-offs:[/yellow]")
+                    for tradeoff in rec.get("tradeoffs", []):
+                        console.print(f"  [yellow]⚠️[/yellow] {tradeoff}")
+
+                    console.print(f"\n[dim]Best for:[/dim] {rec.get('best_for', '')}")
+                    console.print(
+                        f"[dim]Not recommended if:[/dim] {rec.get('not_recommended_if', '')}\n"
+                    )
 
         # Merge band steering recommendations into main recommendations list
         band_steering_recs = advanced_analysis["band_steering_analysis"].get("recommendations", [])

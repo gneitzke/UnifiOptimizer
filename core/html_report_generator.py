@@ -882,6 +882,11 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
     if band_steering:
         html_content += generate_band_steering_html(band_steering)
 
+    # Mesh Necessity Analysis Section
+    mesh_necessity = analysis_data.get("mesh_necessity_analysis")
+    if mesh_necessity:
+        html_content += generate_mesh_necessity_html(mesh_necessity)
+
     # Min RSSI Analysis Section
     min_rssi = analysis_data.get("min_rssi_analysis")
     if min_rssi:
@@ -3008,6 +3013,85 @@ def generate_band_steering_html(band_steering):
 """
 
 
+def generate_mesh_necessity_html(mesh_necessity):
+    """Generate mesh necessity analysis section"""
+    if not mesh_necessity:
+        return ""
+
+    mesh_count = mesh_necessity.get("mesh_aps_count", 0)
+    wired_count = mesh_necessity.get("wired_aps_count", 0)
+    mesh_aps = mesh_necessity.get("mesh_aps", [])
+    recommendations = mesh_necessity.get("recommendations", [])
+
+    # Only show section if there's a recommendation
+    if not recommendations:
+        return ""
+
+    # Check if recommendation is to disable mesh
+    disable_rec = next((r for r in recommendations if r.get("type") == "disable_unused_mesh"), None)
+
+    if not disable_rec:
+        # Mesh is in use - don't show this section (or show brief info)
+        return ""
+
+    benefits_list = "<br>".join([f"✓ {b}" for b in disable_rec.get("benefits", [])])
+    tradeoffs_list = "<br>".join([f"⚠️ {t}" for t in disable_rec.get("tradeoffs", [])])
+
+    return f"""
+            <div class="section">
+                <h2>🔗 Wireless Mesh Configuration</h2>
+                <div style="background: #3b82f615; padding: 20px; border-radius: 8px; border-left: 4px solid #3b82f6; margin-bottom: 20px;">
+                    <strong style="font-size: 1.2em; color: #3b82f6;">All {wired_count} APs are Wired (PoE)</strong>
+                    <p style="margin-top: 10px; color: #666;">No wireless mesh APs detected. Consider disabling mesh to optimize performance.</p>
+                </div>
+
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px;">
+                    <div style="padding: 15px; background: #10b98115; border-radius: 8px; border-left: 3px solid #10b981;">
+                        <h3 style="margin: 0 0 10px 0; color: #10b981;">✓ Benefits of Disabling Mesh</h3>
+                        <div style="color: #666; line-height: 1.8;">
+                            {benefits_list}
+                        </div>
+                    </div>
+                    <div style="padding: 15px; background: #f59e0b15; border-radius: 8px; border-left: 3px solid #f59e0b;">
+                        <h3 style="margin: 0 0 10px 0; color: #f59e0b;">⚠️ Trade-offs to Consider</h3>
+                        <div style="color: #666; line-height: 1.8;">
+                            {tradeoffs_list}
+                        </div>
+                    </div>
+                </div>
+
+                <div style="padding: 15px; background: #f3f4f6; border-radius: 8px; margin-bottom: 20px;">
+                    <h3 style="margin-top: 0;">📋 Recommendation</h3>
+                    <p style="color: #374151; line-height: 1.6;">{disable_rec.get("recommendation", "")}</p>
+                </div>
+
+                <div style="padding: 15px; background: #eff6ff; border-radius: 8px; border: 1px solid #dbeafe;">
+                    <strong style="color: #1e40af;">💡 When to Disable Mesh:</strong>
+                    <p style="margin-top: 8px; color: #666; line-height: 1.6;">
+                        {disable_rec.get("best_for", "")}
+                    </p>
+                    <strong style="color: #dc2626; display: block; margin-top: 12px;">🚫 When NOT to Disable:</strong>
+                    <p style="margin-top: 8px; color: #666; line-height: 1.6;">
+                        {disable_rec.get("not_recommended_if", "")}
+                    </p>
+                </div>
+
+                <div style="margin-top: 20px; padding: 15px; background: #f3f4f6; border-radius: 8px;">
+                    <strong>How to Disable Mesh in UniFi:</strong>
+                    <ol style="margin-top: 10px; color: #666; line-height: 1.8; padding-left: 20px;">
+                        <li>Navigate to Settings → Wireless Networks</li>
+                        <li>Select your SSID and scroll to Advanced Settings</li>
+                        <li>Disable "Wireless Uplink" or "Mesh" option</li>
+                        <li>Apply changes to all APs (may require brief reconnection)</li>
+                    </ol>
+                    <p style="margin-top: 15px; color: #666; font-style: italic;">
+                        Note: This can always be re-enabled later if you decide to add wireless mesh APs.
+                    </p>
+                </div>
+            </div>
+"""
+
+
 def generate_min_rssi_html(min_rssi):
     """Generate minimum RSSI analysis section"""
     if not min_rssi:
@@ -3626,17 +3710,21 @@ def generate_airtime_analysis_html(airtime_analysis):
             channel = data.get("channel", "Unknown")
             if channel not in channels_used:
                 channels_used[channel] = []
-            channels_used[channel].append({
-                "ap_key": ap_key,
-                "airtime": data.get("airtime_pct", 0),
-                "clients": data.get("clients", 0),
-                "band": data.get("band", "Unknown")
-            })
+            channels_used[channel].append(
+                {
+                    "ap_key": ap_key,
+                    "airtime": data.get("airtime_pct", 0),
+                    "clients": data.get("clients", 0),
+                    "band": data.get("band", "Unknown"),
+                }
+            )
 
         # Build channel mapping display
         if channels_used:
             channel_rows = ""
-            for channel in sorted(channels_used.keys(), key=lambda x: (0 if isinstance(x, int) else 1, x)):
+            for channel in sorted(
+                channels_used.keys(), key=lambda x: (0 if isinstance(x, int) else 1, x)
+            ):
                 aps_on_channel = channels_used[channel]
                 # Determine if channel is overloaded
                 max_util = max(ap["airtime"] for ap in aps_on_channel)
@@ -3656,10 +3744,12 @@ def generate_airtime_analysis_html(airtime_analysis):
                     recommendation = "Operating normally"
 
                 # Build AP list
-                ap_list = "<br>".join([
-                    f"• {ap['ap_key']}: {ap['airtime']:.1f}% ({ap['clients']} clients)"
-                    for ap in aps_on_channel
-                ])
+                ap_list = "<br>".join(
+                    [
+                        f"• {ap['ap_key']}: {ap['airtime']:.1f}% ({ap['clients']} clients)"
+                        for ap in aps_on_channel
+                    ]
+                )
 
                 channel_rows += f"""
                     <tr>
