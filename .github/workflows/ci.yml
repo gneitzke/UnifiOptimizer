@@ -30,6 +30,9 @@ jobs:
         pip install -r requirements.txt
         pip install -r requirements-dev.txt
 
+    - name: Add to PYTHONPATH
+      run: echo "PYTHONPATH=$PYTHONPATH:$PWD" >> $GITHUB_ENV
+
     - name: Syntax Check - Compile Python Files
       run: |
         echo "Checking Python syntax..."
@@ -68,7 +71,7 @@ jobs:
     - name: Verify Module Imports
       run: |
         echo "Verifying module imports..."
-        python -c "from core.advanced_analyzer import ExpertNetworkAnalyzer; print('✅ ExpertNetworkAnalyzer imports successfully')"
+        python -c "from core.advanced_analyzer import AdvancedNetworkAnalyzer; print('✅ AdvancedNetworkAnalyzer imports successfully')"
         python -c "from core.switch_analyzer import SwitchAnalyzer; print('✅ SwitchAnalyzer imports successfully')"
         python -c "from core.html_report_generator import generate_html_report; print('✅ HTML generator imports successfully')"
         python -c "from api.cloudkey_gen2_client import CloudKeyGen2Client; print('✅ CloudKey client imports successfully')"
@@ -100,6 +103,9 @@ jobs:
       run: |
         pip install bandit safety
 
+    - name: Add to PYTHONPATH
+      run: echo "PYTHONPATH=$PYTHONPATH:$PWD" >> $GITHUB_ENV
+
     - name: Run Bandit Security Scanner
       run: |
         echo "Running security scan..."
@@ -129,6 +135,9 @@ jobs:
       run: |
         pip install radon mccabe
 
+    - name: Add to PYTHONPATH
+      run: echo "PYTHONPATH=$PYTHONPATH:$PWD" >> $GITHUB_ENV
+
     - name: Check Code Complexity
       run: |
         echo "Checking code complexity..."
@@ -155,6 +164,9 @@ jobs:
       uses: actions/setup-python@v4
       with:
         python-version: '3.11'
+
+    - name: Add to PYTHONPATH
+      run: echo "PYTHONPATH=$PYTHONPATH:$PWD" >> $GITHUB_ENV
 
     - name: Check for Mock Data Generation
       run: |
@@ -192,6 +204,9 @@ jobs:
     - name: Install dependencies
       run: |
         pip install -r requirements.txt
+
+    - name: Add to PYTHONPATH
+      run: echo "PYTHONPATH=$PYTHONPATH:$PWD" >> $GITHUB_ENV
 
     - name: Validate All Core Modules Load
       run: |
