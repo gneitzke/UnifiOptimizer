@@ -10,6 +10,68 @@ from datetime import datetime
 from pathlib import Path
 
 
+def make_collapsible(section_id, section_title, section_content):
+    """Wrap a section in collapsible HTML structure
+
+    If section_content is already a complete <div class="section"> block,
+    just add the collapsible controls around it.
+    """
+    if not section_content or section_content.strip() == "":
+        return ""
+
+    return f"""
+        <div class="collapsible-section">
+            <div class="section-header" onclick="toggleSection('{section_id}')">
+                <h2>{section_title}</h2>
+                <span class="section-toggle">▼</span>
+            </div>
+            <div id="{section_id}" class="section-content">
+                {section_content}
+            </div>
+        </div>
+"""
+
+
+def generate_navigation_menu(analysis_data, recommendations, client_health, switch_analysis):
+    """Generate sticky navigation menu for quick access to sections"""
+    nav_items = []
+
+    # Always show these core sections
+    nav_items.append(('<a class="nav-link" href="#" onclick="scrollToSection(\'section-summary\'); return false;">📊 Summary</a>'))
+    nav_items.append(('<a class="nav-link" href="#" onclick="scrollToSection(\'section-recommendations\'); return false;">💡 Recommendations</a>'))
+
+    # Conditional sections based on data availability
+    if client_health:
+        nav_items.append(('<a class="nav-link" href="#" onclick="scrollToSection(\'section-client-health\'); return false;">👥 Clients</a>'))
+        if client_health.get("disconnection_prone"):
+            nav_items.append(('<a class="nav-link" href="#" onclick="scrollToSection(\'section-disconnected-clients\'); return false;">🔄 Disconnects</a>'))
+
+    if analysis_data.get("ap_analysis"):
+        nav_items.append(('<a class="nav-link" href="#" onclick="scrollToSection(\'section-access-points\'); return false;">📡 APs</a>'))
+
+    if analysis_data.get("channel_analysis"):
+        nav_items.append(('<a class="nav-link" href="#" onclick="scrollToSection(\'section-channels\'); return false;">📻 Channels</a>'))
+
+    if switch_analysis and switch_analysis.get("switches"):
+        nav_items.append(('<a class="nav-link" href="#" onclick="scrollToSection(\'section-switches\'); return false;">🔌 Switches</a>'))
+
+    if analysis_data.get("mesh_analysis", {}).get("mesh_aps"):
+        nav_items.append(('<a class="nav-link" href="#" onclick="scrollToSection(\'section-mesh\'); return false;">🔗 Mesh</a>'))
+
+    # Control buttons
+    nav_items.append('<a class="nav-link" href="#" onclick="expandAll(); return false;" style="margin-left: 20px; background: rgba(255,255,255,0.1);">⬇ Expand All</a>')
+    nav_items.append('<a class="nav-link" href="#" onclick="collapseAll(); return false;" style="background: rgba(255,255,255,0.1);">⬆ Collapse All</a>')
+
+    nav_html = '\n'.join(nav_items)
+
+    return f"""
+        <div class="nav-menu">
+            <span class="nav-menu-title">Jump to:</span>
+            {nav_html}
+        </div>
+"""
+
+
 def generate_html_report(analysis_data, recommendations, site_name, output_dir="reports"):
     """
     Generate a comprehensive HTML report from analysis data
@@ -507,8 +569,189 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
                 padding: 6px 4px;
             }}
         }}
+
+        /* Navigation Menu Styles */
+        .nav-menu {{
+            position: sticky;
+            top: 0;
+            z-index: 1000;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 15px 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+            justify-content: center;
+        }}
+
+        .nav-menu-title {{
+            color: white;
+            font-weight: 600;
+            margin-right: 15px;
+            font-size: 0.95em;
+        }}
+
+        .nav-link {{
+            color: white;
+            text-decoration: none;
+            padding: 6px 12px;
+            border-radius: 4px;
+            font-size: 0.9em;
+            transition: background 0.2s;
+            display: inline-block;
+        }}
+
+        .nav-link:hover {{
+            background: rgba(255,255,255,0.2);
+        }}
+
+        /* Collapsible Section Styles */
+        .collapsible-section {{
+            margin-bottom: 20px;
+        }}
+
+        .section-header {{
+            cursor: pointer;
+            user-select: none;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 8px 8px 0 0;
+            transition: background 0.3s;
+        }}
+
+        .section-header:hover {{
+            background: linear-gradient(135deg, #5a6fd8 0%, #6a4190 100%);
+        }}
+
+        .section-header h2 {{
+            color: white;
+            margin: 0;
+            border: none;
+            padding: 0;
+        }}
+
+        .section-toggle {{
+            font-size: 1.5em;
+            transition: transform 0.3s;
+            font-weight: bold;
+        }}
+
+        .section-toggle.collapsed {{
+            transform: rotate(-90deg);
+        }}
+
+        .section-content {{
+            max-height: 10000px;
+            overflow: hidden;
+            transition: max-height 0.3s ease-out, opacity 0.3s ease-out;
+            opacity: 1;
+        }}
+
+        .section-content.collapsed {{
+            max-height: 0;
+            opacity: 0;
+        }}
+
+        .section-inner {{
+            padding: 30px;
+            background: #f8f9fa;
+            border-radius: 0 0 8px 8px;
+            border-left: 4px solid #667eea;
+        }}
+
+        @media (max-width: 768px) {{
+            .nav-menu {{
+                padding: 10px;
+            }}
+
+            .nav-menu-title {{
+                width: 100%;
+                text-align: center;
+                margin-bottom: 5px;
+            }}
+
+            .nav-link {{
+                font-size: 0.8em;
+                padding: 5px 8px;
+            }}
+        }}
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script>
+        // Collapsible section toggle functionality
+        function toggleSection(sectionId) {{
+            const content = document.getElementById(sectionId);
+            const toggle = document.querySelector(`[onclick="toggleSection('${{sectionId}}')"] .section-toggle`);
+
+            if (content.classList.contains('collapsed')) {{
+                content.classList.remove('collapsed');
+                toggle.classList.remove('collapsed');
+                // Save state
+                localStorage.setItem(sectionId, 'expanded');
+            }} else {{
+                content.classList.add('collapsed');
+                toggle.classList.add('collapsed');
+                // Save state
+                localStorage.setItem(sectionId, 'collapsed');
+            }}
+        }}
+
+        // Restore section states on page load
+        window.addEventListener('DOMContentLoaded', function() {{
+            document.querySelectorAll('[id^="section-"]').forEach(function(section) {{
+                const state = localStorage.getItem(section.id);
+                if (state === 'collapsed') {{
+                    section.classList.add('collapsed');
+                    const toggle = document.querySelector(`[onclick="toggleSection('${{section.id}}')"] .section-toggle`);
+                    if (toggle) toggle.classList.add('collapsed');
+                }}
+            }});
+        }});
+
+        // Expand all sections
+        function expandAll() {{
+            document.querySelectorAll('[id^="section-"]').forEach(function(section) {{
+                section.classList.remove('collapsed');
+                localStorage.setItem(section.id, 'expanded');
+            }});
+            document.querySelectorAll('.section-toggle').forEach(function(toggle) {{
+                toggle.classList.remove('collapsed');
+            }});
+        }}
+
+        // Collapse all sections
+        function collapseAll() {{
+            document.querySelectorAll('[id^="section-"]').forEach(function(section) {{
+                section.classList.add('collapsed');
+                localStorage.setItem(section.id, 'collapsed');
+            }});
+            document.querySelectorAll('.section-toggle').forEach(function(toggle) {{
+                toggle.classList.add('collapsed');
+            }});
+        }}
+
+        // Smooth scroll to section and expand it
+        function scrollToSection(sectionId) {{
+            const section = document.getElementById(sectionId);
+            if (section) {{
+                section.classList.remove('collapsed');
+                const toggle = document.querySelector(`[onclick="toggleSection('${{sectionId}}')"] .section-toggle`);
+                if (toggle) toggle.classList.remove('collapsed');
+                localStorage.setItem(sectionId, 'expanded');
+
+                // Scroll to the section header
+                const header = section.previousElementSibling;
+                if (header) {{
+                    header.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+                }}
+            }}
+        }}
+    </script>
 </head>
 <body>
     <div class="container">
@@ -520,6 +763,10 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
 
         <div class="content">
 """
+
+    # Add Navigation Menu
+    switch_analysis = analysis_data.get("switch_analysis")
+    html_content += generate_navigation_menu(analysis_data, recommendations, client_health, switch_analysis)
 
     # API Error Warning Banner (if there were errors)
     api_errors = analysis_data.get("api_errors")
@@ -539,8 +786,10 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
             </div>
 """
 
-    # Executive Summary Section
-    html_content += generate_executive_summary_html(analysis_data, recommendations)
+    # Executive Summary Section (Collapsible)
+    summary_content = generate_executive_summary_html(analysis_data, recommendations)
+    if summary_content:
+        html_content += make_collapsible("section-summary", "📊 Executive Summary", summary_content)
 
     # Network Health Analysis Section
     health_analysis = analysis_data.get("health_analysis")
@@ -598,29 +847,43 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
 
         html_content += generate_manufacturer_insights_html(manufacturer_analysis)
 
-    # Switch Analysis Section
-    switch_analysis = analysis_data.get("switch_analysis")
+    # Switch Analysis Section (Collapsible)
     switch_port_history = analysis_data.get("switch_port_history")
     if switch_analysis and switch_analysis.get("switches"):
-        html_content += generate_switch_analysis_html(switch_analysis, switch_port_history)
+        switch_content = generate_switch_analysis_html(switch_analysis, switch_port_history)
+        html_content += make_collapsible("section-switches", "🔌 Switch Analysis", switch_content)
 
-    # Access Points Section
-    html_content += generate_ap_overview_html(
+    # Access Points Section (Collapsible)
+    ap_content = generate_ap_overview_html(
         ap_analysis, mesh_aps, analysis_data.get("devices", [])
     )
+    if ap_content:
+        html_content += make_collapsible("section-access-points", "📡 Access Points", ap_content)
 
-    # Mesh Topology Section (if mesh APs exist)
+    # Mesh Topology Section (Collapsible, if mesh APs exist)
     if mesh_aps and mesh_aps.get("mesh_aps"):
-        html_content += generate_mesh_topology_html(mesh_aps, analysis_data.get("devices", []))
+        mesh_content = generate_mesh_topology_html(mesh_aps, analysis_data.get("devices", []))
+        html_content += make_collapsible("section-mesh", "🔗 Mesh Topology", mesh_content)
 
-    # Recommendations Section
-    html_content += generate_recommendations_html(recommendations)
+    # Recommendations Section (Collapsible)
+    recs_content = generate_recommendations_html(recommendations)
+    if recs_content:
+        html_content += make_collapsible("section-recommendations", "💡 Recommendations", recs_content)
 
-    # Channel Analysis Section
-    html_content += generate_channel_analysis_html(channel_analysis)
+    # Channel Analysis Section (Collapsible)
+    channel_content = generate_channel_analysis_html(channel_analysis)
+    if channel_content:
+        html_content += make_collapsible("section-channels", "📻 Channel Analysis", channel_content)
 
-    # Client Health Section
-    html_content += generate_client_health_html(client_health)
+    # Client Health Section (Collapsible)
+    client_health_content = generate_client_health_html(client_health)
+    if client_health_content:
+        html_content += make_collapsible("section-client-health", "👥 Client Health", client_health_content)
+
+    # Frequently Disconnected Clients Section (Collapsible)
+    disconnected_content = generate_disconnected_clients_html(client_health)
+    if disconnected_content:
+        html_content += make_collapsible("section-disconnected-clients", "🔄 Frequently Disconnected Clients", disconnected_content)
 
     # Findings Section
     html_content += generate_findings_html(analysis_data)
@@ -2248,6 +2511,101 @@ def generate_client_health_html(client_health):
                         {grade_rows}
                     </tbody>
                 </table>
+            </div>
+"""
+
+
+def generate_disconnected_clients_html(client_health):
+    """Generate frequently disconnected clients section"""
+    disconnection_prone = client_health.get("disconnection_prone", [])
+    if not disconnection_prone:
+        return ""
+
+    # Sort by disconnect count (highest first)
+    sorted_clients = sorted(disconnection_prone, key=lambda x: x.get("disconnect_count", 0), reverse=True)
+
+    clients_html = ""
+    for client in sorted_clients[:20]:  # Show top 20
+        mac = client.get("mac", "Unknown")
+        hostname = client.get("hostname", "Unknown")
+        ip = client.get("ip", "Unknown")
+        disconnect_count = client.get("disconnect_count", 0)
+        rssi = client.get("rssi", 0)
+        ap_mac = client.get("ap_mac", "Unknown")
+
+        # Fix RSSI if positive
+        if rssi > 0:
+            rssi = -rssi
+
+        # Determine signal quality
+        if rssi > -50:
+            signal_badge = '<span style="background: #10b981; color: white; padding: 3px 8px; border-radius: 4px; font-size: 0.85em;">Excellent</span>'
+        elif rssi > -60:
+            signal_badge = '<span style="background: #3b82f6; color: white; padding: 3px 8px; border-radius: 4px; font-size: 0.85em;">Good</span>'
+        elif rssi > -70:
+            signal_badge = '<span style="background: #f59e0b; color: white; padding: 3px 8px; border-radius: 4px; font-size: 0.85em;">Fair</span>'
+        elif rssi > -80:
+            signal_badge = '<span style="background: #f97316; color: white; padding: 3px 8px; border-radius: 4px; font-size: 0.85em;">Poor</span>'
+        else:
+            signal_badge = '<span style="background: #ef4444; color: white; padding: 3px 8px; border-radius: 4px; font-size: 0.85em;">Critical</span>'
+
+        # Severity color based on disconnect count
+        if disconnect_count >= 10:
+            severity_color = "#ef4444"  # red
+            severity_icon = "🔴"
+        elif disconnect_count >= 5:
+            severity_color = "#f59e0b"  # amber
+            severity_icon = "🟡"
+        else:
+            severity_color = "#3b82f6"  # blue
+            severity_icon = "🔵"
+
+        clients_html += f"""
+                <div style="background: white; padding: 15px; margin: 10px 0; border-radius: 8px; border-left: 4px solid {severity_color}; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+                    <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+                        <div style="flex-grow: 1;">
+                            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+                                <span style="font-size: 1.2em;">{severity_icon}</span>
+                                <strong style="color: #111827; font-size: 1.05em;">{hostname}</strong>
+                                <span style="background: {severity_color}15; color: {severity_color}; padding: 2px 10px; border-radius: 12px; font-size: 0.85em; font-weight: 500;">
+                                    {disconnect_count} disconnects
+                                </span>
+                            </div>
+                            <div style="color: #6b7280; font-size: 0.9em; font-family: monospace;">
+                                <span style="margin-right: 15px;">📱 {mac}</span>
+                                <span style="margin-right: 15px;">🌐 {ip}</span>
+                                <span>📡 AP: {ap_mac[:17] if len(ap_mac) > 17 else ap_mac}</span>
+                            </div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 15px;">
+                            <div style="text-align: right;">
+                                <div style="color: #6b7280; font-size: 0.85em; margin-bottom: 4px;">Signal</div>
+                                <div style="font-weight: 600; color: #111827; font-size: 1.1em;">{rssi} dBm</div>
+                                <div style="margin-top: 4px;">{signal_badge}</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+"""
+
+    return f"""
+            <div class="section">
+                <h2>🔄 Frequently Disconnected Clients</h2>
+                <p style="color: #666; margin-bottom: 20px;">
+                    Clients that have experienced multiple disconnections during the analysis period.
+                    Frequent disconnections may indicate poor signal strength, roaming issues, interference, or device problems.
+                </p>
+                <div style="background: #eff6ff; padding: 15px; border-radius: 8px; border-left: 4px solid #3b82f6; margin-bottom: 20px;">
+                    <strong style="color: #1e40af;">💡 Troubleshooting Tips:</strong>
+                    <ul style="margin-top: 10px; margin-left: 20px; color: #374151;">
+                        <li>Check signal strength (RSSI) - clients with poor signal should be closer to an AP or need better coverage</li>
+                        <li>Review channel interference - high utilization can cause disconnects</li>
+                        <li>Consider enabling Minimum RSSI to force weak clients to roam earlier</li>
+                        <li>Check for device-specific issues (old firmware, driver problems)</li>
+                        <li>Review band steering settings for dual-band capable devices</li>
+                    </ul>
+                </div>
+                {clients_html}
             </div>
 """
 

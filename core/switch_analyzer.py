@@ -886,7 +886,7 @@ class SwitchAnalyzer:
                     avg_loss = sum(loss_values) / len(loss_values) if loss_values else 0
                     max_loss = max(loss_values) if loss_values else 0
                     min_loss = min(loss_values) if loss_values else 0
-                    
+
                     # Calculate total dropped packets over the period
                     total_dropped_values = [h["total_dropped"] for h in hourly_data]
                     total_dropped_sum = sum(total_dropped_values) if total_dropped_values else 0
