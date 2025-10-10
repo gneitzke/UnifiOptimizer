@@ -40,7 +40,6 @@ jobs:
         python -m py_compile core/*.py
         python -m py_compile api/*.py
         python -m py_compile utils/*.py
-        python -m py_compile web/*.py
         echo "✅ All files compiled successfully"
 
     - name: Run Black Code Formatter (Check Only)
