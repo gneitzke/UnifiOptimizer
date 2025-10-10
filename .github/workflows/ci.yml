@@ -169,19 +169,7 @@ jobs:
     - name: Verify Execution Order Fix
       run: |
         echo "Checking execution order..."
-        python -c "
-import re
-with open('core/advanced_analyzer.py') as f:
-    content = f.read()
-    # Find both method calls
-    history_pos = content.find('analyze_switch_port_history')
-    switches_pos = content.find('analyze_switches()')
-    if history_pos < switches_pos and history_pos > 0:
-        print('✅ Execution order correct: analyze_switch_port_history called before analyze_switches')
-    else:
-        print('❌ Execution order incorrect!')
-        exit(1)
-        "
+        python -c "import re; content = open('core/advanced_analyzer.py').read(); history_pos = content.find('analyze_switch_port_history'); switches_pos = content.find('analyze_switches()'); exit(0 if (history_pos < switches_pos and history_pos > 0) else 1); print('✅ Execution order correct' if (history_pos < switches_pos and history_pos > 0) else '❌ Execution order incorrect')"
 
     - name: Verify Recommendation Format Handler
       run: |
@@ -207,38 +195,38 @@ with open('core/advanced_analyzer.py') as f:
 
     - name: Validate All Core Modules Load
       run: |
-        python -c "
-import sys
-modules_to_test = [
-    'core.advanced_analyzer',
-    'core.switch_analyzer',
-    'core.html_report_generator',
-    'core.optimize_network',
-    'core.channel_optimizer',
-    'core.network_analyzer',
-    'core.network_health_analyzer',
-    'core.client_health',
-    'core.client_rssi_tracker',
-    'core.manufacturer_analyzer',
-    'api.cloudkey_gen2_client',
-    'api.cloudkey_jwt_helper',
-    'api.csrf_token_manager'
-]
-failed = []
-for module in modules_to_test:
-    try:
-        __import__(module)
-        print(f'✅ {module}')
-    except Exception as e:
-        print(f'❌ {module}: {e}')
-        failed.append(module)
+        python << 'EOF'
+        import sys
+        modules_to_test = [
+            'core.advanced_analyzer',
+            'core.switch_analyzer',
+            'core.html_report_generator',
+            'core.optimize_network',
+            'core.channel_optimizer',
+            'core.network_analyzer',
+            'core.network_health_analyzer',
+            'core.client_health',
+            'core.client_rssi_tracker',
+            'core.manufacturer_analyzer',
+            'api.cloudkey_gen2_client',
+            'api.cloudkey_jwt_helper',
+            'api.csrf_token_manager'
+        ]
+        failed = []
+        for module in modules_to_test:
+            try:
+                __import__(module)
+                print(f'✅ {module}')
+            except Exception as e:
+                print(f'❌ {module}: {e}')
+                failed.append(module)
 
-if failed:
-    print(f'\n❌ {len(failed)} modules failed to import')
-    sys.exit(1)
-else:
-    print(f'\n✅ All {len(modules_to_test)} modules imported successfully')
-        "
+        if failed:
+            print(f'\n❌ {len(failed)} modules failed to import')
+            sys.exit(1)
+        else:
+            print(f'\n✅ All {len(modules_to_test)} modules imported successfully')
+        EOF
 
     - name: Final Status
       run: |
