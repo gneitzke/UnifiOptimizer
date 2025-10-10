@@ -18,6 +18,39 @@ from api.cloudkey_gen2_client import CloudKeyGen2Client
 console = Console()
 
 
+def prompt_min_rssi_strategy():
+    """Prompt user to select Min RSSI strategy"""
+    console.print("\n[bold cyan]Min RSSI Strategy Selection[/bold cyan]")
+    console.print("\nChoose your roaming strategy:\n")
+
+    console.print("[green]1. Optimal (Recommended)[/green]")
+    console.print("   • Aggressive roaming for best performance")
+    console.print("   • Forces clients to move to better APs early")
+    console.print("   • Best for: Dense AP deployment, performance-critical networks")
+    console.print("   • Thresholds: -75 dBm (2.4GHz), -72 dBm (5GHz), -70 dBm (6GHz)\n")
+
+    console.print("[yellow]2. Max Connectivity[/yellow]")
+    console.print("   • Conservative roaming for maximum reliability")
+    console.print("   • Lets clients stay connected longer")
+    console.print("   • Best for: Sparse AP deployment, iOS-heavy networks, large areas")
+    console.print("   • Thresholds: -80 dBm (2.4GHz), -77 dBm (5GHz), -75 dBm (6GHz)")
+    console.print("   • Extra -3 dBm tolerance for iPhones/iPads\n")
+
+    while True:
+        choice = input("Select strategy (1-2) [1]: ").strip()
+
+        if not choice or choice == "1":
+            console.print("[green]✓ Using Optimal strategy (aggressive roaming)[/green]")
+            return "optimal"
+        elif choice == "2":
+            console.print(
+                "[yellow]✓ Using Max Connectivity strategy (conservative roaming)[/yellow]"
+            )
+            return "max_connectivity"
+        else:
+            console.print("[red]Invalid choice. Please select 1 or 2.[/red]")
+
+
 def validate_credentials(host, username, password, site):
     """Validate credentials by attempting to login"""
     try:
@@ -52,6 +85,9 @@ def run_expert_analysis(host, username, password, site):
     if not Confirm.ask("\nProceed with expert analysis?", default=True):
         return
 
+    # Prompt for Min RSSI strategy
+    strategy = prompt_min_rssi_strategy()
+
     console.print("\n[dim]Running analysis modules...[/dim]\n")
 
     # Run analyze mode which includes everything
@@ -69,6 +105,8 @@ def run_expert_analysis(host, username, password, site):
         site,
         "--lookback",
         "3",
+        "--min-rssi-strategy",
+        strategy,
     ]
     subprocess.run(cmd)
 
@@ -115,6 +153,9 @@ def run_dry_run(host, username, password, site):
     if not Confirm.ask("\nProceed with dry-run?", default=True):
         return
 
+    # Prompt for Min RSSI strategy
+    strategy = prompt_min_rssi_strategy()
+
     console.print("\n[dim]Running: core/optimize_network.py apply --dry-run --lookback 3[/dim]\n")
 
     import subprocess
@@ -134,6 +175,8 @@ def run_dry_run(host, username, password, site):
         "--dry-run",
         "--lookback",
         "3",
+        "--min-rssi-strategy",
+        strategy,
     ]
     subprocess.run(cmd)
 
@@ -154,6 +197,9 @@ def run_analyze_and_apply(host, username, password, site):
     if not Confirm.ask("\nProceed with analysis?", default=True):
         return
 
+    # Prompt for Min RSSI strategy
+    strategy = prompt_min_rssi_strategy()
+
     console.print("\n[dim]Running complete analysis with 3-day lookback...[/dim]\n")
 
     # Run apply mode which shows analysis + executive summary first
@@ -172,6 +218,8 @@ def run_analyze_and_apply(host, username, password, site):
         "--dry-run",
         "--lookback",
         "3",
+        "--min-rssi-strategy",
+        strategy,
     ]
     subprocess.run(cmd)
 
@@ -214,6 +262,8 @@ def run_analyze_and_apply(host, username, password, site):
             "--lookback",
             "3",
             "--yes",
+            "--min-rssi-strategy",
+            strategy,
         ]
         subprocess.run(cmd)
 
@@ -237,6 +287,8 @@ def run_analyze_and_apply(host, username, password, site):
             "--interactive",
             "--lookback",
             "3",
+            "--min-rssi-strategy",
+            strategy,
         ]
         subprocess.run(cmd)
 
