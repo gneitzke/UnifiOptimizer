@@ -962,10 +962,11 @@ class AdvancedNetworkAnalyzer:
                     for other_device in devices:
                         if other_device.get("type") == "uap":
                             other_uplink = other_device.get("uplink", {})
-                            if (other_uplink.get("type") == "wireless" and (
-                                    other_uplink.get("uplink_remote_mac") == ap_mac)):
+                            if other_uplink.get("type") == "wireless" and (
+                                other_uplink.get("uplink_remote_mac") == ap_mac
+                            ):
                                 is_mesh_parent = True
-                                mesh_children_count += 1                # Any mesh involvement = protection
+                                mesh_children_count += 1  # Any mesh involvement = protection
                 is_mesh = is_mesh_child or is_mesh_parent
 
                 # **COVERAGE EXTENSION DETECTION**
@@ -1016,7 +1017,11 @@ class AdvancedNetworkAnalyzer:
                                     radio_ap_mac = radio_entry.get("ap_mac")
                                     radio_rssi = radio_entry.get("signal")
                                     # Alternative AP must have at least -80 dBm (barely usable)
-                                    if radio_ap_mac in other_ap_macs and radio_rssi and radio_rssi > -80:
+                                    if (
+                                        radio_ap_mac in other_ap_macs
+                                        and radio_rssi
+                                        and radio_rssi > -80
+                                    ):
                                         has_alternative = True
                                         break
 
@@ -1032,7 +1037,9 @@ class AdvancedNetworkAnalyzer:
                         # - >30% of clients have no alternative AP
                         if mesh_client_count > 0:
                             weak_percentage = (weak_client_count / mesh_client_count) * 100
-                            no_alternative_percentage = (clients_with_no_alternative / mesh_client_count) * 100
+                            no_alternative_percentage = (
+                                clients_with_no_alternative / mesh_client_count
+                            ) * 100
 
                             # Check if this is a coverage extender
                             is_weak_signals = weak_percentage > 50
@@ -1095,11 +1102,19 @@ class AdvancedNetworkAnalyzer:
                                 # Build detailed warning about clients
                                 client_warning = []
                                 if weak_client_count > 0:
-                                    client_warning.append(f"{weak_client_count}/{mesh_client_count} clients with weak signal")
+                                    client_warning.append(
+                                        f"{weak_client_count}/{mesh_client_count} clients with weak signal"
+                                    )
                                 if clients_with_no_alternative > 0:
-                                    client_warning.append(f"{clients_with_no_alternative}/{mesh_client_count} clients with NO alternative AP")
+                                    client_warning.append(
+                                        f"{clients_with_no_alternative}/{mesh_client_count} clients with NO alternative AP"
+                                    )
 
-                                client_detail = ", ".join(client_warning) if client_warning else f"{mesh_client_count} clients"
+                                client_detail = (
+                                    ", ".join(client_warning)
+                                    if client_warning
+                                    else f"{mesh_client_count} clients"
+                                )
 
                                 message = (
                                     f"🚨 COVERAGE EXTENDER {ap_name} {band} has min RSSI enabled ({min_rssi_value} dBm)\n"
@@ -1118,7 +1133,9 @@ class AdvancedNetworkAnalyzer:
                                 if is_mesh_child:
                                     role_parts.append("MESH CHILD")
                                 if is_mesh_parent:
-                                    role_parts.append(f"MESH PARENT (has {mesh_children_count} mesh children)")
+                                    role_parts.append(
+                                        f"MESH PARENT (has {mesh_children_count} mesh children)"
+                                    )
 
                                 role_text = " + ".join(role_parts) if role_parts else "MESH AP"
 
@@ -1131,13 +1148,23 @@ class AdvancedNetworkAnalyzer:
                                 # Build role-specific recommendation
                                 danger_parts = []
                                 if is_mesh_child:
-                                    danger_parts.append(f"break THIS AP's wireless uplink (current: {uplink_rssi} dBm)")
+                                    danger_parts.append(
+                                        f"break THIS AP's wireless uplink (current: {uplink_rssi} dBm)"
+                                    )
                                 if is_mesh_parent:
-                                    danger_parts.append(f"KICK OFF {mesh_children_count} mesh children connecting to this AP")
+                                    danger_parts.append(
+                                        f"KICK OFF {mesh_children_count} mesh children connecting to this AP"
+                                    )
                                 if mesh_client_count > 0 and clients_with_no_alternative > 0:
-                                    danger_parts.append(f"disconnect {clients_with_no_alternative} clients with NO alternative AP")
+                                    danger_parts.append(
+                                        f"disconnect {clients_with_no_alternative} clients with NO alternative AP"
+                                    )
 
-                                danger_text = ", ".join(danger_parts) if danger_parts else "break mesh connectivity"
+                                danger_text = (
+                                    ", ".join(danger_parts)
+                                    if danger_parts
+                                    else "break mesh connectivity"
+                                )
 
                                 recommendation = (
                                     f"DISABLE min RSSI immediately! This AP is critical to mesh network. "
@@ -1224,32 +1251,56 @@ class AdvancedNetworkAnalyzer:
                                 if is_mesh_child:
                                     role_parts.append("MESH CHILD")
                                 if is_mesh_parent:
-                                    role_parts.append(f"MESH PARENT ({mesh_children_count} children)")
+                                    role_parts.append(
+                                        f"MESH PARENT ({mesh_children_count} children)"
+                                    )
 
                                 role_text = " + ".join(role_parts) if role_parts else "MESH AP"
 
                                 # Build detail about clients
                                 client_detail = []
                                 if weak_client_count > 0:
-                                    client_detail.append(f"{weak_client_count}/{mesh_client_count} weak-signal clients")
+                                    client_detail.append(
+                                        f"{weak_client_count}/{mesh_client_count} weak-signal clients"
+                                    )
                                 if clients_with_no_alternative > 0:
-                                    client_detail.append(f"{clients_with_no_alternative} with NO alternative AP")
+                                    client_detail.append(
+                                        f"{clients_with_no_alternative} with NO alternative AP"
+                                    )
 
-                                detail_text = ", ".join(client_detail) if client_detail else f"{mesh_client_count} clients"
-                                avg_text = f" (avg RSSI: {avg_client_rssi:.0f} dBm)" if avg_client_rssi else ""
+                                detail_text = (
+                                    ", ".join(client_detail)
+                                    if client_detail
+                                    else f"{mesh_client_count} clients"
+                                )
+                                avg_text = (
+                                    f" (avg RSSI: {avg_client_rssi:.0f} dBm)"
+                                    if avg_client_rssi
+                                    else ""
+                                )
 
                                 # Build protection reason
                                 protection_reason = []
                                 if is_mesh_child:
                                     protection_reason.append("protect wireless uplink")
                                 if is_mesh_parent:
-                                    protection_reason.append(f"prevent kicking off {mesh_children_count} mesh children")
+                                    protection_reason.append(
+                                        f"prevent kicking off {mesh_children_count} mesh children"
+                                    )
                                 if clients_with_no_alternative > 0:
-                                    protection_reason.append(f"maintain connectivity for {clients_with_no_alternative} clients with no alternative AP")
+                                    protection_reason.append(
+                                        f"maintain connectivity for {clients_with_no_alternative} clients with no alternative AP"
+                                    )
 
-                                reason_text = ", ".join(protection_reason) if protection_reason else "protect mesh connectivity"
+                                reason_text = (
+                                    ", ".join(protection_reason)
+                                    if protection_reason
+                                    else "protect mesh connectivity"
+                                )
 
-                                display_type = "COVERAGE EXTENDER" if is_coverage_extender else role_text
+                                display_type = (
+                                    "COVERAGE EXTENDER" if is_coverage_extender else role_text
+                                )
 
                                 results["recommendations"].append(
                                     {
@@ -1873,17 +1924,19 @@ class AdvancedNetworkAnalyzer:
                         # Non-PSC is not critical, but recommended for optimal performance
                         priority = "low"
 
-                        results["recommendations"].append({
-                            "type": "non_psc_channel",
-                            "device": ap_name,
-                            "band": "6GHz",
-                            "message": message,
-                            "recommendation": recommendation,
-                            "priority": priority,
-                            "current_channel": channel,
-                            "recommended_channel": nearest_psc,
-                            "channel_width": channel_width,
-                        })
+                        results["recommendations"].append(
+                            {
+                                "type": "non_psc_channel",
+                                "device": ap_name,
+                                "band": "6GHz",
+                                "message": message,
+                                "recommendation": recommendation,
+                                "priority": priority,
+                                "current_channel": channel,
+                                "recommended_channel": nearest_psc,
+                                "channel_width": channel_width,
+                            }
+                        )
 
                         # Update severity (low priority issue)
                         if results["severity"] == "ok":
@@ -1968,9 +2021,10 @@ class AdvancedNetworkAnalyzer:
                     results["radios_6ghz"] += 1
 
                     # Get power mode (UniFi field names may vary)
-                    power_mode = radio.get("tx_power_mode",
-                                          radio.get("ap_pwr_type",
-                                          radio.get("power_mode", "Unknown")))
+                    power_mode = radio.get(
+                        "tx_power_mode",
+                        radio.get("ap_pwr_type", radio.get("power_mode", "Unknown")),
+                    )
 
                     channel = radio.get("channel")
                     channel_width = radio.get("ht", 20)
@@ -1978,8 +2032,7 @@ class AdvancedNetworkAnalyzer:
 
                     # Get stats for this radio if available
                     radio_stats = next(
-                        (r for r in radio_table_stats if r.get("radio") == radio_name),
-                        {}
+                        (r for r in radio_table_stats if r.get("radio") == radio_name), {}
                     )
 
                     tx_retries_pct = radio_stats.get("tx_retries_pct", 0)
@@ -2047,9 +2100,7 @@ class AdvancedNetworkAnalyzer:
                             )
 
                         if needs_sp:
-                            message = (
-                                f"{ap_name} 6GHz using {mode_label} power mode (+24dBm limit)"
-                            )
+                            message = f"{ap_name} 6GHz using {mode_label} power mode (+24dBm limit)"
 
                             recommendation = (
                                 f"Enable AFC and Standard Power mode for +12dB gain (+36dBm EIRP). "
@@ -2066,21 +2117,23 @@ class AdvancedNetworkAnalyzer:
                             else:
                                 priority = "low"
 
-                            results["recommendations"].append({
-                                "type": "6ghz_power_mode_upgrade",
-                                "device": ap_name,
-                                "band": "6GHz",
-                                "message": message,
-                                "recommendation": recommendation,
-                                "priority": priority,
-                                "current_mode": mode_label,
-                                "recommended_mode": "SP (Standard Power)",
-                                "power_gain_db": 12,
-                                "range_multiplier": "~4x",
-                                "retry_pct": tx_retries_pct,
-                                "channel_width": channel_width,
-                                "clients": num_clients,
-                            })
+                            results["recommendations"].append(
+                                {
+                                    "type": "6ghz_power_mode_upgrade",
+                                    "device": ap_name,
+                                    "band": "6GHz",
+                                    "message": message,
+                                    "recommendation": recommendation,
+                                    "priority": priority,
+                                    "current_mode": mode_label,
+                                    "recommended_mode": "SP (Standard Power)",
+                                    "power_gain_db": 12,
+                                    "range_multiplier": "~4x",
+                                    "retry_pct": tx_retries_pct,
+                                    "channel_width": channel_width,
+                                    "clients": num_clients,
+                                }
+                            )
 
                             # Update severity
                             if priority == "high":
@@ -2096,15 +2149,17 @@ class AdvancedNetworkAnalyzer:
                             "Switch to LPI (+24dBm) minimum, or SP (+36dBm) with AFC for best performance."
                         )
 
-                        results["recommendations"].append({
-                            "type": "6ghz_vlp_warning",
-                            "device": ap_name,
-                            "message": message,
-                            "recommendation": recommendation,
-                            "priority": "high",
-                            "current_mode": "VLP",
-                            "recommended_mode": "SP or LPI",
-                        })
+                        results["recommendations"].append(
+                            {
+                                "type": "6ghz_vlp_warning",
+                                "device": ap_name,
+                                "message": message,
+                                "recommendation": recommendation,
+                                "priority": "high",
+                                "current_mode": "VLP",
+                                "recommended_mode": "SP or LPI",
+                            }
+                        )
 
                         results["severity"] = "high"
 
@@ -2510,7 +2565,7 @@ class AdvancedNetworkAnalyzer:
             "firmware_by_model": {},
             "inconsistencies": [],
             "recommendations": [],
-            "severity": "ok"
+            "severity": "ok",
         }
 
         # Collect firmware versions by model
@@ -2525,19 +2580,13 @@ class AdvancedNetworkAnalyzer:
             results["total_aps"] += 1
 
             if model not in results["firmware_by_model"]:
-                results["firmware_by_model"][model] = {
-                    "versions": {},
-                    "aps": []
-                }
+                results["firmware_by_model"][model] = {"versions": {}, "aps": []}
 
             if firmware not in results["firmware_by_model"][model]["versions"]:
                 results["firmware_by_model"][model]["versions"][firmware] = []
 
             results["firmware_by_model"][model]["versions"][firmware].append(name)
-            results["firmware_by_model"][model]["aps"].append({
-                "name": name,
-                "firmware": firmware
-            })
+            results["firmware_by_model"][model]["aps"].append({"name": name, "firmware": firmware})
 
         # Analyze each model for inconsistencies
         for model, data in results["firmware_by_model"].items():
@@ -2549,7 +2598,9 @@ class AdvancedNetworkAnalyzer:
                 version_list.sort(reverse=True)  # Newest first
 
                 newest_version = version_list[0]
-                outdated_count = sum(len(aps) for ver, aps in versions.items() if ver != newest_version)
+                outdated_count = sum(
+                    len(aps) for ver, aps in versions.items() if ver != newest_version
+                )
 
                 inconsistency = {
                     "model": model,
@@ -2558,7 +2609,7 @@ class AdvancedNetworkAnalyzer:
                     "newest_version": newest_version,
                     "outdated_count": outdated_count,
                     "total_count": len(data["aps"]),
-                    "details": {}
+                    "details": {},
                 }
 
                 # Detail which APs have which versions
@@ -2566,37 +2617,44 @@ class AdvancedNetworkAnalyzer:
                     inconsistency["details"][version] = {
                         "aps": ap_list,
                         "count": len(ap_list),
-                        "status": "current" if version == newest_version else "outdated"
+                        "status": "current" if version == newest_version else "outdated",
                     }
 
                 results["inconsistencies"].append(inconsistency)
 
                 # Generate recommendation
                 severity = "high" if outdated_count > 1 else "medium"
-                results["recommendations"].append({
-                    "type": "firmware_upgrade",
-                    "severity": severity,
-                    "model": model,
-                    "action": f"Upgrade {outdated_count} AP(s) to version {newest_version}",
-                    "current_state": f"{outdated_count}/{len(data['aps'])} APs on older firmware",
-                    "target_state": f"All {len(data['aps'])} APs on {newest_version}",
-                    "aps_to_upgrade": [
-                        {"name": ap, "current_version": ver}
-                        for ver, aps in versions.items() if ver != newest_version
-                        for ap in aps
-                    ],
-                    "rationale": [
-                        "Uniform firmware improves stability",
-                        "Prevents subtle compatibility issues",
-                        "Ensures consistent feature set",
-                        "Simplifies troubleshooting"
-                    ]
-                })
+                results["recommendations"].append(
+                    {
+                        "type": "firmware_upgrade",
+                        "severity": severity,
+                        "model": model,
+                        "action": f"Upgrade {outdated_count} AP(s) to version {newest_version}",
+                        "current_state": f"{outdated_count}/{len(data['aps'])} APs on older firmware",
+                        "target_state": f"All {len(data['aps'])} APs on {newest_version}",
+                        "aps_to_upgrade": [
+                            {"name": ap, "current_version": ver}
+                            for ver, aps in versions.items()
+                            if ver != newest_version
+                            for ap in aps
+                        ],
+                        "rationale": [
+                            "Uniform firmware improves stability",
+                            "Prevents subtle compatibility issues",
+                            "Ensures consistent feature set",
+                            "Simplifies troubleshooting",
+                        ],
+                    }
+                )
 
         # Determine overall severity
         if results["inconsistencies"]:
-            high_severity_count = sum(1 for r in results["recommendations"] if r.get("severity") == "high")
-            medium_severity_count = sum(1 for r in results["recommendations"] if r.get("severity") == "medium")
+            high_severity_count = sum(
+                1 for r in results["recommendations"] if r.get("severity") == "high"
+            )
+            medium_severity_count = sum(
+                1 for r in results["recommendations"] if r.get("severity") == "medium"
+            )
 
             if high_severity_count > 0 or medium_severity_count > 0:
                 results["severity"] = "warning"
@@ -2618,20 +2676,22 @@ class AdvancedNetworkAnalyzer:
 
                         # Example: Versions < 6.0 may lack full 6GHz support
                         if major < 6:
-                            results["recommendations"].append({
-                                "type": "feature_compatibility",
-                                "severity": "high",
-                                "model": model,
-                                "action": f"Upgrade firmware to enable full 6GHz features",
-                                "current_state": f"Firmware {version} may lack WiFi 6E optimizations",
-                                "target_state": "Firmware 6.0+ for full 6GHz support",
-                                "rationale": [
-                                    "Enables PSC channel optimization",
-                                    "Unlocks AFC/Standard Power modes",
-                                    "Improves 6GHz client compatibility",
-                                    "Required for MLO (WiFi 7) if applicable"
-                                ]
-                            })
+                            results["recommendations"].append(
+                                {
+                                    "type": "feature_compatibility",
+                                    "severity": "high",
+                                    "model": model,
+                                    "action": f"Upgrade firmware to enable full 6GHz features",
+                                    "current_state": f"Firmware {version} may lack WiFi 6E optimizations",
+                                    "target_state": "Firmware 6.0+ for full 6GHz support",
+                                    "rationale": [
+                                        "Enables PSC channel optimization",
+                                        "Unlocks AFC/Standard Power modes",
+                                        "Improves 6GHz client compatibility",
+                                        "Required for MLO (WiFi 7) if applicable",
+                                    ],
+                                }
+                            )
                     except (ValueError, IndexError):
                         # Can't parse version number, skip
                         pass
@@ -2661,6 +2721,9 @@ def run_advanced_analysis(client, site="default", devices=None, clients=None, lo
     switch_analyzer = SwitchAnalyzer(client, site)
     switch_analysis = switch_analyzer.analyze_switches()
 
+    # Collect switch port packet loss history (7 days)
+    switch_port_history = switch_analyzer.analyze_switch_port_history(lookback_hours=168)
+
     results = {
         "dfs_analysis": analyzer.analyze_dfs_events(lookback_days),
         "band_steering_analysis": analyzer.analyze_band_steering(devices, clients),
@@ -2674,6 +2737,7 @@ def run_advanced_analysis(client, site="default", devices=None, clients=None, lo
         "client_capabilities": analyzer.analyze_client_capabilities(clients, devices),
         "client_security": analyzer.analyze_client_security(clients),
         "switch_analysis": switch_analysis,
+        "switch_port_history": switch_port_history,
     }
 
     # Calculate overall health score

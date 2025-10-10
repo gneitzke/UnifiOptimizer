@@ -604,7 +604,9 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
         html_content += generate_switch_analysis_html(switch_analysis, switch_port_history)
 
     # Access Points Section
-    html_content += generate_ap_overview_html(ap_analysis, mesh_aps, analysis_data.get("devices", []))
+    html_content += generate_ap_overview_html(
+        ap_analysis, mesh_aps, analysis_data.get("devices", [])
+    )
 
     # Mesh Topology Section (if mesh APs exist)
     if mesh_aps and mesh_aps.get("mesh_aps"):
@@ -904,8 +906,9 @@ def generate_executive_summary_html(analysis_data, recommendations):
         if device.get("type") == "uap":
             uplink_type = device.get("uplink", {}).get("type", "")
             uplink_rssi = device.get("uplink", {}).get("rssi")
-            is_mesh = (device.get("adopted", False) and (
-                uplink_type == "wireless" or (uplink_rssi and uplink_rssi < -70)))
+            is_mesh = device.get("adopted", False) and (
+                uplink_type == "wireless" or (uplink_rssi and uplink_rssi < -70)
+            )
             if is_mesh:
                 mesh_aps.append(device)
                 parent_mac = device.get("uplink", {}).get("uplink_remote_mac")
@@ -917,7 +920,9 @@ def generate_executive_summary_html(analysis_data, recommendations):
     mesh_parent_count = len([mac for mac in mesh_parent_macs if mac in ap_macs])
 
     # If parent is a gateway (UDM, UDM Pro, etc), we still protect it but call it differently
-    mesh_parent_gateways = len([mac for mac in mesh_parent_macs if mac in all_device_macs and mac not in ap_macs])
+    mesh_parent_gateways = len(
+        [mac for mac in mesh_parent_macs if mac in all_device_macs and mac not in ap_macs]
+    )
 
     mesh_child_count = len(mesh_aps)
     total_mesh_protected = mesh_child_count + mesh_parent_count
@@ -936,7 +941,9 @@ def generate_executive_summary_html(analysis_data, recommendations):
     # Build infrastructure summary
     infra_summary = f"{ap_count} access point{'s' if ap_count != 1 else ''}"
     if mesh_child_count > 0:
-        infra_summary += f" (including {mesh_child_count} mesh node{'s' if mesh_child_count != 1 else ''})"
+        infra_summary += (
+            f" (including {mesh_child_count} mesh node{'s' if mesh_child_count != 1 else ''})"
+        )
     if switch_count > 0:
         infra_summary += f" and {switch_count} managed switch{'es' if switch_count != 1 else ''}"
 
@@ -1008,7 +1015,9 @@ def generate_executive_summary_html(analysis_data, recommendations):
         elif mesh_parent_count > 0:
             parent_desc = f"{mesh_parent_count} parent AP{'s' if mesh_parent_count != 1 else ''}"
         elif mesh_parent_gateways > 0:
-            parent_desc = f"{mesh_parent_gateways} parent gateway{'s' if mesh_parent_gateways != 1 else ''}"
+            parent_desc = (
+                f"{mesh_parent_gateways} parent gateway{'s' if mesh_parent_gateways != 1 else ''}"
+            )
         else:
             parent_desc = "parent devices"
 
@@ -1502,13 +1511,15 @@ def generate_mesh_topology_html(mesh_aps, all_devices):
             parent_name = parent_ap.get("name", "Unknown Parent")
             parent_aps.add(uplink_remote_mac)
 
-        topology_data.append({
-            "child_name": ap_name,
-            "parent_name": parent_name,
-            "uplink_rssi": uplink_rssi,
-            "parent_mac": uplink_remote_mac,
-            "is_mesh": True
-        })
+        topology_data.append(
+            {
+                "child_name": ap_name,
+                "parent_name": parent_name,
+                "uplink_rssi": uplink_rssi,
+                "parent_mac": uplink_remote_mac,
+                "is_mesh": True,
+            }
+        )
 
     # Generate HTML
     html = """
@@ -1713,7 +1724,11 @@ def generate_ap_overview_html(ap_analysis, mesh_aps, all_devices=None):
         # Build 2.4GHz details with power highlighting
         ng_details = f"{ng_channel}" if ng_channel else "-"
         if ng_power or ng_width:
-            power_color = "#10b981" if ng_power == "High" else "#f59e0b" if ng_power == "Medium" else "#6b7280"
+            power_color = (
+                "#10b981"
+                if ng_power == "High"
+                else "#f59e0b" if ng_power == "Medium" else "#6b7280"
+            )
             ng_details += (
                 f"<br><span style='font-size: 0.85em; color: {power_color}; font-weight: 600;'>{ng_power}</span>"
                 f"<span style='font-size: 0.85em; color: #666;'>, {ng_width}</span>"
@@ -1722,7 +1737,11 @@ def generate_ap_overview_html(ap_analysis, mesh_aps, all_devices=None):
         # Build 5GHz details with power highlighting
         na_details = f"{na_channel}" if na_channel else "-"
         if na_power or na_width:
-            power_color = "#10b981" if na_power == "High" else "#f59e0b" if na_power == "Medium" else "#6b7280"
+            power_color = (
+                "#10b981"
+                if na_power == "High"
+                else "#f59e0b" if na_power == "Medium" else "#6b7280"
+            )
             na_details += (
                 f"<br><span style='font-size: 0.85em; color: {power_color}; font-weight: 600;'>{na_power}</span>"
                 f"<span style='font-size: 0.85em; color: #666;'>, {na_width}</span>"
@@ -2767,32 +2786,104 @@ def generate_airtime_analysis_html(airtime_analysis):
 
     if time_series:
         import json
+        from datetime import datetime
+
+        def group_by_15min(data_points):
+            """Group hourly data points into 15-minute buckets for smoother visualization"""
+            grouped = {}
+            for point in data_points:
+                dt_str = point["datetime"]
+                # Parse datetime and round to 15-minute intervals
+                dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+                minute = (dt.minute // 15) * 15
+                bucket = dt.replace(minute=minute, second=0, microsecond=0)
+                bucket_key = bucket.strftime("%Y-%m-%d %H:%M")
+
+                if bucket_key not in grouped:
+                    grouped[bucket_key] = {
+                        "airtime_pct": [],
+                        "tx_pct": [],
+                        "rx_pct": [],
+                        "clients": [],
+                    }
+
+                grouped[bucket_key]["airtime_pct"].append(point.get("airtime_pct", 0))
+                grouped[bucket_key]["tx_pct"].append(point.get("tx_pct", 0))
+                grouped[bucket_key]["rx_pct"].append(point.get("rx_pct", 0))
+                grouped[bucket_key]["clients"].append(point.get("clients", 0))
+
+            # Average values in each bucket
+            result = []
+            for bucket_key in sorted(grouped.keys()):
+                bucket_data = grouped[bucket_key]
+                result.append(
+                    {
+                        "datetime": bucket_key,
+                        "airtime_pct": sum(bucket_data["airtime_pct"])
+                        / len(bucket_data["airtime_pct"]),
+                        "tx_pct": sum(bucket_data["tx_pct"]) / len(bucket_data["tx_pct"]),
+                        "rx_pct": sum(bucket_data["rx_pct"]) / len(bucket_data["rx_pct"]),
+                        "clients": max(bucket_data["clients"]),  # Use max clients in interval
+                    }
+                )
+
+            return result
 
         # Create chart for each AP
         for idx, (ap_key, data_points) in enumerate(time_series.items()):
             if not data_points:
                 continue
 
+            # Group data into 15-minute intervals
+            grouped_data = group_by_15min(data_points)
+
+            if not grouped_data:
+                continue
+
             # Prepare data for Chart.js
-            labels = [point["datetime"] for point in data_points]
-            airtime_data = [point["airtime_pct"] for point in data_points]
-            tx_data = [point["tx_pct"] for point in data_points]
-            rx_data = [point["rx_pct"] for point in data_points]
-            client_data = [point["clients"] for point in data_points]
+            labels = [point["datetime"] for point in grouped_data]
+            airtime_data = [point["airtime_pct"] for point in grouped_data]
+            tx_data = [point["tx_pct"] for point in grouped_data]
+            rx_data = [point["rx_pct"] for point in grouped_data]
+            client_data = [point["clients"] for point in grouped_data]
 
             # Determine color based on average airtime
             avg_airtime = sum(airtime_data) / len(airtime_data) if airtime_data else 0
             if avg_airtime > 70:
                 chart_color = "rgba(239, 68, 68, 0.7)"  # red
+                border_color = "rgba(239, 68, 68, 1)"
             elif avg_airtime > 50:
                 chart_color = "rgba(245, 158, 11, 0.7)"  # yellow
+                border_color = "rgba(245, 158, 11, 1)"
             else:
                 chart_color = "rgba(16, 185, 129, 0.7)"  # green
+                border_color = "rgba(16, 185, 129, 1)"
+
+            # Format labels for display (show only time, group by hour for axis labels)
+            display_labels = []
+            for i, label in enumerate(labels):
+                dt = datetime.fromisoformat(label)
+                if dt.minute == 0:
+                    display_labels.append(dt.strftime("%H:%M"))
+                elif i % 4 == 0:  # Show every hour
+                    display_labels.append(dt.strftime("%H:%M"))
+                else:
+                    display_labels.append("")  # Empty label for intermediate points
 
             charts_html += f"""
-                <div style="margin: 30px 0; padding: 20px; background: #f9fafb; border-radius: 8px;">
-                    <h4 style="margin-bottom: 15px;">{ap_key} - Historical Airtime</h4>
-                    <canvas id="airtimeChart{idx}" style="max-height: 300px;"></canvas>
+                <div style="margin: 30px 0; padding: 20px; background: #f9fafb; border-radius: 8px; border: 1px solid #e5e7eb;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <h4 style="margin: 0;">{ap_key} - Utilization Trend</h4>
+                        <span style="background: {chart_color}; color: white; padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: 600;">
+                            Avg: {avg_airtime:.1f}%
+                        </span>
+                    </div>
+                    <div style="position: relative; height: 300px;">
+                        <canvas id="airtimeChart{idx}"></canvas>
+                    </div>
+                    <div style="margin-top: 15px; padding: 12px; background: white; border-radius: 6px; border: 1px solid #e5e7eb; font-size: 12px; color: #666;">
+                        <strong>📊 Data grouped in 15-minute intervals</strong> • Showing last 24 hours of utilization patterns
+                    </div>
                 </div>
 """
 
@@ -2800,55 +2891,127 @@ def generate_airtime_analysis_html(airtime_analysis):
                 new Chart(document.getElementById('airtimeChart{idx}'), {{
                     type: 'line',
                     data: {{
-                        labels: {json.dumps([dt.split('T')[1][:5] for dt in labels])},
+                        labels: {json.dumps(display_labels)},
                         datasets: [{{
                             label: 'Total Airtime %',
                             data: {json.dumps(airtime_data)},
-                            borderColor: '{chart_color}',
+                            borderColor: '{border_color}',
                             backgroundColor: '{chart_color}',
-                            fill: false,
-                            tension: 0.4
+                            borderWidth: 2,
+                            fill: true,
+                            tension: 0.4,
+                            pointRadius: 2,
+                            pointHoverRadius: 5,
+                            pointBackgroundColor: '{border_color}',
+                            order: 1
                         }}, {{
                             label: 'TX %',
                             data: {json.dumps(tx_data)},
-                            borderColor: 'rgba(99, 102, 241, 0.7)',
-                            backgroundColor: 'rgba(99, 102, 241, 0.3)',
+                            borderColor: 'rgba(99, 102, 241, 0.8)',
+                            backgroundColor: 'rgba(99, 102, 241, 0.2)',
+                            borderWidth: 1.5,
                             fill: true,
-                            tension: 0.4
+                            tension: 0.4,
+                            pointRadius: 0,
+                            pointHoverRadius: 4,
+                            order: 2
                         }}, {{
                             label: 'RX %',
                             data: {json.dumps(rx_data)},
-                            borderColor: 'rgba(147, 51, 234, 0.7)',
-                            backgroundColor: 'rgba(147, 51, 234, 0.3)',
+                            borderColor: 'rgba(147, 51, 234, 0.8)',
+                            backgroundColor: 'rgba(147, 51, 234, 0.2)',
+                            borderWidth: 1.5,
                             fill: true,
-                            tension: 0.4
+                            tension: 0.4,
+                            pointRadius: 0,
+                            pointHoverRadius: 4,
+                            order: 3
                         }}]
                     }},
                     options: {{
                         responsive: true,
                         maintainAspectRatio: false,
+                        interaction: {{
+                            mode: 'index',
+                            intersect: false
+                        }},
                         plugins: {{
                             legend: {{
-                                position: 'bottom'
+                                position: 'bottom',
+                                labels: {{
+                                    padding: 15,
+                                    usePointStyle: true,
+                                    font: {{
+                                        size: 11
+                                    }}
+                                }}
                             }},
                             tooltip: {{
                                 mode: 'index',
-                                intersect: false
+                                intersect: false,
+                                backgroundColor: 'rgba(0, 0, 0, 0.8)',
+                                padding: 12,
+                                titleFont: {{
+                                    size: 13,
+                                    weight: 'bold'
+                                }},
+                                bodyFont: {{
+                                    size: 12
+                                }},
+                                callbacks: {{
+                                    title: function(tooltipItems) {{
+                                        const index = tooltipItems[0].dataIndex;
+                                        const fullLabels = {json.dumps(labels)};
+                                        return fullLabels[index];
+                                    }},
+                                    afterBody: function(tooltipItems) {{
+                                        const index = tooltipItems[0].dataIndex;
+                                        const clients = {json.dumps(client_data)};
+                                        return '\\nClients: ' + clients[index];
+                                    }}
+                                }}
                             }}
                         }},
                         scales: {{
                             y: {{
                                 beginAtZero: true,
                                 max: 100,
+                                grid: {{
+                                    color: 'rgba(0, 0, 0, 0.05)'
+                                }},
                                 title: {{
                                     display: true,
-                                    text: 'Utilization %'
+                                    text: 'Utilization %',
+                                    font: {{
+                                        size: 12,
+                                        weight: 'bold'
+                                    }}
+                                }},
+                                ticks: {{
+                                    callback: function(value) {{
+                                        return value + '%';
+                                    }}
                                 }}
                             }},
                             x: {{
+                                grid: {{
+                                    color: 'rgba(0, 0, 0, 0.05)'
+                                }},
                                 title: {{
                                     display: true,
-                                    text: 'Time'
+                                    text: 'Time (15-min intervals)',
+                                    font: {{
+                                        size: 12,
+                                        weight: 'bold'
+                                    }}
+                                }},
+                                ticks: {{
+                                    maxRotation: 45,
+                                    minRotation: 45,
+                                    autoSkip: true,
+                                    font: {{
+                                        size: 10
+                                    }}
                                 }}
                             }}
                         }}
@@ -3152,9 +3315,12 @@ def generate_client_security_html(security):
 
 
 def generate_packet_loss_history_html(switch_port_history):
-    """Generate packet loss history visualization with trends"""
+    """Generate packet loss history visualization with trends and Chart.js for critical ports"""
     if not switch_port_history or not switch_port_history.get("port_history"):
         return ""
+
+    import json
+    from datetime import datetime
 
     summary = switch_port_history.get("summary", {})
     port_history = switch_port_history.get("port_history", {})
@@ -3184,11 +3350,58 @@ def generate_packet_loss_history_html(switch_port_history):
         <p style="color: #666; font-style: italic; margin-bottom: 20px;">{summary.get('message', '')}</p>
     """
 
-    # Per-port details
+    def group_by_15min(hourly_data):
+        """Group hourly data into 15-minute buckets"""
+        grouped = {}
+        for point in hourly_data:
+            dt_str = point["datetime"]
+            dt = datetime.fromisoformat(dt_str)
+            minute = (dt.minute // 15) * 15
+            bucket = dt.replace(minute=minute, second=0, microsecond=0)
+            bucket_key = bucket.strftime("%Y-%m-%d %H:%M")
+
+            if bucket_key not in grouped:
+                grouped[bucket_key] = {
+                    "packet_loss_pct": [],
+                    "rx_dropped": [],
+                    "tx_dropped": [],
+                    "total_packets": [],
+                }
+
+            grouped[bucket_key]["packet_loss_pct"].append(point.get("packet_loss_pct", 0))
+            grouped[bucket_key]["rx_dropped"].append(point.get("rx_dropped", 0))
+            grouped[bucket_key]["tx_dropped"].append(point.get("tx_dropped", 0))
+            grouped[bucket_key]["total_packets"].append(point.get("total_packets", 0))
+
+        # Average values in each bucket
+        result = []
+        for bucket_key in sorted(grouped.keys()):
+            bucket_data = grouped[bucket_key]
+            result.append(
+                {
+                    "datetime": bucket_key,
+                    "packet_loss_pct": sum(bucket_data["packet_loss_pct"])
+                    / len(bucket_data["packet_loss_pct"]),
+                    "rx_dropped": sum(bucket_data["rx_dropped"]) / len(bucket_data["rx_dropped"]),
+                    "tx_dropped": sum(bucket_data["tx_dropped"]) / len(bucket_data["tx_dropped"]),
+                    "total_packets": sum(bucket_data["total_packets"])
+                    / len(bucket_data["total_packets"]),
+                }
+            )
+
+        return result
+
+    # Per-port details with Chart.js for critical ports
     ports_html = ""
+    chart_script = ""
+    chart_idx = 0
     for port_key, port_data in sorted(port_history.items()):
         stats = port_data.get("statistics", {})
         trend = stats.get("trend", "unknown")
+        avg_loss = stats.get("avg_loss", 0)
+
+        # Determine if this is a critical port (>1% average loss) needing detailed Chart.js
+        is_critical = avg_loss > 1.0
 
         # Trend styling
         if trend == "improving":
@@ -3207,10 +3420,199 @@ def generate_packet_loss_history_html(switch_port_history):
             trend_icon = "→"
             trend_text = "Stable"
 
-        # Create mini sparkline data
+        # Get hourly data
         hourly_data = port_data.get("hourly_data", [])
-        sparkline_html = ""
 
+        # For critical ports, create Chart.js visualization with 15-min grouping
+        chart_html = ""
+        if is_critical and len(hourly_data) > 0:
+            # Group data into 15-minute intervals
+            grouped_data = group_by_15min(hourly_data)
+
+            if grouped_data:
+                labels = [point["datetime"] for point in grouped_data]
+                packet_loss_data = [point["packet_loss_pct"] for point in grouped_data]
+                rx_dropped_data = [point["rx_dropped"] for point in grouped_data]
+                tx_dropped_data = [point["tx_dropped"] for point in grouped_data]
+
+                # Format labels for display
+                display_labels = []
+                for i, label in enumerate(labels):
+                    dt = datetime.fromisoformat(label)
+                    if dt.minute == 0 or i % 4 == 0:
+                        display_labels.append(dt.strftime("%m/%d %H:%M"))
+                    else:
+                        display_labels.append("")
+
+                chart_html = f"""
+                <div style="background: #fff; padding: 20px; border-radius: 8px; margin-top: 15px; border: 1px solid #e5e7eb;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <h5 style="margin: 0; color: #374151;">📈 Detailed Packet Loss Analysis</h5>
+                        <span style="background: #fef2f2; color: #dc2626; padding: 4px 12px; border-radius: 12px; font-size: 11px; font-weight: 600;">
+                            CRITICAL PORT
+                        </span>
+                    </div>
+                    <div style="position: relative; height: 300px;">
+                        <canvas id="packetLossChart{chart_idx}"></canvas>
+                    </div>
+                    <div style="margin-top: 12px; padding: 10px; background: #f9fafb; border-radius: 6px; font-size: 11px; color: #6b7280;">
+                        <strong>💡 Chart shows:</strong> Total packet loss % (red), RX dropped packets (blue), TX dropped packets (purple) • Grouped in 15-minute intervals
+                    </div>
+                </div>
+                """
+
+                chart_script += f"""
+                new Chart(document.getElementById('packetLossChart{chart_idx}'), {{
+                    type: 'line',
+                    data: {{
+                        labels: {json.dumps(display_labels)},
+                        datasets: [{{
+                            label: 'Packet Loss %',
+                            data: {json.dumps(packet_loss_data)},
+                            borderColor: 'rgba(220, 38, 38, 1)',
+                            backgroundColor: 'rgba(220, 38, 38, 0.1)',
+                            borderWidth: 2,
+                            fill: true,
+                            tension: 0.4,
+                            pointRadius: 2,
+                            pointHoverRadius: 6,
+                            yAxisID: 'y'
+                        }}, {{
+                            label: 'RX Dropped',
+                            data: {json.dumps(rx_dropped_data)},
+                            borderColor: 'rgba(59, 130, 246, 0.8)',
+                            backgroundColor: 'rgba(59, 130, 246, 0.2)',
+                            borderWidth: 1.5,
+                            fill: true,
+                            tension: 0.4,
+                            pointRadius: 0,
+                            pointHoverRadius: 4,
+                            yAxisID: 'y1'
+                        }}, {{
+                            label: 'TX Dropped',
+                            data: {json.dumps(tx_dropped_data)},
+                            borderColor: 'rgba(147, 51, 234, 0.8)',
+                            backgroundColor: 'rgba(147, 51, 234, 0.2)',
+                            borderWidth: 1.5,
+                            fill: true,
+                            tension: 0.4,
+                            pointRadius: 0,
+                            pointHoverRadius: 4,
+                            yAxisID: 'y1'
+                        }}]
+                    }},
+                    options: {{
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        interaction: {{
+                            mode: 'index',
+                            intersect: false
+                        }},
+                        plugins: {{
+                            legend: {{
+                                position: 'bottom',
+                                labels: {{
+                                    padding: 12,
+                                    usePointStyle: true,
+                                    font: {{
+                                        size: 11
+                                    }}
+                                }}
+                            }},
+                            tooltip: {{
+                                mode: 'index',
+                                intersect: false,
+                                backgroundColor: 'rgba(0, 0, 0, 0.8)',
+                                padding: 12,
+                                callbacks: {{
+                                    title: function(tooltipItems) {{
+                                        const index = tooltipItems[0].dataIndex;
+                                        const fullLabels = {json.dumps(labels)};
+                                        return fullLabels[index];
+                                    }}
+                                }}
+                            }}
+                        }},
+                        scales: {{
+                            y: {{
+                                type: 'linear',
+                                display: true,
+                                position: 'left',
+                                beginAtZero: true,
+                                grid: {{
+                                    color: 'rgba(0, 0, 0, 0.05)'
+                                }},
+                                title: {{
+                                    display: true,
+                                    text: 'Packet Loss %',
+                                    color: '#dc2626',
+                                    font: {{
+                                        size: 11,
+                                        weight: 'bold'
+                                    }}
+                                }},
+                                ticks: {{
+                                    callback: function(value) {{
+                                        return value.toFixed(2) + '%';
+                                    }},
+                                    font: {{
+                                        size: 10
+                                    }}
+                                }}
+                            }},
+                            y1: {{
+                                type: 'linear',
+                                display: true,
+                                position: 'right',
+                                beginAtZero: true,
+                                grid: {{
+                                    drawOnChartArea: false
+                                }},
+                                title: {{
+                                    display: true,
+                                    text: 'Dropped Packets',
+                                    color: '#3b82f6',
+                                    font: {{
+                                        size: 11,
+                                        weight: 'bold'
+                                    }}
+                                }},
+                                ticks: {{
+                                    font: {{
+                                        size: 10
+                                    }}
+                                }}
+                            }},
+                            x: {{
+                                grid: {{
+                                    color: 'rgba(0, 0, 0, 0.05)'
+                                }},
+                                title: {{
+                                    display: true,
+                                    text: 'Time (15-min intervals)',
+                                    font: {{
+                                        size: 11,
+                                        weight: 'bold'
+                                    }}
+                                }},
+                                ticks: {{
+                                    maxRotation: 45,
+                                    minRotation: 45,
+                                    autoSkip: true,
+                                    font: {{
+                                        size: 9
+                                    }}
+                                }}
+                            }}
+                        }}
+                    }}
+                }});
+                """
+
+                chart_idx += 1
+
+        # Create simple sparkline for all ports
+        sparkline_html = ""
         if len(hourly_data) > 0:
             # Sample every 6 hours to keep visualization simple (max 28 bars for 7 days)
             sample_rate = max(1, len(hourly_data) // 28)
@@ -3231,7 +3633,7 @@ def generate_packet_loss_history_html(switch_port_history):
             sparkline_html = '<div style="color: #999;">No data</div>'
 
         ports_html += f"""
-            <div style="background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 20px; margin-bottom: 15px;">
+            <div style="background: white; border: 1px solid {'#dc2626' if is_critical else '#e5e7eb'}; border-width: {'2px' if is_critical else '1px'}; border-radius: 8px; padding: 20px; margin-bottom: 15px;">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
                     <div>
                         <h4 style="margin: 0; color: #1f2937;">{port_data.get('switch_name', 'Unknown Switch')} - {port_data.get('port_name', 'Unknown Port')}</h4>
@@ -3246,11 +3648,11 @@ def generate_packet_loss_history_html(switch_port_history):
                 <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 15px; margin-bottom: 15px;">
                     <div>
                         <div style="color: #6b7280; font-size: 0.85em; margin-bottom: 5px;">Current Loss</div>
-                        <div style="font-size: 1.2em; font-weight: bold; color: #1f2937;">{stats.get('current_loss', 0):.3f}%</div>
+                        <div style="font-size: 1.2em; font-weight: bold; color: {'#dc2626' if stats.get('current_loss', 0) > 1 else '#1f2937'};">{stats.get('current_loss', 0):.3f}%</div>
                     </div>
                     <div>
                         <div style="color: #6b7280; font-size: 0.85em; margin-bottom: 5px;">Average Loss</div>
-                        <div style="font-size: 1.2em; font-weight: bold; color: #1f2937;">{stats.get('avg_loss', 0):.3f}%</div>
+                        <div style="font-size: 1.2em; font-weight: bold; color: {'#dc2626' if avg_loss > 1 else '#1f2937'};">{avg_loss:.3f}%</div>
                     </div>
                     <div>
                         <div style="color: #6b7280; font-size: 0.85em; margin-bottom: 5px;">Max Loss</div>
@@ -3263,7 +3665,7 @@ def generate_packet_loss_history_html(switch_port_history):
                 </div>
 
                 <div style="background: #f9fafb; padding: 15px; border-radius: 6px;">
-                    <div style="color: #6b7280; font-size: 0.85em; margin-bottom: 10px; font-weight: 500;">7-Day Packet Loss Trend</div>
+                    <div style="color: #6b7280; font-size: 0.85em; margin-bottom: 10px; font-weight: 500;">7-Day Packet Loss Overview</div>
                     <div style="display: flex; gap: 2px; height: 40px;">
                         {sparkline_html}
                     </div>
@@ -3272,6 +3674,8 @@ def generate_packet_loss_history_html(switch_port_history):
                         <span>Now</span>
                     </div>
                 </div>
+                
+                {chart_html}
             </div>
         """
 
@@ -3286,10 +3690,20 @@ def generate_packet_loss_history_html(switch_port_history):
             </div>
         """
 
+    # Add Chart.js script for critical ports
+    script_html = ""
+    if chart_script:
+        script_html = f"""
+        <script>
+            {chart_script}
+        </script>
+        """
+
     return f"""
         <div style="margin: 20px 0;">
             {summary_html}
             {ports_html}
+            {script_html}
         </div>
     """
 
@@ -3501,7 +3915,9 @@ def generate_switch_analysis_html(switch_analysis, switch_port_history=None):
 """
 
     # Generate packet loss history section
-    packet_loss_html = generate_packet_loss_history_html(switch_port_history) if switch_port_history else ""
+    packet_loss_html = (
+        generate_packet_loss_history_html(switch_port_history) if switch_port_history else ""
+    )
 
     return f"""
         <div class="section">

@@ -539,7 +539,9 @@ class SwitchAnalyzer:
         """
         from datetime import datetime, timedelta
 
-        console.print(f"[cyan]Collecting switch port history ({lookback_hours}h lookback)...[/cyan]")
+        console.print(
+            f"[cyan]Collecting switch port history ({lookback_hours}h lookback)...[/cyan]"
+        )
 
         # Get switch devices
         devices_response = self.client.get(f"s/{self.site}/stat/device")
@@ -560,8 +562,8 @@ class SwitchAnalyzer:
                 "ports_with_loss": 0,
                 "improving": 0,
                 "stable": 0,
-                "worsening": 0
-            }
+                "worsening": 0,
+            },
         }
 
         # Calculate time range
@@ -615,7 +617,9 @@ class SwitchAnalyzer:
                         if total_packets < 1000:
                             continue
 
-                        packet_loss_pct = (total_dropped / total_packets * 100) if total_packets > 0 else 0
+                        packet_loss_pct = (
+                            (total_dropped / total_packets * 100) if total_packets > 0 else 0
+                        )
 
                         # Initialize port tracking
                         port_key = f"{switch_mac}_{port_idx}"
@@ -625,21 +629,23 @@ class SwitchAnalyzer:
                                 "switch_mac": switch_mac,
                                 "port_idx": port_idx,
                                 "port_name": port_name,
-                                "hourly_data": []
+                                "hourly_data": [],
                             }
 
                         # Add this hour's data
-                        port_time_series[port_key]["hourly_data"].append({
-                            "timestamp": timestamp,
-                            "datetime": datetime.fromtimestamp(timestamp / 1000).isoformat(),
-                            "packet_loss_pct": round(packet_loss_pct, 3),
-                            "rx_dropped": rx_dropped,
-                            "tx_dropped": tx_dropped,
-                            "total_dropped": total_dropped,
-                            "rx_packets": rx_packets,
-                            "tx_packets": tx_packets,
-                            "total_packets": total_packets
-                        })
+                        port_time_series[port_key]["hourly_data"].append(
+                            {
+                                "timestamp": timestamp,
+                                "datetime": datetime.fromtimestamp(timestamp / 1000).isoformat(),
+                                "packet_loss_pct": round(packet_loss_pct, 3),
+                                "rx_dropped": rx_dropped,
+                                "tx_dropped": tx_dropped,
+                                "total_dropped": total_dropped,
+                                "rx_packets": rx_packets,
+                                "tx_packets": tx_packets,
+                                "total_packets": total_packets,
+                            }
+                        )
 
                 # Analyze trends for each port
                 for port_key, port_data in port_time_series.items():
@@ -673,11 +679,11 @@ class SwitchAnalyzer:
                     # Calculate trend direction
                     if last_quarter_avg < first_quarter_avg * 0.8:
                         trend = "improving"
-                        trend_pct = ((first_quarter_avg - last_quarter_avg) / first_quarter_avg * 100)
+                        trend_pct = (first_quarter_avg - last_quarter_avg) / first_quarter_avg * 100
                         results["summary"]["improving"] += 1
                     elif last_quarter_avg > first_quarter_avg * 1.2:
                         trend = "worsening"
-                        trend_pct = ((last_quarter_avg - first_quarter_avg) / first_quarter_avg * 100)
+                        trend_pct = (last_quarter_avg - first_quarter_avg) / first_quarter_avg * 100
                         results["summary"]["worsening"] += 1
                     else:
                         trend = "stable"
@@ -695,7 +701,7 @@ class SwitchAnalyzer:
                         "first_quarter_avg": round(first_quarter_avg, 3),
                         "last_quarter_avg": round(last_quarter_avg, 3),
                         "data_points": len(hourly_data),
-                        "hours_tracked": round(len(hourly_data))
+                        "hours_tracked": round(len(hourly_data)),
                     }
 
                     results["port_history"][port_key] = port_data
@@ -705,7 +711,7 @@ class SwitchAnalyzer:
                         "trend": trend,
                         "current_loss": round(current_loss, 3),
                         "avg_loss": round(avg_loss, 3),
-                        "trend_pct": round(trend_pct, 1)
+                        "trend_pct": round(trend_pct, 1),
                     }
 
             except Exception as e:

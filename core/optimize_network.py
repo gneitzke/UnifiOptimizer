@@ -137,6 +137,7 @@ def analyze_network(client, site="default", lookback_days=3):
         analysis["airtime_analysis"] = advanced_analysis["airtime_analysis"]
         analysis["client_capabilities"] = advanced_analysis["client_capabilities"]
         analysis["switch_analysis"] = advanced_analysis["switch_analysis"]
+        analysis["switch_port_history"] = advanced_analysis["switch_port_history"]
 
         # Merge band steering recommendations into main recommendations list
         band_steering_recs = advanced_analysis["band_steering_analysis"].get("recommendations", [])
@@ -399,6 +400,70 @@ def analyze_network(client, site="default", lookback_days=3):
                                         f"          Action: [dim]{issue['recommendation']}[/dim]"
                                     )
 
+        # Display Switch Port Packet Loss History
+        switch_port_history = advanced_analysis.get("switch_port_history", {})
+        if switch_port_history and switch_port_history.get("port_history"):
+            summary = switch_port_history.get("summary", {})
+            trends = switch_port_history.get("trends", {})
+
+            console.print(f"\n[bold cyan]📊 Switch Port Packet Loss Trends (7 Days):[/bold cyan]")
+
+            # Show summary
+            console.print(
+                f"  Monitored: {summary.get('ports_with_loss', 0)} ports with packet loss"
+            )
+
+            if summary.get("improving", 0) > 0:
+                console.print(f"  [green]↗️  {summary.get('improving', 0)} improving[/green]")
+            if summary.get("stable", 0) > 0:
+                console.print(f"  [yellow]→  {summary.get('stable', 0)} stable[/yellow]")
+            if summary.get("worsening", 0) > 0:
+                console.print(f"  [red]↘️  {summary.get('worsening', 0)} worsening[/red]")
+
+            # Show top problem ports
+            if trends:
+                # Sort by current loss, show top 5
+                sorted_trends = sorted(
+                    trends.items(), key=lambda x: x[1].get("current_loss", 0), reverse=True
+                )[:5]
+
+                console.print(f"\n[bold]  Top Ports by Current Packet Loss:[/bold]")
+                for port_key, trend_data in sorted_trends:
+                    switch_name = trend_data.get("switch_name", "Unknown")
+                    port_name = trend_data.get("port_name", "Unknown")
+                    trend = trend_data.get("trend", "unknown")
+                    current = trend_data.get("current_loss", 0)
+                    avg = trend_data.get("avg_loss", 0)
+                    trend_pct = trend_data.get("trend_pct", 0)
+
+                    # Trend display
+                    if trend == "improving":
+                        trend_icon = "↗️"
+                        trend_color = "green"
+                        trend_text = f"improving {trend_pct:.1f}%"
+                    elif trend == "worsening":
+                        trend_icon = "↘️"
+                        trend_color = "red"
+                        trend_text = f"worsening {trend_pct:.1f}%"
+                    else:
+                        trend_icon = "→"
+                        trend_color = "yellow"
+                        trend_text = "stable"
+
+                    # Loss severity color
+                    if current > 5:
+                        loss_color = "red"
+                    elif current > 1:
+                        loss_color = "yellow"
+                    else:
+                        loss_color = "white"
+
+                    console.print(
+                        f"  [{loss_color}]• {switch_name} - {port_name}[/{loss_color}]: "
+                        f"[bold]{current:.3f}%[/bold] (avg: {avg:.3f}%) "
+                        f"[{trend_color}]{trend_icon} {trend_text}[/{trend_color}]"
+                    )
+
         console.print()
 
         # Display Network Health Analysis - use the Grade-based scoring for consistency
@@ -489,7 +554,10 @@ def analyze_network(client, site="default", lookback_days=3):
         # Fallback to basic analysis
         devices = get_devices(client)
         aps = [d for d in devices if d.get("type") == "uap"]
-        return {"recommendations": _generate_basic_recommendations(aps, devices), "full_analysis": None}
+        return {
+            "recommendations": _generate_basic_recommendations(aps, devices),
+            "full_analysis": None,
+        }
 
 
 def _convert_expert_recommendations(expert_recs, all_devices=None):
@@ -547,10 +615,11 @@ def _convert_expert_recommendations(expert_recs, all_devices=None):
                 aps = [d for d in all_devices if d.get("type") == "uap"]
                 for other_ap in aps:
                     other_uplink = other_ap.get("uplink", {})
-                    if (other_uplink.get("type") == "wireless" and (
-                            other_uplink.get("uplink_remote_mac") == ap_mac)):
+                    if other_uplink.get("type") == "wireless" and (
+                        other_uplink.get("uplink_remote_mac") == ap_mac
+                    ):
                         is_mesh_parent = True
-                        break            # Skip power reduction for ANY mesh-involved AP
+                        break  # Skip power reduction for ANY mesh-involved AP
             if is_mesh_child or is_mesh_parent:
                 console.print(
                     f"[yellow]⚠ Skipping power reduction for {ap_info['name']} - "
@@ -754,8 +823,9 @@ def _generate_health_based_recommendations(aps, health_analysis):
                         uplink_rssi = ap.get("uplink", {}).get("rssi")
                         is_wireless_uplink = uplink_type == "wireless"
 
-                        is_mesh = (ap.get("adopted", False) and (
-                                   is_wireless_uplink or (uplink_rssi and uplink_rssi < -70)))
+                        is_mesh = ap.get("adopted", False) and (
+                            is_wireless_uplink or (uplink_rssi and uplink_rssi < -70)
+                        )
 
                         # Additional safety: Never reduce power if uplink RSSI is weak
                         has_weak_uplink = uplink_rssi and uplink_rssi < -65
@@ -763,7 +833,12 @@ def _generate_health_based_recommendations(aps, health_analysis):
                         # Check if this AP is a parent to mesh nodes
                         is_mesh_parent = _is_mesh_parent(ap, aps)
 
-                        if power == "high" and not is_mesh and not has_weak_uplink and not is_mesh_parent:
+                        if (
+                            power == "high"
+                            and not is_mesh
+                            and not has_weak_uplink
+                            and not is_mesh_parent
+                        ):
                             recommendations.append(
                                 {
                                     "device": ap,
@@ -855,8 +930,9 @@ def _generate_health_based_recommendations(aps, health_analysis):
                 uplink_rssi = ap.get("uplink", {}).get("rssi")
                 is_wireless_uplink = uplink_type == "wireless"
 
-                is_mesh = (ap.get("adopted", False) and (
-                    is_wireless_uplink or (uplink_rssi and uplink_rssi < -70)))
+                is_mesh = ap.get("adopted", False) and (
+                    is_wireless_uplink or (uplink_rssi and uplink_rssi < -70)
+                )
 
                 # Additional safety: Never reduce power if uplink RSSI is weak
                 has_weak_uplink = uplink_rssi and uplink_rssi < -65
@@ -864,7 +940,12 @@ def _generate_health_based_recommendations(aps, health_analysis):
                 # Check if this AP is a parent to mesh nodes (needs high power for TX to children)
                 is_mesh_parent = _is_mesh_parent(ap, aps)
 
-                if power in ["high", "medium"] and not is_mesh and not has_weak_uplink and not is_mesh_parent:
+                if (
+                    power in ["high", "medium"]
+                    and not is_mesh
+                    and not has_weak_uplink
+                    and not is_mesh_parent
+                ):
                     new_power = "medium" if power == "high" else "low"
                     recommendations.append(
                         {
@@ -960,11 +1041,7 @@ def _get_parent_ap_info(mesh_ap, all_aps):
     # Check parent's power settings on relevant radios
     # The mesh uplink is typically on 5GHz or 6GHz
     radio_table = parent_ap.get("radio_table", [])
-    parent_power_status = {
-        "has_low_power": False,
-        "low_power_bands": [],
-        "power_modes": {}
-    }
+    parent_power_status = {"has_low_power": False, "low_power_bands": [], "power_modes": {}}
 
     for radio in radio_table:
         radio_name = radio.get("radio")
@@ -1019,8 +1096,9 @@ def _generate_basic_recommendations(aps, all_devices=None):
     for ap in aps:
         uplink_type = ap.get("uplink", {}).get("type", "")
         uplink_rssi = ap.get("uplink", {}).get("rssi")
-        is_mesh = (ap.get("adopted", False) and (
-                   uplink_type == "wireless" or (uplink_rssi and uplink_rssi < -70)))
+        is_mesh = ap.get("adopted", False) and (
+            uplink_type == "wireless" or (uplink_rssi and uplink_rssi < -70)
+        )
         if is_mesh:
             mesh_aps.append(ap)
             parent_mac = ap.get("uplink", {}).get("uplink_remote_mac")
@@ -1052,14 +1130,16 @@ def _generate_basic_recommendations(aps, all_devices=None):
             parent_line,
             f"[green]🛡️  Protected APs: {len(mesh_aps) + mesh_parent_aps}[/green]",
             f"",
-            f"[dim]All mesh nodes maintain HIGH power for reliable wireless backhaul[/dim]"
+            f"[dim]All mesh nodes maintain HIGH power for reliable wireless backhaul[/dim]",
         ]
-        console.print(Panel(
-            "\n".join(mesh_summary_lines),
-            title="🔗 Mesh Topology",
-            border_style="cyan",
-            padding=(1, 2)
-        ))
+        console.print(
+            Panel(
+                "\n".join(mesh_summary_lines),
+                title="🔗 Mesh Topology",
+                border_style="cyan",
+                padding=(1, 2),
+            )
+        )
         console.print()
 
     # Analyze each AP
@@ -1076,8 +1156,9 @@ def _generate_basic_recommendations(aps, all_devices=None):
 
         # Enhanced mesh detection: wireless uplink is PRIMARY indicator
         # Only use RSSI as secondary check for very weak uplinks (< -70 dBm suggests wireless)
-        is_mesh = (ap.get("adopted", False) and (
-                   is_wireless_uplink or (uplink_rssi and uplink_rssi < -70)))
+        is_mesh = ap.get("adopted", False) and (
+            is_wireless_uplink or (uplink_rssi and uplink_rssi < -70)
+        )
 
         mesh_label = " [MESH]" if is_mesh else ""
 
@@ -1133,17 +1214,27 @@ def _generate_basic_recommendations(aps, all_devices=None):
                     signal_text = "Weak"
                     signal_color = "red"
 
-                console.print(f"  [{signal_color}]{signal_emoji} Uplink: {uplink_rssi} dBm ({signal_text})[/{signal_color}]")
+                console.print(
+                    f"  [{signal_color}]{signal_emoji} Uplink: {uplink_rssi} dBm ({signal_text})[/{signal_color}]"
+                )
 
                 # Enhanced bidirectional power requirements
                 if uplink_rssi < -70:
                     console.print(f"  [yellow]⚠️  Bidirectional Power Requirements:[/yellow]")
-                    console.print(f"  [yellow]   ← RX: Child receiving weak signal from parent[/yellow]")
-                    console.print(f"  [yellow]   → TX: Child needs HIGH power to reach parent[/yellow]")
-                    console.print(f"  [yellow]   → TX: Parent needs HIGH power to reach child[/yellow]")
+                    console.print(
+                        f"  [yellow]   ← RX: Child receiving weak signal from parent[/yellow]"
+                    )
+                    console.print(
+                        f"  [yellow]   → TX: Child needs HIGH power to reach parent[/yellow]"
+                    )
+                    console.print(
+                        f"  [yellow]   → TX: Parent needs HIGH power to reach child[/yellow]"
+                    )
                     console.print(f"  [green]   🛡️  Both APs protected from power reduction[/green]")
                 else:
-                    console.print(f"  [green]🛡️  Power Protected - Maintaining HIGH power for reliable mesh[/green]")
+                    console.print(
+                        f"  [green]🛡️  Power Protected - Maintaining HIGH power for reliable mesh[/green]"
+                    )
 
             # Parent side (TX): Show if parent has low power
             if parent_warning:
@@ -1176,7 +1267,9 @@ def _generate_basic_recommendations(aps, all_devices=None):
                     }
                 )
             elif is_mesh_parent:
-                console.print(f"  [green]🛡️  Mesh Parent - Maintaining HIGH power (TX → children)[/green]")
+                console.print(
+                    f"  [green]🛡️  Mesh Parent - Maintaining HIGH power (TX → children)[/green]"
+                )
 
         console.print()
 
@@ -1350,7 +1443,7 @@ def display_airtime_trends(analysis):
             return "█" * width  # Flat line
 
         # Map to spark characters
-        spark_chars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']
+        spark_chars = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
 
         # Sample values to fit width
         step = max(1, len(values) // width)
@@ -1409,7 +1502,7 @@ def display_airtime_trends(analysis):
             f"[{current_color}]{status}{current:.0f}%[/{current_color}]",
             f"{avg:.0f}%",
             f"{peak:.0f}%",
-            sparkline_display
+            sparkline_display,
         )
 
     console.print(table)
@@ -1768,9 +1861,7 @@ def apply_recommendations(client, recommendations, dry_run=False, interactive=Tr
 
             if radio_name:
                 # Single radio recommendation (legacy)
-                if applier.apply_min_rssi(
-                    device, radio_name, rec["new_enabled"], rec["new_value"]
-                ):
+                if applier.apply_min_rssi(device, radio_name, rec["new_enabled"], rec["new_value"]):
                     devices_to_restart.add(device_id)
             else:
                 # Apply to all radios (recommended approach)
