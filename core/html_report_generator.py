@@ -2562,6 +2562,9 @@ def generate_min_rssi_html(min_rssi):
     radios_without = min_rssi.get("radios_without_min_rssi", [])
     severity = min_rssi.get("severity", "ok")
     recommendations = min_rssi.get("recommendations", [])
+    strategy = min_rssi.get("strategy", "optimal")
+    ios_device_count = min_rssi.get("ios_device_count", 0)
+    ios_devices_detected = min_rssi.get("ios_devices_detected", False)
 
     # Radio configuration table
     radio_config_html = ""
@@ -2600,9 +2603,50 @@ def generate_min_rssi_html(min_rssi):
 
     pct_disabled = (disabled_count / total_radios * 100) if total_radios > 0 else 0
 
+    # Strategy information
+    strategy_display = (
+        "Optimal (Aggressive Roaming)"
+        if strategy == "optimal"
+        else "Max Connectivity (Conservative Roaming)"
+    )
+    strategy_color = "#10b981" if strategy == "optimal" else "#f59e0b"
+    strategy_icon = "⚡" if strategy == "optimal" else "🛡️"
+
+    strategy_desc = ""
+    if strategy == "optimal":
+        strategy_desc = "Aggressive roaming for best performance. Forces clients to move to better APs early. Best for dense AP deployment."
+    else:
+        strategy_desc = "Conservative roaming for maximum reliability. Lets clients stay connected longer. Best for sparse AP deployment or iOS-heavy networks."
+
+    # iOS detection info
+    ios_info_html = ""
+    if ios_devices_detected:
+        ios_info_html = f"""
+                <div style="margin-top: 10px; padding: 12px; background: #fffbeb; border-left: 3px solid #f59e0b; border-radius: 4px;">
+                    <strong style="color: #f59e0b;">🍎 iOS Devices Detected: {ios_device_count}</strong>
+                    <p style="margin: 5px 0 0 0; color: #666; font-size: 0.9em;">
+                        iPhone/iPad devices may be more sensitive to aggressive Min RSSI thresholds.
+                        {"Current strategy includes extra tolerance for iOS devices." if strategy == "max_connectivity" else "Consider using Max Connectivity strategy for more iOS tolerance."}
+                    </p>
+                </div>
+"""
+
     return f"""
             <div class="section">
                 <h2>📡 Minimum RSSI Configuration</h2>
+
+                <!-- Strategy Display -->
+                <div style="background: {strategy_color}15; padding: 20px; border-radius: 8px; border-left: 4px solid {strategy_color}; margin-bottom: 20px;">
+                    <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 10px;">
+                        <span style="font-size: 2em;">{strategy_icon}</span>
+                        <div>
+                            <strong style="font-size: 1.3em; color: {strategy_color};">Strategy: {strategy_display}</strong>
+                            <p style="margin: 5px 0 0 0; color: #666;">{strategy_desc}</p>
+                        </div>
+                    </div>
+                    {ios_info_html}
+                </div>
+
                 <div style="background: {severity_color}15; padding: 20px; border-radius: 8px; border-left: 4px solid {severity_color}; margin-bottom: 20px;">
                     <strong style="font-size: 1.2em; color: {severity_color};">{disabled_count} of {total_radios} Radios ({pct_disabled:.0f}%) Without Min RSSI</strong>
                     <p style="margin-top: 10px; color: #666;">Minimum RSSI forces weak clients to roam before signal degrades too much, preventing sticky client problems and improving network performance.</p>
@@ -3816,6 +3860,128 @@ def generate_switch_analysis_html(switch_analysis, switch_port_history=None):
                         {message}
                         {f"<br/><em style='color: {color};'>Impact:</em> {impact}" if impact else ""}
                         {f"<br/><em>Action:</em> {recommendation}" if recommendation else ""}
+                    </td>
+                </tr>
+"""
+
+                # Add inline Chart.js graph if history is available
+                if port.get("mini_history"):
+                    import json
+
+                    history = port["mini_history"]
+
+                    # Generate unique chart ID
+                    chart_id = f"portChart_{switch['mac'].replace(':', '')}_{port['port_idx']}"
+
+                    # Extract data for chart
+                    labels = [h["datetime"].split("T")[1].split(":")[0] + ":00" for h in history]
+                    packet_loss_data = [h["packet_loss_pct"] for h in history]
+                    error_rate_data = [h["error_rate"] for h in history]
+
+                    max_loss = max(packet_loss_data) if packet_loss_data else 0
+                    min_loss = min(packet_loss_data) if packet_loss_data else 0
+                    avg_loss = (
+                        sum(packet_loss_data) / len(packet_loss_data) if packet_loss_data else 0
+                    )
+
+                    ports_html += f"""
+                <tr style="background: {bg_color};">
+                    <td colspan="8" style="padding: 20px;">
+                        <div style="background: white; padding: 15px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+                            <h4 style="margin: 0 0 10px 0; color: #374151; font-size: 0.95em;">
+                                📊 24-Hour Health History
+                                <span style="font-weight: normal; color: #6b7280; font-size: 0.9em;">
+                                    (Max: {max_loss:.2f}% | Avg: {avg_loss:.2f}% | Min: {min_loss:.2f}%)
+                                </span>
+                            </h4>
+                            <canvas id="{chart_id}" style="max-height: 200px;"></canvas>
+                            <script>
+                            (function() {{
+                                const ctx = document.getElementById('{chart_id}').getContext('2d');
+                                new Chart(ctx, {{
+                                    type: 'line',
+                                    data: {{
+                                        labels: {json.dumps(labels)},
+                                        datasets: [
+                                            {{
+                                                label: 'Packet Loss %',
+                                                data: {json.dumps(packet_loss_data)},
+                                                borderColor: '{color}',
+                                                backgroundColor: '{color}33',
+                                                borderWidth: 2,
+                                                fill: true,
+                                                tension: 0.3,
+                                                pointRadius: 2,
+                                                pointHoverRadius: 5
+                                            }},
+                                            {{
+                                                label: 'Error Rate %',
+                                                data: {json.dumps(error_rate_data)},
+                                                borderColor: '#f59e0b',
+                                                backgroundColor: '#f59e0b33',
+                                                borderWidth: 2,
+                                                fill: true,
+                                                tension: 0.3,
+                                                pointRadius: 2,
+                                                pointHoverRadius: 5
+                                            }}
+                                        ]
+                                    }},
+                                    options: {{
+                                        responsive: true,
+                                        maintainAspectRatio: true,
+                                        plugins: {{
+                                            legend: {{
+                                                display: true,
+                                                position: 'top',
+                                                labels: {{
+                                                    boxWidth: 12,
+                                                    padding: 10,
+                                                    font: {{ size: 11 }}
+                                                }}
+                                            }},
+                                            tooltip: {{
+                                                mode: 'index',
+                                                intersect: false,
+                                                callbacks: {{
+                                                    label: function(context) {{
+                                                        return context.dataset.label + ': ' + context.parsed.y.toFixed(3) + '%';
+                                                    }}
+                                                }}
+                                            }}
+                                        }},
+                                        scales: {{
+                                            x: {{
+                                                display: true,
+                                                title: {{
+                                                    display: true,
+                                                    text: 'Time (24h)',
+                                                    font: {{ size: 11 }}
+                                                }},
+                                                ticks: {{
+                                                    maxRotation: 45,
+                                                    minRotation: 45,
+                                                    font: {{ size: 10 }}
+                                                }}
+                                            }},
+                                            y: {{
+                                                display: true,
+                                                title: {{
+                                                    display: true,
+                                                    text: 'Percentage (%)',
+                                                    font: {{ size: 11 }}
+                                                }},
+                                                beginAtZero: true,
+                                                ticks: {{
+                                                    font: {{ size: 10 }}
+                                                }}
+                                            }}
+                                        }}
+                                    }}
+                                }});
+                            }})();
+                            </script>
+                        </div>
                     </td>
                 </tr>
 """

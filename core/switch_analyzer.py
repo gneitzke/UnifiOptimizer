@@ -350,7 +350,127 @@ class SwitchAnalyzer:
                     }
                 )
 
+            # Fetch inline history for ports with issues (for visualization)
+            if port_info["issues"] and switch_mac:
+                port_history = self.get_port_mini_history(
+                    switch_mac, port.get("port_idx"), hours=24
+                )
+                if port_history:
+                    port_info["mini_history"] = port_history
+
         return port_info
+
+    def generate_ascii_sparkline(self, values, width=40, height=5):
+        """
+        Generate ASCII sparkline graph for CLI display
+        Returns list of strings (one per line)
+        """
+        if not values or len(values) < 2:
+            return ["No data available"]
+
+        # Normalize values to height
+        min_val = min(values)
+        max_val = max(values)
+
+        if max_val == min_val:
+            # All values the same
+            mid_line = int(height / 2)
+            lines = []
+            for i in range(height):
+                if i == mid_line:
+                    lines.append("─" * width)
+                else:
+                    lines.append(" " * width)
+            return lines
+
+        # Normalize to 0-height range
+        normalized = [(v - min_val) / (max_val - min_val) * (height - 1) for v in values]
+
+        # Sample data to fit width
+        if len(normalized) > width:
+            step = len(normalized) / width
+            sampled = [normalized[int(i * step)] for i in range(width)]
+        else:
+            sampled = normalized
+
+        # Build graph from top to bottom
+        lines = []
+        for row in range(height - 1, -1, -1):
+            line = ""
+            for val in sampled:
+                if int(round(val)) == row:
+                    line += "●"
+                elif val > row:
+                    line += "│"
+                else:
+                    line += " "
+            lines.append(line)
+
+        return lines
+
+    def get_port_mini_history(self, switch_mac, port_idx, hours=24):
+        """
+        Get mini history for a specific port (last 24 hours)
+        Used for inline visualization of problematic ports
+        """
+        from datetime import datetime, timedelta
+
+        end_time = int(datetime.now().timestamp() * 1000)
+        start_time = int((datetime.now() - timedelta(hours=hours)).timestamp() * 1000)
+
+        try:
+            hourly_stats = self.client.get(
+                f"s/{self.site}/stat/report/hourly.device/{switch_mac}?start={start_time}&end={end_time}"
+            )
+
+            if not hourly_stats or "data" not in hourly_stats:
+                return None
+
+            # Extract data for this specific port
+            port_data = []
+            for stat in hourly_stats["data"]:
+                port_table = stat.get("port_table", [])
+                for port in port_table:
+                    if port.get("port_idx") == port_idx:
+                        timestamp = stat.get("time", 0)
+                        rx_packets = port.get("rx_packets", 0)
+                        tx_packets = port.get("tx_packets", 0)
+                        rx_dropped = port.get("rx_dropped", 0)
+                        tx_dropped = port.get("tx_dropped", 0)
+                        rx_errors = port.get("rx_errors", 0)
+                        tx_errors = port.get("tx_errors", 0)
+
+                        total_packets = rx_packets + tx_packets
+                        total_dropped = rx_dropped + tx_dropped
+                        total_errors = rx_errors + tx_errors
+
+                        if total_packets > 0:
+                            packet_loss_pct = total_dropped / total_packets * 100
+                            error_rate = total_errors / total_packets * 100
+                        else:
+                            packet_loss_pct = 0
+                            error_rate = 0
+
+                        port_data.append(
+                            {
+                                "timestamp": timestamp,
+                                "datetime": datetime.fromtimestamp(timestamp / 1000).isoformat(),
+                                "packet_loss_pct": round(packet_loss_pct, 3),
+                                "error_rate": round(error_rate, 3),
+                                "rx_dropped": rx_dropped,
+                                "tx_dropped": tx_dropped,
+                                "total_dropped": total_dropped,
+                                "rx_errors": rx_errors,
+                                "tx_errors": tx_errors,
+                            }
+                        )
+                        break
+
+            return sorted(port_data, key=lambda x: x["timestamp"]) if port_data else None
+
+        except Exception as e:
+            console.print(f"[dim red]Could not fetch port history: {e}[/dim red]")
+            return None
 
     def _check_switch_health(self, switch, summary):
         """Check overall switch health"""
@@ -547,14 +667,23 @@ class SwitchAnalyzer:
         devices_response = self.client.get(f"s/{self.site}/stat/device")
         if not devices_response or "data" not in devices_response:
             console.print("[yellow]⚠️  Failed to get devices for port history[/yellow]")
-            return {"error": "Failed to get devices", "port_history": {}, "trends": {}, "summary": {"ports_with_loss": 0}}
+            return {
+                "error": "Failed to get devices",
+                "port_history": {},
+                "trends": {},
+                "summary": {"ports_with_loss": 0},
+            }
 
         devices = devices_response["data"]
         switches = [d for d in devices if d.get("type") == "usw"]
 
         if not switches:
             console.print("[yellow]⚠️  No managed switches found for port history analysis[/yellow]")
-            return {"port_history": {}, "trends": {}, "summary": {"ports_with_loss": 0, "message": "No managed switches found"}}
+            return {
+                "port_history": {},
+                "trends": {},
+                "summary": {"ports_with_loss": 0, "message": "No managed switches found"},
+            }
 
         console.print(f"[dim]Found {len(switches)} switch(es) to analyze[/dim]")
 
@@ -725,48 +854,53 @@ class SwitchAnalyzer:
         # If no packet loss data was found, add mock/demo data for visualization testing
         # TODO: Remove this mock data block once real data is confirmed working
         if results["summary"]["ports_with_loss"] == 0 and len(switches) > 0:
-            console.print("[yellow]⚠️  No real packet loss detected. Adding demo data for visualization testing...[/yellow]")
-            
+            console.print(
+                "[yellow]⚠️  No real packet loss detected. Adding demo data for visualization testing...[/yellow]"
+            )
+
             # Create mock hourly data for demonstration
             import random
+
             mock_port_key = f"{switches[0].get('mac', 'demo_switch')}_8"
             mock_hourly_data = []
-            
+
             # Generate 168 hours (7 days) of mock data
             current_time = datetime.now()
             base_loss = 1.5  # Start at 1.5% loss
-            
+
             for hour in range(168):
                 timestamp_dt = current_time - timedelta(hours=(168 - hour))
                 timestamp_ms = int(timestamp_dt.timestamp() * 1000)
-                
+
                 # Simulate improving trend (loss decreases over time)
                 hour_loss = max(0.2, base_loss - (hour / 168.0) * 1.0 + random.uniform(-0.2, 0.2))
-                
+
                 # Calculate mock packet counts
                 total_packets = random.randint(100000, 500000)
                 total_dropped = int(total_packets * (hour_loss / 100.0))
                 rx_dropped = int(total_dropped * 0.6)
                 tx_dropped = total_dropped - rx_dropped
-                
-                mock_hourly_data.append({
-                    "timestamp": timestamp_ms,
-                    "datetime": timestamp_dt.isoformat(),
-                    "packet_loss_pct": round(hour_loss, 3),
-                    "rx_dropped": rx_dropped,
-                    "tx_dropped": tx_dropped,
-                    "total_dropped": total_dropped,
-                    "rx_packets": int(total_packets * 0.5),
-                    "tx_packets": int(total_packets * 0.5),
-                    "total_packets": total_packets
-                })
-            
+
+                mock_hourly_data.append(
+                    {
+                        "timestamp": timestamp_ms,
+                        "datetime": timestamp_dt.isoformat(),
+                        "packet_loss_pct": round(hour_loss, 3),
+                        "rx_dropped": rx_dropped,
+                        "tx_dropped": tx_dropped,
+                        "total_dropped": total_dropped,
+                        "rx_packets": int(total_packets * 0.5),
+                        "tx_packets": int(total_packets * 0.5),
+                        "total_packets": total_packets,
+                    }
+                )
+
             # Calculate statistics for mock data
             loss_values = [h["packet_loss_pct"] for h in mock_hourly_data]
             quarter_size = max(1, len(loss_values) // 4)
             first_quarter_avg = sum(loss_values[:quarter_size]) / quarter_size
             last_quarter_avg = sum(loss_values[-quarter_size:]) / quarter_size
-            
+
             mock_port_data = {
                 "switch_name": switches[0].get("name", "Demo Switch"),
                 "switch_mac": switches[0].get("mac", "demo_mac"),
@@ -779,14 +913,16 @@ class SwitchAnalyzer:
                     "max_loss": round(max(loss_values), 3),
                     "min_loss": round(min(loss_values), 3),
                     "trend": "improving",
-                    "trend_pct": round(((first_quarter_avg - last_quarter_avg) / first_quarter_avg * 100), 1),
+                    "trend_pct": round(
+                        ((first_quarter_avg - last_quarter_avg) / first_quarter_avg * 100), 1
+                    ),
                     "first_quarter_avg": round(first_quarter_avg, 3),
                     "last_quarter_avg": round(last_quarter_avg, 3),
                     "data_points": len(mock_hourly_data),
-                    "hours_tracked": len(mock_hourly_data)
-                }
+                    "hours_tracked": len(mock_hourly_data),
+                },
             }
-            
+
             results["port_history"][mock_port_key] = mock_port_data
             results["trends"][mock_port_key] = {
                 "switch_name": mock_port_data["switch_name"],
@@ -794,17 +930,19 @@ class SwitchAnalyzer:
                 "trend": "improving",
                 "current_loss": mock_port_data["statistics"]["current_loss"],
                 "avg_loss": mock_port_data["statistics"]["avg_loss"],
-                "trend_pct": mock_port_data["statistics"]["trend_pct"]
+                "trend_pct": mock_port_data["statistics"]["trend_pct"],
             }
-            
+
             results["summary"]["ports_with_loss"] = 1
             results["summary"]["total_ports_analyzed"] = 1
             results["summary"]["improving"] = 1
             results["summary"]["stable"] = 0
             results["summary"]["worsening"] = 0
             results["summary"]["message"] = "Demo data: 1 port showing improving packet loss trend"
-            
-            console.print("[cyan]✓ Demo data added: 1 port with 1.5% → 0.5% loss (improving trend)[/cyan]")
+
+            console.print(
+                "[cyan]✓ Demo data added: 1 port with 1.5% → 0.5% loss (improving trend)[/cyan]"
+            )
 
         # Add summary message
         if results["summary"]["ports_with_loss"] > 0:

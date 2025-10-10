@@ -829,7 +829,7 @@ class AdvancedNetworkAnalyzer:
 
         return results
 
-    def analyze_min_rssi(self, devices, clients=None):
+    def analyze_min_rssi(self, devices, clients=None, strategy="optimal"):
         """
         Analyze minimum RSSI configuration across APs
 
@@ -865,6 +865,7 @@ class AdvancedNetworkAnalyzer:
             "severity": "ok",
             "ios_devices_detected": False,
             "ios_device_count": 0,
+            "strategy": strategy,  # Store strategy for display
         }
 
         # Detect iOS/iPhone devices on network
@@ -2699,7 +2700,9 @@ class AdvancedNetworkAnalyzer:
         return results
 
 
-def run_advanced_analysis(client, site="default", devices=None, clients=None, lookback_days=3):
+def run_advanced_analysis(
+    client, site="default", devices=None, clients=None, lookback_days=3, min_rssi_strategy="optimal"
+):
     """
     Run all advanced analysis features
 
@@ -2727,7 +2730,7 @@ def run_advanced_analysis(client, site="default", devices=None, clients=None, lo
     results = {
         "dfs_analysis": analyzer.analyze_dfs_events(lookback_days),
         "band_steering_analysis": analyzer.analyze_band_steering(devices, clients),
-        "min_rssi_analysis": analyzer.analyze_min_rssi(devices, clients),
+        "min_rssi_analysis": analyzer.analyze_min_rssi(devices, clients, min_rssi_strategy),
         "fast_roaming_analysis": analyzer.analyze_fast_roaming(devices),
         "airtime_analysis": analyzer.analyze_airtime_utilization(devices),
         "radio_performance_analysis": analyzer.analyze_radio_performance(devices, clients),

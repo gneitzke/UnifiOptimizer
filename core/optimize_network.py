@@ -34,7 +34,7 @@ from utils.keychain import (
 console = Console()
 
 
-def analyze_network(client, site="default", lookback_days=3):
+def analyze_network(client, site="default", lookback_days=3, min_rssi_strategy="optimal"):
     """
     Expert-level network analysis with RSSI monitoring, historical data, and mesh optimization
 
@@ -121,7 +121,9 @@ def analyze_network(client, site="default", lookback_days=3):
         console.print("[bold cyan]Running advanced analysis...[/bold cyan]")
         devices = analysis.get("devices", [])
         clients = analysis.get("clients", [])
-        advanced_analysis = run_advanced_analysis(client, site, devices, clients, lookback_days)
+        advanced_analysis = run_advanced_analysis(
+            client, site, devices, clients, lookback_days, min_rssi_strategy
+        )
 
         # Run manufacturer analysis
         from core.manufacturer_analyzer import analyze_manufacturers
@@ -378,7 +380,7 @@ def analyze_network(client, site="default", lookback_days=3):
                                 )
                                 if has_high_severity:
                                     console.print(
-                                        f"      [bold red]� {port_display} [AP UPLINK - CRITICAL]:[/bold red]"
+                                        f"      [bold red]📡 {port_display} [AP UPLINK - CRITICAL]:[/bold red]"
                                     )
                                 else:
                                     console.print(f"      [cyan]📡 {port_display} [AP]:[/cyan]")
@@ -400,6 +402,38 @@ def analyze_network(client, site="default", lookback_days=3):
                                         f"          Action: [dim]{issue['recommendation']}[/dim]"
                                     )
 
+                            # Show inline sparkline graph if history is available
+                            if port.get("mini_history"):
+                                history = port["mini_history"]
+                                packet_loss_values = [h["packet_loss_pct"] for h in history]
+
+                                if packet_loss_values:
+                                    # Import switch_analyzer for graph generation
+                                    from core.switch_analyzer import SwitchAnalyzer
+
+                                    switch_analyzer = SwitchAnalyzer(client, site)
+
+                                    # Generate sparkline
+                                    sparkline = switch_analyzer.generate_ascii_sparkline(
+                                        packet_loss_values, width=50, height=5
+                                    )
+
+                                    # Display graph with axis labels
+                                    max_loss = max(packet_loss_values)
+                                    min_loss = min(packet_loss_values)
+                                    avg_loss = sum(packet_loss_values) / len(packet_loss_values)
+
+                                    console.print(
+                                        f"          [dim]📊 24-Hour Packet Loss History:[/dim]"
+                                    )
+                                    console.print(
+                                        f"          [dim]Max: {max_loss:.2f}%  Avg: {avg_loss:.2f}%  Min: {min_loss:.2f}%[/dim]"
+                                    )
+                                    for line in sparkline:
+                                        console.print(f"          [cyan]{line}[/cyan]")
+                                    console.print(f"          [dim]{'─' * 50}[/dim]")
+                                    console.print(f"          [dim]24h ago{' ' * 34}Now[/dim]")
+
         # Display Switch Port Packet Loss History
         switch_port_history = advanced_analysis.get("switch_port_history", {})
         if switch_port_history:
@@ -408,7 +442,9 @@ def analyze_network(client, site="default", lookback_days=3):
 
             # Check if we have packet loss to display
             if summary.get("ports_with_loss", 0) > 0:
-                console.print(f"\n[bold cyan]📊 Switch Port Packet Loss Trends (7 Days):[/bold cyan]")
+                console.print(
+                    f"\n[bold cyan]📊 Switch Port Packet Loss Trends (7 Days):[/bold cyan]"
+                )
 
                 # Show summary
                 console.print(
@@ -467,8 +503,12 @@ def analyze_network(client, site="default", lookback_days=3):
                         )
             else:
                 # No packet loss detected
-                console.print(f"\n[bold cyan]📊 Switch Port Packet Loss Trends (7 Days):[/bold cyan]")
-                console.print(f"  [green]✓ {summary.get('message', 'No significant packet loss detected')}[/green]")
+                console.print(
+                    f"\n[bold cyan]📊 Switch Port Packet Loss Trends (7 Days):[/bold cyan]"
+                )
+                console.print(
+                    f"  [green]✓ {summary.get('message', 'No significant packet loss detected')}[/green]"
+                )
 
         console.print()
 
@@ -1945,6 +1985,12 @@ Examples:
         action="store_true",
         help="Show detailed error messages and debugging information",
     )
+    parser.add_argument(
+        "--min-rssi-strategy",
+        choices=["optimal", "max_connectivity"],
+        default="optimal",
+        help="Min RSSI recommendation strategy: 'optimal' (aggressive roaming for performance) or 'max_connectivity' (conservative for reliability)",
+    )
 
     args = parser.parse_args()
 
@@ -2084,7 +2130,7 @@ Examples:
         return 1
 
     # Analyze network with expert analysis
-    result = analyze_network(client, site, args.lookback)
+    result = analyze_network(client, site, args.lookback, args.min_rssi_strategy)
     recommendations = result["recommendations"]
     full_analysis = result.get("full_analysis")
 
