@@ -402,11 +402,14 @@ def analyze_network(client, site="default", lookback_days=3):
 
         # Display Switch Port Packet Loss History
         switch_port_history = advanced_analysis.get("switch_port_history", {})
-        if switch_port_history and switch_port_history.get("port_history"):
+        if switch_port_history:
             summary = switch_port_history.get("summary", {})
-            trends = switch_port_history.get("trends", {})
+            
+            # Always show the section header if we have summary data
+            if summary.get("ports_with_loss", 0) > 0:
+                trends = switch_port_history.get("trends", {})
 
-            console.print(f"\n[bold cyan]📊 Switch Port Packet Loss Trends (7 Days):[/bold cyan]")
+                console.print(f"\n[bold cyan]📊 Switch Port Packet Loss Trends (7 Days):[/bold cyan]")
 
             # Show summary
             console.print(
@@ -463,6 +466,10 @@ def analyze_network(client, site="default", lookback_days=3):
                         f"[bold]{current:.3f}%[/bold] (avg: {avg:.3f}%) "
                         f"[{trend_color}]{trend_icon} {trend_text}[/{trend_color}]"
                     )
+            else:
+                # No packet loss detected
+                console.print(f"\n[bold cyan]📊 Switch Port Packet Loss Trends (7 Days):[/bold cyan]")
+                console.print(f"  [green]✓ {summary.get('message', 'No significant packet loss detected')}[/green]")
 
         console.print()
 
