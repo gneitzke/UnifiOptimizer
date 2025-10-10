@@ -353,8 +353,9 @@ class SwitchAnalyzer:
 
             # Fetch inline history for ports with issues (for visualization)
             if port_info["issues"] and switch_mac:
+                # Get 7 days of data aggregated by day for inline graphs
                 port_history = self.get_port_mini_history(
-                    switch_mac, port.get("port_idx"), hours=24
+                    switch_mac, port.get("port_idx"), hours=168, aggregate_by_day=True
                 )
                 if port_history:
                     port_info["mini_history"] = port_history
@@ -409,11 +410,17 @@ class SwitchAnalyzer:
 
         return lines
 
-    def get_port_mini_history(self, switch_mac, port_idx, hours=24):
+    def get_port_mini_history(self, switch_mac, port_idx, hours=24, aggregate_by_day=False):
         """
-        Get mini history for a specific port (last 24 hours)
+        Get mini history for a specific port
         Used for inline visualization of problematic ports
         Uses cached data from analyze_switch_port_history if available
+
+        Args:
+            switch_mac: MAC address of the switch
+            port_idx: Port index number
+            hours: Number of hours to look back (default 24, use 168 for 7 days)
+            aggregate_by_day: If True, aggregates hourly data into daily totals
         """
         from datetime import datetime, timedelta
 
@@ -478,7 +485,55 @@ class SwitchAnalyzer:
                         )
                         break
 
-            return sorted(port_data, key=lambda x: x["timestamp"]) if port_data else None
+            if not port_data:
+                return None
+
+            # Sort by timestamp
+            port_data = sorted(port_data, key=lambda x: x["timestamp"])
+
+            # If aggregate_by_day is True, group by day and sum the dropped packets
+            if aggregate_by_day:
+                from collections import defaultdict
+                daily_data = defaultdict(lambda: {
+                    "rx_dropped": 0,
+                    "tx_dropped": 0,
+                    "total_dropped": 0,
+                    "rx_errors": 0,
+                    "tx_errors": 0,
+                    "packet_loss_pct_sum": 0,
+                    "error_rate_sum": 0,
+                    "count": 0
+                })
+
+                # Group by date (YYYY-MM-DD)
+                for entry in port_data:
+                    date_key = entry["datetime"][:10]  # Get YYYY-MM-DD
+                    daily_data[date_key]["rx_dropped"] += entry["rx_dropped"]
+                    daily_data[date_key]["tx_dropped"] += entry["tx_dropped"]
+                    daily_data[date_key]["total_dropped"] += entry["total_dropped"]
+                    daily_data[date_key]["rx_errors"] += entry["rx_errors"]
+                    daily_data[date_key]["tx_errors"] += entry["tx_errors"]
+                    daily_data[date_key]["packet_loss_pct_sum"] += entry["packet_loss_pct"]
+                    daily_data[date_key]["error_rate_sum"] += entry["error_rate"]
+                    daily_data[date_key]["count"] += 1
+
+                # Convert to list with averaged percentages
+                port_data = []
+                for date_str, data in sorted(daily_data.items()):
+                    port_data.append({
+                        "date": date_str,
+                        "datetime": date_str,
+                        "rx_dropped": data["rx_dropped"],
+                        "tx_dropped": data["tx_dropped"],
+                        "total_dropped": data["total_dropped"],
+                        "rx_errors": data["rx_errors"],
+                        "tx_errors": data["tx_errors"],
+                        "packet_loss_pct": round(data["packet_loss_pct_sum"] / data["count"], 3) if data["count"] > 0 else 0,
+                        "error_rate": round(data["error_rate_sum"] / data["count"], 3) if data["count"] > 0 else 0,
+                        "hours_counted": data["count"]
+                    })
+
+            return port_data
 
         except Exception as e:
             console.print(f"[dim red]Could not fetch port history: {e}[/dim red]")

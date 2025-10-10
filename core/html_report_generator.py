@@ -2626,49 +2626,110 @@ def generate_min_rssi_html(min_rssi):
 
     pct_disabled = (disabled_count / total_radios * 100) if total_radios > 0 else 0
 
-    # Strategy information
-    strategy_display = (
-        "Optimal (Aggressive Roaming)"
-        if strategy == "optimal"
-        else "Max Connectivity (Conservative Roaming)"
-    )
-    strategy_color = "#10b981" if strategy == "optimal" else "#f59e0b"
-    strategy_icon = "⚡" if strategy == "optimal" else "🛡️"
-
-    strategy_desc = ""
-    if strategy == "optimal":
-        strategy_desc = "Aggressive roaming for best performance. Forces clients to move to better APs early. Best for dense AP deployment."
-    else:
-        strategy_desc = "Conservative roaming for maximum reliability. Lets clients stay connected longer. Best for sparse AP deployment or iOS-heavy networks."
-
+    # Strategy information - Show BOTH strategies side-by-side
     # iOS detection info
     ios_info_html = ""
     if ios_devices_detected:
         ios_info_html = f"""
-                <div style="margin-top: 10px; padding: 12px; background: #fffbeb; border-left: 3px solid #f59e0b; border-radius: 4px;">
+                <div style="margin-top: 15px; padding: 12px; background: #fffbeb; border-left: 3px solid #f59e0b; border-radius: 4px;">
                     <strong style="color: #f59e0b;">🍎 iOS Devices Detected: {ios_device_count}</strong>
                     <p style="margin: 5px 0 0 0; color: #666; font-size: 0.9em;">
                         iPhone/iPad devices may be more sensitive to aggressive Min RSSI thresholds.
-                        {"Current strategy includes extra tolerance for iOS devices." if strategy == "max_connectivity" else "Consider using Max Connectivity strategy for more iOS tolerance."}
+                        The Max Connectivity strategy includes extra tolerance for iOS devices.
                     </p>
                 </div>
+"""
+
+    # Build strategy comparison section showing BOTH options
+    strategies_html = f"""
+                <h3 style="margin-bottom: 15px;">Min RSSI Strategy Options</h3>
+                <p style="margin-bottom: 20px; color: #666;">Choose the strategy that best fits your network environment. Both options are valid - your choice depends on your priorities.</p>
+
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 30px;">
+                    <!-- Optimal (Aggressive) Strategy -->
+                    <div style="border: 2px solid {'#10b981' if strategy == 'optimal' else '#e5e7eb'}; padding: 20px; border-radius: 8px; background: {'#f0fdf4' if strategy == 'optimal' else 'white'}; position: relative;">
+                        {('<div style="position: absolute; top: 10px; right: 10px; background: #10b981; color: white; padding: 4px 12px; border-radius: 12px; font-size: 0.85em; font-weight: 600;">SELECTED</div>' if strategy == 'optimal' else '')}
+                        <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px;">
+                            <span style="font-size: 2em;">⚡</span>
+                            <div>
+                                <strong style="font-size: 1.2em; color: #10b981;">Optimal (Aggressive)</strong>
+                            </div>
+                        </div>
+                        <p style="margin: 10px 0; color: #666; font-size: 0.95em;">
+                            Forces clients to move to better APs early for best performance.
+                        </p>
+
+                        <div style="margin-top: 15px;">
+                            <strong style="color: #059669; font-size: 0.9em;">✅ PROS:</strong>
+                            <ul style="margin: 8px 0; padding-left: 20px; color: #666; font-size: 0.9em; line-height: 1.6;">
+                                <li>Better overall network performance</li>
+                                <li>Faster roaming to stronger signals</li>
+                                <li>Reduces congestion on busy APs</li>
+                                <li>Optimal for dense AP deployments</li>
+                            </ul>
+                        </div>
+
+                        <div style="margin-top: 12px;">
+                            <strong style="color: #dc2626; font-size: 0.9em;">⚠️ CONS:</strong>
+                            <ul style="margin: 8px 0; padding-left: 20px; color: #666; font-size: 0.9em; line-height: 1.6;">
+                                <li>May cause more disconnects in edge areas</li>
+                                <li>iOS devices may disconnect more frequently</li>
+                                <li>Requires good AP coverage</li>
+                            </ul>
+                        </div>
+
+                        <div style="margin-top: 15px; padding: 10px; background: #fef3c7; border-radius: 6px; font-size: 0.85em;">
+                            <strong>Typical Values:</strong><br>
+                            2.4GHz: -75 dBm | 5GHz: -72 dBm | 6GHz: -70 dBm
+                        </div>
+                    </div>
+
+                    <!-- Max Connectivity (Conservative) Strategy -->
+                    <div style="border: 2px solid {'#f59e0b' if strategy == 'max_connectivity' else '#e5e7eb'}; padding: 20px; border-radius: 8px; background: {'#fffbeb' if strategy == 'max_connectivity' else 'white'}; position: relative;">
+                        {('<div style="position: absolute; top: 10px; right: 10px; background: #f59e0b; color: white; padding: 4px 12px; border-radius: 12px; font-size: 0.85em; font-weight: 600;">SELECTED</div>' if strategy == 'max_connectivity' else '')}
+                        <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px;">
+                            <span style="font-size: 2em;">🛡️</span>
+                            <div>
+                                <strong style="font-size: 1.2em; color: #f59e0b;">Max Connectivity (Conservative)</strong>
+                            </div>
+                        </div>
+                        <p style="margin: 10px 0; color: #666; font-size: 0.95em;">
+                            Lets clients stay connected longer for maximum reliability.
+                        </p>
+
+                        <div style="margin-top: 15px;">
+                            <strong style="color: #059669; font-size: 0.9em;">✅ PROS:</strong>
+                            <ul style="margin: 8px 0; padding-left: 20px; color: #666; font-size: 0.9em; line-height: 1.6;">
+                                <li>Fewer unexpected disconnects</li>
+                                <li>Better for iOS/iPhone users</li>
+                                <li>Works with sparse AP coverage</li>
+                                <li>More stable connections overall</li>
+                            </ul>
+                        </div>
+
+                        <div style="margin-top: 12px;">
+                            <strong style="color: #dc2626; font-size: 0.9em;">⚠️ CONS:</strong>
+                            <ul style="margin: 8px 0; padding-left: 20px; color: #666; font-size: 0.9em; line-height: 1.6;">
+                                <li>Clients may stay on distant APs longer</li>
+                                <li>Potential for lower throughput</li>
+                                <li>More "sticky client" issues</li>
+                            </ul>
+                        </div>
+
+                        <div style="margin-top: 15px; padding: 10px; background: #fef3c7; border-radius: 6px; font-size: 0.85em;">
+                            <strong>Typical Values:</strong><br>
+                            2.4GHz: -80 dBm | 5GHz: -77 dBm | 6GHz: -75 dBm
+                        </div>
+                    </div>
+                </div>
+                {ios_info_html}
 """
 
     return f"""
             <div class="section">
                 <h2>📡 Minimum RSSI Configuration</h2>
 
-                <!-- Strategy Display -->
-                <div style="background: {strategy_color}15; padding: 20px; border-radius: 8px; border-left: 4px solid {strategy_color}; margin-bottom: 20px;">
-                    <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 10px;">
-                        <span style="font-size: 2em;">{strategy_icon}</span>
-                        <div>
-                            <strong style="font-size: 1.3em; color: {strategy_color};">Strategy: {strategy_display}</strong>
-                            <p style="margin: 5px 0 0 0; color: #666;">{strategy_desc}</p>
-                        </div>
-                    </div>
-                    {ios_info_html}
-                </div>
+                {strategies_html}
 
                 <div style="background: {severity_color}15; padding: 20px; border-radius: 8px; border-left: 4px solid {severity_color}; margin-bottom: 20px;">
                     <strong style="font-size: 1.2em; color: {severity_color};">{disabled_count} of {total_radios} Radios ({pct_disabled:.0f}%) Without Min RSSI</strong>
@@ -3896,59 +3957,114 @@ def generate_switch_analysis_html(switch_analysis, switch_port_history=None):
                     # Generate unique chart ID
                     chart_id = f"portChart_{switch['mac'].replace(':', '')}_{port['port_idx']}"
 
-                    # Extract data for chart
-                    labels = [h["datetime"].split("T")[1].split(":")[0] + ":00" for h in history]
-                    packet_loss_data = [h["packet_loss_pct"] for h in history]
-                    error_rate_data = [h["error_rate"] for h in history]
+                    # Check if this is daily aggregated data (has 'date' field) or hourly
+                    is_daily = "date" in history[0] if history else False
 
-                    max_loss = max(packet_loss_data) if packet_loss_data else 0
-                    min_loss = min(packet_loss_data) if packet_loss_data else 0
-                    avg_loss = (
-                        sum(packet_loss_data) / len(packet_loss_data) if packet_loss_data else 0
-                    )
+                    # Extract data for chart
+                    if is_daily:
+                        # Daily data: show date labels and dropped packet counts
+                        labels = [h["date"] for h in history]
+                        dropped_data = [h["total_dropped"] for h in history]
+                        rx_dropped_data = [h["rx_dropped"] for h in history]
+                        tx_dropped_data = [h["tx_dropped"] for h in history]
+                        timeframe_label = f"{len(history)}-Day History"
+                        max_val = max(dropped_data) if dropped_data else 0
+                        min_val = min(dropped_data) if dropped_data else 0
+                        avg_val = sum(dropped_data) / len(dropped_data) if dropped_data else 0
+                        unit = "packets/day"
+                    else:
+                        # Hourly data: show time labels and packet loss percentage
+                        labels = [h["datetime"].split("T")[1].split(":")[0] + ":00" for h in history]
+                        packet_loss_data = [h["packet_loss_pct"] for h in history]
+                        error_rate_data = [h["error_rate"] for h in history]
+                        timeframe_label = "24-Hour History"
+                        max_val = max(packet_loss_data) if packet_loss_data else 0
+                        min_val = min(packet_loss_data) if packet_loss_data else 0
+                        avg_val = sum(packet_loss_data) / len(packet_loss_data) if packet_loss_data else 0
+                        unit = "%"
+
+                    # Build dataset configuration based on data type
+                    if is_daily:
+                        # Daily data: show dropped packet counts
+                        datasets_js = f"""
+                                datasets.push({{
+                                    label: 'Total Dropped',
+                                    data: {json.dumps(dropped_data)},
+                                    borderColor: '{color}',
+                                    backgroundColor: '{color}33',
+                                    borderWidth: 2,
+                                    fill: true,
+                                    tension: 0.3,
+                                    pointRadius: 3,
+                                    pointHoverRadius: 6
+                                }});
+                                datasets.push({{
+                                    label: 'RX Dropped',
+                                    data: {json.dumps(rx_dropped_data)},
+                                    borderColor: '#3b82f6',
+                                    backgroundColor: '#3b82f633',
+                                    borderWidth: 1.5,
+                                    fill: false,
+                                    tension: 0.3,
+                                    pointRadius: 2,
+                                    pointHoverRadius: 5
+                                }});
+                                datasets.push({{
+                                    label: 'TX Dropped',
+                                    data: {json.dumps(tx_dropped_data)},
+                                    borderColor: '#8b5cf6',
+                                    backgroundColor: '#8b5cf633',
+                                    borderWidth: 1.5,
+                                    fill: false,
+                                    tension: 0.3,
+                                    pointRadius: 2,
+                                    pointHoverRadius: 5
+                                }});
+"""
+                        tooltip_format = "context.dataset.label + ': ' + context.parsed.y.toLocaleString() + ' packets'"
+                        x_axis_label = f"{len(history)} Days"
+                        y_axis_label = "Dropped Packets"
+                    else:
+                        # Hourly data: show packet loss percentage
+                        datasets_js = f"""
+                                datasets.push({{
+                                    label: 'Packet Loss %',
+                                    data: {json.dumps(packet_loss_data)},
+                                    borderColor: '{color}',
+                                    backgroundColor: '{color}33',
+                                    borderWidth: 2,
+                                    fill: true,
+                                    tension: 0.3,
+                                    pointRadius: 2,
+                                    pointHoverRadius: 5
+                                }});
+"""
+                        tooltip_format = "context.dataset.label + ': ' + context.parsed.y.toFixed(3) + '%'"
+                        x_axis_label = "Time (24h)"
+                        y_axis_label = "Percentage (%)"
 
                     ports_html += f"""
                 <tr style="background: {bg_color};">
                     <td colspan="8" style="padding: 20px;">
                         <div style="background: white; padding: 15px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
                             <h4 style="margin: 0 0 10px 0; color: #374151; font-size: 0.95em;">
-                                📊 24-Hour Health History
+                                📊 {timeframe_label}
                                 <span style="font-weight: normal; color: #6b7280; font-size: 0.9em;">
-                                    (Max: {max_loss:.2f}% | Avg: {avg_loss:.2f}% | Min: {min_loss:.2f}%)
+                                    (Max: {max_val:,.0f if is_daily else .2f}{unit} | Avg: {avg_val:,.0f if is_daily else .2f}{unit} | Min: {min_val:,.0f if is_daily else .2f}{unit})
                                 </span>
                             </h4>
                             <canvas id="{chart_id}" style="max-height: 200px;"></canvas>
                             <script>
                             (function() {{
                                 const ctx = document.getElementById('{chart_id}').getContext('2d');
+                                const datasets = [];
+
+{datasets_js}
                                 new Chart(ctx, {{
                                     type: 'line',
                                     data: {{
                                         labels: {json.dumps(labels)},
-                                        datasets: [
-                                            {{
-                                                label: 'Packet Loss %',
-                                                data: {json.dumps(packet_loss_data)},
-                                                borderColor: '{color}',
-                                                backgroundColor: '{color}33',
-                                                borderWidth: 2,
-                                                fill: true,
-                                                tension: 0.3,
-                                                pointRadius: 2,
-                                                pointHoverRadius: 5
-                                            }},
-                                            {{
-                                                label: 'Error Rate %',
-                                                data: {json.dumps(error_rate_data)},
-                                                borderColor: '#f59e0b',
-                                                backgroundColor: '#f59e0b33',
-                                                borderWidth: 2,
-                                                fill: true,
-                                                tension: 0.3,
-                                                pointRadius: 2,
-                                                pointHoverRadius: 5
-                                            }}
-                                        ]
+                                        datasets: datasets
                                     }},
                                     options: {{
                                         responsive: true,
@@ -3968,7 +4084,7 @@ def generate_switch_analysis_html(switch_analysis, switch_port_history=None):
                                                 intersect: false,
                                                 callbacks: {{
                                                     label: function(context) {{
-                                                        return context.dataset.label + ': ' + context.parsed.y.toFixed(3) + '%';
+                                                        return {tooltip_format};
                                                     }}
                                                 }}
                                             }}
@@ -3978,7 +4094,7 @@ def generate_switch_analysis_html(switch_analysis, switch_port_history=None):
                                                 display: true,
                                                 title: {{
                                                     display: true,
-                                                    text: 'Time (24h)',
+                                                    text: '{x_axis_label}',
                                                     font: {{ size: 11 }}
                                                 }},
                                                 ticks: {{
@@ -3991,7 +4107,7 @@ def generate_switch_analysis_html(switch_analysis, switch_port_history=None):
                                                 display: true,
                                                 title: {{
                                                     display: true,
-                                                    text: 'Percentage (%)',
+                                                    text: '{y_axis_label}',
                                                     font: {{ size: 11 }}
                                                 }},
                                                 beginAtZero: true,

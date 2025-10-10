@@ -211,7 +211,7 @@ with open('core/advanced_analyzer.py') as f:
 import sys
 modules_to_test = [
     'core.advanced_analyzer',
-    'core.switch_analyzer', 
+    'core.switch_analyzer',
     'core.html_report_generator',
     'core.optimize_network',
     'core.channel_optimizer',
@@ -232,7 +232,7 @@ for module in modules_to_test:
     except Exception as e:
         print(f'❌ {module}: {e}')
         failed.append(module)
-        
+
 if failed:
     print(f'\n❌ {len(failed)} modules failed to import')
     sys.exit(1)
