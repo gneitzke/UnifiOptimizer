@@ -3973,33 +3973,106 @@ def generate_switch_analysis_html(switch_analysis, switch_port_history=None):
                         avg_val = sum(dropped_data) / len(dropped_data) if dropped_data else 0
                         unit = "packets/day"
                     else:
-                        # Hourly data: show time labels and packet loss percentage
-                        labels = [
-                            h["datetime"].split("T")[1].split(":")[0] + ":00" for h in history
-                        ]
-                        packet_loss_data = [h["packet_loss_pct"] for h in history]
-                        error_rate_data = [h["error_rate"] for h in history]
-                        timeframe_label = "24-Hour History"
-                        max_val = max(packet_loss_data) if packet_loss_data else 0
-                        min_val = min(packet_loss_data) if packet_loss_data else 0
-                        avg_val = (
-                            sum(packet_loss_data) / len(packet_loss_data) if packet_loss_data else 0
-                        )
-                        unit = "%"
+                        # Hourly data: aggregate into 4-hour buckets for 7-day view (168 hours → 42 points)
+                        # This keeps the graph readable while showing the full 7-day trend
+                        from collections import defaultdict
+                        from datetime import datetime
+
+                        # Determine if this is 7-day data (>48 hours) or 24-hour data
+                        is_7day = len(history) > 48
+
+                        if is_7day:
+                            # Group into 4-hour buckets for readability
+                            bucket_size = 4
+                            buckets = defaultdict(
+                                lambda: {
+                                    "rx_dropped": [],
+                                    "tx_dropped": [],
+                                    "total_dropped": [],
+                                    "timestamps": [],
+                                }
+                            )
+
+                            for h in history:
+                                # Round timestamp to nearest 4-hour bucket
+                                dt = datetime.fromisoformat(h["datetime"])
+                                bucket_hour = (dt.hour // bucket_size) * bucket_size
+                                bucket_key = f"{dt.strftime('%Y-%m-%d')} {bucket_hour:02d}:00"
+
+                                buckets[bucket_key]["rx_dropped"].append(h.get("rx_dropped", 0))
+                                buckets[bucket_key]["tx_dropped"].append(h.get("tx_dropped", 0))
+                                buckets[bucket_key]["total_dropped"].append(
+                                    h.get("total_dropped", 0)
+                                )
+                                buckets[bucket_key]["timestamps"].append(h["datetime"])
+
+                            # Average each bucket
+                            labels = []
+                            rx_dropped_data = []
+                            tx_dropped_data = []
+                            total_dropped_data = []
+
+                            for bucket_key in sorted(buckets.keys()):
+                                bucket = buckets[bucket_key]
+                                labels.append(bucket_key)
+                                rx_dropped_data.append(
+                                    sum(bucket["rx_dropped"]) / len(bucket["rx_dropped"])
+                                    if bucket["rx_dropped"]
+                                    else 0
+                                )
+                                tx_dropped_data.append(
+                                    sum(bucket["tx_dropped"]) / len(bucket["tx_dropped"])
+                                    if bucket["tx_dropped"]
+                                    else 0
+                                )
+                                total_dropped_data.append(
+                                    sum(bucket["total_dropped"]) / len(bucket["total_dropped"])
+                                    if bucket["total_dropped"]
+                                    else 0
+                                )
+
+                            # Calculate statistics on total dropped
+                            timeframe_label = "7-Day History (4-hour average)"
+                            max_val = max(total_dropped_data) if total_dropped_data else 0
+                            min_val = min(total_dropped_data) if total_dropped_data else 0
+                            avg_val = (
+                                sum(total_dropped_data) / len(total_dropped_data)
+                                if total_dropped_data
+                                else 0
+                            )
+                            unit = "packets/4h"
+
+                        else:
+                            # 24-hour data: show hourly with full granularity
+                            labels = [
+                                h["datetime"].split("T")[1].split(":")[0] + ":00" for h in history
+                            ]
+                            rx_dropped_data = [h.get("rx_dropped", 0) for h in history]
+                            tx_dropped_data = [h.get("tx_dropped", 0) for h in history]
+                            total_dropped_data = [h.get("total_dropped", 0) for h in history]
+
+                            timeframe_label = "24-Hour History (hourly)"
+                            max_val = max(total_dropped_data) if total_dropped_data else 0
+                            min_val = min(total_dropped_data) if total_dropped_data else 0
+                            avg_val = (
+                                sum(total_dropped_data) / len(total_dropped_data)
+                                if total_dropped_data
+                                else 0
+                            )
+                            unit = "packets/hour"
 
                     # Build dataset configuration based on data type
-                    if is_daily:
-                        # Daily data: show dropped packet counts
-                        datasets_js = f"""
+                    # All data types now show RX/TX dropped packets
+                    datasets_js = f"""
                                 datasets.push({{
                                     label: 'Total Dropped',
-                                    data: {json.dumps(dropped_data)},
+                                    data: {json.dumps(total_dropped_data if not is_daily else dropped_data)},
                                     borderColor: '{color}',
                                     backgroundColor: '{color}33',
                                     borderWidth: 2,
                                     fill: true,
                                     tension: 0.3,
-                                    pointRadius: 3,
+                                    pointRadius: 3 if is_daily else 1,
                                     pointHoverRadius: 6
                                 }});
                                 datasets.push({{
@@ -4010,7 +4083,7 @@ def generate_switch_analysis_html(switch_analysis, switch_port_history=None):
                                     borderWidth: 1.5,
                                     fill: false,
                                     tension: 0.3,
-                                    pointRadius: 2,
+                                    pointRadius: 2 if is_daily else 1,
                                     pointHoverRadius: 5
                                 }});
                                 datasets.push({{
@@ -4021,33 +4094,13 @@ def generate_switch_analysis_html(switch_analysis, switch_port_history=None):
                                     borderWidth: 1.5,
                                     fill: false,
                                     tension: 0.3,
-                                    pointRadius: 2,
+                                    pointRadius: 2 if is_daily else 1,
                                     pointHoverRadius: 5
                                 }});
 """
-                        tooltip_format = "context.dataset.label + ': ' + context.parsed.y.toLocaleString() + ' packets'"
-                        x_axis_label = f"{len(history)} Days"
-                        y_axis_label = "Dropped Packets"
-                    else:
-                        # Hourly data: show packet loss percentage
-                        datasets_js = f"""
-                                datasets.push({{
-                                    label: 'Packet Loss %',
-                                    data: {json.dumps(packet_loss_data)},
-                                    borderColor: '{color}',
-                                    backgroundColor: '{color}33',
-                                    borderWidth: 2,
-                                    fill: true,
-                                    tension: 0.3,
-                                    pointRadius: 2,
-                                    pointHoverRadius: 5
-                                }});
-"""
-                        tooltip_format = (
-                            "context.dataset.label + ': ' + context.parsed.y.toFixed(3) + '%'"
-                        )
-                        x_axis_label = "Time (24h)"
-                        y_axis_label = "Percentage (%)"
+                    tooltip_format = "context.dataset.label + ': ' + context.parsed.y.toLocaleString() + ' packets'"
+                    x_axis_label = f"Time - {timeframe_label}"
+                    y_axis_label = "Dropped Packets"
 
                     ports_html += f"""
                 <tr style="background: {bg_color};">
