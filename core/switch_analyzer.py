@@ -353,9 +353,10 @@ class SwitchAnalyzer:
 
             # Fetch inline history for ports with issues (for visualization)
             if port_info["issues"] and switch_mac:
-                # Get 7 days of data aggregated by day for inline graphs
+                # Get 7 days of hourly data for inline graphs (168 hours)
+                # This provides hourly granularity for TX/RX dropped packets
                 port_history = self.get_port_mini_history(
-                    switch_mac, port.get("port_idx"), hours=168, aggregate_by_day=True
+                    switch_mac, port.get("port_idx"), hours=168, aggregate_by_day=False
                 )
                 if port_history:
                     port_info["mini_history"] = port_history
@@ -803,8 +804,12 @@ class SwitchAnalyzer:
                     console.print(f"[yellow]No historical data for {switch_name}[/yellow]")
                     continue
 
-                # Cache the data for inline mini-graphs (last 24h will be extracted as needed)
-                # Cache key format: {switch_mac}_24 for 24-hour lookback
+                # Cache the full 168-hour data for inline mini-graphs
+                # Cache with the same key format used by get_port_mini_history
+                cache_key_168h = f"{switch_mac}_168"
+                self.hourly_data_cache[cache_key_168h] = hourly_stats["data"]
+
+                # Also cache as 24h key for backward compatibility
                 cache_key_24h = f"{switch_mac}_24"
                 self.hourly_data_cache[cache_key_24h] = hourly_stats["data"]
 
