@@ -37,32 +37,68 @@ def generate_navigation_menu(analysis_data, recommendations, client_health, swit
     nav_items = []
 
     # Always show these core sections
-    nav_items.append(('<a class="nav-link" href="#" onclick="scrollToSection(\'section-summary\'); return false;">📊 Summary</a>'))
-    nav_items.append(('<a class="nav-link" href="#" onclick="scrollToSection(\'section-recommendations\'); return false;">💡 Recommendations</a>'))
+    nav_items.append(
+        (
+            '<a class="nav-link" href="#" onclick="scrollToSection(\'section-summary\'); return false;">📊 Summary</a>'
+        )
+    )
+    nav_items.append(
+        (
+            '<a class="nav-link" href="#" onclick="scrollToSection(\'section-recommendations\'); return false;">💡 Recommendations</a>'
+        )
+    )
 
     # Conditional sections based on data availability
     if client_health:
-        nav_items.append(('<a class="nav-link" href="#" onclick="scrollToSection(\'section-client-health\'); return false;">👥 Clients</a>'))
+        nav_items.append(
+            (
+                '<a class="nav-link" href="#" onclick="scrollToSection(\'section-client-health\'); return false;">👥 Clients</a>'
+            )
+        )
         if client_health.get("disconnection_prone"):
-            nav_items.append(('<a class="nav-link" href="#" onclick="scrollToSection(\'section-disconnected-clients\'); return false;">🔄 Disconnects</a>'))
+            nav_items.append(
+                (
+                    '<a class="nav-link" href="#" onclick="scrollToSection(\'section-disconnected-clients\'); return false;">🔄 Disconnects</a>'
+                )
+            )
 
     if analysis_data.get("ap_analysis"):
-        nav_items.append(('<a class="nav-link" href="#" onclick="scrollToSection(\'section-access-points\'); return false;">📡 APs</a>'))
+        nav_items.append(
+            (
+                '<a class="nav-link" href="#" onclick="scrollToSection(\'section-access-points\'); return false;">📡 APs</a>'
+            )
+        )
 
     if analysis_data.get("channel_analysis"):
-        nav_items.append(('<a class="nav-link" href="#" onclick="scrollToSection(\'section-channels\'); return false;">📻 Channels</a>'))
+        nav_items.append(
+            (
+                '<a class="nav-link" href="#" onclick="scrollToSection(\'section-channels\'); return false;">📻 Channels</a>'
+            )
+        )
 
     if switch_analysis and switch_analysis.get("switches"):
-        nav_items.append(('<a class="nav-link" href="#" onclick="scrollToSection(\'section-switches\'); return false;">🔌 Switches</a>'))
+        nav_items.append(
+            (
+                '<a class="nav-link" href="#" onclick="scrollToSection(\'section-switches\'); return false;">🔌 Switches</a>'
+            )
+        )
 
     if analysis_data.get("mesh_analysis", {}).get("mesh_aps"):
-        nav_items.append(('<a class="nav-link" href="#" onclick="scrollToSection(\'section-mesh\'); return false;">🔗 Mesh</a>'))
+        nav_items.append(
+            (
+                '<a class="nav-link" href="#" onclick="scrollToSection(\'section-mesh\'); return false;">🔗 Mesh</a>'
+            )
+        )
 
     # Control buttons
-    nav_items.append('<a class="nav-link" href="#" onclick="expandAll(); return false;" style="margin-left: 20px; background: rgba(255,255,255,0.1);">⬇ Expand All</a>')
-    nav_items.append('<a class="nav-link" href="#" onclick="collapseAll(); return false;" style="background: rgba(255,255,255,0.1);">⬆ Collapse All</a>')
+    nav_items.append(
+        '<a class="nav-link" href="#" onclick="expandAll(); return false;" style="margin-left: 20px; background: rgba(255,255,255,0.1);">⬇ Expand All</a>'
+    )
+    nav_items.append(
+        '<a class="nav-link" href="#" onclick="collapseAll(); return false;" style="background: rgba(255,255,255,0.1);">⬆ Collapse All</a>'
+    )
 
-    nav_html = '\n'.join(nav_items)
+    nav_html = "\n".join(nav_items)
 
     return f"""
         <div class="nav-menu">
@@ -711,6 +747,37 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
                     if (toggle) toggle.classList.add('collapsed');
                 }}
             }});
+
+            // Easter egg: Triple-click the rocket to launch Rick Roll
+            const rocket = document.getElementById('rocket-easter-egg');
+            if (rocket) {{
+                let clickCount = 0;
+                let clickTimer = null;
+
+                rocket.addEventListener('click', function(e) {{
+                    clickCount++;
+
+                    if (clickTimer) clearTimeout(clickTimer);
+
+                    if (clickCount === 3) {{
+                        // Triple click detected! Launch the easter egg
+                        window.open('https://www.youtube.com/watch?v=dQw4w9WgXcQ', '_blank');
+                        clickCount = 0;
+
+                        // Add a little animation
+                        rocket.style.transform = 'scale(1.5) rotate(360deg)';
+                        rocket.style.transition = 'transform 0.5s ease';
+                        setTimeout(function() {{
+                            rocket.style.transform = 'scale(1) rotate(0deg)';
+                        }}, 500);
+                    }}
+
+                    // Reset counter after 500ms
+                    clickTimer = setTimeout(function() {{
+                        clickCount = 0;
+                    }}, 500);
+                }});
+            }}
         }});
 
         // Expand all sections
@@ -756,7 +823,7 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
 <body>
     <div class="container">
         <div class="header">
-            <h1>🚀 UniFi Network Analysis Report</h1>
+            <h1><span id="rocket-easter-egg" style="cursor: pointer;">🚀</span> UniFi Network Analysis Report</h1>
             <div class="subtitle">Site: {site_name}</div>
             <div class="timestamp">Generated: {datetime.now().strftime("%B %d, %Y at %I:%M %p")}</div>
         </div>
@@ -766,7 +833,9 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
 
     # Add Navigation Menu
     switch_analysis = analysis_data.get("switch_analysis")
-    html_content += generate_navigation_menu(analysis_data, recommendations, client_health, switch_analysis)
+    html_content += generate_navigation_menu(
+        analysis_data, recommendations, client_health, switch_analysis
+    )
 
     # API Error Warning Banner (if there were errors)
     api_errors = analysis_data.get("api_errors")
@@ -854,9 +923,7 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
         html_content += make_collapsible("section-switches", "🔌 Switch Analysis", switch_content)
 
     # Access Points Section (Collapsible)
-    ap_content = generate_ap_overview_html(
-        ap_analysis, mesh_aps, analysis_data.get("devices", [])
-    )
+    ap_content = generate_ap_overview_html(ap_analysis, mesh_aps, analysis_data.get("devices", []))
     if ap_content:
         html_content += make_collapsible("section-access-points", "📡 Access Points", ap_content)
 
@@ -868,7 +935,9 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
     # Recommendations Section (Collapsible)
     recs_content = generate_recommendations_html(recommendations)
     if recs_content:
-        html_content += make_collapsible("section-recommendations", "💡 Recommendations", recs_content)
+        html_content += make_collapsible(
+            "section-recommendations", "💡 Recommendations", recs_content
+        )
 
     # Channel Analysis Section (Collapsible)
     channel_content = generate_channel_analysis_html(channel_analysis)
@@ -878,12 +947,18 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
     # Client Health Section (Collapsible)
     client_health_content = generate_client_health_html(client_health)
     if client_health_content:
-        html_content += make_collapsible("section-client-health", "👥 Client Health", client_health_content)
+        html_content += make_collapsible(
+            "section-client-health", "👥 Client Health", client_health_content
+        )
 
     # Frequently Disconnected Clients Section (Collapsible)
     disconnected_content = generate_disconnected_clients_html(client_health)
     if disconnected_content:
-        html_content += make_collapsible("section-disconnected-clients", "🔄 Frequently Disconnected Clients", disconnected_content)
+        html_content += make_collapsible(
+            "section-disconnected-clients",
+            "🔄 Frequently Disconnected Clients",
+            disconnected_content,
+        )
 
     # Findings Section
     html_content += generate_findings_html(analysis_data)
@@ -2522,7 +2597,9 @@ def generate_disconnected_clients_html(client_health):
         return ""
 
     # Sort by disconnect count (highest first)
-    sorted_clients = sorted(disconnection_prone, key=lambda x: x.get("disconnect_count", 0), reverse=True)
+    sorted_clients = sorted(
+        disconnection_prone, key=lambda x: x.get("disconnect_count", 0), reverse=True
+    )
 
     clients_html = ""
     for client in sorted_clients[:20]:  # Show top 20
@@ -3202,20 +3279,32 @@ def generate_airtime_analysis_html(airtime_analysis):
                     current_util = band_info["current"]
                     clients = band_info["clients"]
 
+                    # Try to get channel from device data
+                    full_key = band_info.get("full_key", "")
+                    channel_info = ""
+                    # Look up channel from ap_utilization if available
+                    if full_key in ap_utilization:
+                        ap_data = ap_utilization[full_key]
+                        if "channel" in ap_data:
+                            channel_info = f" • Ch {ap_data['channel']}"
+
                     # Color for this specific band
                     if avg_util > 70:
                         band_color = "#ef4444"
-                        status = "Needs Attention"
+                        status = "⚠️ Needs Attention - Consider adding AP"
+                        action_hint = "High utilization may cause slow speeds and poor performance"
                     elif avg_util > 50:
                         band_color = "#f59e0b"
-                        status = "Monitor"
+                        status = "👀 Monitor - Approaching capacity"
+                        action_hint = "Watch for degradation during peak hours"
                     else:
                         band_color = "#10b981"
-                        status = "Good"
+                        status = "✅ Good - Healthy utilization"
+                        action_hint = "Operating within optimal range"
 
                     avg_summary_html += f"""
-                    <div style="margin-bottom: 10px; padding: 10px; background: #f9fafb; border-radius: 6px; border-left: 3px solid {band_color};">
-                        <div style="font-weight: 600; font-size: 12px; color: #666; margin-bottom: 4px;">📡 {band}</div>
+                    <div style="margin-bottom: 10px; padding: 12px; background: #f9fafb; border-radius: 6px; border-left: 3px solid {band_color};">
+                        <div style="font-weight: 600; font-size: 12px; color: #666; margin-bottom: 4px;">📡 {band}{channel_info}</div>
                         <div style="display: flex; justify-content: space-between; align-items: center;">
                             <div>
                                 <div style="font-size: 1.8em; font-weight: bold; color: {band_color};">{avg_util:.1f}%</div>
@@ -3223,10 +3312,11 @@ def generate_airtime_analysis_html(airtime_analysis):
                             </div>
                             <div style="text-align: right; font-size: 11px; color: #666;">
                                 <div>Current: {current_util:.1f}%</div>
-                                <div>{clients} clients</div>
+                                <div>{clients} client{'s' if clients != 1 else ''}</div>
                             </div>
                         </div>
-                        <div style="font-size: 10px; color: {band_color}; font-weight: 600; margin-top: 4px;">{status}</div>
+                        <div style="font-size: 10px; color: {band_color}; font-weight: 600; margin-top: 6px;">{status}</div>
+                        <div style="font-size: 9px; color: #6b7280; margin-top: 3px; font-style: italic;">{action_hint}</div>
                     </div>
                     """
 
@@ -3527,6 +3617,87 @@ def generate_airtime_analysis_html(airtime_analysis):
             # Fallback to CDN on any error
             chart_js_script = '<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>'
 
+    # Build Channel<>AP mapping table for capacity planning
+    channel_mapping_html = ""
+    if ap_utilization:
+        # Group by channel
+        channels_used = {}
+        for ap_key, data in ap_utilization.items():
+            channel = data.get("channel", "Unknown")
+            if channel not in channels_used:
+                channels_used[channel] = []
+            channels_used[channel].append({
+                "ap_key": ap_key,
+                "airtime": data.get("airtime_pct", 0),
+                "clients": data.get("clients", 0),
+                "band": data.get("band", "Unknown")
+            })
+
+        # Build channel mapping display
+        if channels_used:
+            channel_rows = ""
+            for channel in sorted(channels_used.keys(), key=lambda x: (0 if isinstance(x, int) else 1, x)):
+                aps_on_channel = channels_used[channel]
+                # Determine if channel is overloaded
+                max_util = max(ap["airtime"] for ap in aps_on_channel)
+                total_clients = sum(ap["clients"] for ap in aps_on_channel)
+
+                if max_util > 70:
+                    channel_color = "#ef4444"
+                    channel_status = "🔴 Saturated"
+                    recommendation = "Add AP on different channel or redistribute load"
+                elif max_util > 50:
+                    channel_color = "#f59e0b"
+                    channel_status = "🟡 Busy"
+                    recommendation = "Monitor during peak hours"
+                else:
+                    channel_color = "#10b981"
+                    channel_status = "🟢 Normal"
+                    recommendation = "Operating normally"
+
+                # Build AP list
+                ap_list = "<br>".join([
+                    f"• {ap['ap_key']}: {ap['airtime']:.1f}% ({ap['clients']} clients)"
+                    for ap in aps_on_channel
+                ])
+
+                channel_rows += f"""
+                    <tr>
+                        <td style="font-weight: bold; font-size: 1.1em;">Ch {channel}</td>
+                        <td style="color: {channel_color}; font-weight: bold;">{channel_status}</td>
+                        <td style="font-size: 0.9em;">{ap_list}</td>
+                        <td style="text-align: center; font-weight: bold; font-size: 1.1em;">{total_clients}</td>
+                        <td style="font-size: 0.9em; color: #666;">{recommendation}</td>
+                    </tr>
+                """
+
+            channel_mapping_html = f"""
+                <h3 style="margin-top: 30px; margin-bottom: 15px;">📻 Channel<>AP Mapping (Capacity Planning)</h3>
+                <div style="background: #f0fdf4; padding: 15px; border-radius: 8px; border-left: 4px solid #10b981; margin-bottom: 15px;">
+                    <strong>💡 Use this to identify:</strong>
+                    <ul style="margin: 10px 0 0 20px; color: #666; line-height: 1.8;">
+                        <li>🔴 <strong>Saturated channels (&gt;70%)</strong> - Need additional AP or channel change</li>
+                        <li>🟡 <strong>Busy channels (&gt;50%)</strong> - Approaching capacity, monitor closely</li>
+                        <li>✅ <strong>Multiple APs on same channel</strong> - May indicate need for better channel distribution</li>
+                        <li>🎯 <strong>Client distribution</strong> - Uneven client loads suggest coverage gaps</li>
+                    </ul>
+                </div>
+                <table class="ap-table">
+                    <thead>
+                        <tr>
+                            <th>Channel</th>
+                            <th>Status</th>
+                            <th>APs on Channel (Utilization & Clients)</th>
+                            <th>Total Clients</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {channel_rows}
+                    </tbody>
+                </table>
+            """
+
     return f"""
             <div class="section">
                 <h2>⏱️ Airtime Utilization</h2>
@@ -3534,6 +3705,8 @@ def generate_airtime_analysis_html(airtime_analysis):
                     <strong>What is Airtime?</strong>
                     <p style="margin-top: 10px; color: #666;">Airtime utilization measures how busy the wireless channel is. High airtime (>70%) indicates saturation even with few clients, typically caused by interference, legacy devices, or poor signal quality forcing retransmissions.</p>
                 </div>
+
+                {channel_mapping_html}
 
                 {f'<h3 style="margin-top: 30px; margin-bottom: 15px;">📊 Average Utilization (24h)</h3>{avg_summary_html}' if avg_summary_html else ''}
 
