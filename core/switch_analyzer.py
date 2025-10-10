@@ -524,3 +524,205 @@ class SwitchAnalyzer:
                     "impact": "Improves security and adds new features",
                 }
             )
+
+    def analyze_switch_port_history(self, lookback_hours=168):
+        """
+        Analyze switch port packet loss over time to identify trends
+
+        Args:
+            lookback_hours: Hours to look back (default 168 = 7 days)
+
+        Returns dict with:
+        - port_history: Time-series data for each problematic port
+        - trends: Analysis of whether packet loss is improving/stable/worsening
+        - summary: Overall packet loss statistics
+        """
+        from datetime import datetime, timedelta
+
+        console.print(f"[cyan]Collecting switch port history ({lookback_hours}h lookback)...[/cyan]")
+
+        # Get switch devices
+        devices_response = self.client.get(f"s/{self.site}/stat/device")
+        if not devices_response or "data" not in devices_response:
+            return {"error": "Failed to get devices"}
+
+        devices = devices_response["data"]
+        switches = [d for d in devices if d.get("type") == "usw"]
+
+        if not switches:
+            return {"switches": [], "message": "No managed switches found"}
+
+        results = {
+            "port_history": {},
+            "trends": {},
+            "summary": {
+                "total_ports_analyzed": 0,
+                "ports_with_loss": 0,
+                "improving": 0,
+                "stable": 0,
+                "worsening": 0
+            }
+        }
+
+        # Calculate time range
+        end_time = int(datetime.now().timestamp() * 1000)
+        start_time = int((datetime.now() - timedelta(hours=lookback_hours)).timestamp() * 1000)
+
+        for switch in switches:
+            switch_mac = switch.get("mac")
+            switch_name = switch.get("name", "Unnamed Switch")
+
+            if not switch_mac:
+                continue
+
+            console.print(f"[dim]Collecting history for {switch_name}...[/dim]")
+
+            try:
+                # Query hourly stats for this switch
+                # API format: /api/s/{site}/stat/report/hourly.device/{mac}
+                hourly_stats = self.client.get(
+                    f"s/{self.site}/stat/report/hourly.device/{switch_mac}?start={start_time}&end={end_time}"
+                )
+
+                if not hourly_stats or "data" not in hourly_stats:
+                    console.print(f"[yellow]No historical data for {switch_name}[/yellow]")
+                    continue
+
+                # Process each port's time-series data
+                port_time_series = {}
+
+                for stat in hourly_stats["data"]:
+                    timestamp = stat.get("time", 0)
+                    port_table = stat.get("port_table", [])
+
+                    for port in port_table:
+                        port_idx = port.get("port_idx")
+                        port_name = port.get("name", f"Port {port_idx}")
+
+                        if port_idx is None:
+                            continue
+
+                        # Calculate packet loss for this hour
+                        rx_packets = port.get("rx_packets", 0)
+                        tx_packets = port.get("tx_packets", 0)
+                        rx_dropped = port.get("rx_dropped", 0)
+                        tx_dropped = port.get("tx_dropped", 0)
+
+                        total_packets = rx_packets + tx_packets
+                        total_dropped = rx_dropped + tx_dropped
+
+                        # Only track if there's meaningful traffic
+                        if total_packets < 1000:
+                            continue
+
+                        packet_loss_pct = (total_dropped / total_packets * 100) if total_packets > 0 else 0
+
+                        # Initialize port tracking
+                        port_key = f"{switch_mac}_{port_idx}"
+                        if port_key not in port_time_series:
+                            port_time_series[port_key] = {
+                                "switch_name": switch_name,
+                                "switch_mac": switch_mac,
+                                "port_idx": port_idx,
+                                "port_name": port_name,
+                                "hourly_data": []
+                            }
+
+                        # Add this hour's data
+                        port_time_series[port_key]["hourly_data"].append({
+                            "timestamp": timestamp,
+                            "datetime": datetime.fromtimestamp(timestamp / 1000).isoformat(),
+                            "packet_loss_pct": round(packet_loss_pct, 3),
+                            "rx_dropped": rx_dropped,
+                            "tx_dropped": tx_dropped,
+                            "total_dropped": total_dropped,
+                            "rx_packets": rx_packets,
+                            "tx_packets": tx_packets,
+                            "total_packets": total_packets
+                        })
+
+                # Analyze trends for each port
+                for port_key, port_data in port_time_series.items():
+                    hourly_data = port_data["hourly_data"]
+
+                    if len(hourly_data) < 2:
+                        continue
+
+                    # Sort by timestamp
+                    hourly_data.sort(key=lambda x: x["timestamp"])
+
+                    # Calculate statistics
+                    loss_values = [h["packet_loss_pct"] for h in hourly_data]
+                    current_loss = loss_values[-1] if loss_values else 0
+                    avg_loss = sum(loss_values) / len(loss_values) if loss_values else 0
+                    max_loss = max(loss_values) if loss_values else 0
+                    min_loss = min(loss_values) if loss_values else 0
+
+                    # Only track ports with significant packet loss (>0.1%)
+                    if avg_loss < 0.1:
+                        continue
+
+                    results["summary"]["total_ports_analyzed"] += 1
+                    results["summary"]["ports_with_loss"] += 1
+
+                    # Determine trend: compare first 25% vs last 25% of data
+                    quarter_size = max(1, len(loss_values) // 4)
+                    first_quarter_avg = sum(loss_values[:quarter_size]) / quarter_size
+                    last_quarter_avg = sum(loss_values[-quarter_size:]) / quarter_size
+
+                    # Calculate trend direction
+                    if last_quarter_avg < first_quarter_avg * 0.8:
+                        trend = "improving"
+                        trend_pct = ((first_quarter_avg - last_quarter_avg) / first_quarter_avg * 100)
+                        results["summary"]["improving"] += 1
+                    elif last_quarter_avg > first_quarter_avg * 1.2:
+                        trend = "worsening"
+                        trend_pct = ((last_quarter_avg - first_quarter_avg) / first_quarter_avg * 100)
+                        results["summary"]["worsening"] += 1
+                    else:
+                        trend = "stable"
+                        trend_pct = 0
+                        results["summary"]["stable"] += 1
+
+                    # Store results
+                    port_data["statistics"] = {
+                        "current_loss": round(current_loss, 3),
+                        "avg_loss": round(avg_loss, 3),
+                        "max_loss": round(max_loss, 3),
+                        "min_loss": round(min_loss, 3),
+                        "trend": trend,
+                        "trend_pct": round(trend_pct, 1),
+                        "first_quarter_avg": round(first_quarter_avg, 3),
+                        "last_quarter_avg": round(last_quarter_avg, 3),
+                        "data_points": len(hourly_data),
+                        "hours_tracked": round(len(hourly_data))
+                    }
+
+                    results["port_history"][port_key] = port_data
+                    results["trends"][port_key] = {
+                        "switch_name": port_data["switch_name"],
+                        "port_name": port_data["port_name"],
+                        "trend": trend,
+                        "current_loss": round(current_loss, 3),
+                        "avg_loss": round(avg_loss, 3),
+                        "trend_pct": round(trend_pct, 1)
+                    }
+
+            except Exception as e:
+                console.print(f"[red]Error collecting history for {switch_name}: {e}[/red]")
+                continue
+
+        # Add summary message
+        if results["summary"]["ports_with_loss"] > 0:
+            results["summary"]["message"] = (
+                f"Analyzed {results['summary']['total_ports_analyzed']} ports with packet loss: "
+                f"{results['summary']['improving']} improving, "
+                f"{results['summary']['stable']} stable, "
+                f"{results['summary']['worsening']} worsening"
+            )
+        else:
+            results["summary"]["message"] = "No ports with significant packet loss detected"
+
+        console.print(f"[green]✓ Port history analysis complete[/green]")
+
+        return results
