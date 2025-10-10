@@ -518,6 +518,142 @@ class ChangeApplier:
                 )
                 return False
 
+    def apply_min_rssi_all_bands(self, device, new_enabled=True, values=None):
+        """
+        Apply minimum RSSI configuration to ALL radios/bands on an AP
+
+        Args:
+            device: Device dict from API
+            new_enabled: Whether to enable min RSSI
+            values: Dict mapping radio names to values, e.g. {'ng': -75, 'na': -72, '6e': -70}
+                   If None, uses recommended defaults based on band
+
+        Returns:
+            bool: True if all changes were applied successfully
+        """
+        device_name = device.get("name", "Unnamed AP")
+        radio_table = device.get("radio_table", [])
+
+        if not radio_table:
+            console.print(f"[yellow]{device_name} has no radios[/yellow]")
+            return False
+
+        # Default recommended values per band
+        default_values = {
+            'ng': -75,   # 2.4GHz
+            'na': -72,   # 5GHz
+            '6e': -70,   # 6GHz
+            'ax': -70,   # 6GHz (alternate name)
+            '6g': -70,   # 6GHz (alternate name)
+        }
+
+        if values is None:
+            values = default_values
+
+        success_count = 0
+        total_radios = len(radio_table)
+
+        console.print(f"\n[bold cyan]Applying Min RSSI to all bands on {device_name}[/bold cyan]")
+
+        for radio in radio_table:
+            radio_name = radio.get("radio", "unknown")
+            band = "2.4GHz" if radio_name == "ng" else "5GHz" if radio_name == "na" else "6GHz"
+            value = values.get(radio_name, default_values.get(radio_name, -75))
+
+            if self.apply_min_rssi(device, radio_name, new_enabled, value):
+                success_count += 1
+
+        if success_count == total_radios:
+            console.print(f"[green]✓ Min RSSI configured on all {total_radios} radios![/green]")
+            return True
+        elif success_count > 0:
+            console.print(f"[yellow]⚠ Min RSSI configured on {success_count}/{total_radios} radios[/yellow]")
+            return False
+        else:
+            console.print(f"[red]✗ Failed to configure Min RSSI on any radio[/red]")
+            return False
+
+    def restart_ap(self, device, soft_restart=True):
+        """
+        Restart an access point to apply configuration changes
+
+        Args:
+            device: Device dict from API
+            soft_restart: If True, uses soft restart (faster, less disruptive)
+                         If False, uses hard restart (power cycle)
+
+        Returns:
+            bool: True if restart command was sent successfully
+        """
+        device_id = device["_id"]
+        device_name = device.get("name", "Unnamed AP")
+        device_mac = device.get("mac", "unknown")
+
+        restart_type = "Soft Restart" if soft_restart else "Hard Restart"
+
+        impact = {
+            "type": f"AP {restart_type}",
+            "severity": "MEDIUM",
+            "client_impact": "All connected clients will be disconnected for 30-60 seconds",
+            "benefits": ["Applies configuration changes", "Clears any stuck states"],
+            "risks": ["Temporary service interruption", "Clients must reconnect"],
+            "estimated_downtime": "30-60 seconds",
+        }
+
+        self._display_change_details(
+            device_name=device_name,
+            change_type=restart_type,
+            old_value="Running",
+            new_value="Restarting",
+            impact=impact,
+        )
+
+        # Get approval if interactive
+        if self.interactive and not self.dry_run:
+            if not Confirm.ask(f"Restart {device_name}?", default=False):
+                console.print("[yellow]Restart cancelled[/yellow]")
+                self._log_change(device_name, restart_type, "SKIPPED", "User cancelled")
+                return False
+
+        # Apply or simulate
+        if self.dry_run:
+            console.print(f"[cyan]DRY RUN: Would restart {device_name}[/cyan]")
+            self._log_change(device_name, restart_type, "DRY-RUN", "Simulated")
+            return True
+        else:
+            console.print(f"[yellow]Restarting {device_name}...[/yellow]")
+
+            try:
+                if soft_restart:
+                    # Soft restart: POST to restart endpoint
+                    cmd_data = {"mac": device_mac, "cmd": "restart"}
+                    result = self.client.post(
+                        f"s/{self.client.site}/cmd/devmgr",
+                        cmd_data
+                    )
+                else:
+                    # Hard restart: POST to power-cycle endpoint
+                    cmd_data = {"mac": device_mac, "cmd": "power-cycle"}
+                    result = self.client.post(
+                        f"s/{self.client.site}/cmd/devmgr",
+                        cmd_data
+                    )
+
+                if result:
+                    console.print(f"[green]✓ Restart command sent to {device_name}![/green]")
+                    console.print(f"[dim]AP will be offline for 30-60 seconds[/dim]")
+                    self._log_change(device_name, restart_type, "SUCCESS", "Command sent")
+                    return True
+                else:
+                    console.print(f"[red]✗ Failed to restart {device_name}[/red]")
+                    self._log_change(device_name, restart_type, "FAILED", "API call failed")
+                    return False
+
+            except Exception as e:
+                console.print(f"[red]✗ Error restarting {device_name}: {e}[/red]")
+                self._log_change(device_name, restart_type, "FAILED", str(e))
+                return False
+
     def _display_change_details(self, device_name, change_type, old_value, new_value, impact):
         """Display detailed change information"""
         console.print("\n")

@@ -1738,23 +1738,54 @@ def apply_recommendations(client, recommendations, dry_run=False, interactive=Tr
     # Create applier
     applier = ChangeApplier(client, dry_run=dry_run, interactive=interactive)
 
+    # Track which devices need restart
+    devices_to_restart = set()
+    devices_by_id = {}
+
     # Apply each recommendation
     for rec in recommendations:
         action = rec["action"]
+        device = rec["device"]
+        device_id = device.get("_id")
+        devices_by_id[device_id] = device
 
         if action == "channel_change":
-            applier.apply_channel_change(rec["device"], rec["radio"], rec["new_channel"])
+            if applier.apply_channel_change(device, rec["radio"], rec["new_channel"]):
+                devices_to_restart.add(device_id)
 
         elif action == "power_change":
-            applier.apply_power_change(rec["device"], rec["radio"], rec["new_power"])
+            if applier.apply_power_change(device, rec["radio"], rec["new_power"]):
+                devices_to_restart.add(device_id)
 
         elif action == "band_steering":
-            applier.apply_band_steering(rec["device"], rec["new_mode"])
+            if applier.apply_band_steering(device, rec["new_mode"]):
+                devices_to_restart.add(device_id)
 
         elif action == "min_rssi":
-            applier.apply_min_rssi(
-                rec["device"], rec["radio"], rec["new_enabled"], rec["new_value"]
-            )
+            # Apply min RSSI to ALL bands on the AP, not just one
+            # Check if we need to configure all radios or just one
+            radio_name = rec.get("radio")
+
+            if radio_name:
+                # Single radio recommendation (legacy)
+                if applier.apply_min_rssi(
+                    device, radio_name, rec["new_enabled"], rec["new_value"]
+                ):
+                    devices_to_restart.add(device_id)
+            else:
+                # Apply to all radios (recommended approach)
+                values = rec.get("values")  # Optional: per-band values
+                if applier.apply_min_rssi_all_bands(device, rec["new_enabled"], values):
+                    devices_to_restart.add(device_id)
+
+    # Restart APs that had configuration changes
+    if devices_to_restart and not dry_run:
+        console.print(f"\n[bold yellow]Configuration changes require AP restart[/bold yellow]")
+        console.print(f"[dim]{len(devices_to_restart)} AP(s) need to be restarted[/dim]\n")
+
+        for device_id in devices_to_restart:
+            device = devices_by_id[device_id]
+            applier.restart_ap(device, soft_restart=True)
 
     # Generate report
     applier.generate_report()

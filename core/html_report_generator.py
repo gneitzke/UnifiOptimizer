@@ -599,8 +599,9 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
 
     # Switch Analysis Section
     switch_analysis = analysis_data.get("switch_analysis")
+    switch_port_history = analysis_data.get("switch_port_history")
     if switch_analysis and switch_analysis.get("switches"):
-        html_content += generate_switch_analysis_html(switch_analysis)
+        html_content += generate_switch_analysis_html(switch_analysis, switch_port_history)
 
     # Access Points Section
     html_content += generate_ap_overview_html(ap_analysis, mesh_aps, analysis_data.get("devices", []))
@@ -3150,8 +3151,151 @@ def generate_client_security_html(security):
 """
 
 
-def generate_switch_analysis_html(switch_analysis):
-    """Generate switch analysis section with port details and PoE"""
+def generate_packet_loss_history_html(switch_port_history):
+    """Generate packet loss history visualization with trends"""
+    if not switch_port_history or not switch_port_history.get("port_history"):
+        return ""
+
+    summary = switch_port_history.get("summary", {})
+    port_history = switch_port_history.get("port_history", {})
+    trends = switch_port_history.get("trends", {})
+
+    # Summary statistics
+    summary_html = f"""
+        <h3>📊 Packet Loss Tracking (7 Days)</h3>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 20px;">
+            <div style="background: #f3f4f6; padding: 15px; border-radius: 8px; text-align: center;">
+                <div style="font-size: 1.5em; font-weight: bold; color: #3b82f6;">{summary.get('ports_with_loss', 0)}</div>
+                <div style="color: #666; font-size: 0.9em; margin-top: 5px;">Ports with Loss</div>
+            </div>
+            <div style="background: #d1fae5; padding: 15px; border-radius: 8px; text-align: center;">
+                <div style="font-size: 1.5em; font-weight: bold; color: #10b981;">{summary.get('improving', 0)} ↗️</div>
+                <div style="color: #065f46; font-size: 0.9em; margin-top: 5px;">Improving</div>
+            </div>
+            <div style="background: #fef3c7; padding: 15px; border-radius: 8px; text-align: center;">
+                <div style="font-size: 1.5em; font-weight: bold; color: #f59e0b;">{summary.get('stable', 0)} →</div>
+                <div style="color: #92400e; font-size: 0.9em; margin-top: 5px;">Stable</div>
+            </div>
+            <div style="background: #fee2e2; padding: 15px; border-radius: 8px; text-align: center;">
+                <div style="font-size: 1.5em; font-weight: bold; color: #ef4444;">{summary.get('worsening', 0)} ↘️</div>
+                <div style="color: #991b1b; font-size: 0.9em; margin-top: 5px;">Worsening</div>
+            </div>
+        </div>
+        <p style="color: #666; font-style: italic; margin-bottom: 20px;">{summary.get('message', '')}</p>
+    """
+
+    # Per-port details
+    ports_html = ""
+    for port_key, port_data in sorted(port_history.items()):
+        stats = port_data.get("statistics", {})
+        trend = stats.get("trend", "unknown")
+
+        # Trend styling
+        if trend == "improving":
+            trend_color = "#10b981"
+            trend_bg = "#d1fae5"
+            trend_icon = "↗️"
+            trend_text = "Improving"
+        elif trend == "worsening":
+            trend_color = "#ef4444"
+            trend_bg = "#fee2e2"
+            trend_icon = "↘️"
+            trend_text = "Worsening"
+        else:
+            trend_color = "#f59e0b"
+            trend_bg = "#fef3c7"
+            trend_icon = "→"
+            trend_text = "Stable"
+
+        # Create mini sparkline data
+        hourly_data = port_data.get("hourly_data", [])
+        sparkline_html = ""
+
+        if len(hourly_data) > 0:
+            # Sample every 6 hours to keep visualization simple (max 28 bars for 7 days)
+            sample_rate = max(1, len(hourly_data) // 28)
+            sampled_data = hourly_data[::sample_rate]
+            loss_values = [h.get("packet_loss_pct", 0) for h in sampled_data]
+            max_loss = max(loss_values) if loss_values else 1
+
+            # FIX: Ensure max_loss is never 0 to avoid division by zero
+            if max_loss == 0:
+                max_loss = 0.001
+
+            # Create simple bar chart
+            for loss in loss_values:
+                height_pct = (loss / max_loss * 100) if max_loss > 0 else 0
+                bar_color = "#ef4444" if loss > 5 else "#f59e0b" if loss > 1 else "#10b981"
+                sparkline_html += f'<div style="flex: 1; height: 40px; display: flex; align-items: flex-end;"><div style="width: 100%; height: {height_pct}%; background: {bar_color}; border-radius: 2px 2px 0 0;"></div></div>'
+        else:
+            sparkline_html = '<div style="color: #999;">No data</div>'
+
+        ports_html += f"""
+            <div style="background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 20px; margin-bottom: 15px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                    <div>
+                        <h4 style="margin: 0; color: #1f2937;">{port_data.get('switch_name', 'Unknown Switch')} - {port_data.get('port_name', 'Unknown Port')}</h4>
+                        <p style="margin: 5px 0 0 0; color: #6b7280; font-size: 0.9em;">Port {port_data.get('port_idx', '?')}</p>
+                    </div>
+                    <div style="background: {trend_bg}; color: {trend_color}; padding: 8px 16px; border-radius: 20px; font-weight: bold; font-size: 0.9em;">
+                        {trend_icon} {trend_text}
+                        {f" ({abs(stats.get('trend_pct', 0)):.1f}%)" if stats.get('trend_pct', 0) != 0 else ""}
+                    </div>
+                </div>
+
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 15px; margin-bottom: 15px;">
+                    <div>
+                        <div style="color: #6b7280; font-size: 0.85em; margin-bottom: 5px;">Current Loss</div>
+                        <div style="font-size: 1.2em; font-weight: bold; color: #1f2937;">{stats.get('current_loss', 0):.3f}%</div>
+                    </div>
+                    <div>
+                        <div style="color: #6b7280; font-size: 0.85em; margin-bottom: 5px;">Average Loss</div>
+                        <div style="font-size: 1.2em; font-weight: bold; color: #1f2937;">{stats.get('avg_loss', 0):.3f}%</div>
+                    </div>
+                    <div>
+                        <div style="color: #6b7280; font-size: 0.85em; margin-bottom: 5px;">Max Loss</div>
+                        <div style="font-size: 1.2em; font-weight: bold; color: #ef4444;">{stats.get('max_loss', 0):.3f}%</div>
+                    </div>
+                    <div>
+                        <div style="color: #6b7280; font-size: 0.85em; margin-bottom: 5px;">Data Points</div>
+                        <div style="font-size: 1.2em; font-weight: bold; color: #1f2937;">{stats.get('data_points', 0)}</div>
+                    </div>
+                </div>
+
+                <div style="background: #f9fafb; padding: 15px; border-radius: 6px;">
+                    <div style="color: #6b7280; font-size: 0.85em; margin-bottom: 10px; font-weight: 500;">7-Day Packet Loss Trend</div>
+                    <div style="display: flex; gap: 2px; height: 40px;">
+                        {sparkline_html}
+                    </div>
+                    <div style="display: flex; justify-content: space-between; margin-top: 5px; color: #9ca3af; font-size: 0.75em;">
+                        <span>7 days ago</span>
+                        <span>Now</span>
+                    </div>
+                </div>
+            </div>
+        """
+
+    if not ports_html:
+        return f"""
+            <div style="margin: 20px 0;">
+                {summary_html}
+                <div style="background: #d1fae5; padding: 15px; border-radius: 8px; color: #065f46;">
+                    <strong>✓ No ports with significant packet loss detected</strong>
+                    <p style="margin-top: 8px;">All monitored switch ports are operating normally with minimal packet loss (&lt;0.1%).</p>
+                </div>
+            </div>
+        """
+
+    return f"""
+        <div style="margin: 20px 0;">
+            {summary_html}
+            {ports_html}
+        </div>
+    """
+
+
+def generate_switch_analysis_html(switch_analysis, switch_port_history=None):
+    """Generate switch analysis section with port details, PoE, and packet loss history"""
     if not switch_analysis or not switch_analysis.get("switches"):
         return ""
 
@@ -3356,10 +3500,15 @@ def generate_switch_analysis_html(switch_analysis):
                 </div>
 """
 
+    # Generate packet loss history section
+    packet_loss_html = generate_packet_loss_history_html(switch_port_history) if switch_port_history else ""
+
     return f"""
         <div class="section">
             <h2>🔌 Switch Analysis</h2>
             {switches_html}
+
+            {packet_loss_html}
 
             {f'<h3>Recommendations</h3>{recs_html}' if recs_html else ''}
 
