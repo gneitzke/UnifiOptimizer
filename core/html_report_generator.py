@@ -3674,7 +3674,7 @@ def generate_packet_loss_history_html(switch_port_history):
                         <span>Now</span>
                     </div>
                 </div>
-                
+
                 {chart_html}
             </div>
         """
