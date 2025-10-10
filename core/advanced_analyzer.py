@@ -2722,10 +2722,12 @@ def run_advanced_analysis(
     from core.switch_analyzer import SwitchAnalyzer
 
     switch_analyzer = SwitchAnalyzer(client, site)
-    switch_analysis = switch_analyzer.analyze_switches()
 
-    # Collect switch port packet loss history (7 days)
+    # Collect switch port packet loss history FIRST (7 days) - this populates cache for inline graphs
     switch_port_history = switch_analyzer.analyze_switch_port_history(lookback_hours=168)
+
+    # Then analyze current switch state (uses cached data for inline 24h graphs)
+    switch_analysis = switch_analyzer.analyze_switches()
 
     results = {
         "dfs_analysis": analyzer.analyze_dfs_events(lookback_days),
