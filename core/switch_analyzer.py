@@ -546,13 +546,17 @@ class SwitchAnalyzer:
         # Get switch devices
         devices_response = self.client.get(f"s/{self.site}/stat/device")
         if not devices_response or "data" not in devices_response:
-            return {"error": "Failed to get devices"}
+            console.print("[yellow]⚠️  Failed to get devices for port history[/yellow]")
+            return {"error": "Failed to get devices", "port_history": {}, "trends": {}, "summary": {"ports_with_loss": 0}}
 
         devices = devices_response["data"]
         switches = [d for d in devices if d.get("type") == "usw"]
 
         if not switches:
-            return {"switches": [], "message": "No managed switches found"}
+            console.print("[yellow]⚠️  No managed switches found for port history analysis[/yellow]")
+            return {"port_history": {}, "trends": {}, "summary": {"ports_with_loss": 0, "message": "No managed switches found"}}
+
+        console.print(f"[dim]Found {len(switches)} switch(es) to analyze[/dim]")
 
         results = {
             "port_history": {},
@@ -726,9 +730,13 @@ class SwitchAnalyzer:
                 f"{results['summary']['stable']} stable, "
                 f"{results['summary']['worsening']} worsening"
             )
+            console.print(
+                f"[green]✓ Port history analysis complete: {results['summary']['ports_with_loss']} ports with loss detected[/green]"
+            )
         else:
             results["summary"]["message"] = "No ports with significant packet loss detected"
-
-        console.print(f"[green]✓ Port history analysis complete[/green]")
+            console.print(
+                f"[green]✓ Port history analysis complete: No significant packet loss (all ports <0.1%)[/green]"
+            )
 
         return results
