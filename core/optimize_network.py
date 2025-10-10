@@ -404,68 +404,67 @@ def analyze_network(client, site="default", lookback_days=3):
         switch_port_history = advanced_analysis.get("switch_port_history", {})
         if switch_port_history:
             summary = switch_port_history.get("summary", {})
+            trends = switch_port_history.get("trends", {})
 
-            # Always show the section header if we have summary data
+            # Check if we have packet loss to display
             if summary.get("ports_with_loss", 0) > 0:
-                trends = switch_port_history.get("trends", {})
-
                 console.print(f"\n[bold cyan]📊 Switch Port Packet Loss Trends (7 Days):[/bold cyan]")
 
-            # Show summary
-            console.print(
-                f"  Monitored: {summary.get('ports_with_loss', 0)} ports with packet loss"
-            )
+                # Show summary
+                console.print(
+                    f"  Monitored: {summary.get('ports_with_loss', 0)} ports with packet loss"
+                )
 
-            if summary.get("improving", 0) > 0:
-                console.print(f"  [green]↗️  {summary.get('improving', 0)} improving[/green]")
-            if summary.get("stable", 0) > 0:
-                console.print(f"  [yellow]→  {summary.get('stable', 0)} stable[/yellow]")
-            if summary.get("worsening", 0) > 0:
-                console.print(f"  [red]↘️  {summary.get('worsening', 0)} worsening[/red]")
+                if summary.get("improving", 0) > 0:
+                    console.print(f"  [green]↗️  {summary.get('improving', 0)} improving[/green]")
+                if summary.get("stable", 0) > 0:
+                    console.print(f"  [yellow]→  {summary.get('stable', 0)} stable[/yellow]")
+                if summary.get("worsening", 0) > 0:
+                    console.print(f"  [red]↘️  {summary.get('worsening', 0)} worsening[/red]")
 
-            # Show top problem ports
-            if trends:
-                # Sort by current loss, show top 5
-                sorted_trends = sorted(
-                    trends.items(), key=lambda x: x[1].get("current_loss", 0), reverse=True
-                )[:5]
+                # Show top problem ports
+                if trends:
+                    # Sort by current loss, show top 5
+                    sorted_trends = sorted(
+                        trends.items(), key=lambda x: x[1].get("current_loss", 0), reverse=True
+                    )[:5]
 
-                console.print(f"\n[bold]  Top Ports by Current Packet Loss:[/bold]")
-                for port_key, trend_data in sorted_trends:
-                    switch_name = trend_data.get("switch_name", "Unknown")
-                    port_name = trend_data.get("port_name", "Unknown")
-                    trend = trend_data.get("trend", "unknown")
-                    current = trend_data.get("current_loss", 0)
-                    avg = trend_data.get("avg_loss", 0)
-                    trend_pct = trend_data.get("trend_pct", 0)
+                    console.print(f"\n[bold]  Top Ports by Current Packet Loss:[/bold]")
+                    for port_key, trend_data in sorted_trends:
+                        switch_name = trend_data.get("switch_name", "Unknown")
+                        port_name = trend_data.get("port_name", "Unknown")
+                        trend = trend_data.get("trend", "unknown")
+                        current = trend_data.get("current_loss", 0)
+                        avg = trend_data.get("avg_loss", 0)
+                        trend_pct = trend_data.get("trend_pct", 0)
 
-                    # Trend display
-                    if trend == "improving":
-                        trend_icon = "↗️"
-                        trend_color = "green"
-                        trend_text = f"improving {trend_pct:.1f}%"
-                    elif trend == "worsening":
-                        trend_icon = "↘️"
-                        trend_color = "red"
-                        trend_text = f"worsening {trend_pct:.1f}%"
-                    else:
-                        trend_icon = "→"
-                        trend_color = "yellow"
-                        trend_text = "stable"
+                        # Trend display
+                        if trend == "improving":
+                            trend_icon = "↗️"
+                            trend_color = "green"
+                            trend_text = f"improving {trend_pct:.1f}%"
+                        elif trend == "worsening":
+                            trend_icon = "↘️"
+                            trend_color = "red"
+                            trend_text = f"worsening {trend_pct:.1f}%"
+                        else:
+                            trend_icon = "→"
+                            trend_color = "yellow"
+                            trend_text = "stable"
 
-                    # Loss severity color
-                    if current > 5:
-                        loss_color = "red"
-                    elif current > 1:
-                        loss_color = "yellow"
-                    else:
-                        loss_color = "white"
+                        # Loss severity color
+                        if current > 5:
+                            loss_color = "red"
+                        elif current > 1:
+                            loss_color = "yellow"
+                        else:
+                            loss_color = "white"
 
-                    console.print(
-                        f"  [{loss_color}]• {switch_name} - {port_name}[/{loss_color}]: "
-                        f"[bold]{current:.3f}%[/bold] (avg: {avg:.3f}%) "
-                        f"[{trend_color}]{trend_icon} {trend_text}[/{trend_color}]"
-                    )
+                        console.print(
+                            f"  [{loss_color}]• {switch_name} - {port_name}[/{loss_color}]: "
+                            f"[bold]{current:.3f}%[/bold] (avg: {avg:.3f}%) "
+                            f"[{trend_color}]{trend_icon} {trend_text}[/{trend_color}]"
+                        )
             else:
                 # No packet loss detected
                 console.print(f"\n[bold cyan]📊 Switch Port Packet Loss Trends (7 Days):[/bold cyan]")
