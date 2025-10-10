@@ -2047,11 +2047,34 @@ def generate_recommendations_html(recommendations):
     items = ""
     for i, rec in enumerate(recommendations, 1):
         priority = rec.get("priority", "medium")
-        device_name = rec.get("device", {}).get("name", "Unknown Device")
+
+        # Handle device name from multiple possible formats
+        if isinstance(rec.get("device"), dict):
+            device_name = rec.get("device", {}).get("name", "Unknown Device")
+        elif isinstance(rec.get("device"), str):
+            device_name = rec.get("device", "Unknown Device")
+        elif isinstance(rec.get("ap"), dict):
+            device_name = rec.get("ap", {}).get("name", "Unknown Device")
+        else:
+            device_name = "Unknown Device"
 
         # Handle both recommendation formats (expert analyzer and converted)
-        message = rec.get("message", rec.get("reason", "Optimization recommended"))
-        recommendation = rec.get("recommendation", "")
+        # If "reason" exists, it's the converted format with message+recommendation combined
+        if "reason" in rec and not rec.get("message"):
+            # Converted format: "reason" contains both message and recommendation
+            # Try to split it back or use as-is
+            reason = rec.get("reason", "")
+            if ". " in reason:
+                parts = reason.split(". ", 1)
+                message = parts[0]
+                recommendation = parts[1] if len(parts) > 1 else ""
+            else:
+                message = reason
+                recommendation = ""
+        else:
+            # Original format: separate message and recommendation
+            message = rec.get("message", "Optimization recommended")
+            recommendation = rec.get("recommendation", "")
 
         # If no explicit recommendation, build it from action details
         if not recommendation:
