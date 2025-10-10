@@ -38,7 +38,7 @@ jobs:
       run: |
         echo "Checking for breaking changes in modified files..."
         git diff --name-only origin/${{ github.base_ref }}...HEAD | tee changed_files.txt
-        
+
         # Check if critical files were modified
         if grep -q "api/cloudkey_gen2_client.py\|core/optimize_network.py\|optimizer.py" changed_files.txt; then
           echo "⚠️ Critical files modified - ensure backward compatibility"
@@ -76,13 +76,13 @@ jobs:
     - name: Verify Bug Fixes Intact
       run: |
         echo "Verifying October 10 bug fixes remain intact..."
-        
+
         # Check mock data removal
         ! grep -q "Demo AP Uplink" core/switch_analyzer.py && echo "✅ Mock data still removed" || (echo "❌ Mock data reintroduced!" && exit 1)
-        
+
         # Check cache implementation
         grep -q "hourly_data_cache" core/switch_analyzer.py && echo "✅ Cache still implemented" || (echo "❌ Cache removed!" && exit 1)
-        
+
         # Check execution order
         python -c "
 import re
@@ -116,12 +116,12 @@ with open('core/advanced_analyzer.py') as f:
         CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | wc -l)
         ADDED_LINES=$(git diff --shortstat origin/${{ github.base_ref }}...HEAD | grep -oE '[0-9]+ insertion' | grep -oE '[0-9]+' || echo "0")
         DELETED_LINES=$(git diff --shortstat origin/${{ github.base_ref }}...HEAD | grep -oE '[0-9]+ deletion' | grep -oE '[0-9]+' || echo "0")
-        
+
         echo "📊 PR Statistics:"
         echo "Files changed: $CHANGED_FILES"
         echo "Lines added: $ADDED_LINES"
         echo "Lines deleted: $DELETED_LINES"
-        
+
         if [ "$CHANGED_FILES" -gt 20 ]; then
           echo "⚠️ Large PR - consider breaking into smaller PRs"
         else

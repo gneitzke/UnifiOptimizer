@@ -47,14 +47,14 @@ repos:
         language: system
         files: \.py$
         pass_filenames: true
-        
+
       - id: validate-mesh-protection
         name: Check Mesh RSSI Protection
         entry: bash -c 'grep -q "Skip.*mesh.*min.*rssi\|EXCLUDED.*mesh" core/advanced_analyzer.py || (echo "❌ Mesh protection missing!" && exit 1)'
         language: system
         pass_filenames: false
         files: core/advanced_analyzer\.py$
-        
+
       - id: check-no-mock-data
         name: Verify No Mock Data
         entry: bash -c '! grep -q "Demo AP Uplink\|demo.*uplink" core/switch_analyzer.py || (echo "❌ Mock data found!" && exit 1)'

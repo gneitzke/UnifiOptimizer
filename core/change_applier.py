@@ -9,7 +9,7 @@ from datetime import datetime
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Confirm
+from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 console = Console()
@@ -129,6 +129,95 @@ class ChangeApplier:
         self.interactive = interactive
         self.analyzer = ChangeImpactAnalyzer()
         self.changes_log = []
+        self.min_rssi_strategy_selected = None  # Cache strategy selection
+
+    def prompt_min_rssi_strategy(self, ios_device_count=0):
+        """
+        Prompt user to select Min RSSI strategy with pros/cons
+
+        Args:
+            ios_device_count: Number of iOS devices detected
+
+        Returns:
+            str: 'optimal' or 'max_connectivity'
+        """
+        # If already selected in this session, reuse it
+        if self.min_rssi_strategy_selected:
+            return self.min_rssi_strategy_selected
+
+        console.print("\n")
+        console.print(Panel(
+            "[bold yellow]MIN RSSI STRATEGY SELECTION[/bold yellow]\n\n"
+            "Choose how aggressively clients should be forced to roam to better APs.\n"
+            f"{'[bold red]⚠️  ' + str(ios_device_count) + ' iOS devices detected on your network[/bold red]' if ios_device_count > 0 else ''}",
+            style="yellow"
+        ))
+
+        # Build comparison table
+        table = Table(show_header=True, header_style="bold cyan", show_lines=True)
+        table.add_column("Strategy", style="bold", width=22)
+        table.add_column("⚡ Optimal (Aggressive)", style="green", width=40)
+        table.add_column("🛡️  Max Connectivity (Conservative)", style="yellow", width=40)
+
+        table.add_row(
+            "[bold]Description[/bold]",
+            "Forces clients to move to better APs early for best performance",
+            "Lets clients stay connected longer for maximum reliability"
+        )
+
+        table.add_row(
+            "[bold]Typical Values[/bold]",
+            "2.4GHz: -75 dBm\n5GHz: -72 dBm\n6GHz: -70 dBm",
+            "2.4GHz: -80 dBm\n5GHz: -77 dBm\n6GHz: -75 dBm"
+        )
+
+        table.add_row(
+            "[green]✅ PROS[/green]",
+            "• Better performance\n• Faster roaming\n• Less congestion\n• Optimal for dense APs",
+            "• Fewer disconnects\n• Better for iOS devices\n• Works with sparse coverage\n• More stable overall"
+        )
+
+        table.add_row(
+            "[red]⚠️  CONS[/red]",
+            "• More disconnects at edges\n• iOS devices may struggle\n• Needs good coverage",
+            "• Clients stay on distant APs\n• Lower throughput potential\n• More 'sticky client' issues"
+        )
+
+        table.add_row(
+            "[bold]Best For[/bold]",
+            "Dense AP deployment\nAndroid/Windows-heavy\nPerformance priority",
+            "Sparse AP coverage\niOS/iPhone-heavy networks\nStability priority"
+        )
+
+        console.print(table)
+        console.print()
+
+        if ios_device_count > 0:
+            console.print(Panel(
+                f"[yellow]🍎 Recommendation:[/yellow] With {ios_device_count} iOS devices detected, "
+                "[bold yellow]Max Connectivity[/bold yellow] may provide better stability.\n"
+                "However, [bold green]Optimal[/bold green] can work if you have good AP coverage.",
+                style="yellow"
+            ))
+            console.print()
+
+        # Prompt for choice
+        choice = Prompt.ask(
+            "Select strategy",
+            choices=["1", "2"],
+            default="1" if ios_device_count == 0 else "2"
+        )
+
+        if choice == "1":
+            strategy = "optimal"
+            console.print("[green]✓ Selected: Optimal (Aggressive) strategy[/green]")
+        else:
+            strategy = "max_connectivity"
+            console.print("[yellow]✓ Selected: Max Connectivity (Conservative) strategy[/yellow]")
+
+        # Cache the selection for this session
+        self.min_rssi_strategy_selected = strategy
+        return strategy
 
     def apply_channel_change(self, device, radio, new_channel):
         """
@@ -518,7 +607,7 @@ class ChangeApplier:
                 )
                 return False
 
-    def apply_min_rssi_all_bands(self, device, new_enabled=True, values=None):
+    def apply_min_rssi_all_bands(self, device, new_enabled=True, values=None, strategy=None, ios_device_count=0):
         """
         Apply minimum RSSI configuration to ALL radios/bands on an AP
 
@@ -526,7 +615,9 @@ class ChangeApplier:
             device: Device dict from API
             new_enabled: Whether to enable min RSSI
             values: Dict mapping radio names to values, e.g. {'ng': -75, 'na': -72, '6e': -70}
-                   If None, uses recommended defaults based on band
+                   If None, uses defaults based on strategy
+            strategy: 'optimal' or 'max_connectivity'. If None and interactive, prompts user
+            ios_device_count: Number of iOS devices detected (for strategy recommendation)
 
         Returns:
             bool: True if all changes were applied successfully
@@ -538,14 +629,32 @@ class ChangeApplier:
             console.print(f"[yellow]{device_name} has no radios[/yellow]")
             return False
 
-        # Default recommended values per band
-        default_values = {
-            "ng": -75,  # 2.4GHz
-            "na": -72,  # 5GHz
-            "6e": -70,  # 6GHz
-            "ax": -70,  # 6GHz (alternate name)
-            "6g": -70,  # 6GHz (alternate name)
-        }
+        # If no strategy provided and interactive mode, prompt user (once per session)
+        if strategy is None and self.interactive and not self.dry_run:
+            strategy = self.prompt_min_rssi_strategy(ios_device_count)
+        elif strategy is None:
+            # Default to optimal if not interactive
+            strategy = "optimal"
+
+        # Strategy-based default values
+        if strategy == "max_connectivity":
+            # Conservative - more tolerant thresholds
+            default_values = {
+                "ng": -80,  # 2.4GHz
+                "na": -77,  # 5GHz
+                "6e": -75,  # 6GHz
+                "ax": -75,  # 6GHz (alternate name)
+                "6g": -75,  # 6GHz (alternate name)
+            }
+        else:
+            # Optimal - aggressive thresholds
+            default_values = {
+                "ng": -75,  # 2.4GHz
+                "na": -72,  # 5GHz
+                "6e": -70,  # 6GHz
+                "ax": -70,  # 6GHz (alternate name)
+                "6g": -70,  # 6GHz (alternate name)
+            }
 
         if values is None:
             values = default_values
