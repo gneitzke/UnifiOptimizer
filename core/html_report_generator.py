@@ -2430,7 +2430,7 @@ def generate_recommendations_html(recommendations):
                     else (
                         "5GHz"
                         if radio == "na"
-                        else "6GHz" if radio in ["6e", "ax", "6g"] else "Unknown"
+                        else "6GHz" if radio in ["6e", "6g"] else "Unknown"
                     )
                 )
                 recommendation = f"Change {band} channel from {current} to {new}"
@@ -2444,7 +2444,7 @@ def generate_recommendations_html(recommendations):
                     else (
                         "5GHz"
                         if radio == "na"
-                        else "6GHz" if radio in ["6e", "ax", "6g"] else "Unknown"
+                        else "6GHz" if radio in ["6e", "6g"] else "Unknown"
                     )
                 )
                 recommendation = f"Change {band} transmit power from {current} to {new}"
