@@ -105,7 +105,14 @@ body {
 .stat-card .label { font-size: 11px; color: #5f6368; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
 .stat-card .value { font-size: 20px; font-weight: 700; }
 .stat-card .detail { font-size: 12px; color: #9aa0a6; margin-top: 2px; }
-.narrative { font-size: 14px; color: #9aa0a6; line-height: 1.6; }
+.exec-inline { margin-top: 10px; padding: 10px 14px; background: #0d1a2e; border-radius: 8px; border: 1px solid #1e2d4a; }
+.exec-findings { font-size: 13px; color: #e8eaed; line-height: 1.5; }
+.exec-actions { font-size: 12px; color: #9aa0a6; margin-top: 4px; }
+.print-btn {
+    background: #162540; border: 1px solid #1e2d4a; color: #9aa0a6;
+    padding: 8px 20px; border-radius: 6px; cursor: pointer; font-size: 13px;
+}
+.print-btn:hover { background: #1a2f50; color: #e8eaed; }
 
 /* Section titles */
 .section-title {
@@ -254,7 +261,7 @@ body {
 }
 .behavior-stable { background: #34a85320; color: #34a853; }
 .behavior-roamer { background: #2196f320; color: #2196f3; }
-.behavior-flapping { background: #ea433520; color: #ea4335; }
+.behavior-flapping, .behavior-high-roam { background: #ea433520; color: #ea4335; }
 .behavior-sticky { background: #fbbc0420; color: #fbbc04; }
 
 /* Swim lane */
@@ -262,29 +269,38 @@ body {
 .swim-lane-title { font-size: 12px; font-weight: 600; margin-bottom: 6px; }
 .swim-lane-subtitle { font-size: 11px; color: #9aa0a6; margin-bottom: 8px; }
 
-/* Executive */
-.executive {
-    background: #111d33; border-radius: 12px; padding: 28px 32px;
-    border: 1px solid #1e2d4a; margin-top: 28px;
-}
-.executive h2 { font-size: 16px; margin-bottom: 16px; }
-.executive p { color: #9aa0a6; line-height: 1.7; margin-bottom: 12px; font-size: 14px; }
-.print-btn {
-    background: #162540; border: 1px solid #1e2d4a; color: #9aa0a6;
-    padding: 8px 20px; border-radius: 6px; cursor: pointer; font-size: 13px;
-    margin-top: 8px;
-}
-.print-btn:hover { background: #1a2f50; color: #e8eaed; }
-
-/* Print */
+/* Responsive */
 @media print {
-    body { background: #fff; color: #222; }
-    .report-header, .topology-wrap, .tabs-container, .actions-list { display: none; }
-    .hero { background: #f5f5f5; border: 1px solid #ddd; }
-    .executive { background: #fff; border: 1px solid #ddd; page-break-inside: avoid; }
-    .executive p { color: #333; }
-    .print-btn { display: none; }
-    .stat-card { background: #f5f5f5; border: 1px solid #ddd; }
+    body { background: #fff !important; color: #222 !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    .container { padding: 0 12px; }
+    .report-header { background: #f5f5f5; border-bottom-color: #006fff; }
+    .report-header h1, .report-header .meta { color: #222; }
+    .report-header h1 span { color: #006fff; }
+    .hero { background: #f5f5f5; border-color: #ddd; }
+    .stat-card { background: #fff; border-color: #ddd; }
+    .stat-card .label, .stat-card .detail { color: #666; }
+    .stat-card .value { color: #222; }
+    .exec-inline { background: #f9f9f9; border-color: #ddd; }
+    .exec-findings { color: #222; }
+    .exec-actions { color: #555; }
+    .topology-wrap { background: #fff; border-color: #ddd; }
+    .action-card { background: #fff; border-color: #ddd; }
+    .action-detail, .action-meta { color: #555; }
+    .panel-card { background: #fff; border-color: #ddd; }
+    .panel-card h3 { color: #222; }
+    .tab-content { display: block !important; page-break-inside: avoid; margin-bottom: 16px; }
+    .tab-nav { display: none; }
+    details { open: true; }
+    details[open] { display: block; }
+    details .detail-body { background: #f9f9f9; border-color: #ddd; }
+    details .detail-body td, details .detail-body th { color: #333; }
+    .print-btn { display: none !important; }
+    .show-more-btn { display: none !important; }
+    #more-actions { display: block !important; }
+    .topo-node-rect { fill: #f5f5f5; stroke: #ccc; }
+    .topo-label { fill: #222; }
+    .topo-sublabel { fill: #666; }
+    .topo-edge { stroke: #ccc; }
 }
 
 /* Expandable detail sections */
@@ -368,6 +384,15 @@ function toggleMore(id) {
     if (btn && btn.classList.contains('show-more-btn')) {
         btn.textContent = showing ? 'Show more ▾' : 'Show less ▴';
     }
+}
+function printReport() {
+    // Expand all <details> and hidden sections
+    document.querySelectorAll('details').forEach(function(d) { d.open = true; });
+    var more = document.getElementById('more-actions');
+    if (more) more.style.display = 'block';
+    // Show all tabs
+    document.querySelectorAll('.tab-content').forEach(function(el) { el.classList.add('active'); });
+    setTimeout(function() { window.print(); }, 200);
 }
 """
 
@@ -516,20 +541,193 @@ def _svg_swim_lane(client_name, client_data, width=700):
 
     parts.append("</svg>")
 
-    bclass = "behavior-flapping" if behavior == "flapping" else "behavior-roamer" if "roam" in behavior else "behavior-sticky" if behavior == "sticky" else "behavior-stable"
+    bclass = "behavior-high-roam" if behavior == "flapping" else "behavior-roamer" if "roam" in behavior else "behavior-sticky" if behavior == "sticky" else "behavior-stable"
+    behavior_display = "High Roam" if behavior == "flapping" else behavior.replace("_", " ").title()
 
     return (
         f'<div class="swim-lane-wrap">'
         f'<div class="swim-lane-title">{_esc(client_name)} '
-        f'<span class="behavior-badge {bclass}">{_esc(behavior)}</span></div>'
+        f'<span class="behavior-badge {bclass}">{_esc(behavior_display)}</span></div>'
         f'<div class="swim-lane-subtitle">{roams} roams ({daily:.0f}/day) across {len(visited_aps)} APs</div>'
         f'{"".join(parts)}</div>'
     )
 
 
+def _behavior_display(behavior):
+    """Map internal behavior string to user-friendly label."""
+    if behavior == "flapping":
+        return "High Roam"
+    return behavior.replace("_", " ").title()
+
+
+def _behavior_css_class(behavior):
+    if behavior == "flapping":
+        return "behavior-high-roam"
+    if "roam" in behavior:
+        return "behavior-roamer"
+    if behavior == "sticky":
+        return "behavior-sticky"
+    return "behavior-stable"
+
+
 # ---------------------------------------------------------------------------
-# Section: Header
+# SVG: Device Activity Timeline
 # ---------------------------------------------------------------------------
+
+def _svg_device_timeline(analysis_data, width=860):
+    """Timeline chart: top devices on Y, 6-hour time blocks on X.
+    Shows roam events, disconnects, and uptime gaps."""
+    from datetime import datetime as _dt, timedelta
+
+    journeys = analysis_data.get("client_journeys", {})
+    jc = journeys.get("clients", {})
+    ap_events = analysis_data.get("event_timeline", {}).get("ap_events", {})
+    devices = analysis_data.get("devices", [])
+
+    # Collect all timestamped events per device (AP)
+    device_events = {}  # ap_name -> [(ts, event_type), ...]
+
+    # From ap_events summary
+    for ap_name, ecounts in ap_events.items():
+        if not isinstance(ecounts, dict):
+            continue
+        device_events.setdefault(ap_name, [])
+
+    # From client journeys ap_path (roaming events)
+    for mac, jdata in jc.items():
+        for evt in jdata.get("ap_path", []):
+            ts = evt.get("ts", 0)
+            if ts:
+                to_ap = evt.get("to_ap", "")
+                if to_ap:
+                    device_events.setdefault(to_ap, []).append((ts, "roam"))
+
+    # Device uptimes
+    for dev in devices:
+        name = dev.get("name", "")
+        uptime = dev.get("uptime", 0) or 0
+        last_seen = dev.get("last_seen", 0) or 0
+        if last_seen and uptime and name:
+            boot_ts = last_seen - uptime
+            device_events.setdefault(name, []).append((boot_ts, "restart"))
+
+    if not device_events:
+        return ""
+
+    # Rank devices by event count, take top 7
+    ranked = sorted(device_events.items(), key=lambda x: len(x[1]), reverse=True)
+    top_devices = [(name, evts) for name, evts in ranked if evts][:7]
+    if not top_devices:
+        return ""
+
+    # Time range from all events
+    all_ts = [ts for _, evts in top_devices for ts, _ in evts]
+    if not all_ts:
+        return ""
+    t_min = min(all_ts)
+    t_max = max(all_ts)
+    t_span = t_max - t_min
+    if t_span < 3600:
+        return ""
+
+    # Snap to 6-hour blocks
+    block_secs = 6 * 3600
+    t_start = (t_min // block_secs) * block_secs
+    t_end = ((t_max // block_secs) + 1) * block_secs
+    n_blocks = int((t_end - t_start) / block_secs)
+    if n_blocks < 2:
+        return ""
+
+    row_h = 28
+    label_w = 100
+    top_pad = 30
+    h = len(top_devices) * row_h + top_pad + 20
+    chart_w = width - label_w - 10
+
+    parts = [f'<svg viewBox="0 0 {width} {h}" width="100%" preserveAspectRatio="xMinYMin meet" style="max-width:{width}px">']
+
+    # X-axis labels (every 4th block or daily if many blocks)
+    label_every = max(1, n_blocks // 12)
+    for i in range(0, n_blocks + 1, label_every):
+        x = label_w + (i / n_blocks) * chart_w
+        block_ts = t_start + i * block_secs
+        dt = _dt.fromtimestamp(block_ts)
+        label = dt.strftime("%b %d") if (block_ts % 86400 < block_secs) else dt.strftime("%H:%M")
+        parts.append(
+            f'<text x="{x:.0f}" y="{top_pad - 8}" fill="#5f6368" font-size="9" '
+            f'text-anchor="middle" font-family="sans-serif">{label}</text>'
+        )
+        parts.append(
+            f'<line x1="{x:.0f}" y1="{top_pad}" x2="{x:.0f}" y2="{h - 10}" '
+            f'stroke="#1e2d4a" stroke-width="0.5" stroke-dasharray="3 3"/>'
+        )
+
+    event_colors = {"roam": "#006fff", "restart": "#ea4335", "disconnect": "#fbbc04"}
+
+    for row_idx, (dev_name, evts) in enumerate(top_devices):
+        y_center = top_pad + row_idx * row_h + row_h // 2
+
+        # Device label
+        parts.append(
+            f'<text x="{label_w - 6}" y="{y_center + 3}" fill="#9aa0a6" '
+            f'font-size="10" text-anchor="end" font-family="sans-serif">{_esc(dev_name[:14])}</text>'
+        )
+        # Row background line
+        parts.append(
+            f'<line x1="{label_w}" y1="{y_center}" x2="{width - 10}" y2="{y_center}" '
+            f'stroke="#1e2d4a" stroke-width="0.5"/>'
+        )
+
+        # Bin events into 6h blocks for density display
+        bins = [0] * n_blocks
+        for ts, etype in evts:
+            bi = int((ts - t_start) / block_secs)
+            if 0 <= bi < n_blocks:
+                bins[bi] += 1
+
+        max_bin = max(bins) if bins else 1
+        for bi, count in enumerate(bins):
+            if count == 0:
+                continue
+            x = label_w + (bi / n_blocks) * chart_w
+            bw = max(3, chart_w / n_blocks - 1)
+            intensity = min(1.0, count / max(max_bin, 1))
+            opacity = 0.2 + intensity * 0.7
+            color = "#006fff"
+            # Check for restarts in this block
+            for ts, etype in evts:
+                bi2 = int((ts - t_start) / block_secs)
+                if bi2 == bi and etype == "restart":
+                    color = "#ea4335"
+                    break
+            bar_h = 6 + intensity * 12
+            parts.append(
+                f'<rect x="{x:.1f}" y="{y_center - bar_h/2:.1f}" '
+                f'width="{bw:.1f}" height="{bar_h:.1f}" rx="2" '
+                f'fill="{color}" opacity="{opacity:.2f}"/>'
+            )
+            if count > 2:
+                parts.append(
+                    f'<text x="{x + bw/2:.1f}" y="{y_center + 3}" fill="#e8eaed" '
+                    f'font-size="7" text-anchor="middle" font-family="sans-serif">{count}</text>'
+                )
+
+    parts.append("</svg>")
+
+    legend = (
+        '<div style="display:flex;gap:14px;justify-content:center;margin-top:6px;font-size:11px;color:#5f6368">'
+        '<span>🔵 Roaming</span><span>🔴 Restart</span>'
+        '<span style="color:#9aa0a6">Bar height = event density per 6hr block</span>'
+        '</div>'
+    )
+
+    return (
+        f'<div class="section-title"><span class="icon">📊</span> Device Activity Timeline</div>'
+        f'<div class="topology-wrap">'
+        f'{"".join(parts)}{legend}</div>'
+    )
+
+
 
 def _header(site_name, analysis_data):
     now = datetime.now().strftime("%B %d, %Y at %H:%M")
@@ -546,7 +744,7 @@ def _header(site_name, analysis_data):
 # Section: Hero Dashboard
 # ---------------------------------------------------------------------------
 
-def _hero(analysis_data, recommendations):
+def _hero(analysis_data, recommendations, site_name="default"):
     hs = analysis_data.get("health_score", {})
     score = hs.get("score", 0) or 0
 
@@ -570,48 +768,59 @@ def _hero(analysis_data, recommendations):
     top_issue_text = critical[0].get("message", "No critical issues")[:60] if critical else "No critical issues"
 
     # Action count
-    action_count = len(_group_recs(recommendations, analysis_data))
+    actions = _group_recs(recommendations, analysis_data)
+    action_count = len(actions)
 
-    # Narrative
-    narrative_parts = [f"{total_aps} APs serving {wireless_clients} wireless clients."]
-    if critical:
-        narrative_parts.append(critical[0].get("message", "")[:80] + ".")
+    ring = _svg_ring(score)
+
+    # Build executive summary (compact, inline)
+    findings = []
+    for issue in critical[:3]:
+        findings.append(issue.get("message", ""))
     bs = analysis_data.get("band_steering_analysis", {})
     stuck_2g = bs.get("dual_band_clients_on_2ghz", 0)
     if stuck_2g > 5:
-        narrative_parts.append(f"{stuck_2g} capable clients stuck on 2.4GHz.")
-    if action_count:
-        narrative_parts.append(f"{action_count} actionable fixes identified.")
-    narrative = " ".join(narrative_parts)
+        findings.append(f"{stuck_2g} dual-band clients stuck on 2.4GHz.")
+    weak = ca.get("weak_signal", [])
+    if len(weak) > 2:
+        findings.append(f"{len(weak)} clients below -70 dBm.")
 
-    ring = _svg_ring(score)
+    finding_text = " ".join(findings[:4]) if findings else "No significant issues detected."
+
+    action_text = ""
+    if actions:
+        action_names = [a["title"].lower() for a in actions[:4]]
+        action_text = f"{action_count} fix{'es' if action_count > 1 else ''}: {', '.join(action_names)}."
+
+    exec_html = (
+        f'<div class="exec-inline">'
+        f'<div class="exec-findings">{_esc(finding_text)}</div>'
+        f'{f"<div class=exec-actions>{_esc(action_text)}</div>" if action_text else ""}'
+        f'</div>'
+    )
 
     return (
         f'<div class="hero">'
         f'<div class="ring-container">{ring}</div>'
         f'<div class="hero-content">'
         f'<div class="stat-cards">'
-        # Card 1: APs
         f'<div class="stat-card">'
         f'<div class="label">Access Points</div>'
         f'<div class="value">{total_aps}</div>'
         f'<div class="detail">{wired_ap_count} wired · {mesh_count} mesh</div></div>'
-        # Card 2: Clients
         f'<div class="stat-card">'
         f'<div class="label">Clients</div>'
         f'<div class="value">{wireless_clients}</div>'
         f'<div class="detail">{wired_clients} wired</div></div>'
-        # Card 3: Top Issue
         f'<div class="stat-card">'
         f'<div class="label">Top Issue</div>'
         f'<div class="value" style="font-size:13px;line-height:1.3;margin-top:2px">{_esc(top_issue_text)}</div></div>'
-        # Card 4: Actions
         f'<div class="stat-card">'
         f'<div class="label">Actions</div>'
         f'<div class="value">{action_count}</div>'
         f'<div class="detail">optimization{"s" if action_count != 1 else ""} available</div></div>'
         f'</div>'
-        f'<div class="narrative">{_esc(narrative)}</div>'
+        f'{exec_html}'
         f'</div></div>'
     )
 
@@ -1442,76 +1651,6 @@ def _tabs(analysis_data):
 
 
 # ---------------------------------------------------------------------------
-# Section: Executive Summary
-# ---------------------------------------------------------------------------
-
-def _executive(analysis_data, recommendations, site_name):
-    hs = analysis_data.get("health_score", {})
-    score = hs.get("score", 0) or 0
-    grade = hs.get("grade", "?")
-    ap_count = analysis_data.get("ap_analysis", {}).get("total_aps", 0)
-    mesh_aps = analysis_data.get("ap_analysis", {}).get("mesh_aps", [])
-    wired_aps = analysis_data.get("ap_analysis", {}).get("wired_aps", [])
-    mesh_count = len(mesh_aps) if isinstance(mesh_aps, list) else 0
-    wired_ap_count = len(wired_aps) if isinstance(wired_aps, list) else 0
-
-    ca = analysis_data.get("client_analysis", {})
-    total_clients = ca.get("total_clients", 0)
-    wired_clients = sum(1 for c in ca.get("clients", []) if c.get("is_wired"))
-    wireless = total_clients - wired_clients
-
-    # Paragraph 1: Overview
-    p1 = (
-        f"This report analyzes the {_esc(site_name)} network, consisting of "
-        f"{ap_count} access points ({wired_ap_count} wired, {mesh_count} mesh) "
-        f"serving {wireless} wireless and {wired_clients} wired clients. "
-        f"The network scores {score}/100 (Grade {grade})."
-    )
-
-    # Paragraph 2: Key findings
-    findings = []
-    issues = analysis_data.get("health_analysis", {}).get("issues", [])
-    for issue in issues:
-        if issue.get("severity") in ("high", "critical"):
-            findings.append(issue.get("message", ""))
-    bs = analysis_data.get("band_steering_analysis", {})
-    stuck = bs.get("dual_band_clients_on_2ghz", 0)
-    if stuck > 5:
-        findings.append(
-            f"{stuck} dual-band capable clients are connected to the slower 2.4GHz "
-            f"band due to band steering being disabled."
-        )
-    weak = ca.get("weak_signal", [])
-    if len(weak) > 2:
-        findings.append(f"{len(weak)} clients have weak signal strength below -70 dBm.")
-
-    p2 = " ".join(findings) if findings else "No significant issues were identified."
-
-    # Paragraph 3: Recommendations summary
-    actions = _group_recs(recommendations, analysis_data)
-    if actions:
-        action_descs = [a["title"].lower() for a in actions[:5]]
-        p3 = (
-            f"{len(actions)} optimization group{'s' if len(actions) > 1 else ''} identified: "
-            f"{', '.join(action_descs)}. "
-            f"These changes would improve client roaming, reduce interference, "
-            f"and increase overall throughput."
-        )
-    else:
-        p3 = "No optimization opportunities were identified. The network is well-configured."
-
-    return (
-        f'<div class="executive" id="section-executive">'
-        f'<h2>Executive Summary</h2>'
-        f'<p>{p1}</p>'
-        f'<p>{p2}</p>'
-        f'<p>{p3}</p>'
-        f'<button class="print-btn" onclick="window.print()">🖨 Print Report</button>'
-        f'</div>'
-    )
-
-
-# ---------------------------------------------------------------------------
 # Main Generator
 # ---------------------------------------------------------------------------
 
@@ -1539,11 +1678,14 @@ def generate_v2_report(analysis_data, recommendations, site_name, output_dir="re
         '<body>',
         _header(site_name, analysis_data),
         '<div class="container">',
-        _hero(analysis_data, recommendations),
+        _hero(analysis_data, recommendations, site_name),
         _topology(analysis_data),
+        _svg_device_timeline(analysis_data),
         _actions(recommendations, analysis_data),
         _tabs(analysis_data),
-        _executive(analysis_data, recommendations, site_name),
+        '<div style="text-align:center;margin:24px 0">'
+        '<button class="print-btn" onclick="printReport()">🖨 Expand All &amp; Print</button>'
+        '</div>',
         '</div>',
         '<script>', _js(), '</script>',
         '</body></html>',
