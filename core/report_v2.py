@@ -779,16 +779,24 @@ def _svg_device_timeline(analysis_data, width=860):
 
     parts.append("</svg>")
 
-    # Data gap notice
-    data_end = t_last.strftime("%b %d %Y")
-    gap_days = int((now - t_last).total_seconds() / 86400)
-    gap_note = ""
-    if gap_days > 1:
-        gap_note = (
+    # Data source note
+    stat_report_hours = et.get("stat_report_hours", 0)
+    stat_report_roams = et.get("stat_report_roams", 0)
+    data_note = ""
+    if stat_report_hours:
+        data_note = (
             f'<div style="font-size:11px;color:#5f6368;margin-top:4px;text-align:center">'
-            f'Event data covers {t_first.strftime("%b %d")} – {data_end} · '
-            f'{gap_days}-day gap to today (no recent events on controller)</div>'
+            f'Event log: {t_first.strftime("%b %d")} – {t_last.strftime("%b %d %Y")} · '
+            f'AP stats: +{stat_report_hours} hours with {_fmt(stat_report_roams)} roams through today</div>'
         )
+    else:
+        gap_days = int((now - t_last).total_seconds() / 86400)
+        if gap_days > 1:
+            data_note = (
+                f'<div style="font-size:11px;color:#5f6368;margin-top:4px;text-align:center">'
+                f'Event data covers {t_first.strftime("%b %d")} – {t_last.strftime("%b %d %Y")} · '
+                f'{gap_days}-day gap to today (no recent events on controller)</div>'
+            )
 
     legend = (
         '<div style="display:flex;gap:14px;justify-content:center;margin-top:6px;font-size:11px;color:#5f6368">'
@@ -802,7 +810,7 @@ def _svg_device_timeline(analysis_data, width=860):
     return (
         f'<div class="section-title"><span class="icon">📊</span> Event Timeline</div>'
         f'<div class="topology-wrap">'
-        f'{"".join(parts)}{legend}{gap_note}</div>'
+        f'{"".join(parts)}{legend}{data_note}</div>'
     )
 
 

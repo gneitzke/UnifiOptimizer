@@ -93,6 +93,26 @@ class ExpertNetworkAnalyzer:
             f"{len(self.historical_events)} events collected[/green]\n"
         )
 
+        # Collect hourly AP stats from stat/report (has current data even when
+        # stat/event log has rolled over and stopped recording new events)
+        self.hourly_ap_stats = []
+        try:
+            now_ms = int(_time.time() * 1000)
+            start_ms = now_ms - lookback_days * 86400 * 1000
+            resp = self.client.post(f"s/{self.site}/stat/report/hourly.ap", {
+                "attrs": ["bytes", "num_sta", "num_wifi_roam_to_events", "time"],
+                "start": start_ms,
+                "end": now_ms,
+            })
+            self.hourly_ap_stats = resp.get("data", []) if resp else []
+            if self.hourly_ap_stats:
+                console.print(
+                    f"[green]  ↳ {len(self.hourly_ap_stats)} hourly AP stat records "
+                    f"(covers last {lookback_days} days)[/green]"
+                )
+        except Exception:
+            pass
+
     def analyze_aps(self):
         """
         Analyze access points with expert-level recommendations
@@ -735,6 +755,94 @@ def _build_event_timeline(events, lookback_days):
     }
 
 
+def _merge_hourly_ap_stats(event_timeline, hourly_ap_stats, devices):
+    """Merge stat/report/hourly.ap data into the event timeline.
+
+    stat/event can stop recording when its log rolls over, but
+    stat/report/hourly.ap always has current aggregated data including
+    roam counts per AP per hour. This fills any gap between the event
+    log and the present.
+    """
+    if not hourly_ap_stats:
+        return
+
+    # Build AP MAC → name lookup
+    mac_to_name = {}
+    for d in devices:
+        if d.get("type") == "uap":
+            mac_to_name[d.get("mac", "")] = d.get("name", "Unknown")
+
+    existing_hours = set(event_timeline.get("hours", []))
+    categories = event_timeline.setdefault("categories", {})
+    hours_list = event_timeline.setdefault("hours", [])
+    totals = event_timeline.setdefault("totals", {})
+    ap_events = event_timeline.setdefault("ap_events", {})
+
+    # Bucket stat records by hour
+    new_hourly = defaultdict(lambda: defaultdict(int))
+    new_ap_roams = defaultdict(int)
+
+    for record in hourly_ap_stats:
+        ts = record.get("time", 0)
+        if not ts:
+            continue
+        ts_sec = ts / 1000 if ts > 1e12 else ts
+        try:
+            dt = datetime.fromtimestamp(ts_sec, tz=timezone.utc)
+        except (ValueError, OSError):
+            continue
+        hour_key = dt.strftime("%Y-%m-%d %H:00")
+
+        roams = int(record.get("num_wifi_roam_to_events", 0) or 0)
+        if roams and hour_key not in existing_hours:
+            new_hourly[hour_key]["roaming"] += roams
+
+        # Track per-AP roaming totals
+        ap_mac = record.get("ap", "")
+        ap_name = mac_to_name.get(ap_mac, ap_mac[:8] if ap_mac else "")
+        if roams and ap_name:
+            new_ap_roams[ap_name] += roams
+
+    if not new_hourly:
+        return
+
+    # Merge new hours into the timeline
+    new_hours_sorted = sorted(new_hourly.keys())
+    all_hours = sorted(set(hours_list) | set(new_hours_sorted))
+
+    # Rebuild category arrays aligned to all_hours
+    old_hour_idx = {h: i for i, h in enumerate(hours_list)}
+    for cat_name in ["disconnect", "roaming", "dfs_radar", "device_restart"]:
+        old_arr = categories.get(cat_name, [])
+        new_arr = []
+        for h in all_hours:
+            if h in old_hour_idx:
+                idx = old_hour_idx[h]
+                new_arr.append(old_arr[idx] if idx < len(old_arr) else 0)
+            elif h in new_hourly:
+                new_arr.append(new_hourly[h].get(cat_name, 0))
+            else:
+                new_arr.append(0)
+        categories[cat_name] = new_arr
+
+    event_timeline["hours"] = all_hours
+
+    # Update totals
+    added_roams = sum(new_hourly[h].get("roaming", 0) for h in new_hours_sorted)
+    totals["roaming"] = totals.get("roaming", 0) + added_roams
+
+    # Update per-AP roaming totals
+    for ap_name, count in new_ap_roams.items():
+        if ap_name in ap_events:
+            ap_events[ap_name]["roaming"] = ap_events[ap_name].get("roaming", 0) + count
+        else:
+            ap_events[ap_name] = {"roaming": count}
+
+    # Add source annotation
+    event_timeline["stat_report_hours"] = len(new_hours_sorted)
+    event_timeline["stat_report_roams"] = added_roams
+
+
 def _build_client_journeys(events, clients, devices, lookback_days):
     """Build per-client journey profiles from historical events and current state.
 
@@ -978,6 +1086,10 @@ def run_expert_analysis(client, site="default", lookback_days=3):
 
     # Build event timeline for historical analysis
     event_timeline = _build_event_timeline(analyzer.historical_events, lookback_days)
+
+    # Merge hourly AP stats into timeline (has current data from stat/report)
+    if hasattr(analyzer, "hourly_ap_stats") and analyzer.hourly_ap_stats:
+        _merge_hourly_ap_stats(event_timeline, analyzer.hourly_ap_stats, analyzer.devices)
 
     # Build per-client journey profiles
     client_journeys = _build_client_journeys(
