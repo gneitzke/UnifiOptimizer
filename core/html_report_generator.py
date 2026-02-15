@@ -10,22 +10,21 @@ from datetime import datetime
 from pathlib import Path
 
 
-def make_collapsible(section_id, section_title, section_content):
-    """Wrap a section in collapsible HTML structure
-
-    If section_content is already a complete <div class="section"> block,
-    just add the collapsible controls around it.
-    """
+def make_collapsible(section_id, section_title, section_content, start_collapsed=False):
+    """Wrap a section in collapsible HTML structure"""
     if not section_content or section_content.strip() == "":
         return ""
+
+    collapsed_class = " collapsed" if start_collapsed else ""
+    toggle_class = " collapsed" if start_collapsed else ""
 
     return f"""
         <div class="collapsible-section">
             <div class="section-header" onclick="toggleSection('{section_id}')">
                 <h2>{section_title}</h2>
-                <span class="section-toggle">▼</span>
+                <span class="section-toggle{toggle_class}">▼</span>
             </div>
-            <div id="{section_id}" class="section-content">
+            <div id="{section_id}" class="section-content{collapsed_class}">
                 {section_content}
             </div>
         </div>
@@ -105,6 +104,97 @@ def generate_navigation_menu(analysis_data, recommendations, client_health, swit
             <span class="nav-menu-title">Jump to:</span>
             {nav_html}
         </div>
+"""
+
+
+def _generate_overview_charts(analysis_data, signal_distribution):
+    """Generate Chart.js overview charts: RSSI doughnut, band pie, client capability pie."""
+    # Extract data for charts
+    rssi_data = {
+        "excellent": signal_distribution.get("excellent", 0),
+        "good": signal_distribution.get("good", 0),
+        "fair": signal_distribution.get("fair", 0),
+        "poor": signal_distribution.get("poor", 0),
+        "critical": signal_distribution.get("critical", 0),
+    }
+    total_wireless = sum(rssi_data.values())
+
+    # Band distribution from AP analysis
+    ap_analysis = analysis_data.get("ap_analysis", {})
+    band_counts = {"2.4GHz": 0, "5GHz": 0, "6GHz": 0}
+    for ap_info in ap_analysis.get("ap_details", []):
+        for band in ap_info.get("radios", {}):
+            if band in band_counts:
+                band_counts[band] += ap_info.get("client_count", 0)
+
+    # Client capabilities
+    caps = analysis_data.get("client_capabilities", {})
+    cap_dist = caps.get("capability_distribution", {})
+
+    if total_wireless == 0 and sum(band_counts.values()) == 0:
+        return ""
+
+    return f"""
+    <div class="section" style="margin-bottom: 30px;">
+        <h2>📊 Network Overview</h2>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 24px; margin-top: 16px;">
+            <div style="background: #1e1e2e; border-radius: 12px; padding: 20px; text-align: center;">
+                <h3 style="color: #cdd6f4; margin: 0 0 12px 0; font-size: 14px;">Signal Quality Distribution</h3>
+                <canvas id="rssiDoughnut" width="240" height="240"></canvas>
+            </div>
+            <div style="background: #1e1e2e; border-radius: 12px; padding: 20px; text-align: center;">
+                <h3 style="color: #cdd6f4; margin: 0 0 12px 0; font-size: 14px;">Clients by Band</h3>
+                <canvas id="bandPie" width="240" height="240"></canvas>
+            </div>
+            <div style="background: #1e1e2e; border-radius: 12px; padding: 20px; text-align: center;">
+                <h3 style="color: #cdd6f4; margin: 0 0 12px 0; font-size: 14px;">Client Capabilities</h3>
+                <canvas id="capPie" width="240" height="240"></canvas>
+            </div>
+        </div>
+    </div>
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {{
+        // RSSI Doughnut
+        if (document.getElementById('rssiDoughnut')) {{
+            new Chart(document.getElementById('rssiDoughnut'), {{
+                type: 'doughnut',
+                data: {{
+                    labels: ['Excellent', 'Good', 'Fair', 'Poor', 'Critical'],
+                    datasets: [{{ data: [{rssi_data["excellent"]}, {rssi_data["good"]}, {rssi_data["fair"]}, {rssi_data["poor"]}, {rssi_data["critical"]}],
+                        backgroundColor: ['#a6e3a1','#94e2d5','#f9e2af','#fab387','#f38ba8'],
+                        borderWidth: 0 }}]
+                }},
+                options: {{ responsive: false, plugins: {{ legend: {{ position: 'bottom', labels: {{ color: '#cdd6f4', font: {{ size: 11 }} }} }} }} }}
+            }});
+        }}
+        // Band Pie
+        if (document.getElementById('bandPie')) {{
+            new Chart(document.getElementById('bandPie'), {{
+                type: 'doughnut',
+                data: {{
+                    labels: ['2.4 GHz', '5 GHz', '6 GHz'],
+                    datasets: [{{ data: [{band_counts["2.4GHz"]}, {band_counts["5GHz"]}, {band_counts["6GHz"]}],
+                        backgroundColor: ['#f9e2af','#89b4fa','#cba6f7'],
+                        borderWidth: 0 }}]
+                }},
+                options: {{ responsive: false, plugins: {{ legend: {{ position: 'bottom', labels: {{ color: '#cdd6f4', font: {{ size: 11 }} }} }} }} }}
+            }});
+        }}
+        // Capability Pie
+        if (document.getElementById('capPie')) {{
+            new Chart(document.getElementById('capPie'), {{
+                type: 'doughnut',
+                data: {{
+                    labels: ['WiFi 6 (ax)', 'WiFi 5 (ac)', 'WiFi 4 (n)', 'Legacy'],
+                    datasets: [{{ data: [{cap_dist.get("802.11ax", 0)}, {cap_dist.get("802.11ac", 0)}, {cap_dist.get("802.11n", 0)}, {cap_dist.get("legacy", 0)}],
+                        backgroundColor: ['#a6e3a1','#89b4fa','#f9e2af','#f38ba8'],
+                        borderWidth: 0 }}]
+                }},
+                options: {{ responsive: false, plugins: {{ legend: {{ position: 'bottom', labels: {{ color: '#cdd6f4', font: {{ size: 11 }} }} }} }} }}
+            }});
+        }}
+    }});
+    </script>
 """
 
 
@@ -860,66 +950,78 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
     if summary_content:
         html_content += make_collapsible("section-summary", "📊 Executive Summary", summary_content)
 
-    # Network Health Analysis Section
+    # Network Health Analysis Section (always visible — top-level dashboard)
     health_analysis = analysis_data.get("health_analysis")
     health_score = analysis_data.get("health_score")  # Get Grade-based score
     if health_analysis:
         html_content += generate_network_health_html(health_analysis, health_score)
 
-    # Key Metrics Section
+    # Key Metrics Section (always visible — essential at-a-glance)
     html_content += generate_key_metrics_html(analysis_data, client_health)
 
-    # RSSI Distribution Section
+    # RSSI Distribution Section (always visible — key visual)
     html_content += generate_rssi_distribution_html(signal_distribution)
 
-    # DFS Analysis Section
+    # --- Charts Section: Band usage + Client capabilities ---
+    html_content += _generate_overview_charts(analysis_data, signal_distribution)
+
+    # DFS Analysis Section (collapsible, starts collapsed)
     dfs_analysis = analysis_data.get("dfs_analysis")
     if dfs_analysis:
-        html_content += generate_dfs_analysis_html(dfs_analysis)
+        dfs_content = generate_dfs_analysis_html(dfs_analysis)
+        html_content += make_collapsible("section-dfs", "📡 DFS Radar Events", dfs_content, start_collapsed=True)
 
-    # Band Steering Analysis Section
+    # Band Steering Analysis Section (collapsible, starts collapsed)
     band_steering = analysis_data.get("band_steering_analysis")
     if band_steering:
-        html_content += generate_band_steering_html(band_steering)
+        bs_content = generate_band_steering_html(band_steering)
+        html_content += make_collapsible("section-band-steering", "🔄 Band Steering", bs_content, start_collapsed=True)
 
-    # Mesh Necessity Analysis Section
+    # Mesh Necessity Analysis Section (collapsible, starts collapsed)
     mesh_necessity = analysis_data.get("mesh_necessity_analysis")
     if mesh_necessity:
-        html_content += generate_mesh_necessity_html(mesh_necessity)
+        mesh_nec_content = generate_mesh_necessity_html(mesh_necessity)
+        html_content += make_collapsible("section-mesh-necessity", "🔗 Mesh Configuration", mesh_nec_content, start_collapsed=True)
 
-    # Min RSSI Analysis Section
+    # Min RSSI Analysis Section (collapsible, starts collapsed)
     min_rssi = analysis_data.get("min_rssi_analysis")
     if min_rssi:
-        html_content += generate_min_rssi_html(min_rssi)
+        min_rssi_content = generate_min_rssi_html(min_rssi)
+        html_content += make_collapsible("section-min-rssi", "📡 Minimum RSSI", min_rssi_content, start_collapsed=True)
 
-    # Airtime Analysis Section
+    # Airtime Analysis Section (collapsible, starts collapsed)
     airtime_analysis = analysis_data.get("airtime_analysis")
     if airtime_analysis:
-        html_content += generate_airtime_analysis_html(airtime_analysis)
+        airtime_content = generate_airtime_analysis_html(airtime_analysis)
+        html_content += make_collapsible("section-airtime", "⏱️ Airtime Utilization", airtime_content, start_collapsed=True)
 
-    # Firmware Analysis Section
+    # Firmware Analysis Section (collapsible, starts collapsed)
     firmware_analysis = analysis_data.get("firmware_analysis")
     if firmware_analysis and firmware_analysis.get("total_aps") > 0:
-        html_content += generate_firmware_analysis_html(firmware_analysis)
+        fw_content = generate_firmware_analysis_html(firmware_analysis)
+        html_content += make_collapsible("section-firmware", "🔧 Firmware Status", fw_content, start_collapsed=True)
 
-    # Client Capabilities Section
+    # Client Capabilities Section (collapsible, starts collapsed)
     client_capabilities = analysis_data.get("client_capabilities")
     if client_capabilities:
-        html_content += generate_client_capabilities_html(client_capabilities)
+        cap_content = generate_client_capabilities_html(client_capabilities)
+        html_content += make_collapsible("section-capabilities", "📊 Client Capabilities", cap_content, start_collapsed=True)
 
-    # Client Security Section
+    # Client Security Section (collapsible, starts collapsed)
     client_security = analysis_data.get("client_security")
     if client_security and (
         client_security.get("blocked_clients") or client_security.get("isolated_clients")
     ):
-        html_content += generate_client_security_html(client_security)
+        sec_content = generate_client_security_html(client_security)
+        html_content += make_collapsible("section-security", "🔒 Client Security", sec_content, start_collapsed=True)
 
-    # Manufacturer Analysis Section
+    # Manufacturer Analysis Section (collapsible, starts collapsed)
     manufacturer_analysis = analysis_data.get("manufacturer_analysis")
     if manufacturer_analysis:
         from core.manufacturer_analyzer import generate_manufacturer_insights_html
 
-        html_content += generate_manufacturer_insights_html(manufacturer_analysis)
+        mfr_content = generate_manufacturer_insights_html(manufacturer_analysis)
+        html_content += make_collapsible("section-manufacturers", "🏭 Manufacturers", mfr_content, start_collapsed=True)
 
     # Switch Analysis Section (Collapsible)
     switch_port_history = analysis_data.get("switch_port_history")
@@ -965,8 +1067,10 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
             disconnected_content,
         )
 
-    # Findings Section
-    html_content += generate_findings_html(analysis_data)
+    # Findings Section (collapsible, starts collapsed)
+    findings_content = generate_findings_html(analysis_data)
+    if findings_content:
+        html_content += make_collapsible("section-findings", "🔍 Detailed Findings", findings_content, start_collapsed=True)
 
     # Footer
     html_content += f"""
