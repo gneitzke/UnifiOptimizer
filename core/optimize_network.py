@@ -2166,6 +2166,11 @@ Examples:
         default="optimal",
         help="Min RSSI recommendation strategy: 'optimal' (aggressive roaming for performance) or 'max_connectivity' (conservative for reliability)",
     )
+    parser.add_argument(
+        "--newReport",
+        action="store_true",
+        help="Generate premium V2 report (visual topology, grouped actions, deep dive tabs)",
+    )
 
     args = parser.parse_args()
 
@@ -2345,6 +2350,17 @@ Examples:
             except Exception as e:
                 console.print(f"\n[yellow]⚠️  Could not generate HTML report: {e}[/yellow]")
 
+            # Generate V2 premium report if requested
+            if getattr(args, "newReport", False):
+                try:
+                    from core.report_v2 import generate_v2_report
+                    v2_path, _ = generate_v2_report(full_analysis, recommendations, site)
+                    console.print(
+                        f"[green]✨ Premium Report:[/green] [cyan]{v2_path}[/cyan]"
+                    )
+                except Exception as e:
+                    console.print(f"\n[yellow]⚠️  Could not generate V2 report: {e}[/yellow]")
+
             # Cache analysis results for regenerate_report.py
             try:
                 import json
@@ -2424,6 +2440,17 @@ Examples:
                 console.print(f"[dim]   (Works in email/iMessage - uses static images)[/dim]")
             except Exception as e:
                 console.print(f"\n[yellow]⚠️  Could not generate HTML report: {e}[/yellow]")
+
+            # Generate V2 premium report if requested
+            if getattr(args, "newReport", False):
+                try:
+                    from core.report_v2 import generate_v2_report
+                    v2_path, _ = generate_v2_report(full_analysis, recommendations, site)
+                    console.print(
+                        f"[green]✨ Premium Report:[/green] [cyan]{v2_path}[/cyan]"
+                    )
+                except Exception as e:
+                    console.print(f"\n[yellow]⚠️  Could not generate V2 report: {e}[/yellow]")
 
             # Cache analysis results for regenerate_report.py
             try:
