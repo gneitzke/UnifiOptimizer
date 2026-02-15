@@ -381,5 +381,77 @@ class TestEventTimeline(unittest.TestCase):
         self.assertTrue(any("DFS radar" in i for i in result["insights"]))
 
 
+class TestClientJourneys(unittest.TestCase):
+    """Tests for per-client journey tracking."""
+
+    def test_empty_data(self):
+        from core.network_analyzer import _build_client_journeys
+        result = _build_client_journeys([], [], [], 3)
+        self.assertEqual(result["clients"], {})
+
+    def test_classifies_stable_client(self):
+        import time
+        from core.network_analyzer import _build_client_journeys
+        clients = [{"mac": "aa:bb:cc:dd:ee:ff", "hostname": "TestPhone",
+                     "rssi": -55, "ap_mac": "11:22:33:44:55:66", "is_wired": False}]
+        devices = [{"type": "uap", "mac": "11:22:33:44:55:66", "name": "LivingRoom"}]
+        result = _build_client_journeys([], clients, devices, 3)
+        self.assertIn("aa:bb:cc:dd:ee:ff", result["clients"])
+        self.assertEqual(result["clients"]["aa:bb:cc:dd:ee:ff"]["behavior"], "stable")
+
+    def test_classifies_sticky_client(self):
+        from core.network_analyzer import _build_client_journeys
+        clients = [{"mac": "aa:bb:cc:dd:ee:ff", "hostname": "OldLaptop",
+                     "rssi": -82, "ap_mac": "11:22:33:44:55:66", "is_wired": False}]
+        devices = [{"type": "uap", "mac": "11:22:33:44:55:66", "name": "Office"}]
+        result = _build_client_journeys([], clients, devices, 3)
+        j = result["clients"]["aa:bb:cc:dd:ee:ff"]
+        self.assertEqual(j["behavior"], "sticky")
+        self.assertIn("stuck", j["behavior_detail"])
+
+    def test_classifies_unstable_client(self):
+        import time
+        from core.network_analyzer import _build_client_journeys
+        now = time.time() * 1000
+        events = []
+        for i in range(20):
+            events.append({"time": now - i * 3600000, "key": "EVT_WU_Disconnected",
+                           "user": "aa:bb:cc:dd:ee:ff", "ap_name": "Office"})
+        clients = [{"mac": "aa:bb:cc:dd:ee:ff", "hostname": "BadDevice",
+                     "rssi": -70, "ap_mac": "11:22:33:44:55:66", "is_wired": False}]
+        devices = [{"type": "uap", "mac": "11:22:33:44:55:66", "name": "Office"}]
+        result = _build_client_journeys(events, clients, devices, 3)
+        j = result["clients"]["aa:bb:cc:dd:ee:ff"]
+        self.assertEqual(j["behavior"], "unstable")
+        self.assertTrue(any(i["severity"] == "high" for i in result["top_issues"]))
+
+    def test_tracks_roaming_path(self):
+        import time
+        from core.network_analyzer import _build_client_journeys
+        now = time.time() * 1000
+        events = [
+            {"time": now - 7200000, "key": "EVT_WU_Roam", "user": "aa:bb:cc:dd:ee:ff",
+             "ap_from": "11:11:11:11:11:11", "ap_to": "22:22:22:22:22:22", "ap_name": "Office"},
+            {"time": now - 3600000, "key": "EVT_WU_Roam", "user": "aa:bb:cc:dd:ee:ff",
+             "ap_from": "22:22:22:22:22:22", "ap_to": "11:11:11:11:11:11", "ap_name": "LivingRoom"},
+        ]
+        clients = [{"mac": "aa:bb:cc:dd:ee:ff", "hostname": "Phone",
+                     "rssi": -60, "ap_mac": "11:11:11:11:11:11", "is_wired": False}]
+        devices = [
+            {"type": "uap", "mac": "11:11:11:11:11:11", "name": "LivingRoom"},
+            {"type": "uap", "mac": "22:22:22:22:22:22", "name": "Office"},
+        ]
+        result = _build_client_journeys(events, clients, devices, 1)
+        j = result["clients"]["aa:bb:cc:dd:ee:ff"]
+        self.assertEqual(j["roam_count"], 2)
+        self.assertEqual(len(j["ap_path"]), 2)
+
+    def test_wired_clients_excluded(self):
+        from core.network_analyzer import _build_client_journeys
+        clients = [{"mac": "aa:bb:cc:dd:ee:ff", "hostname": "Server", "is_wired": True}]
+        result = _build_client_journeys([], clients, [], 3)
+        self.assertEqual(len(result["clients"]), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

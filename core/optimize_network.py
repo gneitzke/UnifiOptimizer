@@ -566,6 +566,18 @@ def analyze_network(client, site="default", lookback_days=3, min_rssi_strategy="
                         console.print(f"     • {f['message']}")
                 console.print()
 
+        # Display Client Journey Summary
+        client_journeys = analysis.get("client_journeys", {})
+        if client_journeys and client_journeys.get("top_issues"):
+            console.print("[bold cyan]🗺️ Client Journey Insights:[/bold cyan]")
+            for issue in client_journeys["top_issues"][:5]:
+                sev = issue["severity"]
+                color = "red" if sev == "high" else "yellow"
+                console.print(f"  [{color}]• {issue['client']}: {issue['issue']}[/{color}]")
+            tracked = client_journeys.get("total_tracked", 0)
+            console.print(f"  [dim]{tracked} wireless clients tracked over lookback period[/dim]")
+            console.print()
+
         # Display Network Health Analysis - use the Grade-based scoring for consistency
         health_score = analysis.get("health_score", {})
         health_analysis = analysis.get("health_analysis", {})

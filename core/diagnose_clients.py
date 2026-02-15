@@ -189,14 +189,10 @@ Examples:
                         client["hostname"][:20],
                         client["ip"],
                         f"[{grade_color}]{client['grade']}[/{grade_color}]",
-                        f"{client['score']}/100",
-                        f"{client['signal_score']}/100",
-                        (
-                            str(client["disconnect_penalty"] // 5)
-                            if client["disconnect_penalty"] > 0
-                            else "-"
-                        ),
-                        str(client["roam_penalty"] // 2) if client["roam_penalty"] > 0 else "-",
+                        f"{client.get('score', client.get('health_score', 0))}/100",
+                        f"{client.get('signal_quality', client.get('signal_score', 0))}/100",
+                        str(client.get("disconnect_count", 0)) if client.get("disconnect_count", 0) > 0 else "-",
+                        str(client.get("roam_count", 0)) if client.get("roam_count", 0) > 0 else "-",
                     )
 
                 console.print(table)
