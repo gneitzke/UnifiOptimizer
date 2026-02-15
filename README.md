@@ -32,7 +32,8 @@ A comprehensive toolkit for analyzing and optimizing Ubiquiti UniFi networks. Pr
 - **🌐 Mesh AP Monitoring**: Uplink signal strength, reliability checks, DFS avoidance
 - **📱 Device Intelligence**: Manufacturer identification, IoT device categorization, VLAN recommendations
 
-### Interactive Optimization
+### Optimization Workflow
+- **📊 Analyze Mode**: Safe read-only analysis with HTML reports
 - **👀 Dry-Run Mode**: Preview all changes before applying
 - **✅ Interactive Approval**: Review and approve each change individually
 - **📈 Smart Recommendations**: Historical data prevents repeated suggestions
@@ -166,42 +167,30 @@ The UniFi API requires **Admin** or **Full Management** role for:
 
 ## 🎯 Quick Start
 
-### Interactive Mode (Easiest)
+### Two-Command CLI
+
+The optimizer has two modes:
+
+| Command | Purpose |
+|---------|---------|
+| `analyze` | Read-only analysis + HTML report (safe, no changes) |
+| `optimize` | Analysis + apply changes (with `--dry-run` option) |
 
 ```bash
-python3 optimizer.py
+# Analyze your network (read-only, generates report)
+python3 optimizer.py analyze --host https://YOUR_CONTROLLER_IP --username admin
+
+# Preview changes without applying (dry-run)
+python3 optimizer.py optimize --host https://YOUR_CONTROLLER_IP --username admin --dry-run
+
+# Apply changes interactively (prompts before each change)
+python3 optimizer.py optimize --host https://YOUR_CONTROLLER_IP --username admin
 ```
 
-Follow the prompts to:
-1. Enter your controller IP address
-2. Enter your username (e.g., `audit`)
-3. Enter your password (stored securely in macOS Keychain)
-4. Select analysis type from the menu
-
-### Main Menu Options
-
-When you run `python3 optimizer.py`, you'll see:
-
-```
-╭────────────────────────────────────────╮
-│     UniFi Network Optimizer            │
-╰────────────────────────────────────────╯
-
-Available Modes:
-
-1. Client Health Diagnostics
-   Colored histograms, health scores, problem detection
-
-2. Expert Network Analysis
-   3-day lookback, mesh checks, channel/power optimization
-
-3. Dry-Run Mode
-   Safe simulation showing impact without changes
-
-4. Interactive Mode
-   Apply changes with approval for each one
-
-5. Exit
+### Using Saved Profiles
+After first login, credentials are saved to macOS Keychain:
+```bash
+python3 optimizer.py analyze --profile default
 ```
 
 ---
@@ -210,38 +199,63 @@ Available Modes:
 
 ### Analyze Network (Safe, Read-Only)
 ```bash
-python3 optimizer.py analyze --host https://YOUR_CONTROLLER_IP --username admin
+python3 optimizer.py analyze --host https://192.168.1.1 --username audit
+```
+Generates:
+- Console output with RSSI histogram, health dashboard, recommendations
+- HTML report in `reports/` directory
+- Analysis cache for offline report regeneration
+
+### Custom Lookback Period
+```bash
+python3 optimizer.py analyze --host https://192.168.1.1 --username audit --lookback 7
 ```
 
 ### Verbose Mode (Detailed API Logging)
 ```bash
-python3 optimizer.py analyze --host https://YOUR_CONTROLLER_IP --username admin --verbose
+python3 optimizer.py analyze --host https://192.168.1.1 --username audit --verbose
 ```
 **Shows real-time API debugging information:**
 - 📤 All GET/POST/PUT requests with full URLs and payloads
 - 📥 Complete response data formatted as readable JSON
 - ⚠️ Detailed error messages with stack traces
 - 🔍 Perfect for troubleshooting and identifying bugs
-- 🎨 Color-coded output (cyan=GET, yellow=PUT, magenta=POST, red=errors)
 
 **See:** [`docs/VERBOSE_MODE.md`](docs/VERBOSE_MODE.md) for complete guide
 
-**Also creates:** `verbose_YYYYMMDD_HHMMSS.log` with timestamped records
-
 ### Preview Changes (Dry-Run)
 ```bash
-python3 optimizer.py apply --host https://YOUR_CONTROLLER_IP --username admin --dry-run
+python3 optimizer.py optimize --host https://192.168.1.1 --username audit --dry-run
 ```
 
-### Apply Changes Interactively
+### Apply Changes (Auto-approve)
 ```bash
-python3 optimizer.py apply --host https://YOUR_CONTROLLER_IP --username admin
+python3 optimizer.py optimize --host https://192.168.1.1 --username audit --yes
 ```
 
-### Using Saved Profiles
-After first login, credentials are saved to macOS Keychain:
+### Regenerate Report from Cache
 ```bash
-python3 optimizer.py --profile default
+python3 regenerate_report.py
+```
+Regenerates HTML report from the last cached analysis without connecting to the controller.
+
+### Customize Thresholds
+Edit `data/config.yaml` to tune RSSI thresholds, min RSSI strategy, mesh tolerance, and more:
+```yaml
+thresholds:
+  rssi:
+    excellent: -50
+    good: -60
+    fair: -70
+    poor: -80
+  min_rssi:
+    optimal:
+      2.4ghz: -75
+      5ghz: -72
+      6ghz: -70
+options:
+  lookback_days: 3
+  min_rssi_strategy: optimal  # or "max_connectivity"
 ```
 
 ---
@@ -363,26 +377,32 @@ The tool disables SSL verification by default for self-signed certificates. If y
 ## 📁 Project Structure
 
 ```
-unifi-network-optimizer/
+UnifiOptimizer/
 ├── api/                    # API modules for controller communication
 │   ├── cloudkey_gen2_client.py
 │   ├── csrf_token_manager.py
 │   └── ...
 ├── core/                   # Core analysis modules
-│   ├── optimize_network.py
-│   ├── diagnose_clients.py
-│   ├── advanced_analyzer.py
+│   ├── optimize_network.py # Main orchestrator (CLI, analysis, apply)
+│   ├── network_analyzer.py # Expert analysis & data collection
+│   ├── advanced_analyzer.py # DFS, roaming, airtime, min RSSI
+│   ├── channel_optimizer.py # Smart channel recommendations
+│   ├── change_applier.py   # Safe change application
+│   ├── html_report_generator.py
 │   └── ...
 ├── utils/                  # Utility modules
-│   ├── keychain.py        # Secure credential storage
-│   └── ...
+│   ├── keychain.py         # Secure credential storage
+│   ├── config.py           # Customizable threshold loader
+│   └── network_helpers.py  # Shared mesh/RSSI helpers
+├── data/
+│   ├── config.yaml         # User-customizable thresholds & options
+│   └── wifi_device_capabilities.json
 ├── tests/                  # Test modules
-│   ├── cloudkey/
-│   └── ...
 ├── reports/                # Generated HTML reports (gitignored)
-├── optimizer.py            # Main interactive script
+├── optimizer.py            # CLI entry point (analyze / optimize)
+├── regenerate_report.py    # Rebuild report from cached analysis
 ├── requirements.txt        # Python dependencies
-└── README.md              # This file
+└── README.md
 ```
 
 ---

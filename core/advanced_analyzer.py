@@ -82,8 +82,15 @@ class AdvancedNetworkAnalyzer:
         try:
             # Get events from controller
             within_hours = lookback_days * 24
-            events = self.client.get(f"s/{self.site}/stat/event?within={within_hours}&_limit=1000")
+            events_response = self.client.get(
+                f"s/{self.site}/stat/event",
+                params={"within": within_hours, "_limit": 1000},
+            )
 
+            if not events_response:
+                return results
+
+            events = events_response.get("data", [])
             if not events:
                 return results
 
@@ -755,48 +762,73 @@ class AdvancedNetworkAnalyzer:
         """
         Validate fast roaming (802.11r/k/v) configuration
 
-        Checks:
-        - 802.11r (Fast Transition) enabled
-        - 802.11k (Neighbor Reports) enabled
-        - 802.11v (BSS Transition) enabled
-        - Configuration consistency across APs
+        NOTE: 802.11r/k/v settings are configured per-WLAN (network), not per-AP.
+        We query WLAN groups to get accurate configuration. If the WLAN endpoint
+        is unavailable, we report that roaming config could not be determined
+        rather than guessing incorrectly.
         """
         results = {
             "roaming_features": {
-                "802.11r": {"enabled_count": 0, "disabled_count": 0, "aps": []},
-                "802.11k": {"enabled_count": 0, "disabled_count": 0, "aps": []},
-                "802.11v": {"enabled_count": 0, "disabled_count": 0, "aps": []},
+                "802.11r": {"enabled_count": 0, "disabled_count": 0, "wlans": []},
+                "802.11k": {"enabled_count": 0, "disabled_count": 0, "wlans": []},
+                "802.11v": {"enabled_count": 0, "disabled_count": 0, "wlans": []},
             },
             "consistent_config": True,
             "recommendations": [],
             "severity": "ok",
+            "wlan_count": 0,
         }
 
         try:
-            for device in devices:
-                if device.get("type") != "uap":
+            # 802.11r/k/v are WLAN-level settings, not device-level
+            wlan_response = self.client.get(f"s/{self.site}/rest/wlanconf")
+            wlans = wlan_response.get("data", []) if wlan_response else []
+
+            if not wlans:
+                results["recommendations"].append(
+                    {
+                        "type": "roaming_unknown",
+                        "message": "Could not retrieve WLAN configuration to check 802.11r/k/v",
+                        "recommendation": "Verify fast roaming settings manually in UniFi Controller under WiFi settings",
+                        "priority": "low",
+                    }
+                )
+                return results
+
+            results["wlan_count"] = len(wlans)
+
+            for wlan in wlans:
+                wlan_name = wlan.get("name", "Unnamed WLAN")
+                is_enabled = wlan.get("enabled", True)
+                if not is_enabled:
                     continue
 
-                ap_name = device.get("name", "Unnamed AP")
+                # 802.11r (Fast BSS Transition)
+                ft_enabled = wlan.get("fast_roaming_enabled", False)
+                if ft_enabled:
+                    results["roaming_features"]["802.11r"]["enabled_count"] += 1
+                    results["roaming_features"]["802.11r"]["wlans"].append(wlan_name)
+                else:
+                    results["roaming_features"]["802.11r"]["disabled_count"] += 1
 
-                # Check 802.11r (Fast Transition)
-                ft_enabled = device.get("wlangroup_id_ng") or device.get("wlangroup_id_na")
-                # Note: Actual FT config is in WLAN settings, not device
-                # This is a simplified check
+                # 802.11k (Radio Resource Management / Neighbor Reports)
+                # UniFi calls this "rrm_enabled" or enables it implicitly
+                rrm_enabled = wlan.get("rrm_enabled", False)
+                if rrm_enabled:
+                    results["roaming_features"]["802.11k"]["enabled_count"] += 1
+                    results["roaming_features"]["802.11k"]["wlans"].append(wlan_name)
+                else:
+                    results["roaming_features"]["802.11k"]["disabled_count"] += 1
 
-                # Check radio table for roaming settings
-                radio_table = device.get("radio_table", [])
-                for radio in radio_table:
-                    # 802.11k and 802.11v are typically in radio settings
-                    min_rssi = radio.get("min_rssi_enabled", False)
+                # 802.11v (BSS Transition Management)
+                bss_transition = wlan.get("bss_transition", False)
+                if bss_transition:
+                    results["roaming_features"]["802.11v"]["enabled_count"] += 1
+                    results["roaming_features"]["802.11v"]["wlans"].append(wlan_name)
+                else:
+                    results["roaming_features"]["802.11v"]["disabled_count"] += 1
 
-                    if min_rssi:
-                        results["roaming_features"]["802.11v"]["enabled_count"] += 1
-                        results["roaming_features"]["802.11v"]["aps"].append(ap_name)
-                    else:
-                        results["roaming_features"]["802.11v"]["disabled_count"] += 1
-
-            # Check consistency
+            # Check consistency and generate recommendations
             for feature, data in results["roaming_features"].items():
                 if data["enabled_count"] > 0 and data["disabled_count"] > 0:
                     results["consistent_config"] = False
@@ -804,13 +836,12 @@ class AdvancedNetworkAnalyzer:
                         {
                             "type": "roaming_inconsistent",
                             "feature": feature,
-                            "message": f'{feature} enabled on {data["enabled_count"]} APs but disabled on {data["disabled_count"]} APs',
-                            "recommendation": f"Enable {feature} on all APs for consistent roaming behavior",
+                            "message": f'{feature} enabled on {data["enabled_count"]} WLAN(s) but disabled on {data["disabled_count"]}',
+                            "recommendation": f"Enable {feature} on all WLANs for consistent roaming behavior",
                             "priority": "high",
                         }
                     )
 
-            # Recommend enabling if mostly disabled
             for feature, data in results["roaming_features"].items():
                 if data["enabled_count"] == 0 and data["disabled_count"] > 0:
                     results["severity"] = "medium"
@@ -818,7 +849,7 @@ class AdvancedNetworkAnalyzer:
                         {
                             "type": "roaming_disabled",
                             "feature": feature,
-                            "message": f"{feature} disabled on all APs",
+                            "message": f"{feature} disabled on all WLANs",
                             "recommendation": f"Enable {feature} to improve roaming performance and VoIP quality",
                             "priority": "medium",
                         }
@@ -997,24 +1028,16 @@ class AdvancedNetworkAnalyzer:
         results["ios_devices_detected"] = ios_count > 0
         results["ios_device_count"] = ios_count
 
-        # Recommended thresholds based on industry best practices
-        # These values balance roaming aggressiveness with connection stability
-        # Sources: Cisco WLAN Design Guide, Aruba Best Practices, UniFi recommendations
+        # Load thresholds from config (user-customizable via data/config.yaml)
+        from utils.config import get_threshold
 
-        # AGGRESSIVE thresholds (Optimal strategy - forces early roaming for performance)
-        OPTIMAL_MIN_RSSI_24GHZ = -75  # 2.4GHz: Aggressive roaming
-        OPTIMAL_MIN_RSSI_5GHZ = -72  # 5GHz: Aggressive roaming
-        OPTIMAL_MIN_RSSI_6GHZ = (
-            -70
-        )  # 6GHz: Aggressive roaming (6GHz needs stronger signal due to poor propagation, line-of-sight sensitive)
+        OPTIMAL_MIN_RSSI_24GHZ = get_threshold("min_rssi.optimal.2.4ghz", -75)
+        OPTIMAL_MIN_RSSI_5GHZ = get_threshold("min_rssi.optimal.5ghz", -72)
+        OPTIMAL_MIN_RSSI_6GHZ = get_threshold("min_rssi.optimal.6ghz", -70)
 
-        # CONSERVATIVE thresholds (Max Connectivity strategy - stays connected longer)
-        # These are MORE NEGATIVE (weaker signal) = client can stay connected longer
-        CONSERVATIVE_MIN_RSSI_24GHZ = -80  # 2.4GHz: Maximum connectivity
-        CONSERVATIVE_MIN_RSSI_5GHZ = -77  # 5GHz: Maximum connectivity
-        CONSERVATIVE_MIN_RSSI_6GHZ = (
-            -75
-        )  # 6GHz: Maximum connectivity (6GHz degrades quickly below -75, line-of-sight critical)
+        CONSERVATIVE_MIN_RSSI_24GHZ = get_threshold("min_rssi.max_connectivity.2.4ghz", -80)
+        CONSERVATIVE_MIN_RSSI_5GHZ = get_threshold("min_rssi.max_connectivity.5ghz", -77)
+        CONSERVATIVE_MIN_RSSI_6GHZ = get_threshold("min_rssi.max_connectivity.6ghz", -75)
 
         # Calculate iOS percentage for recommendations
         total_clients = len(clients) if clients else 0

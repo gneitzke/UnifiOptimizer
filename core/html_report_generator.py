@@ -1250,9 +1250,7 @@ def generate_executive_summary_html(analysis_data, recommendations):
         if device.get("type") == "uap":
             uplink_type = device.get("uplink", {}).get("type", "")
             uplink_rssi = device.get("uplink", {}).get("rssi")
-            is_mesh = device.get("adopted", False) and (
-                uplink_type == "wireless" or (uplink_rssi and uplink_rssi < -70)
-            )
+            is_mesh = uplink_type == "wireless"
             if is_mesh:
                 mesh_aps.append(device)
                 parent_mac = device.get("uplink", {}).get("uplink_remote_mac")
