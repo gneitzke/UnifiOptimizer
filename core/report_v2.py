@@ -709,8 +709,8 @@ def _svg_device_timeline(analysis_data, width=860):
 
     parts = [f'<svg viewBox="0 0 {width} {h}" width="100%" preserveAspectRatio="xMinYMin meet" style="max-width:{width}px">']
 
-    # X-axis labels
-    n_labels = min(12, n_blocks)
+    # X-axis labels (no grid lines)
+    n_labels = min(8, n_blocks)
     label_every = max(1, n_blocks // n_labels)
     for i in range(0, n_blocks + 1, label_every):
         x = label_w + (i / n_blocks) * chart_w
@@ -723,12 +723,8 @@ def _svg_device_timeline(analysis_data, width=860):
             f'<text x="{x:.0f}" y="{top_pad - 8}" fill="#5f6368" font-size="9" '
             f'text-anchor="middle" font-family="sans-serif">{label}</text>'
         )
-        parts.append(
-            f'<line x1="{x:.0f}" y1="{top_pad}" x2="{x:.0f}" y2="{h - 10}" '
-            f'stroke="#1e2d4a" stroke-width="0.5" stroke-dasharray="3 3"/>'
-        )
 
-    # "Today" marker at right edge
+    # "Today" marker
     today_x = label_w + chart_w
     parts.append(
         f'<text x="{today_x:.0f}" y="{top_pad - 8}" fill="#006fff" font-size="9" '
@@ -736,7 +732,7 @@ def _svg_device_timeline(analysis_data, width=860):
     )
     parts.append(
         f'<line x1="{today_x:.0f}" y1="{top_pad}" x2="{today_x:.0f}" y2="{h - 10}" '
-        f'stroke="#006fff" stroke-width="1" stroke-dasharray="4 2"/>'
+        f'stroke="#006fff" stroke-width="0.8" opacity="0.5"/>'
     )
 
     for row_idx, (row_label, bins, color, total) in enumerate(rows):
@@ -746,16 +742,6 @@ def _svg_device_timeline(analysis_data, width=860):
             f'<text x="{label_w - 6}" y="{y_center + 3}" fill="#9aa0a6" '
             f'font-size="10" text-anchor="end" font-family="sans-serif">{_esc(row_label)}</text>'
         )
-        parts.append(
-            f'<line x1="{label_w}" y1="{y_center}" x2="{width - 10}" y2="{y_center}" '
-            f'stroke="#1e2d4a" stroke-width="0.5"/>'
-        )
-
-        # Total annotation
-        parts.append(
-            f'<text x="{label_w + 2}" y="{y_center - 8}" fill="#5f6368" '
-            f'font-size="8" font-family="sans-serif">{_fmt(total)} total</text>'
-        )
 
         max_bin = max(bins) if bins else 1
         bw = max(2, chart_w / n_blocks - 0.5)
@@ -764,18 +750,13 @@ def _svg_device_timeline(analysis_data, width=860):
                 continue
             x = label_w + (bi / n_blocks) * chart_w
             intensity = min(1.0, count / max(max_bin, 1))
-            opacity = 0.25 + intensity * 0.65
-            bar_h = 4 + intensity * 14
+            opacity = 0.2 + intensity * 0.7
+            bar_h = row_h - 4
             parts.append(
                 f'<rect x="{x:.1f}" y="{y_center - bar_h/2:.1f}" '
-                f'width="{bw:.1f}" height="{bar_h:.1f}" rx="1.5" '
+                f'width="{bw:.1f}" height="{bar_h:.1f}" rx="1" '
                 f'fill="{color}" opacity="{opacity:.2f}"/>'
             )
-            if count >= 5:
-                parts.append(
-                    f'<text x="{x + bw/2:.1f}" y="{y_center + 3}" fill="#e8eaed" '
-                    f'font-size="7" text-anchor="middle" font-family="sans-serif">{count}</text>'
-                )
 
     parts.append("</svg>")
 
