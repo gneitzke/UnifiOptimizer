@@ -45,6 +45,7 @@ class ExpertNetworkAnalyzer:
         Args:
             lookback_days: Number of days to look back for events
         """
+        self.lookback_days = lookback_days
         console.print(f"[cyan]Collecting network data (last {lookback_days} days)...[/cyan]")
 
         # Get devices
@@ -414,10 +415,10 @@ class ExpertNetworkAnalyzer:
             if disconnect_count == 0:
                 stability = 100
             else:
-                rate = disconnect_count / max(lookback_days, 1)
+                rate = disconnect_count / max(self.lookback_days, 1)
                 stability = max(0, min(100, 100 * math.exp(-0.35 * rate)))
 
-            daily_roams = roam_count / max(lookback_days, 1)
+            daily_roams = roam_count / max(self.lookback_days, 1)
             if daily_roams == 0:
                 roaming = 95 if rssi > -65 else (70 if rssi > -75 else 30)
             elif daily_roams <= 10:
