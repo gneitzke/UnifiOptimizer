@@ -134,28 +134,39 @@ def _generate_overview_charts(analysis_data, signal_distribution):
     if total_wireless == 0 and sum(band_counts.values()) == 0:
         return ""
 
-    return f"""
-    <div class="section" style="margin-bottom: 30px;">
-        <h2>📊 Network Overview</h2>
-        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 24px; margin-top: 16px;">
+    # Build chart cards — only include charts with actual data
+    chart_cards = ""
+
+    if total_wireless > 0:
+        chart_cards += f"""
             <div style="background: #1e1e2e; border-radius: 12px; padding: 20px; text-align: center;">
-                <h3 style="color: #cdd6f4; margin: 0 0 12px 0; font-size: 14px;">Signal Quality Distribution</h3>
+                <h3 style="color: #cdd6f4; margin: 0 0 12px 0; font-size: 14px;">Signal Quality ({total_wireless} clients)</h3>
                 <canvas id="rssiDoughnut" width="240" height="240"></canvas>
-            </div>
+            </div>"""
+
+    total_band = sum(band_counts.values())
+    if total_band > 0:
+        chart_cards += f"""
             <div style="background: #1e1e2e; border-radius: 12px; padding: 20px; text-align: center;">
                 <h3 style="color: #cdd6f4; margin: 0 0 12px 0; font-size: 14px;">Clients by Band</h3>
                 <canvas id="bandPie" width="240" height="240"></canvas>
-            </div>
+            </div>"""
+
+    total_caps = sum(cap_dist.get(k, 0) for k in ["802.11ax", "802.11ac", "802.11n", "legacy"])
+    if total_caps > 0:
+        chart_cards += f"""
             <div style="background: #1e1e2e; border-radius: 12px; padding: 20px; text-align: center;">
                 <h3 style="color: #cdd6f4; margin: 0 0 12px 0; font-size: 14px;">Client Capabilities</h3>
                 <canvas id="capPie" width="240" height="240"></canvas>
-            </div>
-        </div>
-    </div>
-    <script>
-    document.addEventListener('DOMContentLoaded', function() {{
-        // RSSI Doughnut
-        if (document.getElementById('rssiDoughnut')) {{
+            </div>"""
+
+    if not chart_cards:
+        return ""
+
+    # Build chart initialization scripts
+    chart_scripts = ""
+    if total_wireless > 0:
+        chart_scripts += f"""
             new Chart(document.getElementById('rssiDoughnut'), {{
                 type: 'doughnut',
                 data: {{
@@ -165,10 +176,10 @@ def _generate_overview_charts(analysis_data, signal_distribution):
                         borderWidth: 0 }}]
                 }},
                 options: {{ responsive: false, plugins: {{ legend: {{ position: 'bottom', labels: {{ color: '#cdd6f4', font: {{ size: 11 }} }} }} }} }}
-            }});
-        }}
-        // Band Pie
-        if (document.getElementById('bandPie')) {{
+            }});"""
+
+    if total_band > 0:
+        chart_scripts += f"""
             new Chart(document.getElementById('bandPie'), {{
                 type: 'doughnut',
                 data: {{
@@ -178,10 +189,10 @@ def _generate_overview_charts(analysis_data, signal_distribution):
                         borderWidth: 0 }}]
                 }},
                 options: {{ responsive: false, plugins: {{ legend: {{ position: 'bottom', labels: {{ color: '#cdd6f4', font: {{ size: 11 }} }} }} }} }}
-            }});
-        }}
-        // Capability Pie
-        if (document.getElementById('capPie')) {{
+            }});"""
+
+    if total_caps > 0:
+        chart_scripts += f"""
             new Chart(document.getElementById('capPie'), {{
                 type: 'doughnut',
                 data: {{
@@ -191,8 +202,132 @@ def _generate_overview_charts(analysis_data, signal_distribution):
                         borderWidth: 0 }}]
                 }},
                 options: {{ responsive: false, plugins: {{ legend: {{ position: 'bottom', labels: {{ color: '#cdd6f4', font: {{ size: 11 }} }} }} }} }}
-            }});
-        }}
+            }});"""
+
+    return f"""
+    <div class="section" style="margin-bottom: 30px;">
+        <h2>📊 Network Overview</h2>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 24px; margin-top: 16px;">
+            {chart_cards}
+        </div>
+    </div>
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {{
+        if (typeof Chart === 'undefined') return;
+        {chart_scripts}
+    }});
+    </script>
+"""
+
+
+def _generate_event_timeline_chart(timeline):
+    """Generate a stacked bar chart of events over the lookback period."""
+    hours = timeline.get("hours", [])
+    categories = timeline.get("categories", {})
+    insights = timeline.get("insights", [])
+    totals = timeline.get("totals", {})
+
+    if not hours:
+        return ""
+
+    # Downsample if too many hours — group into 4-hour buckets for readability
+    if len(hours) > 48:
+        bucket_size = max(1, len(hours) // 36)
+        bucketed_hours = []
+        bucketed_cats = {cat: [] for cat in categories}
+        for i in range(0, len(hours), bucket_size):
+            bucketed_hours.append(hours[i][:13])  # "YYYY-MM-DD HH"
+            for cat in categories:
+                vals = categories[cat][i : i + bucket_size]
+                bucketed_cats[cat].append(sum(vals))
+        hours = bucketed_hours
+        categories = bucketed_cats
+
+    # Format labels (show just "Mon 2pm" style for readability)
+    import json as _json
+
+    labels_json = _json.dumps(hours)
+    disconnect_json = _json.dumps(categories.get("disconnect", []))
+    roaming_json = _json.dumps(categories.get("roaming", []))
+    dfs_json = _json.dumps(categories.get("dfs_radar", []))
+    restart_json = _json.dumps(categories.get("device_restart", []))
+
+    # Insights HTML
+    insight_html = ""
+    if insights:
+        items = "".join(
+            f'<li style="color: #cdd6f4; margin-bottom: 4px;">{i}</li>' for i in insights
+        )
+        insight_html = f"""
+        <div style="margin-top: 12px; padding: 12px; background: #1e1e2e; border-radius: 8px; border-left: 3px solid #f9e2af;">
+            <strong style="color: #f9e2af;">🔍 Detective Insights</strong>
+            <ul style="margin: 8px 0 0 16px; padding: 0;">{items}</ul>
+        </div>"""
+
+    # Summary counts
+    total_disc = totals.get("disconnect", 0)
+    total_roam = totals.get("roaming", 0)
+    total_dfs = totals.get("dfs_radar", 0)
+    total_restart = totals.get("device_restart", 0)
+    lookback = timeline.get("lookback_days", 3)
+
+    summary_html = f"""
+    <div style="display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 12px;">
+        <span style="color: #f38ba8;">● Disconnects: {total_disc}</span>
+        <span style="color: #94e2d5;">● Roaming: {total_roam}</span>
+        <span style="color: #f9e2af;">● DFS Radar: {total_dfs}</span>
+        <span style="color: #89b4fa;">● Restarts: {total_restart}</span>
+        <span style="color: #6c7086; margin-left: auto;">Last {lookback} days</span>
+    </div>"""
+
+    return f"""
+    <div class="section" style="margin-bottom: 30px;">
+        <h2>📈 Event Timeline</h2>
+        {summary_html}
+        <div style="background: #1e1e2e; border-radius: 12px; padding: 20px;">
+            <canvas id="eventTimeline" height="180"></canvas>
+        </div>
+        {insight_html}
+    </div>
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {{
+        if (typeof Chart === 'undefined') return;
+        var ctx = document.getElementById('eventTimeline');
+        if (!ctx) return;
+        new Chart(ctx, {{
+            type: 'bar',
+            data: {{
+                labels: {labels_json},
+                datasets: [
+                    {{ label: 'Disconnects', data: {disconnect_json}, backgroundColor: '#f38ba8', stack: 'events' }},
+                    {{ label: 'Roaming', data: {roaming_json}, backgroundColor: '#94e2d5', stack: 'events' }},
+                    {{ label: 'DFS Radar', data: {dfs_json}, backgroundColor: '#f9e2af', stack: 'events' }},
+                    {{ label: 'Restarts', data: {restart_json}, backgroundColor: '#89b4fa', stack: 'events' }}
+                ]
+            }},
+            options: {{
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {{
+                    x: {{
+                        stacked: true,
+                        ticks: {{ color: '#6c7086', maxRotation: 45, maxTicksLimit: 24, font: {{ size: 10 }} }},
+                        grid: {{ color: '#313244' }}
+                    }},
+                    y: {{
+                        stacked: true,
+                        beginAtZero: true,
+                        ticks: {{ color: '#6c7086', font: {{ size: 10 }}, stepSize: 1 }},
+                        grid: {{ color: '#313244' }},
+                        title: {{ display: true, text: 'Events', color: '#6c7086' }}
+                    }}
+                }},
+                plugins: {{
+                    legend: {{ position: 'top', labels: {{ color: '#cdd6f4', font: {{ size: 11 }}, usePointStyle: true, boxWidth: 8 }} }},
+                    tooltip: {{ mode: 'index', intersect: false }}
+                }}
+            }}
+        }});
     }});
     </script>
 """
@@ -224,6 +359,10 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
     channel_analysis = analysis_data.get("channel_analysis", {})
     client_health = analysis_data.get("client_health", {})
     signal_distribution = analysis_data.get("signal_distribution", {})
+    # signal_distribution may be nested inside client_analysis
+    if not signal_distribution:
+        client_analysis_data = analysis_data.get("client_analysis", {})
+        signal_distribution = client_analysis_data.get("signal_distribution", {})
     mesh_aps = analysis_data.get("mesh_analysis", {})
 
     # Build HTML content
@@ -964,6 +1103,12 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
 
     # --- Charts Section: Band usage + Client capabilities ---
     html_content += _generate_overview_charts(analysis_data, signal_distribution)
+
+    # --- Event Timeline Chart: Historical events over lookback period ---
+    event_timeline = analysis_data.get("event_timeline", {})
+    if event_timeline and event_timeline.get("hours"):
+        timeline_html = _generate_event_timeline_chart(event_timeline)
+        html_content += timeline_html
 
     # DFS Analysis Section (collapsible, starts collapsed)
     dfs_analysis = analysis_data.get("dfs_analysis")

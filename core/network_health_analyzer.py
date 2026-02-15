@@ -402,9 +402,12 @@ class NetworkHealthAnalyzer:
         for switch in switches:
             switch_name = switch.get("name", "Unknown Switch")
             port_table = switch.get("port_table", [])
+            # Normalize by switch uptime — cumulative counters are meaningless without rate
+            uptime_seconds = switch.get("uptime", 86400) or 86400  # default 1 day
+            uptime_hours = max(1, uptime_seconds / 3600)
 
-            # Collect broadcast counts from all active ports
-            port_broadcasts = []
+            # Collect per-port broadcast RATES (packets/hour)
+            port_rates = []
             port_data = {}
 
             for port in port_table:
@@ -418,44 +421,40 @@ class NetworkHealthAnalyzer:
                 tx_multicast = port.get("tx_multicast", 0)
 
                 total_broadcast = rx_broadcast + tx_broadcast
-                total_multicast = rx_multicast + tx_multicast
+                bcast_per_hour = total_broadcast / uptime_hours
 
-                port_broadcasts.append(total_broadcast)
+                # Identify connected device
+                port_name = port.get("name", "")
+                connected_device = port_name or f"Port {port_idx}"
+                # Check if AP is connected to this port
+                if port.get("port_poe"):
+                    connected_device += " (PoE)"
+
+                port_rates.append(bcast_per_hour)
                 port_data[port_idx] = {
                     "broadcast": total_broadcast,
-                    "multicast": total_multicast,
+                    "bcast_per_hour": bcast_per_hour,
+                    "multicast": rx_multicast + tx_multicast,
                     "rx_broadcast": rx_broadcast,
                     "tx_broadcast": tx_broadcast,
+                    "connected_device": connected_device,
                 }
 
-            if not port_broadcasts:
+            if not port_rates:
                 continue
 
-            # Calculate statistics
-            avg_broadcast = sum(port_broadcasts) / len(port_broadcasts)
-            max_broadcast = max(port_broadcasts)
-            min_broadcast = min(port_broadcasts)
+            avg_rate = sum(port_rates) / len(port_rates)
+            max_rate = max(port_rates)
 
-            # Calculate standard deviation
-            variance = sum((x - avg_broadcast) ** 2 for x in port_broadcasts) / len(port_broadcasts)
-            std_dev = variance**0.5
-
-            # If all ports have similar counts (low variance), it's normal switch behavior
-            # Only flag if there are significant outliers
-            threshold_multiplier = 2.0  # Flag if >2x standard deviation from mean
-
+            # Only flag if a port's rate is 3x+ the average AND exceeds 10K/hour
+            # Normal broadcast: ~500-5000/hour per port (mDNS, ARP, DHCP)
+            # Abnormal: >10,000/hour AND significantly above peers
             for port_idx, data in port_data.items():
-                total_broadcast = data["broadcast"]
-                total_multicast = data["multicast"]
-                rx_broadcast = data["rx_broadcast"]
-                tx_broadcast = data["tx_broadcast"]
+                rate = data["bcast_per_hour"]
+                connected = data["connected_device"]
+                ratio = rate / avg_rate if avg_rate > 0 else 0
 
-                # Calculate deviation from average
-                deviation = abs(total_broadcast - avg_broadcast)
-                is_outlier = deviation > (std_dev * threshold_multiplier) if std_dev > 0 else False
-
-                # Only flag as storm if it's an outlier AND extremely high
-                if is_outlier and total_broadcast > 100000000:  # >100M broadcasts AND outlier
+                if rate > 10000 and ratio > 3.0:
                     analysis["status"] = "critical"
                     analysis["score_penalty"] += 5
 
@@ -465,10 +464,12 @@ class NetworkHealthAnalyzer:
                             "type": "broadcast_storm",
                             "switch": switch_name,
                             "port": port_idx,
-                            "broadcast_count": total_broadcast,
-                            "message": f"Port {port_idx}: Broadcast storm detected ({total_broadcast:,} packets, {(total_broadcast/avg_broadcast):.1f}x average)",
-                            "impact": "Excessive broadcast traffic consuming bandwidth and CPU on all devices",
-                            "recommendation": "Identify device on this port; check for network loops, chatty IoT devices, or misconfigurations",
+                            "broadcast_count": data["broadcast"],
+                            "bcast_per_hour": int(rate),
+                            "connected_device": connected,
+                            "message": f"{switch_name} Port {port_idx} ({connected}): {int(rate):,}/hr broadcast rate ({ratio:.1f}x average)",
+                            "impact": "Excessive broadcast traffic from this device consuming shared airtime",
+                            "recommendation": f"Check device on port {port_idx} for network loops, chatty protocols, or misconfiguration",
                         }
                     )
 
@@ -476,66 +477,46 @@ class NetworkHealthAnalyzer:
                         {
                             "switch": switch_name,
                             "port": port_idx,
-                            "broadcast": total_broadcast,
-                            "multicast": total_multicast,
+                            "broadcast": data["broadcast"],
+                            "bcast_per_hour": int(rate),
+                            "connected_device": connected,
                             "severity": "high",
                         }
                     )
 
-                # Flag significantly higher TX broadcasts (device generating broadcasts)
-                elif is_outlier and tx_broadcast > (rx_broadcast * 2) and tx_broadcast > 50000000:
-                    if analysis["status"] == "healthy":
-                        analysis["status"] = "warning"
-                    analysis["score_penalty"] += 3
+                elif rate > 5000 and ratio > 2.0:
+                    # Elevated but not critical
+                    tx_rate = data["tx_broadcast"] / uptime_hours
+                    if tx_rate > rate * 0.6:  # Mostly transmitting = source
+                        if analysis["status"] == "healthy":
+                            analysis["status"] = "warning"
+                        analysis["score_penalty"] += 2
 
-                    analysis["issues"].append(
-                        {
-                            "severity": "medium",
-                            "type": "broadcast_source",
-                            "switch": switch_name,
-                            "port": port_idx,
-                            "broadcast_count": tx_broadcast,
-                            "message": f"Port {port_idx}: Device generating excessive broadcasts ({tx_broadcast:,} TX packets)",
-                            "impact": "Device is source of broadcast traffic affecting network performance",
-                            "recommendation": "Identify device and check for misconfiguration or chatty protocol (mDNS, NetBIOS, etc.)",
-                        }
-                    )
+                        analysis["issues"].append(
+                            {
+                                "severity": "medium",
+                                "type": "broadcast_source",
+                                "switch": switch_name,
+                                "port": port_idx,
+                                "broadcast_count": data["tx_broadcast"],
+                                "bcast_per_hour": int(tx_rate),
+                                "connected_device": connected,
+                                "message": f"{switch_name} Port {port_idx} ({connected}): {int(tx_rate):,}/hr TX broadcast rate — chatty device",
+                                "impact": "Device generating elevated broadcast traffic",
+                                "recommendation": f"Identify device on port {port_idx}; consider VLAN isolation if IoT device",
+                            }
+                        )
 
-                    analysis["ports_with_issues"].append(
-                        {
-                            "switch": switch_name,
-                            "port": port_idx,
-                            "broadcast": total_broadcast,
-                            "multicast": total_multicast,
-                            "severity": "medium",
-                        }
-                    )
-
-                # Info: High multicast (common for media devices)
-                if total_multicast > 100000000 and is_outlier:
-                    analysis["issues"].append(
-                        {
-                            "severity": "low",
-                            "type": "high_multicast",
-                            "switch": switch_name,
-                            "port": port_idx,
-                            "multicast_count": total_multicast,
-                            "message": f"Port {port_idx}: High multicast traffic ({total_multicast:,} packets)",
-                            "impact": "Normal for media devices (Sonos, Chromecast, Apple TV) but unusually high",
-                            "recommendation": "Monitor if causing performance issues; consider IGMP snooping optimization",
-                        }
-                    )
-
-            # Provide informational context if broadcast levels are uniformly high
-            if avg_broadcast > 10000000 and std_dev / avg_broadcast < 0.1:  # High but uniform
-                analysis["recommendations"].append(
-                    {
-                        "priority": "low",
-                        "category": "broadcast",
-                        "message": f"Network has elevated broadcast traffic (~{avg_broadcast/1000000:.1f}M per port) but uniformly distributed",
-                        "action": "This is normal for networks with IoT devices. Consider VLAN segmentation to reduce broadcast domain size if performance issues occur.",
-                    }
-                )
+                        analysis["ports_with_issues"].append(
+                            {
+                                "switch": switch_name,
+                                "port": port_idx,
+                                "broadcast": data["broadcast"],
+                                "bcast_per_hour": int(rate),
+                                "connected_device": connected,
+                                "severity": "medium",
+                            }
+                        )
 
         return analysis
 

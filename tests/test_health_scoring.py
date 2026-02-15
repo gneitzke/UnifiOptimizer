@@ -279,5 +279,107 @@ class Test6GHzDetection(unittest.TestCase):
                                     "'ax' radio should NOT be classified as 6GHz")
 
 
+class TestBroadcastStormDetection(unittest.TestCase):
+    """Tests for broadcast storm rate-based detection."""
+
+    def setUp(self):
+        from unittest.mock import MagicMock
+        self.mock_client = MagicMock()
+        self.mock_client.get.return_value = {"data": []}
+        from core.network_health_analyzer import NetworkHealthAnalyzer
+        self.analyzer = NetworkHealthAnalyzer(self.mock_client, "default")
+
+    def _make_switch(self, uptime, ports):
+        """Helper to create switch device with port_table."""
+        port_table = []
+        for idx, (rx_b, tx_b) in enumerate(ports, 1):
+            port_table.append({
+                "port_idx": idx, "up": True,
+                "rx_broadcast": rx_b, "tx_broadcast": tx_b,
+                "rx_multicast": 0, "tx_multicast": 0,
+            })
+        return [{"type": "usw", "name": "TestSwitch", "uptime": uptime,
+                 "port_table": port_table}]
+
+    def test_uniform_high_counts_no_alarm(self):
+        """129M packets per port over 30 days should NOT trigger storm."""
+        uptime = 30 * 86400  # 30 days
+        devices = self._make_switch(uptime, [
+            (65_000_000, 64_000_000),  # ~129M total
+            (64_000_000, 65_000_000),
+            (63_000_000, 66_000_000),
+            (66_000_000, 63_000_000),
+        ])
+        result = self.analyzer._analyze_broadcast_traffic(devices)
+        self.assertEqual(result["status"], "healthy")
+        self.assertEqual(len(result["issues"]), 0)
+
+    def test_genuine_storm_detected(self):
+        """One port with 10x the broadcast rate should be flagged."""
+        uptime = 86400  # 1 day
+        devices = self._make_switch(uptime, [
+            (100_000, 100_000),     # normal
+            (100_000, 100_000),     # normal
+            (50_000_000, 50_000_000),  # 100M in 1 day = 4.1M/hr — storm
+            (100_000, 100_000),     # normal
+        ])
+        result = self.analyzer._analyze_broadcast_traffic(devices)
+        self.assertEqual(result["status"], "critical")
+        self.assertTrue(any(i["type"] == "broadcast_storm" for i in result["issues"]))
+        # Verify message includes rate
+        storm = [i for i in result["issues"] if i["type"] == "broadcast_storm"][0]
+        self.assertIn("/hr", storm["message"])
+
+    def test_low_traffic_no_alarm(self):
+        """Low broadcast counts should never trigger alarm."""
+        uptime = 86400
+        devices = self._make_switch(uptime, [
+            (1000, 500), (800, 600), (1200, 400), (900, 700),
+        ])
+        result = self.analyzer._analyze_broadcast_traffic(devices)
+        self.assertEqual(result["status"], "healthy")
+
+
+class TestEventTimeline(unittest.TestCase):
+    """Tests for historical event timeline builder."""
+
+    def test_empty_events(self):
+        from core.network_analyzer import _build_event_timeline
+        result = _build_event_timeline([], 3)
+        self.assertEqual(result["hours"], [])
+
+    def test_classifies_events(self):
+        import time
+        from core.network_analyzer import _build_event_timeline
+        now_ms = time.time() * 1000
+        events = [
+            {"time": now_ms, "key": "EVT_WU_Disconnected", "ap_name": "AP-1"},
+            {"time": now_ms, "key": "EVT_WU_Roam", "ap_name": "AP-2"},
+            {"time": now_ms, "key": "EVT_AP_RadarDetected", "ap_name": "AP-1"},
+        ]
+        result = _build_event_timeline(events, 1)
+        self.assertEqual(len(result["hours"]), 1)
+        self.assertEqual(result["totals"]["disconnect"], 1)
+        self.assertEqual(result["totals"]["roaming"], 1)
+        self.assertEqual(result["totals"]["dfs_radar"], 1)
+        # AP-1 has disconnect + dfs_radar
+        self.assertIn("AP-1", result["ap_events"])
+        self.assertEqual(result["ap_events"]["AP-1"]["disconnect"], 1)
+
+    def test_dfs_disconnect_correlation(self):
+        """DFS events coinciding with disconnects should generate insight."""
+        import time
+        from core.network_analyzer import _build_event_timeline
+        now_ms = time.time() * 1000
+        events = [
+            {"time": now_ms, "key": "EVT_AP_RadarDetected", "ap_name": "AP-1"},
+        ]
+        # Add 4 disconnects at same time
+        for _ in range(4):
+            events.append({"time": now_ms, "key": "EVT_WU_Disconnected", "ap_name": "AP-1"})
+        result = _build_event_timeline(events, 1)
+        self.assertTrue(any("DFS radar" in i for i in result["insights"]))
+
+
 if __name__ == "__main__":
     unittest.main()

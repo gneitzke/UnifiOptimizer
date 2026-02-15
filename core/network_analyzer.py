@@ -5,6 +5,7 @@ Includes RSSI analysis, historical lookback, mesh AP optimization, and best prac
 """
 
 from collections import defaultdict
+from datetime import datetime, timezone
 
 from rich.console import Console
 
@@ -577,6 +578,108 @@ class ExpertNetworkAnalyzer:
             return "F"
 
 
+def _build_event_timeline(events, lookback_days):
+    """Time-bucket historical events by hour for trend visualization.
+
+    Categorizes events into disconnect, roaming, DFS radar, and device restart
+    buckets to enable sparkline/bar charts in the report.
+    """
+    if not events:
+        return {"hours": [], "categories": {}, "summary": {}}
+
+    # Classify events
+    category_map = {
+        "EVT_WU_Disconnected": "disconnect",
+        "EVT_WU_Roam": "roaming",
+        "EVT_WU_RoamRadio": "roaming",
+        "EVT_AP_RadarDetected": "dfs_radar",
+        "EVT_AP_ChannelChanged": "dfs_radar",
+        "EVT_SW_RestartedUnknown": "device_restart",
+        "EVT_AP_RestartedUnknown": "device_restart",
+        "EVT_GW_RestartedUnknown": "device_restart",
+        "EVT_SW_Connected": "device_restart",
+        "EVT_AP_Connected": "device_restart",
+    }
+
+    # Build hourly buckets
+    hourly = defaultdict(lambda: defaultdict(int))
+    category_totals = defaultdict(int)
+    ap_event_counts = defaultdict(lambda: defaultdict(int))
+
+    for event in events:
+        ts = event.get("time", 0)
+        if not ts:
+            continue
+        # UniFi timestamps are Unix epoch in milliseconds
+        ts_sec = ts / 1000 if ts > 1e12 else ts
+        try:
+            dt = datetime.fromtimestamp(ts_sec, tz=timezone.utc)
+        except (ValueError, OSError):
+            continue
+
+        key = event.get("key", "")
+        category = category_map.get(key, "other")
+        hour_key = dt.strftime("%Y-%m-%d %H:00")
+        hourly[hour_key][category] += 1
+        category_totals[category] += 1
+
+        # Track per-AP events for detective insights
+        ap_name = event.get("ap_name", event.get("ap", ""))
+        if ap_name and category in ("disconnect", "roaming", "dfs_radar"):
+            ap_event_counts[ap_name][category] += 1
+
+    # Sort hours chronologically
+    sorted_hours = sorted(hourly.keys())
+
+    # Build per-category arrays aligned to sorted hours
+    categories = ["disconnect", "roaming", "dfs_radar", "device_restart"]
+    series = {}
+    for cat in categories:
+        series[cat] = [hourly[h].get(cat, 0) for h in sorted_hours]
+
+    # Detective insights: find peak hours and problem APs
+    insights = []
+    if sorted_hours:
+        # Find peak disconnect hour
+        disconnect_by_hour = {h: hourly[h].get("disconnect", 0) for h in sorted_hours}
+        peak_hour = max(disconnect_by_hour, key=disconnect_by_hour.get, default=None)
+        if peak_hour and disconnect_by_hour[peak_hour] > 3:
+            insights.append(
+                f"Peak disconnects: {disconnect_by_hour[peak_hour]} events at {peak_hour}"
+            )
+
+        # Find AP with most disconnects
+        if ap_event_counts:
+            worst_ap = max(
+                ap_event_counts.keys(),
+                key=lambda a: ap_event_counts[a].get("disconnect", 0),
+                default=None,
+            )
+            if worst_ap and ap_event_counts[worst_ap]["disconnect"] > 5:
+                insights.append(
+                    f"Most disconnects: {worst_ap} ({ap_event_counts[worst_ap]['disconnect']} events)"
+                )
+
+        # DFS correlation
+        dfs_hours = [h for h in sorted_hours if hourly[h].get("dfs_radar", 0) > 0]
+        if dfs_hours:
+            for dfs_h in dfs_hours:
+                disc_count = hourly[dfs_h].get("disconnect", 0)
+                if disc_count > 2:
+                    insights.append(
+                        f"DFS radar at {dfs_h} coincided with {disc_count} disconnects"
+                    )
+
+    return {
+        "hours": sorted_hours,
+        "categories": series,
+        "totals": dict(category_totals),
+        "insights": insights,
+        "ap_events": {k: dict(v) for k, v in ap_event_counts.items()},
+        "lookback_days": lookback_days,
+    }
+
+
 def run_expert_analysis(client, site="default", lookback_days=3):
     """
     Run complete expert network analysis
@@ -603,11 +706,15 @@ def run_expert_analysis(client, site="default", lookback_days=3):
     # Generate expert recommendations
     recommendations = analyzer.generate_expert_recommendations(ap_analysis, client_analysis)
 
+    # Build event timeline for historical analysis
+    event_timeline = _build_event_timeline(analyzer.historical_events, lookback_days)
+
     return {
         "ap_analysis": ap_analysis,
         "client_analysis": client_analysis,
         "recommendations": recommendations,
         "lookback_days": lookback_days,
-        "devices": analyzer.devices,  # Include full device list for change applier
-        "clients": analyzer.clients,  # Include full client list for advanced analysis
+        "devices": analyzer.devices,
+        "clients": analyzer.clients,
+        "event_timeline": event_timeline,
     }
