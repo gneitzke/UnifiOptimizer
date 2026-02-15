@@ -782,12 +782,17 @@ def _svg_device_timeline(analysis_data, width=860):
     # Data source note
     stat_report_hours = et.get("stat_report_hours", 0)
     stat_report_roams = et.get("stat_report_roams", 0)
+    daily_fill = et.get("daily_gap_fill", 0)
     data_note = ""
     if stat_report_hours:
+        sources = []
+        if daily_fill:
+            sources.append(f"daily AP stats filled {_fmt(daily_fill)} roams")
+        sources.append(f"hourly AP stats added {_fmt(stat_report_roams - daily_fill)} roams")
         data_note = (
             f'<div style="font-size:11px;color:#5f6368;margin-top:4px;text-align:center">'
-            f'Event log: {t_first.strftime("%b %d")} – {t_last.strftime("%b %d %Y")} · '
-            f'AP stats: +{stat_report_hours} hours with {_fmt(stat_report_roams)} roams through today</div>'
+            f'Combined: event log ({t_first.strftime("%b %d")} – {t_last.strftime("%b %d %Y")}) + '
+            f'{" + ".join(sources)} through today</div>'
         )
     else:
         gap_days = int((now - t_last).total_seconds() / 86400)

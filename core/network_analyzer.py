@@ -93,22 +93,41 @@ class ExpertNetworkAnalyzer:
             f"{len(self.historical_events)} events collected[/green]\n"
         )
 
-        # Collect hourly AP stats from stat/report (has current data even when
-        # stat/event log has rolled over and stopped recording new events)
+        # Collect AP stats from stat/report — these always have current data
+        # even when stat/event log has rolled over.
+        # Hourly: ~7 day retention on CloudKey. Daily: months of data.
         self.hourly_ap_stats = []
+        self.daily_ap_stats = []
         try:
             now_ms = int(_time.time() * 1000)
-            start_ms = now_ms - lookback_days * 86400 * 1000
+            report_attrs = ["bytes", "num_sta", "num_wifi_roam_to_events", "time"]
+
+            # Hourly AP stats (request full lookback; controller returns what it has)
+            hourly_start = now_ms - max(lookback_days, 7) * 86400 * 1000
             resp = self.client.post(f"s/{self.site}/stat/report/hourly.ap", {
-                "attrs": ["bytes", "num_sta", "num_wifi_roam_to_events", "time"],
-                "start": start_ms,
+                "attrs": report_attrs,
+                "start": hourly_start,
                 "end": now_ms,
             })
             self.hourly_ap_stats = resp.get("data", []) if resp else []
+
+            # Daily AP stats (request 90 days to cover any event log gap)
+            daily_start = now_ms - 90 * 86400 * 1000
+            resp_d = self.client.post(f"s/{self.site}/stat/report/daily.ap", {
+                "attrs": report_attrs,
+                "start": daily_start,
+                "end": now_ms,
+            })
+            self.daily_ap_stats = resp_d.get("data", []) if resp_d else []
+
+            parts = []
             if self.hourly_ap_stats:
+                parts.append(f"{len(self.hourly_ap_stats)} hourly")
+            if self.daily_ap_stats:
+                parts.append(f"{len(self.daily_ap_stats)} daily")
+            if parts:
                 console.print(
-                    f"[green]  ↳ {len(self.hourly_ap_stats)} hourly AP stat records "
-                    f"(covers last {lookback_days} days)[/green]"
+                    f"[green]  ↳ AP stat records: {', '.join(parts)}[/green]"
                 )
         except Exception:
             pass
@@ -755,15 +774,19 @@ def _build_event_timeline(events, lookback_days):
     }
 
 
-def _merge_hourly_ap_stats(event_timeline, hourly_ap_stats, devices):
-    """Merge stat/report/hourly.ap data into the event timeline.
+def _merge_hourly_ap_stats(event_timeline, hourly_ap_stats, daily_ap_stats, devices):
+    """Merge stat/report data into the event timeline for complete coverage.
 
-    stat/event can stop recording when its log rolls over, but
-    stat/report/hourly.ap always has current aggregated data including
-    roam counts per AP per hour. This fills any gap between the event
-    log and the present.
+    Data sources and their retention on CloudKey Gen2+:
+    - stat/event: Fixed-size buffer (~2-3k events). Can stop if full.
+    - stat/report/hourly.ap: ~7 day retention. Hourly roam counts per AP.
+    - stat/report/daily.ap: ~90 day retention. Daily roam counts per AP.
+
+    Strategy: Use hourly data where available (best resolution), then
+    fill remaining gaps with daily data (spread across 24 synthetic hours).
+    Only add data for hours NOT already covered by the event log.
     """
-    if not hourly_ap_stats:
+    if not hourly_ap_stats and not daily_ap_stats:
         return
 
     # Build AP MAC → name lookup
@@ -778,10 +801,11 @@ def _merge_hourly_ap_stats(event_timeline, hourly_ap_stats, devices):
     totals = event_timeline.setdefault("totals", {})
     ap_events = event_timeline.setdefault("ap_events", {})
 
-    # Bucket stat records by hour
     new_hourly = defaultdict(lambda: defaultdict(int))
     new_ap_roams = defaultdict(int)
+    covered_days = set()  # days already covered by hourly data
 
+    # --- Pass 1: Hourly AP stats (best resolution) ---
     for record in hourly_ap_stats:
         ts = record.get("time", 0)
         if not ts:
@@ -792,16 +816,59 @@ def _merge_hourly_ap_stats(event_timeline, hourly_ap_stats, devices):
         except (ValueError, OSError):
             continue
         hour_key = dt.strftime("%Y-%m-%d %H:00")
+        day_key = dt.strftime("%Y-%m-%d")
+        covered_days.add(day_key)
 
         roams = int(record.get("num_wifi_roam_to_events", 0) or 0)
         if roams and hour_key not in existing_hours:
             new_hourly[hour_key]["roaming"] += roams
 
-        # Track per-AP roaming totals
         ap_mac = record.get("ap", "")
         ap_name = mac_to_name.get(ap_mac, ap_mac[:8] if ap_mac else "")
         if roams and ap_name:
             new_ap_roams[ap_name] += roams
+
+    # --- Pass 2: Daily AP stats (fill gaps not covered by event log or hourly) ---
+    # Spread daily roams evenly across 24 hours for that day
+    existing_days = set()
+    for h in existing_hours:
+        existing_days.add(h[:10])  # "YYYY-MM-DD"
+    for day in covered_days:
+        existing_days.add(day)
+
+    daily_added = 0
+    for record in daily_ap_stats:
+        ts = record.get("time", 0)
+        if not ts:
+            continue
+        ts_sec = ts / 1000 if ts > 1e12 else ts
+        try:
+            dt = datetime.fromtimestamp(ts_sec, tz=timezone.utc)
+        except (ValueError, OSError):
+            continue
+        day_key = dt.strftime("%Y-%m-%d")
+
+        if day_key in existing_days:
+            continue  # Already have hourly or event data for this day
+
+        roams = int(record.get("num_wifi_roam_to_events", 0) or 0)
+        if not roams:
+            continue
+
+        ap_mac = record.get("ap", "")
+        ap_name = mac_to_name.get(ap_mac, ap_mac[:8] if ap_mac else "")
+        if ap_name:
+            new_ap_roams[ap_name] += roams
+
+        # Distribute roams across active hours (8am-11pm = 15 hours)
+        per_hour = max(1, roams // 15)
+        remainder = roams - per_hour * 15
+        for hour in range(8, 23):
+            hour_key = f"{day_key} {hour:02d}:00"
+            amount = per_hour + (1 if hour - 8 < remainder else 0)
+            if amount > 0:
+                new_hourly[hour_key]["roaming"] += amount
+                daily_added += amount
 
     if not new_hourly:
         return
@@ -838,9 +905,10 @@ def _merge_hourly_ap_stats(event_timeline, hourly_ap_stats, devices):
         else:
             ap_events[ap_name] = {"roaming": count}
 
-    # Add source annotation
+    # Source annotations
     event_timeline["stat_report_hours"] = len(new_hours_sorted)
     event_timeline["stat_report_roams"] = added_roams
+    event_timeline["daily_gap_fill"] = daily_added
 
 
 def _build_client_journeys(events, clients, devices, lookback_days):
@@ -1087,9 +1155,14 @@ def run_expert_analysis(client, site="default", lookback_days=3):
     # Build event timeline for historical analysis
     event_timeline = _build_event_timeline(analyzer.historical_events, lookback_days)
 
-    # Merge hourly AP stats into timeline (has current data from stat/report)
-    if hasattr(analyzer, "hourly_ap_stats") and analyzer.hourly_ap_stats:
-        _merge_hourly_ap_stats(event_timeline, analyzer.hourly_ap_stats, analyzer.devices)
+    # Merge hourly + daily AP stats into timeline (fills event log gaps)
+    if hasattr(analyzer, "hourly_ap_stats") or hasattr(analyzer, "daily_ap_stats"):
+        _merge_hourly_ap_stats(
+            event_timeline,
+            getattr(analyzer, "hourly_ap_stats", []),
+            getattr(analyzer, "daily_ap_stats", []),
+            analyzer.devices,
+        )
 
     # Build per-client journey profiles
     client_journeys = _build_client_journeys(
