@@ -32,6 +32,7 @@ Options:
   --dry-run            Preview changes without applying
   --yes                Apply all changes without prompts
   --min-rssi-strategy  optimal | max_connectivity
+  --newReport          Generate premium V2 report (visual topology, actions, deep dive)
   --verbose            Show detailed API debugging
   --list-profiles      List saved profiles
   --save-profile NAME  Save credentials as named profile
