@@ -101,9 +101,15 @@ class ClientRSSITracker:
         start_time = int((datetime.now() - timedelta(hours=lookback_hours)).timestamp() * 1000)
 
         try:
-            # Fetch hourly client stats
-            hourly_stats = self.client.get(
-                f"s/{self.site}/stat/report/hourly.client/{mac}?start={start_time}&end={end_time}"
+            # Fetch hourly client stats (POST per UniFi API)
+            hourly_stats = self.client.post(
+                f"s/{self.site}/stat/report/hourly.user",
+                {
+                    "attrs": ["bytes", "rx_bytes", "tx_bytes", "time"],
+                    "start": start_time,
+                    "end": end_time,
+                    "macs": [mac],
+                },
             )
 
             if not hourly_stats or "data" not in hourly_stats:

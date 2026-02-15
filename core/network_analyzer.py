@@ -57,14 +57,16 @@ class ExpertNetworkAnalyzer:
         self.clients = clients_response.get("data", []) if clients_response else []
 
         # Get recent events (default is usually last 1 hour)
-        events_response = self.client.get(f"s/{self.site}/stat/event")
+        events_response = self.client.post(f"s/{self.site}/stat/event", {})
         self.events = events_response.get("data", []) if events_response else []
 
         # Get historical events (last N days)
+        # UniFi stat/event requires POST with {"within": hours} in body
         try:
             within_hours = lookback_days * 24
-            historical_response = self.client.get(
-                f"s/{self.site}/stat/event", params={"within": within_hours}
+            historical_response = self.client.post(
+                f"s/{self.site}/stat/event",
+                {"within": within_hours, "_limit": 5000},
             )
             self.historical_events = (
                 historical_response.get("data", []) if historical_response else []

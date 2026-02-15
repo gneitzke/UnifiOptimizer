@@ -434,9 +434,15 @@ class SwitchAnalyzer:
             if cache_key in self.hourly_data_cache:
                 hourly_stats = {"data": self.hourly_data_cache[cache_key]}
             else:
-                # Fall back to API call if no cached data
-                hourly_stats = self.client.get(
-                    f"s/{self.site}/stat/report/hourly.device/{switch_mac}?start={start_time}&end={end_time}"
+                # Fall back to API call if no cached data (POST per UniFi API)
+                hourly_stats = self.client.post(
+                    f"s/{self.site}/stat/report/hourly.device",
+                    {
+                        "attrs": ["bytes", "rx_bytes", "tx_bytes", "rx_dropped", "tx_dropped", "time"],
+                        "start": start_time,
+                        "end": end_time,
+                        "macs": [switch_mac],
+                    },
                 )
 
                 # Cache the result for future use
@@ -794,10 +800,15 @@ class SwitchAnalyzer:
             console.print(f"[dim]Collecting history for {switch_name}...[/dim]")
 
             try:
-                # Query hourly stats for this switch
-                # API format: /api/s/{site}/stat/report/hourly.device/{mac}
-                hourly_stats = self.client.get(
-                    f"s/{self.site}/stat/report/hourly.device/{switch_mac}?start={start_time}&end={end_time}"
+                # Query hourly stats for this switch (POST per UniFi API)
+                hourly_stats = self.client.post(
+                    f"s/{self.site}/stat/report/hourly.device",
+                    {
+                        "attrs": ["bytes", "rx_bytes", "tx_bytes", "rx_dropped", "tx_dropped", "time"],
+                        "start": start_time,
+                        "end": end_time,
+                        "macs": [switch_mac],
+                    },
                 )
 
                 if not hourly_stats or "data" not in hourly_stats:

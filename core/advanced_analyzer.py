@@ -80,11 +80,11 @@ class AdvancedNetworkAnalyzer:
         }
 
         try:
-            # Get events from controller
+            # Get events from controller (POST required for UniFi stat/event)
             within_hours = lookback_days * 24
-            events_response = self.client.get(
+            events_response = self.client.post(
                 f"s/{self.site}/stat/event",
-                params={"within": within_hours, "_limit": 1000},
+                {"within": within_hours, "_limit": 1000},
             )
 
             if not events_response:
@@ -1642,11 +1642,15 @@ class AdvancedNetworkAnalyzer:
                 if not ap_mac:
                     continue
 
-                # Query hourly stats endpoint
-                # API format: /api/s/{site}/stat/report/hourly.ap/{mac}
-                # Build URL with query parameters
-                hourly_stats = self.client.get(
-                    f"s/{self.site}/stat/report/hourly.ap/{ap_mac}?start={start_time}&end={end_time}"
+                # Query hourly stats endpoint (POST required per UniFi API)
+                hourly_stats = self.client.post(
+                    f"s/{self.site}/stat/report/hourly.ap",
+                    {
+                        "attrs": ["bytes", "num_sta", "time", "rx_bytes", "tx_bytes"],
+                        "start": start_time,
+                        "end": end_time,
+                        "macs": [ap_mac],
+                    },
                 )
 
                 if not hourly_stats or "data" not in hourly_stats:

@@ -733,8 +733,8 @@ def analyze_client_health(client, site="default"):
     clients_response = client.get(f"s/{site}/stat/sta")
     clients = clients_response.get("data", []) if clients_response else []
 
-    # Get events
-    events_response = client.get(f"s/{site}/stat/event")
+    # Get events (POST required for UniFi stat/event endpoint)
+    events_response = client.post(f"s/{site}/stat/event", {"within": 24})
     events = events_response.get("data", []) if events_response else []
 
     console.print(f"[green]Found {len(clients)} clients and {len(events)} events[/green]\n")
