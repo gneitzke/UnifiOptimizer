@@ -127,13 +127,19 @@ def _generate_overview_charts(analysis_data, signal_distribution):
     }
     total_wireless = sum(rssi_data.values())
 
-    # Band distribution from AP analysis
-    ap_analysis = analysis_data.get("ap_analysis", {})
+    # Band distribution — count actual clients by their connected channel
+    clients_list = analysis_data.get("client_analysis", {}).get("clients", [])
     band_counts = {"2.4GHz": 0, "5GHz": 0, "6GHz": 0}
-    for ap_info in ap_analysis.get("ap_details", []):
-        for band in ap_info.get("radios", {}):
-            if band in band_counts:
-                band_counts[band] += ap_info.get("client_count", 0)
+    for c in clients_list:
+        ch = c.get("channel", 0) or 0
+        if ch == 0:
+            continue  # wired or unknown
+        elif ch <= 14:
+            band_counts["2.4GHz"] += 1
+        elif ch < 200:
+            band_counts["5GHz"] += 1
+        else:
+            band_counts["6GHz"] += 1
 
     # Client capabilities
     caps = analysis_data.get("client_capabilities", {})

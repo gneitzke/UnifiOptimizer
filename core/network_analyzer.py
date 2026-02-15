@@ -122,6 +122,9 @@ class ExpertNetworkAnalyzer:
             # Get uplink details for mesh APs
             uplink_remote_mac = uplink.get("uplink_remote_mac") if is_mesh else None
             uplink_rssi = uplink.get("rssi") if is_mesh else None
+            # Normalize RSSI to negative dBm (some controllers return positive values)
+            if uplink_rssi is not None and uplink_rssi > 0:
+                uplink_rssi = -uplink_rssi
 
             # Analyze radios
             radio_table = ap.get("radio_table", [])
@@ -395,12 +398,19 @@ class ExpertNetworkAnalyzer:
         client_analysis = []
 
         for client in self.clients:
+            # Skip wired clients — they don't have wireless metrics
+            if client.get("is_wired", False):
+                continue
+
             mac = client.get("mac")
             hostname = client.get("hostname", "Unknown")
-            rssi = client.get("rssi", -100)
+            rssi = client.get("rssi")
 
-            # FIX: Some UniFi controllers return positive RSSI values
-            # RSSI should always be negative in dBm for WiFi
+            # Skip clients with no RSSI (likely wired or offline)
+            if rssi is None:
+                continue
+
+            # Some UniFi controllers return positive RSSI values
             if rssi > 0:
                 rssi = -rssi
 
