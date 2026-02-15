@@ -844,119 +844,164 @@ def _topology(analysis_data):
         if issue.get("severity") in ("high", "critical"):
             issue_devices.add(issue.get("device", ""))
 
-    # Classify devices
-    switches = [d for d in devices if d.get("type") == "usw"]
-    aps = [d for d in devices if d.get("type") == "uap"]
-    mac_to_dev = {d.get("mac", ""): d for d in devices}
-
-    # Enrich APs with analysis data
-    for ap in aps:
-        name = ap.get("name", "")
+    mac_to_dev = {}
+    for dev in devices:
+        mac = dev.get("mac", "")
+        name = dev.get("name", "")
         info = ap_info_by_name.get(name, {})
-        ap["_is_mesh"] = info.get("is_mesh", False)
-        ap["_clients"] = info.get("client_count", 0)
-        ap["_rssi"] = info.get("uplink_rssi")
-        ap["_has_issue"] = name in issue_devices
+        dev["_is_mesh"] = info.get("is_mesh", False)
+        dev["_clients"] = info.get("client_count", 0)
+        dev["_rssi"] = info.get("uplink_rssi")
+        dev["_has_issue"] = name in issue_devices
+        mac_to_dev[mac] = dev
 
-    wired_aps = [a for a in aps if not a.get("_is_mesh")]
-    mesh_aps = [a for a in aps if a.get("_is_mesh")]
+    # --- Build adjacency tree ---
+    children_of = {}  # parent_mac -> [child_dev, ...]
+    roots = []
+    for dev in devices:
+        mac = dev.get("mac", "")
+        uplink = dev.get("uplink", {}) or {}
+        parent_mac = uplink.get("uplink_mac", "")
+        if parent_mac and parent_mac in mac_to_dev:
+            children_of.setdefault(parent_mac, []).append(dev)
+        else:
+            roots.append(dev)
 
-    # Layout computation
-    svg_w = 960
-    has_mesh = len(mesh_aps) > 0
-    svg_h = 310 if has_mesh else 210
+    # --- Assign DAG levels via BFS ---
+    level_of = {}  # mac -> depth
+    queue = [(r, 0) for r in roots]
+    order = []
+    visited = set()
+    while queue:
+        node, depth = queue.pop(0)
+        mac = node.get("mac", "")
+        if mac in visited:
+            continue
+        visited.add(mac)
+        level_of[mac] = depth
+        order.append(node)
+        for child in children_of.get(mac, []):
+            queue.append((child, depth + 1))
 
-    # Level positions
-    sw_y = 55
-    wap_y = 165
-    map_y = 265
+    max_depth = max(level_of.values()) if level_of else 0
 
-    # Position switches
-    positions = {}
-    if switches:
-        sp = svg_w / (len(switches) + 1)
-        for i, sw in enumerate(switches):
-            positions[sw.get("mac", "")] = (sp * (i + 1), sw_y)
+    # --- Compute subtree widths for balanced layout ---
+    node_width = 130  # horizontal space per node
 
-    # Position wired APs
-    if wired_aps:
-        sp = svg_w / (len(wired_aps) + 1)
-        for i, ap in enumerate(wired_aps):
-            positions[ap.get("mac", "")] = (sp * (i + 1), wap_y)
+    def subtree_width(mac):
+        kids = children_of.get(mac, [])
+        if not kids:
+            return node_width
+        return sum(subtree_width(k.get("mac", "")) for k in kids)
 
-    # Position mesh APs
-    if mesh_aps:
-        sp = svg_w / (len(mesh_aps) + 1)
-        for i, ap in enumerate(mesh_aps):
-            positions[ap.get("mac", "")] = (sp * (i + 1), map_y)
+    # --- Assign X positions (centered over children) ---
+    svg_w = max(960, subtree_width(roots[0].get("mac", "")) + 40) if roots else 960
+    positions = {}  # mac -> (x, y)
+    level_gap = 110
+
+    def layout(node, x_start, x_end, depth):
+        mac = node.get("mac", "")
+        y = 55 + depth * level_gap
+        cx = (x_start + x_end) / 2
+        positions[mac] = (cx, y)
+        kids = children_of.get(mac, [])
+        if not kids:
+            return
+        # Distribute children proportionally across [x_start, x_end]
+        total_w = sum(subtree_width(k.get("mac", "")) for k in kids)
+        cursor = x_start
+        for kid in kids:
+            kid_w = subtree_width(kid.get("mac", ""))
+            share = (kid_w / total_w) * (x_end - x_start) if total_w else (x_end - x_start) / len(kids)
+            layout(kid, cursor, cursor + share, depth + 1)
+            cursor += share
+
+    if roots:
+        padding = 40
+        for i, root in enumerate(roots):
+            if len(roots) == 1:
+                layout(root, padding, svg_w - padding, 0)
+            else:
+                seg = (svg_w - 2 * padding) / len(roots)
+                layout(root, padding + i * seg, padding + (i + 1) * seg, 0)
+
+    svg_h = 55 + (max_depth + 1) * level_gap + 20
 
     svg = [f'<svg viewBox="0 0 {svg_w} {svg_h}" class="topology-svg" xmlns="http://www.w3.org/2000/svg">']
 
-    # Draw edges (behind nodes)
-    for dev in switches + aps:
-        child_mac = dev.get("mac", "")
-        uplink = dev.get("uplink", {}) or {}
-        parent_mac = uplink.get("uplink_mac", "")
-        if not parent_mac or child_mac not in positions or parent_mac not in positions:
+    # --- Draw edges (parent→child) ---
+    for parent_mac, kids in children_of.items():
+        if parent_mac not in positions:
             continue
-        cx, cy = positions[child_mac]
         px, py = positions[parent_mac]
-        is_mesh = dev.get("_is_mesh", False)
-        edge_class = "topo-edge-mesh" if is_mesh else "topo-edge"
-        # Offset: connect from parent bottom to child top
-        py_off = py + (25 if dev.get("type") != "uap" else 30)
-        cy_off = cy - (25 if dev.get("type") == "usw" else 28)
-        svg.append(f'<line x1="{px:.0f}" y1="{py_off}" x2="{cx:.0f}" y2="{cy_off}" class="{edge_class}"/>')
-        if is_mesh and dev.get("_rssi"):
-            mx = (px + cx) / 2
-            my = (py_off + cy_off) / 2
-            svg.append(f'<text x="{mx:.0f}" y="{my:.0f}" class="topo-rssi-label">{dev["_rssi"]} dBm</text>')
+        for kid in kids:
+            kid_mac = kid.get("mac", "")
+            if kid_mac not in positions:
+                continue
+            cx, cy = positions[kid_mac]
+            is_mesh = kid.get("_is_mesh", False)
+            edge_class = "topo-edge-mesh" if is_mesh else "topo-edge"
 
-    # Draw switch nodes
-    for sw in switches:
-        mac = sw.get("mac", "")
-        if mac not in positions:
-            continue
-        x, y = positions[mac]
-        name = sw.get("name", "Switch")[:18]
-        port_count = len([p for p in sw.get("port_table", []) if p.get("speed", 0) > 0]) if sw.get("port_table") else "?"
-        sw_color = "#ea4335" if name in issue_devices else "#1e2d4a"
-        svg.append(
-            f'<g transform="translate({x:.0f},{y:.0f})">'
-            f'<rect x="-58" y="-24" width="116" height="48" rx="6" class="topo-node-rect" style="stroke:{sw_color}"/>'
-            f'<text y="-4" class="topo-label">{_esc(name[:16])}</text>'
-            f'<text y="12" class="topo-sublabel">Switch</text>'
-            f'</g>'
-        )
-
-    # Draw AP nodes
-    for ap in wired_aps + mesh_aps:
-        mac = ap.get("mac", "")
-        if mac not in positions:
-            continue
-        x, y = positions[mac]
-        name = ap.get("name", "AP")[:14]
-        clients = ap.get("_clients", 0)
-        is_mesh = ap.get("_is_mesh", False)
-        has_issue = ap.get("_has_issue", False)
-
-        stroke = "#ea4335" if has_issue else "#006fff" if is_mesh else "#34a853"
-        circle_class = "topo-mesh-circle" if is_mesh else "topo-ap-circle"
-
-        svg.append(
-            f'<g transform="translate({x:.0f},{y:.0f})">'
-            f'<circle r="28" class="{circle_class}" style="stroke:{stroke}"/>'
-            f'<text y="-5" class="topo-label">{_esc(name)}</text>'
-            f'<text y="9" class="topo-sublabel">{clients} client{"s" if clients != 1 else ""}</text>'
-        )
-        # Client count badge
-        if clients > 0:
-            badge_color = "#ea4335" if has_issue else "#006fff" if is_mesh else "#34a853"
+            # Curved path for cleaner look
+            mid_y = (py + cy) / 2
             svg.append(
-                f'<circle cx="20" cy="-20" r="9" fill="{badge_color}"/>'
-                f'<text x="20" y="-17" class="topo-badge">{clients}</text>'
+                f'<path d="M {px:.0f} {py + 28:.0f} C {px:.0f} {mid_y:.0f}, '
+                f'{cx:.0f} {mid_y:.0f}, {cx:.0f} {cy - 28:.0f}" '
+                f'fill="none" class="{edge_class}"/>'
             )
-        svg.append("</g>")
+
+            # RSSI label on mesh links
+            if is_mesh and kid.get("_rssi"):
+                mx = (px + cx) / 2
+                my = mid_y - 6
+                svg.append(
+                    f'<text x="{mx:.0f}" y="{my:.0f}" class="topo-rssi-label">'
+                    f'{kid["_rssi"]} dBm</text>'
+                )
+
+    # --- Draw nodes ---
+    for dev in order:
+        mac = dev.get("mac", "")
+        if mac not in positions:
+            continue
+        x, y = positions[mac]
+        name = dev.get("name", "?")[:16]
+        dtype = dev.get("type", "")
+        is_mesh = dev.get("_is_mesh", False)
+        has_issue = dev.get("_has_issue", False)
+        clients = dev.get("_clients", 0)
+
+        if dtype == "usw":
+            # Switch: rounded rectangle
+            stroke = "#ea4335" if has_issue else "#1e2d4a"
+            active_ports = len([p for p in dev.get("port_table", []) if (p.get("speed", 0) or 0) > 0]) if dev.get("port_table") else "?"
+            svg.append(
+                f'<g transform="translate({x:.0f},{y:.0f})">'
+                f'<rect x="-58" y="-24" width="116" height="48" rx="6" '
+                f'class="topo-node-rect" style="stroke:{stroke}"/>'
+                f'<text y="-4" class="topo-label">{_esc(name)}</text>'
+                f'<text y="12" class="topo-sublabel">Switch</text>'
+                f'</g>'
+            )
+        else:
+            # AP: circle
+            stroke = "#ea4335" if has_issue else "#006fff" if is_mesh else "#34a853"
+            circle_class = "topo-mesh-circle" if is_mesh else "topo-ap-circle"
+            sublabel = f'{clients} client{"s" if clients != 1 else ""}' if clients else "mesh" if is_mesh else "0 clients"
+
+            svg.append(
+                f'<g transform="translate({x:.0f},{y:.0f})">'
+                f'<circle r="28" class="{circle_class}" style="stroke:{stroke}"/>'
+                f'<text y="-5" class="topo-label">{_esc(name)}</text>'
+                f'<text y="9" class="topo-sublabel">{sublabel}</text>'
+            )
+            if clients > 0:
+                badge_color = "#ea4335" if has_issue else "#006fff" if is_mesh else "#34a853"
+                svg.append(
+                    f'<circle cx="20" cy="-20" r="9" fill="{badge_color}"/>'
+                    f'<text x="20" y="-17" class="topo-badge">{clients}</text>'
+                )
+            svg.append("</g>")
 
     svg.append("</svg>")
 
