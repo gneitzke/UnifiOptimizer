@@ -706,6 +706,7 @@ def _convert_expert_recommendations(expert_recs, all_devices=None):
             radio = rec.get("radio", {})
             band = rec.get("band", "")
             current_power = radio.get("tx_power_mode", "high")
+            tx_power_dbm = radio.get("tx_power")  # Actual dBm value from controller
 
             # Determine new power based on recommendation
             new_power = "medium" if current_power == "high" else "low"
@@ -717,6 +718,7 @@ def _convert_expert_recommendations(expert_recs, all_devices=None):
                     "radio": radio.get("radio", "ng"),
                     "current_power": current_power,
                     "new_power": new_power,
+                    "tx_power_dbm": tx_power_dbm,
                     "reason": rec.get("message", "") + ". " + rec.get("recommendation", ""),
                     "priority": priority,
                     "affected_clients": rec.get("affected_clients", 0),
@@ -733,34 +735,34 @@ def _convert_expert_recommendations(expert_recs, all_devices=None):
             except (ValueError, TypeError):
                 current_channel = 1
 
-            # Suggest appropriate channel based on band
-            if band == "2.4GHz":
-                # Suggest different non-overlapping channel
-                if current_channel == 1:
-                    new_channel = 6
-                elif current_channel == 6:
-                    new_channel = 11
-                else:
-                    new_channel = 1
-            elif band == "6GHz":
-                # 6GHz channels (UNII-5 through UNII-8)
-                # Preferred channels: 37, 53, 69, 85, 101, 117, 133, 149, 165, 181, 197, 213
-                if current_channel < 37 or current_channel > 213:
-                    new_channel = 37  # Start of UNII-5
-                elif current_channel == 37:
-                    new_channel = 69  # UNII-5 alternative
-                elif current_channel in [53, 69]:
-                    new_channel = 101  # Move to UNII-6
-                elif current_channel in [85, 101]:
-                    new_channel = 133  # Move to UNII-7
-                else:
-                    new_channel = 37  # Return to start
-            else:  # 5GHz
-                # Suggest non-DFS channel if currently on DFS
-                if 52 <= current_channel <= 144:
-                    new_channel = 36  # Safe non-DFS channel
-                else:
-                    new_channel = 149  # Alternative non-DFS
+            # Use the smart analyzer's recommendation if available
+            new_channel = rec.get("new_channel")
+
+            if new_channel is None:
+                # Fallback: suggest appropriate channel based on band
+                if band == "2.4GHz":
+                    if current_channel == 1:
+                        new_channel = 6
+                    elif current_channel == 6:
+                        new_channel = 11
+                    else:
+                        new_channel = 1
+                elif band == "6GHz":
+                    if current_channel < 37 or current_channel > 213:
+                        new_channel = 37
+                    elif current_channel == 37:
+                        new_channel = 69
+                    elif current_channel in [53, 69]:
+                        new_channel = 101
+                    elif current_channel in [85, 101]:
+                        new_channel = 133
+                    else:
+                        new_channel = 37
+                else:  # 5GHz
+                    if 52 <= current_channel <= 144:
+                        new_channel = 36
+                    else:
+                        new_channel = 149
 
             converted.append(
                 {
@@ -897,12 +899,10 @@ def _generate_health_based_recommendations(aps, health_analysis):
                         uplink_rssi = ap.get("uplink", {}).get("rssi")
                         is_wireless_uplink = uplink_type == "wireless"
 
-                        is_mesh = ap.get("adopted", False) and (
-                            is_wireless_uplink or (uplink_rssi and uplink_rssi < -70)
-                        )
+                        is_mesh = is_wireless_uplink
 
-                        # Additional safety: Never reduce power if uplink RSSI is weak
-                        has_weak_uplink = uplink_rssi and uplink_rssi < -65
+                        # Safety: Never reduce power if uplink RSSI is weak
+                        has_weak_uplink = uplink_rssi is not None and uplink_rssi < -65
 
                         # Check if this AP is a parent to mesh nodes
                         is_mesh_parent = _is_mesh_parent(ap, aps)
@@ -980,12 +980,9 @@ def _generate_health_based_recommendations(aps, health_analysis):
         # Group by AP
         roaming_by_ap = defaultdict(list)
         for client in roaming_issues:
-            # Try to find which AP this client is on
-            mac = client.get("mac")
-            # Look in health_analysis for current AP
-            for ap_mac, ap in ap_by_mac.items():
+            ap_mac = client.get("ap_mac")
+            if ap_mac and ap_mac in ap_by_mac:
                 roaming_by_ap[ap_mac].append(client)
-                break
 
         # Recommend power reduction to improve roaming
         for ap_mac, clients in roaming_by_ap.items():
@@ -1004,12 +1001,10 @@ def _generate_health_based_recommendations(aps, health_analysis):
                 uplink_rssi = ap.get("uplink", {}).get("rssi")
                 is_wireless_uplink = uplink_type == "wireless"
 
-                is_mesh = ap.get("adopted", False) and (
-                    is_wireless_uplink or (uplink_rssi and uplink_rssi < -70)
-                )
+                is_mesh = is_wireless_uplink
 
-                # Additional safety: Never reduce power if uplink RSSI is weak
-                has_weak_uplink = uplink_rssi and uplink_rssi < -65
+                # Safety: Never reduce power if uplink RSSI is weak
+                has_weak_uplink = uplink_rssi is not None and uplink_rssi < -65
 
                 # Check if this AP is a parent to mesh nodes (needs high power for TX to children)
                 is_mesh_parent = _is_mesh_parent(ap, aps)
@@ -1056,31 +1051,10 @@ def _generate_health_based_recommendations(aps, health_analysis):
 
 
 def _is_mesh_parent(ap, all_aps):
-    """
-    Check if this AP is a parent to any mesh nodes
+    """Check if this AP is a parent to any mesh nodes."""
+    from utils.network_helpers import is_mesh_parent
 
-    Args:
-        ap: The AP to check
-        all_aps: List of all AP devices
-
-    Returns:
-        bool: True if this AP is a parent to mesh nodes
-    """
-    ap_mac = ap.get("mac")
-    if not ap_mac:
-        return False
-
-    # Check if any other AP has this AP as its parent
-    for other_ap in all_aps:
-        uplink = other_ap.get("uplink", {})
-        uplink_type = uplink.get("type", "")
-        parent_mac = uplink.get("uplink_remote_mac")
-
-        # If another AP has wireless uplink pointing to this AP
-        if uplink_type == "wireless" and parent_mac == ap_mac:
-            return True
-
-    return False
+    return is_mesh_parent(ap, all_aps)
 
 
 def _get_parent_ap_info(mesh_ap, all_aps):
@@ -1170,9 +1144,7 @@ def _generate_basic_recommendations(aps, all_devices=None):
     for ap in aps:
         uplink_type = ap.get("uplink", {}).get("type", "")
         uplink_rssi = ap.get("uplink", {}).get("rssi")
-        is_mesh = ap.get("adopted", False) and (
-            uplink_type == "wireless" or (uplink_rssi and uplink_rssi < -70)
-        )
+        is_mesh = uplink_type == "wireless"
         if is_mesh:
             mesh_aps.append(ap)
             parent_mac = ap.get("uplink", {}).get("uplink_remote_mac")
@@ -1228,11 +1200,8 @@ def _generate_basic_recommendations(aps, all_devices=None):
         uplink_rssi = ap.get("uplink", {}).get("rssi")
         uplink_remote_mac = ap.get("uplink", {}).get("uplink_remote_mac")
 
-        # Enhanced mesh detection: wireless uplink is PRIMARY indicator
-        # Only use RSSI as secondary check for very weak uplinks (< -70 dBm suggests wireless)
-        is_mesh = ap.get("adopted", False) and (
-            is_wireless_uplink or (uplink_rssi and uplink_rssi < -70)
-        )
+        # Mesh detection: only wireless uplink type is reliable
+        is_mesh = is_wireless_uplink
 
         mesh_label = " [MESH]" if is_mesh else ""
 
@@ -1351,18 +1320,26 @@ def _generate_basic_recommendations(aps, all_devices=None):
 
 
 def display_recommendations(recommendations):
-    """Display optimization recommendations with priority and impact"""
+    """Display optimization recommendations grouped by actionable vs informational."""
     if not recommendations:
         console.print("[green]✓ No optimization recommendations at this time.[/green]")
         console.print("[green]✓ Your network appears to be well-configured![/green]")
         return
 
-    # Count by priority
-    high_priority = len([r for r in recommendations if r.get("priority") == "high"])
-    medium_priority = len([r for r in recommendations if r.get("priority") == "medium"])
-    low_priority = len([r for r in recommendations if r.get("priority") == "low"])
+    # Separate actionable (auto-fixable) from informational
+    actionable_actions = {"channel_change", "power_change", "band_steering", "min_rssi"}
+    actionable = [r for r in recommendations if r.get("action") in actionable_actions]
+    informational = [r for r in recommendations if r.get("action") not in actionable_actions]
 
-    summary = f"[bold]Found {len(recommendations)} Optimization Opportunities[/bold]\n"
+    # Count by priority (actionable only)
+    high_priority = len([r for r in actionable if r.get("priority") == "high"])
+    medium_priority = len([r for r in actionable if r.get("priority") == "medium"])
+    low_priority = len([r for r in actionable if r.get("priority") == "low"])
+
+    summary = f"[bold]Found {len(actionable)} Actionable Optimizations[/bold]"
+    if informational:
+        summary += f", [dim]{len(informational)} Informational[/dim]"
+    summary += "\n"
     if high_priority:
         summary += f"[red]● {high_priority} High Priority[/red] "
     if medium_priority:
@@ -1373,7 +1350,23 @@ def display_recommendations(recommendations):
     console.print(Panel(summary, style="yellow"))
     console.print()
 
-    for i, rec in enumerate(recommendations, 1):
+    # Display actionable items first, then informational
+    display_order = actionable + informational
+    section_shown = set()
+
+    for i, rec in enumerate(display_order, 1):
+        # Show section headers
+        is_actionable = rec.get("action") in actionable_actions
+        section = "actionable" if is_actionable else "informational"
+        if section not in section_shown:
+            section_shown.add(section)
+            if section == "actionable" and actionable:
+                console.print("[bold green]🔧 Actionable Changes[/bold green]")
+                console.print()
+            elif section == "informational" and informational:
+                console.print("[bold dim]📋 Informational Findings[/bold dim]")
+                console.print()
+
         device_name = rec["device"].get("name", "Unnamed AP")
         action = rec["action"]
         priority = rec.get("priority", "low")
@@ -1397,7 +1390,14 @@ def display_recommendations(recommendations):
 
         elif action == "power_change":
             band = "2.4GHz" if rec["radio"] == "ng" else "5GHz"
-            console.print(f"   Change {band} power: {rec['current_power']} → {rec['new_power']}")
+            # Show actual dBm if available for more meaningful display
+            tx_power_dbm = rec.get("tx_power_dbm")
+            power_detail = ""
+            if tx_power_dbm:
+                power_detail = f" ({tx_power_dbm} dBm)"
+            console.print(
+                f"   Change {band} power: {rec['current_power']}{power_detail} → {rec['new_power']}"
+            )
             console.print(f"   Reason: {rec['reason']}")
             if affected_clients > 0:
                 console.print(f"   [dim]Affects {affected_clients} client(s)[/dim]")
@@ -1442,10 +1442,11 @@ def display_rssi_histogram(analysis):
     )
     console.print()
 
-    # Calculate percentages and create horizontal bars
-    total = sum(signal_dist.values())
+    # Calculate percentages based on WIRELESS clients only (exclude wired)
+    wired_count = signal_dist.get("wired", 0)
+    wireless_total = sum(signal_dist.values()) - wired_count
 
-    if total == 0:
+    if wireless_total == 0:
         console.print("[yellow]No wireless clients found[/yellow]\n")
         return
 
@@ -1458,17 +1459,14 @@ def display_rssi_histogram(analysis):
         ("Critical (< -80 dBm)", signal_dist.get("critical", 0), "bright_red"),
     ]
 
-    # Show wired clients separately if present
-    wired_count = signal_dist.get("wired", 0)
-
     max_bar_width = 50
 
     for label, count, color in categories:
         if count == 0:
             continue
 
-        percentage = (count / total) * 100
-        bar_length = int((count / total) * max_bar_width)
+        percentage = (count / wireless_total) * 100
+        bar_length = int((count / wireless_total) * max_bar_width)
         bar = "█" * bar_length
 
         console.print(
@@ -1977,21 +1975,25 @@ Examples:
   # Analyze and show recommendations (safe, read-only)
   python3 optimize_network.py analyze --host https://YOUR_CONTROLLER_IP --username admin
 
-  # Dry-run: See what would change without making actual changes
-  python3 optimize_network.py apply --host https://YOUR_CONTROLLER_IP --username admin --dry-run
+  # Analyze network (safe, read-only report)
+  python3 optimize_network.py analyze --host https://YOUR_CONTROLLER_IP --username admin
 
-  # Interactive: Approve each change individually
-  python3 optimize_network.py apply --host https://YOUR_CONTROLLER_IP --username admin --interactive
+  # Preview changes without applying (dry-run)
+  python3 optimize_network.py optimize --host https://YOUR_CONTROLLER_IP --username admin --dry-run
 
-  # Automatic: Apply all changes without prompts (use with caution!)
-  python3 optimize_network.py apply --host https://YOUR_CONTROLLER_IP --username admin --yes
+  # Apply changes interactively (approve each one)
+  python3 optimize_network.py optimize --host https://YOUR_CONTROLLER_IP --username admin
+
+  # Apply all changes automatically (use with caution!)
+  python3 optimize_network.py optimize --host https://YOUR_CONTROLLER_IP --username admin --yes
         """,
     )
 
     parser.add_argument(
         "command",
-        choices=["analyze", "apply"],
-        help="analyze: Show recommendations only | apply: Apply changes",
+        choices=["analyze", "optimize", "apply"],
+        help="analyze: Full analysis + report (read-only) | optimize: Apply changes (use --dry-run to preview)",
+        metavar="{analyze,optimize}",
     )
     parser.add_argument("--host", help="Controller URL")
     parser.add_argument("--username", help="Username")
@@ -2209,9 +2211,34 @@ Examples:
             except Exception as e:
                 console.print(f"\n[yellow]⚠️  Could not generate HTML report: {e}[/yellow]")
 
-        console.print("\n[dim]Tip: Use 'apply --dry-run' to see detailed impact of changes[/dim]")
+            # Cache analysis results for regenerate_report.py
+            try:
+                import json
 
-    elif args.command == "apply":
+                cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                from datetime import datetime
+
+                cache_file = os.path.join(
+                    cache_dir, f"analysis_cache_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                )
+                with open(cache_file, "w") as f:
+                    json.dump(
+                        {
+                            "full_analysis": full_analysis,
+                            "recommendations": recommendations,
+                            "site_name": site,
+                        },
+                        f,
+                        indent=2,
+                        default=str,
+                    )
+                console.print(f"[dim]💾 Analysis cached: {cache_file}[/dim]")
+            except Exception:
+                pass  # Cache is best-effort
+
+        console.print("\n[dim]Tip: Use 'optimize --dry-run' to see detailed impact of changes[/dim]")
+
+    elif args.command in ("optimize", "apply"):
         if not recommendations:
             console.print("[green]No changes needed - network is optimized![/green]")
             return 0
@@ -2263,6 +2290,31 @@ Examples:
                 console.print(f"[dim]   (Works in email/iMessage - uses static images)[/dim]")
             except Exception as e:
                 console.print(f"\n[yellow]⚠️  Could not generate HTML report: {e}[/yellow]")
+
+            # Cache analysis results for regenerate_report.py
+            try:
+                import json
+
+                cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                from datetime import datetime
+
+                cache_file = os.path.join(
+                    cache_dir, f"analysis_cache_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                )
+                with open(cache_file, "w") as f:
+                    json.dump(
+                        {
+                            "full_analysis": full_analysis,
+                            "recommendations": recommendations,
+                            "site_name": site,
+                        },
+                        f,
+                        indent=2,
+                        default=str,
+                    )
+                console.print(f"[dim]💾 Analysis cached: {cache_file}[/dim]")
+            except Exception:
+                pass  # Cache is best-effort
 
     return 0
 

@@ -1,0 +1,52 @@
+# UniFi Network Optimizer Configuration
+# All thresholds and options are customizable here.
+# Values shown are the defaults — uncomment and change as needed.
+
+thresholds:
+  # Client signal quality classification (dBm)
+  rssi:
+    excellent: -50
+    good: -60
+    fair: -70
+    poor: -80
+
+  # Minimum RSSI roaming thresholds by strategy
+  min_rssi:
+    optimal:
+      2.4ghz: -75
+      5ghz: -72
+      6ghz: -70
+    max_connectivity:
+      2.4ghz: -80
+      5ghz: -77
+      6ghz: -75
+
+  # Mesh AP thresholds
+  mesh:
+    uplink_critical_dbm: -80
+    uplink_acceptable_dbm: -75
+    disconnect_threshold: 5
+
+  # Channel width recommendation thresholds
+  channel_width:
+    # Recommend 40MHz instead of 80MHz when more than this many APs exist
+    prefer_40mhz_when_aps_gt: 4
+    # Only recommend narrowing if client count on the AP is below this
+    narrow_when_clients_lt: 5
+
+  # Power optimization
+  power:
+    # Never reduce power on mesh APs or mesh parent APs
+    skip_reduction_for_mesh: true
+    skip_reduction_for_mesh_parents: true
+
+options:
+  # Days of historical data to analyze
+  lookback_days: 3
+
+  # Min RSSI strategy: "optimal" or "max_connectivity"
+  min_rssi_strategy: optimal
+
+  # Report generation
+  generate_html_report: true
+  generate_share_report: true

@@ -33,50 +33,45 @@ def find_latest_analysis_cache():
 
 def regenerate_report():
     """Regenerate HTML report from cached analysis data"""
+    import json
+
+    from core.html_report_generator import generate_html_report
+    from core.html_report_generator_share import generate_html_report as generate_share_html_report
 
     console.print("\n[bold cyan]HTML Report Regenerator[/bold cyan]\n")
 
-    # For now, just run a fresh analysis
-    # In future, we could cache analysis results
-    console.print("[yellow]Running fresh analysis to generate report...[/yellow]\n")
+    # Try to load from cache first
+    cache_file = find_latest_analysis_cache()
 
-    from api.cloudkey_gen2_client import CloudKeyGen2Client
-    from core.html_report_generator import generate_html_report
-    from core.html_report_generator_share import generate_html_report as generate_share_html_report
-    from core.optimize_network import analyze_network
-    from utils.keychain import get_credentials
-
-    # Load credentials
-    creds = get_credentials("default")
-    if not creds:
-        console.print("[red]Error: No saved credentials. Run optimizer.py first.[/red]")
+    if cache_file:
+        console.print(f"[green]Found cached analysis:[/green] {cache_file}")
+        try:
+            with open(cache_file, "r") as f:
+                cached = json.load(f)
+            analysis = cached.get("full_analysis")
+            recommendations = cached.get("recommendations", [])
+            site_name = cached.get("site_name", "default")
+            console.print("[green]✓[/green] Loaded from cache\n")
+        except Exception as e:
+            console.print(f"[red]Failed to load cache: {e}[/red]")
+            console.print("[yellow]No valid cache available. Run 'optimizer.py analyze' first.[/yellow]")
+            return False
+    else:
+        console.print("[yellow]No cached analysis found.[/yellow]")
+        console.print("[yellow]Run 'python3 optimizer.py analyze' first to generate analysis data.[/yellow]")
         return False
 
-    # Connect
-    console.print(f"[yellow]Connecting to {creds['host']}...[/yellow]")
-    client = CloudKeyGen2Client(
-        creds["host"],
-        creds["username"],
-        creds["password"],
-        site=creds.get("site", "default"),
-        verify_ssl=False,
-    )
-    console.print("[green]✓[/green] Connected\n")
-
-    # Analyze
-    console.print("[yellow]Running analysis...[/yellow]")
-    result = analyze_network(client, site=creds.get("site", "default"), lookback_days=3)
-    console.print("[green]✓[/green] Analysis complete\n")
+    if not analysis:
+        console.print("[red]Cached analysis data is empty.[/red]")
+        return False
 
     # Generate reports (both versions)
     console.print("[yellow]Generating HTML report...[/yellow]")
-    analysis = result.get("full_analysis")
-    recommendations = result.get("recommendations", [])
 
     report_path = generate_html_report(
         analysis_data=analysis,
         recommendations=recommendations,
-        site_name=creds.get("site", "default"),
+        site_name=site_name,
         output_dir="reports",
     )
 
@@ -86,7 +81,7 @@ def regenerate_report():
     share_report_path = generate_share_html_report(
         analysis_data=analysis,
         recommendations=recommendations,
-        site_name=creds.get("site", "default"),
+        site_name=site_name,
         output_dir="reports",
     )
 

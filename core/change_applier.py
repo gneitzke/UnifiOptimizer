@@ -16,9 +16,7 @@ console = Console()
 
 
 class ChangeImpactAnalyzer:
-    """Analyzes the impact of proposed ne        host='https://YOUR_CONTROLLER_IP',
-    username='YOUR_USERNAME',
-    password='YOUR_PASSWORD',rk changes"""
+    """Analyzes the impact of proposed network changes"""
 
     @staticmethod
     def analyze_channel_change(device, old_channel, new_channel, radio_band):
@@ -65,6 +63,9 @@ class ChangeImpactAnalyzer:
 
         return impact
 
+    # Map power mode names to numeric levels for comparison
+    POWER_LEVELS = {"low": 0, "medium": 1, "auto": 2, "high": 3}
+
     @staticmethod
     def analyze_power_change(device, old_power, new_power, radio_band):
         """Analyze impact of changing transmit power"""
@@ -77,7 +78,10 @@ class ChangeImpactAnalyzer:
             "estimated_downtime": "2-5 seconds",
         }
 
-        if new_power < old_power:
+        old_level = ChangeImpactAnalyzer.POWER_LEVELS.get(old_power, 2)
+        new_level = ChangeImpactAnalyzer.POWER_LEVELS.get(new_power, 2)
+
+        if new_level < old_level:
             impact["benefits"].append("Reduces co-channel interference")
             impact["benefits"].append("Improves roaming behavior")
             impact["risks"].append("Slightly reduced coverage area")

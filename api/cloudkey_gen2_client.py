@@ -402,12 +402,13 @@ class CloudKeyGen2Client:
         else:
             return f"{self.host}/proxy/network/api/{path}"
 
-    def get(self, path):
+    def get(self, path, params=None):
         """
         Perform GET request to CloudKey Gen2+ API
 
         Args:
             path: API path (e.g., s/default/stat/device)
+            params: Optional dict of query parameters
 
         Returns:
             dict: JSON response data or None on error
@@ -425,15 +426,19 @@ class CloudKeyGen2Client:
                 self.logger.debug(f"→ GET Request")
                 self.logger.debug(f"  URL: {url}")
                 self.logger.debug(f"  Path: {path}")
+                if params:
+                    self.logger.debug(f"  Params: {params}")
 
         # Verbose mode: Log request details to console
         if self.verbose:
             console.print(f"\n[bold cyan]→ GET Request[/bold cyan]")
             console.print(f"[cyan]URL:[/cyan] {url}")
             console.print(f"[cyan]Path:[/cyan] {path}")
+            if params:
+                console.print(f"[cyan]Params:[/cyan] {params}")
 
         try:
-            response = self.session.get(url, verify=self.verify_ssl)
+            response = self.session.get(url, params=params, verify=self.verify_ssl)
 
             if self.logger:
                 self.logger.info(f"Response: {response.status_code}")

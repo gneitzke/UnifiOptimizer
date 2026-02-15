@@ -5,7 +5,6 @@ Includes RSSI analysis, historical lookback, mesh AP optimization, and best prac
 """
 
 from collections import defaultdict
-from datetime import datetime, timedelta
 
 from rich.console import Console
 
@@ -15,20 +14,6 @@ console = Console()
 class ExpertNetworkAnalyzer:
     """Expert-level network analysis with historical data and best practices"""
 
-    # Best practice thresholds
-    RSSI_EXCELLENT = -50
-    RSSI_GOOD = -60
-    RSSI_FAIR = -70
-    RSSI_POOR = -80
-
-    # Mesh AP specific thresholds (more tolerant for reliability)
-    MESH_RSSI_ACCEPTABLE = -75  # Mesh uplinks can tolerate weaker signal
-    MESH_DISCONNECT_THRESHOLD = 5  # Mesh APs should be very stable
-
-    # Channel recommendations
-    CHANNEL_24_PREFERRED = [1, 6, 11]  # Non-overlapping channels
-    CHANNEL_5_DFS_START = 52  # DFS channels start here
-
     def __init__(self, client, site="default"):
         self.client = client
         self.site = site
@@ -36,6 +21,21 @@ class ExpertNetworkAnalyzer:
         self.clients = []
         self.events = []
         self.historical_events = []
+
+        # Load thresholds from config (user-customizable via data/config.yaml)
+        from utils.config import get_threshold
+
+        self.RSSI_EXCELLENT = get_threshold("rssi.excellent", -50)
+        self.RSSI_GOOD = get_threshold("rssi.good", -60)
+        self.RSSI_FAIR = get_threshold("rssi.fair", -70)
+        self.RSSI_POOR = get_threshold("rssi.poor", -80)
+
+        self.MESH_RSSI_ACCEPTABLE = get_threshold("mesh.uplink_acceptable_dbm", -75)
+        self.MESH_DISCONNECT_THRESHOLD = get_threshold("mesh.disconnect_threshold", 5)
+
+    # Channel recommendations
+    CHANNEL_24_PREFERRED = [1, 6, 11]  # Non-overlapping channels
+    CHANNEL_5_DFS_START = 52  # DFS channels start here
 
     def collect_data(self, lookback_days=3):
         """
@@ -59,12 +59,10 @@ class ExpertNetworkAnalyzer:
         self.events = events_response.get("data", []) if events_response else []
 
         # Get historical events (last N days)
-        # Calculate timestamp for N days ago (in milliseconds)
-        lookback_ms = int((datetime.now() - timedelta(days=lookback_days)).timestamp() * 1000)
-
         try:
+            within_hours = lookback_days * 24
             historical_response = self.client.get(
-                f"s/{self.site}/stat/event", params={"within": lookback_days * 24}
+                f"s/{self.site}/stat/event", params={"within": within_hours}
             )
             self.historical_events = (
                 historical_response.get("data", []) if historical_response else []
