@@ -27,10 +27,12 @@ A comprehensive toolkit for analyzing and optimizing Ubiquiti UniFi networks. Pr
 
 ### Network Analysis
 - **📡 RF Optimization**: Channel overlap detection, transmit power analysis, interference identification
-- **🔌 Client Health**: RSSI histograms, signal quality tracking, disconnect analysis
-- **📊 Historical Analysis**: 3-7 day lookback for trend detection and data-driven recommendations
+- **🔌 Client Health**: Continuous RSSI scoring curve, weighted composite health (signal/stability/roaming/throughput)
+- **📊 Historical Analysis**: 3-7 day lookback with event timeline charts and detective insights
+- **🗺️ Client Journeys**: Per-client roaming path tracking, disconnect patterns, AP transition history, session duration
 - **🌐 Mesh AP Monitoring**: Uplink signal strength, reliability checks, DFS avoidance
 - **📱 Device Intelligence**: Manufacturer identification, IoT device categorization, VLAN recommendations
+- **📈 Event Timeline**: Stacked bar chart of disconnects, roaming, DFS radar, and restarts by hour
 
 ### Optimization Workflow
 - **📊 Analyze Mode**: Safe read-only analysis with HTML reports
@@ -40,7 +42,8 @@ A comprehensive toolkit for analyzing and optimizing Ubiquiti UniFi networks. Pr
 - **🔄 Roaming Analysis**: Minimum RSSI threshold optimization for fast client roaming
 
 ### Reporting & Safety
-- **📱 Mobile-Friendly Reports**: Responsive HTML reports viewable on any device
+- **📱 Mobile-Friendly Reports**: Responsive HTML reports with Chart.js visualizations
+- **📊 Compact & Expandable**: Collapsible sections with at-a-glance summaries
 - **🔒 Read-Only Analysis Mode**: Safe network assessment without changes
 - **💾 Profile Management**: Secure credential storage in macOS Keychain
 - **📝 Change Logging**: Complete audit trail of all modifications
