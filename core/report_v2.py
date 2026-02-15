@@ -490,7 +490,9 @@ def _svg_hbar(items, max_val=None):
 
 
 def _svg_swim_lane(client_name, client_data, width=700):
-    """Client journey swim lane visualization."""
+    """Client journey swim lane visualization with time axis."""
+    from datetime import datetime as _dt
+
     ap_path = client_data.get("ap_path", [])
     visited_aps = client_data.get("visited_aps", [])
     if not ap_path or not visited_aps:
@@ -499,12 +501,14 @@ def _svg_swim_lane(client_name, client_data, width=700):
     behavior = client_data.get("behavior", "unknown")
     roams = client_data.get("roam_count", 0)
     daily = client_data.get("daily_roam_rate", 0)
+    path_count = len(ap_path)
 
     # Limit APs shown to most visited (top 6)
     visited_aps = visited_aps[:6]
     row_h = 24
     label_w = 85
-    h = len(visited_aps) * row_h + 30
+    time_axis_h = 18
+    h = len(visited_aps) * row_h + 30 + time_axis_h
 
     # Time range
     times = [e.get("ts", 0) for e in ap_path if e.get("ts")]
@@ -512,14 +516,32 @@ def _svg_swim_lane(client_name, client_data, width=700):
         return ""
     t_min, t_max = min(times), max(times)
     t_span = t_max - t_min or 1
+    chart_w = width - label_w - 10
 
     ap_colors = ["#006fff", "#34a853", "#fbbc04", "#ea8600", "#9c27b0", "#00bcd4", "#ff5722"]
 
     parts = [f'<svg viewBox="0 0 {width} {h}" width="100%" preserveAspectRatio="xMinYMin meet" style="max-width:{width}px">']
 
+    # Time axis labels
+    n_ticks = min(6, max(2, int(t_span / 3600 / 4)))
+    for i in range(n_ticks + 1):
+        frac = i / n_ticks
+        x = label_w + frac * chart_w
+        tick_ts = t_min + frac * t_span
+        dt = _dt.fromtimestamp(tick_ts)
+        label = dt.strftime("%b %d %H:%M") if t_span > 86400 else dt.strftime("%H:%M")
+        parts.append(
+            f'<text x="{x:.0f}" y="12" fill="#5f6368" font-size="8" '
+            f'text-anchor="middle" font-family="sans-serif">{label}</text>'
+        )
+        parts.append(
+            f'<line x1="{x:.0f}" y1="16" x2="{x:.0f}" y2="{h - 4}" '
+            f'stroke="#1e2d4a" stroke-width="0.5" stroke-dasharray="2 3"/>'
+        )
+
     # Grid lines and AP labels
     for i, ap in enumerate(visited_aps):
-        y = i * row_h + 20
+        y = i * row_h + 20 + time_axis_h
         parts.append(f'<text x="2" y="{y + 4}" fill="#9aa0a6" font-size="9.5" font-family="sans-serif">{_esc(ap[:12])}</text>')
         parts.append(f'<line x1="{label_w}" y1="{y - 6}" x2="{width}" y2="{y - 6}" stroke="#1e2d4a" stroke-width="0.5"/>')
 
@@ -532,24 +554,39 @@ def _svg_swim_lane(client_name, client_data, width=700):
         t_start = event.get("ts", 0)
         t_end = ap_path[i + 1].get("ts", t_max) if i + 1 < len(ap_path) else t_max
 
-        x1 = label_w + (t_start - t_min) / t_span * (width - label_w - 10)
-        x2 = label_w + (t_end - t_min) / t_span * (width - label_w - 10)
-        y = row * row_h + 12
+        x1 = label_w + (t_start - t_min) / t_span * chart_w
+        x2 = label_w + (t_end - t_min) / t_span * chart_w
+        y = row * row_h + 12 + time_axis_h
         color = ap_colors[row % len(ap_colors)]
         w = max(2, x2 - x1)
         parts.append(f'<rect x="{x1:.1f}" y="{y}" width="{w:.1f}" height="{row_h - 6}" rx="2" fill="{color}" opacity="0.65"/>')
 
+        # Roam transition marker
+        if i > 0:
+            parts.append(
+                f'<circle cx="{x1:.1f}" cy="{y + (row_h - 6)/2}" r="3" '
+                f'fill="#e8eaed" stroke="{color}" stroke-width="1"/>'
+            )
+
     parts.append("</svg>")
 
-    bclass = "behavior-high-roam" if behavior == "flapping" else "behavior-roamer" if "roam" in behavior else "behavior-sticky" if behavior == "sticky" else "behavior-stable"
-    behavior_display = "High Roam" if behavior == "flapping" else behavior.replace("_", " ").title()
+    bclass = _behavior_css_class(behavior)
+    behavior_display = _behavior_display(behavior)
+
+    # Data completeness note
+    data_note = ""
+    if roams > path_count:
+        data_note = (
+            f'<div style="font-size:10px;color:#5f6368;margin-top:2px">'
+            f'Showing {path_count} of {roams} roam events (most recent sampled from controller)</div>'
+        )
 
     return (
         f'<div class="swim-lane-wrap">'
         f'<div class="swim-lane-title">{_esc(client_name)} '
         f'<span class="behavior-badge {bclass}">{_esc(behavior_display)}</span></div>'
         f'<div class="swim-lane-subtitle">{roams} roams ({daily:.0f}/day) across {len(visited_aps)} APs</div>'
-        f'{"".join(parts)}</div>'
+        f'{"".join(parts)}{data_note}</div>'
     )
 
 
@@ -575,84 +612,113 @@ def _behavior_css_class(behavior):
 # ---------------------------------------------------------------------------
 
 def _svg_device_timeline(analysis_data, width=860):
-    """Timeline chart: top devices on Y, 6-hour time blocks on X.
-    Shows roam events, disconnects, and uptime gaps."""
-    from datetime import datetime as _dt, timedelta
+    """Network event timeline using accurate hourly event data.
+    Rows: Roaming, Restarts, DFS Radar. X-axis: hours, ending at today."""
+    from datetime import datetime as _dt
+    import time
 
-    journeys = analysis_data.get("client_journeys", {})
-    jc = journeys.get("clients", {})
-    ap_events = analysis_data.get("event_timeline", {}).get("ap_events", {})
-    devices = analysis_data.get("devices", [])
+    et = analysis_data.get("event_timeline", {})
+    hours = et.get("hours", [])
+    cats = et.get("categories", {})
+    ap_events = et.get("ap_events", {})
 
-    # Collect all timestamped events per device (AP)
-    device_events = {}  # ap_name -> [(ts, event_type), ...]
+    roaming = cats.get("roaming", [])
+    restarts = cats.get("device_restart", [])
+    dfs = cats.get("dfs_radar", [])
 
-    # From ap_events summary
-    for ap_name, ecounts in ap_events.items():
-        if not isinstance(ecounts, dict):
-            continue
-        device_events.setdefault(ap_name, [])
+    if not hours or not roaming:
+        return ""
 
-    # From client journeys ap_path (roaming events)
+    n_hours = len(hours)
+
+    # Parse time range from hours array; extend to "now"
+    try:
+        t_first = _dt.strptime(hours[0], "%Y-%m-%d %H:%M")
+        t_last = _dt.strptime(hours[-1], "%Y-%m-%d %H:%M")
+    except (ValueError, IndexError):
+        return ""
+
+    now = _dt.now()
+    # Total hours from first event to now
+    total_span_h = max(1, int((now - t_first).total_seconds() / 3600))
+
+    # Bin into 6-hour blocks for the entire range (data + gap to now)
+    block_h = 6
+    n_blocks = max(1, total_span_h // block_h + 1)
+
+    # Aggregate hourly data into 6h blocks
+    def bin_hourly(hourly_data):
+        bins = [0] * n_blocks
+        for i, val in enumerate(hourly_data):
+            if i < n_hours and val:
+                bi = i // block_h
+                if 0 <= bi < n_blocks:
+                    bins[bi] += val
+        return bins
+
+    # Build rows: one per event category + one per top AP
+    rows = []
+
+    roam_bins = bin_hourly(roaming)
+    if sum(roam_bins):
+        rows.append(("Roaming", roam_bins, "#006fff", sum(roaming)))
+
+    restart_bins = bin_hourly(restarts)
+    if sum(restart_bins):
+        rows.append(("Restarts", restart_bins, "#ea4335", sum(restarts)))
+
+    dfs_bins = bin_hourly(dfs)
+    if sum(dfs_bins):
+        rows.append(("DFS Radar", dfs_bins, "#fbbc04", sum(dfs)))
+
+    # Per-AP rows for top 5 APs by roaming volume
+    top_aps = sorted(ap_events.items(), key=lambda x: x[1].get("roaming", 0) if isinstance(x[1], dict) else 0, reverse=True)[:5]
+    # We don't have per-AP hourly data, but we CAN reconstruct from client journeys
+    jc = analysis_data.get("client_journeys", {}).get("clients", {})
+    ap_hourly = {}
     for mac, jdata in jc.items():
         for evt in jdata.get("ap_path", []):
             ts = evt.get("ts", 0)
-            if ts:
-                to_ap = evt.get("to_ap", "")
-                if to_ap:
-                    device_events.setdefault(to_ap, []).append((ts, "roam"))
+            to_ap = evt.get("to_ap", "")
+            if ts and to_ap:
+                # Convert ts to hour offset from t_first
+                offset_h = int((ts - t_first.timestamp()) / 3600)
+                if 0 <= offset_h < total_span_h:
+                    ap_hourly.setdefault(to_ap, [0] * total_span_h)
+                    if offset_h < len(ap_hourly[to_ap]):
+                        ap_hourly[to_ap][offset_h] += 1
 
-    # Device uptimes
-    for dev in devices:
-        name = dev.get("name", "")
-        uptime = dev.get("uptime", 0) or 0
-        last_seen = dev.get("last_seen", 0) or 0
-        if last_seen and uptime and name:
-            boot_ts = last_seen - uptime
-            device_events.setdefault(name, []).append((boot_ts, "restart"))
+    for ap_name, ecounts in top_aps:
+        total = ecounts.get("roaming", 0) if isinstance(ecounts, dict) else 0
+        if total < 5:
+            continue
+        if ap_name in ap_hourly:
+            bins = bin_hourly(ap_hourly[ap_name])
+        else:
+            bins = [0] * n_blocks
+        rows.append((ap_name[:14], bins, "#34a853", total))
 
-    if not device_events:
-        return ""
-
-    # Rank devices by event count, take top 7
-    ranked = sorted(device_events.items(), key=lambda x: len(x[1]), reverse=True)
-    top_devices = [(name, evts) for name, evts in ranked if evts][:7]
-    if not top_devices:
-        return ""
-
-    # Time range from all events
-    all_ts = [ts for _, evts in top_devices for ts, _ in evts]
-    if not all_ts:
-        return ""
-    t_min = min(all_ts)
-    t_max = max(all_ts)
-    t_span = t_max - t_min
-    if t_span < 3600:
-        return ""
-
-    # Snap to 6-hour blocks
-    block_secs = 6 * 3600
-    t_start = (t_min // block_secs) * block_secs
-    t_end = ((t_max // block_secs) + 1) * block_secs
-    n_blocks = int((t_end - t_start) / block_secs)
-    if n_blocks < 2:
+    if not rows:
         return ""
 
     row_h = 28
     label_w = 100
     top_pad = 30
-    h = len(top_devices) * row_h + top_pad + 20
+    h = len(rows) * row_h + top_pad + 20
     chart_w = width - label_w - 10
 
     parts = [f'<svg viewBox="0 0 {width} {h}" width="100%" preserveAspectRatio="xMinYMin meet" style="max-width:{width}px">']
 
-    # X-axis labels (every 4th block or daily if many blocks)
-    label_every = max(1, n_blocks // 12)
+    # X-axis labels
+    n_labels = min(12, n_blocks)
+    label_every = max(1, n_blocks // n_labels)
     for i in range(0, n_blocks + 1, label_every):
         x = label_w + (i / n_blocks) * chart_w
-        block_ts = t_start + i * block_secs
-        dt = _dt.fromtimestamp(block_ts)
-        label = dt.strftime("%b %d") if (block_ts % 86400 < block_secs) else dt.strftime("%H:%M")
+        from datetime import timedelta
+        block_dt = t_first + timedelta(hours=i * block_h)
+        if block_dt > now:
+            block_dt = now
+        label = block_dt.strftime("%b %d")
         parts.append(
             f'<text x="{x:.0f}" y="{top_pad - 8}" fill="#5f6368" font-size="9" '
             f'text-anchor="middle" font-family="sans-serif">{label}</text>'
@@ -662,51 +728,50 @@ def _svg_device_timeline(analysis_data, width=860):
             f'stroke="#1e2d4a" stroke-width="0.5" stroke-dasharray="3 3"/>'
         )
 
-    event_colors = {"roam": "#006fff", "restart": "#ea4335", "disconnect": "#fbbc04"}
+    # "Today" marker at right edge
+    today_x = label_w + chart_w
+    parts.append(
+        f'<text x="{today_x:.0f}" y="{top_pad - 8}" fill="#006fff" font-size="9" '
+        f'text-anchor="end" font-family="sans-serif" font-weight="600">Today</text>'
+    )
+    parts.append(
+        f'<line x1="{today_x:.0f}" y1="{top_pad}" x2="{today_x:.0f}" y2="{h - 10}" '
+        f'stroke="#006fff" stroke-width="1" stroke-dasharray="4 2"/>'
+    )
 
-    for row_idx, (dev_name, evts) in enumerate(top_devices):
+    for row_idx, (row_label, bins, color, total) in enumerate(rows):
         y_center = top_pad + row_idx * row_h + row_h // 2
 
-        # Device label
         parts.append(
             f'<text x="{label_w - 6}" y="{y_center + 3}" fill="#9aa0a6" '
-            f'font-size="10" text-anchor="end" font-family="sans-serif">{_esc(dev_name[:14])}</text>'
+            f'font-size="10" text-anchor="end" font-family="sans-serif">{_esc(row_label)}</text>'
         )
-        # Row background line
         parts.append(
             f'<line x1="{label_w}" y1="{y_center}" x2="{width - 10}" y2="{y_center}" '
             f'stroke="#1e2d4a" stroke-width="0.5"/>'
         )
 
-        # Bin events into 6h blocks for density display
-        bins = [0] * n_blocks
-        for ts, etype in evts:
-            bi = int((ts - t_start) / block_secs)
-            if 0 <= bi < n_blocks:
-                bins[bi] += 1
+        # Total annotation
+        parts.append(
+            f'<text x="{label_w + 2}" y="{y_center - 8}" fill="#5f6368" '
+            f'font-size="8" font-family="sans-serif">{_fmt(total)} total</text>'
+        )
 
         max_bin = max(bins) if bins else 1
+        bw = max(2, chart_w / n_blocks - 0.5)
         for bi, count in enumerate(bins):
             if count == 0:
                 continue
             x = label_w + (bi / n_blocks) * chart_w
-            bw = max(3, chart_w / n_blocks - 1)
             intensity = min(1.0, count / max(max_bin, 1))
-            opacity = 0.2 + intensity * 0.7
-            color = "#006fff"
-            # Check for restarts in this block
-            for ts, etype in evts:
-                bi2 = int((ts - t_start) / block_secs)
-                if bi2 == bi and etype == "restart":
-                    color = "#ea4335"
-                    break
-            bar_h = 6 + intensity * 12
+            opacity = 0.25 + intensity * 0.65
+            bar_h = 4 + intensity * 14
             parts.append(
                 f'<rect x="{x:.1f}" y="{y_center - bar_h/2:.1f}" '
-                f'width="{bw:.1f}" height="{bar_h:.1f}" rx="2" '
+                f'width="{bw:.1f}" height="{bar_h:.1f}" rx="1.5" '
                 f'fill="{color}" opacity="{opacity:.2f}"/>'
             )
-            if count > 2:
+            if count >= 5:
                 parts.append(
                     f'<text x="{x + bw/2:.1f}" y="{y_center + 3}" fill="#e8eaed" '
                     f'font-size="7" text-anchor="middle" font-family="sans-serif">{count}</text>'
@@ -714,17 +779,30 @@ def _svg_device_timeline(analysis_data, width=860):
 
     parts.append("</svg>")
 
+    # Data gap notice
+    data_end = t_last.strftime("%b %d %Y")
+    gap_days = int((now - t_last).total_seconds() / 86400)
+    gap_note = ""
+    if gap_days > 1:
+        gap_note = (
+            f'<div style="font-size:11px;color:#5f6368;margin-top:4px;text-align:center">'
+            f'Event data covers {t_first.strftime("%b %d")} – {data_end} · '
+            f'{gap_days}-day gap to today (no recent events on controller)</div>'
+        )
+
     legend = (
         '<div style="display:flex;gap:14px;justify-content:center;margin-top:6px;font-size:11px;color:#5f6368">'
-        '<span>🔵 Roaming</span><span>🔴 Restart</span>'
-        '<span style="color:#9aa0a6">Bar height = event density per 6hr block</span>'
+        '<span style="color:#006fff">■</span> Roaming'
+        '<span style="color:#ea4335;margin-left:8px">■</span> Restarts'
+        '<span style="color:#fbbc04;margin-left:8px">■</span> DFS Radar'
+        '<span style="color:#34a853;margin-left:8px">■</span> Per-AP Roaming'
         '</div>'
     )
 
     return (
-        f'<div class="section-title"><span class="icon">📊</span> Device Activity Timeline</div>'
+        f'<div class="section-title"><span class="icon">📊</span> Event Timeline</div>'
         f'<div class="topology-wrap">'
-        f'{"".join(parts)}{legend}</div>'
+        f'{"".join(parts)}{legend}{gap_note}</div>'
     )
 
 
@@ -1365,7 +1443,7 @@ def _clients_panel(analysis_data):
     journey_html = ""
     top_issues = journeys.get("top_issues", [])
     journey_clients = journeys.get("clients", {})
-    for issue in top_issues[:3]:
+    for issue in top_issues[:5]:
         client_name = issue.get("client", "?")
         # Find MAC for this client
         client_mac = None
