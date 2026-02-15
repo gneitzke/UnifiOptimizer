@@ -132,9 +132,9 @@ class NetworkHealthAnalyzer:
 
         try:
             within_hours = lookback_days * 24
-            events_response = self.client.get(
+            events_response = self.client.post(
                 f"s/{self.site}/stat/event",
-                params={"within": within_hours, "_limit": 1000},
+                {"within": within_hours, "_limit": 1000},
             )
 
             if not events_response or "data" not in events_response:
