@@ -287,6 +287,37 @@ body {
     .stat-card { background: #f5f5f5; border: 1px solid #ddd; }
 }
 
+/* Expandable detail sections */
+details { margin-top: 10px; }
+details summary {
+    cursor: pointer; font-size: 12px; color: #006fff; font-weight: 500;
+    padding: 4px 0; user-select: none; list-style: none;
+}
+details summary::-webkit-details-marker { display: none; }
+details summary::before { content: "▸ "; }
+details[open] summary::before { content: "▾ "; }
+details .detail-body {
+    margin-top: 8px; padding: 10px 14px; background: #0d1a2e;
+    border-radius: 6px; border: 1px solid #1e2d4a; font-size: 12px;
+}
+details .detail-body table { width: 100%; border-collapse: collapse; }
+details .detail-body th {
+    text-align: left; padding: 4px 8px; color: #5f6368; font-weight: 500;
+    font-size: 11px; border-bottom: 1px solid #1e2d4a;
+}
+details .detail-body td { padding: 4px 8px; border-bottom: 1px solid #1e2d4a15; color: #9aa0a6; }
+.action-devices { margin-top: 6px; font-size: 12px; color: #5f6368; }
+.health-detail { margin-top: 12px; }
+.health-issue {
+    padding: 8px 12px; margin-bottom: 6px; border-radius: 6px;
+    font-size: 12px; border-left: 3px solid;
+}
+.health-issue.high { background: #ea433510; border-color: #ea4335; }
+.health-issue.medium { background: #fbbc0410; border-color: #fbbc04; }
+.health-issue .issue-msg { color: #e8eaed; }
+.health-issue .issue-impact { color: #9aa0a6; font-size: 11px; margin-top: 2px; }
+.health-issue .issue-fix { color: #006fff; font-size: 11px; margin-top: 2px; }
+
 /* Responsive */
 @media (max-width: 768px) {
     .hero { flex-direction: column; padding: 24px; gap: 20px; }
@@ -800,6 +831,7 @@ def _group_recs(recommendations, analysis_data):
             "action": recs[0].get("recommendation", ""),
             "count": len(recs),
             "devices": devs,
+            "recs": recs,
         })
 
     # Remaining groups
@@ -820,6 +852,31 @@ def _group_recs(recommendations, analysis_data):
 # Section: Top Actions
 # ---------------------------------------------------------------------------
 
+def _action_detail_html(action):
+    """Build expandable detail for an action card."""
+    recs = action.get("recs", [])
+    if not recs and action.get("priority") == "critical":
+        # Critical issues have action/recommendation text
+        fix = action.get("action", "")
+        if fix:
+            return f'<details><summary>View details</summary><div class="detail-body"><p style="color:#9aa0a6">{_esc(fix)}</p></div></details>'
+        return ""
+    if not recs:
+        return ""
+    rows = []
+    for r in recs:
+        ap_name = r.get("ap", {}).get("name", r.get("device", "?"))
+        band = r.get("band", "")
+        msg = r.get("message", r.get("recommendation", ""))
+        rows.append(f'<tr><td style="color:#e8eaed;white-space:nowrap">{_esc(ap_name)}</td><td>{_esc(band)}</td><td>{_esc(msg)}</td></tr>')
+    return (
+        f'<details><summary>View {len(recs)} individual changes</summary>'
+        f'<div class="detail-body"><table>'
+        f'<tr><th>Device</th><th>Band</th><th>Change</th></tr>'
+        f'{"".join(rows)}</table></div></details>'
+    )
+
+
 def _actions(recommendations, analysis_data):
     actions = _group_recs(recommendations, analysis_data)
     if not actions:
@@ -832,6 +889,7 @@ def _actions(recommendations, analysis_data):
     for i, action in enumerate(visible):
         pri = action.get("priority", "recommended")
         color = _priority_color(pri)
+        detail_expand = _action_detail_html(action)
         cards.append(
             f'<div class="action-card {pri}">'
             f'<div class="action-num" style="background:{color}">{i + 1}</div>'
@@ -841,7 +899,9 @@ def _actions(recommendations, analysis_data):
             f'<div class="action-meta">'
             f'<span class="action-badge" style="background:{color}20;color:{color}">{_priority_label(pri)}</span>'
             f'<span>{action.get("count", 1)} change{"s" if action.get("count", 1) > 1 else ""}</span>'
-            f'</div></div></div>'
+            f'</div>'
+            f'{detail_expand}'
+            f'</div></div>'
         )
 
     hidden_html = ""
@@ -850,12 +910,14 @@ def _actions(recommendations, analysis_data):
         for i, action in enumerate(hidden):
             pri = action.get("priority", "recommended")
             color = _priority_color(pri)
+            detail_expand = _action_detail_html(action)
             hidden_cards.append(
                 f'<div class="action-card {pri}">'
                 f'<div class="action-num" style="background:{color}">{i + 6}</div>'
                 f'<div class="action-body">'
                 f'<div class="action-title">{_esc(action["title"])}</div>'
                 f'<div class="action-detail">{_esc(action.get("detail", ""))}</div>'
+                f'{detail_expand}'
                 f'</div></div>'
             )
         hidden_html = (
@@ -932,6 +994,42 @@ def _rf_panel(analysis_data):
         '</table>'
     )
 
+    # Airtime utilization
+    airtime = analysis_data.get("airtime_analysis", {}).get("ap_utilization", {})
+    airtime_items = []
+    for key, data in sorted(airtime.items(), key=lambda x: -x[1].get("airtime_pct", 0)):
+        pct = data.get("airtime_pct", 0)
+        color = "#ea4335" if pct > 80 else "#fbbc04" if pct > 50 else "#34a853"
+        airtime_items.append((key[:18], pct, color))
+    airtime_chart = _svg_hbar(airtime_items[:10], max_val=100) if airtime_items else ""
+
+    # Per-AP detail expand (clients per AP)
+    ap_client_detail = ""
+    for ap in ap_details:
+        ap_name = ap.get("name", "?")
+        ap_clients = ap.get("clients", [])
+        if not ap_clients:
+            continue
+        client_rows = []
+        for c in sorted(ap_clients, key=lambda x: x.get("rssi", -100)):
+            rssi = c.get("rssi", 0)
+            if rssi and rssi > 0:
+                rssi = -rssi
+            hostname = c.get("hostname", c.get("mac", "?")[:12])
+            signal = c.get("signal", rssi)
+            proto = c.get("radio_proto", "?")
+            ch_w = c.get("channel_width", "?")
+            client_rows.append(
+                f'<tr><td style="color:#e8eaed">{_esc(hostname[:20])}</td>'
+                f'<td>{signal} dBm</td><td>{proto}</td><td>{ch_w}MHz</td></tr>'
+            )
+        ap_client_detail += (
+            f'<details><summary>{_esc(ap_name)} — {len(ap_clients)} clients</summary>'
+            f'<div class="detail-body"><table>'
+            f'<tr><th>Client</th><th>Signal</th><th>Proto</th><th>Width</th></tr>'
+            f'{"".join(client_rows)}</table></div></details>'
+        )
+
     return (
         f'<div class="panel-grid">'
         # Signal distribution
@@ -946,10 +1044,19 @@ def _rf_panel(analysis_data):
         f'<div class="panel-card">'
         f'<h3>Client Capabilities</h3>'
         f'{cap_donut}</div>'
-        # Power/Channel matrix
+        # Airtime
         f'<div class="panel-card">'
+        f'<h3>Airtime Utilization <span class="count">(%)</span></h3>'
+        f'{airtime_chart if airtime_chart else "<span style=color:#5f6368>No airtime data</span>"}</div>'
+        # Power/Channel matrix
+        f'<div class="panel-card full">'
         f'<h3>Channel &amp; Power Map</h3>'
         f'{matrix_html}</div>'
+        # Per-AP client detail
+        f'<div class="panel-card full">'
+        f'<h3>Per-AP Client Detail</h3>'
+        f'{ap_client_detail if ap_client_detail else "<span style=color:#5f6368>No client data</span>"}'
+        f'</div>'
         f'</div>'
     )
 
@@ -1029,14 +1136,65 @@ def _clients_panel(analysis_data):
 
     total_tracked = journeys.get("total_tracked", 0)
 
+    # Full client list expandable
+    all_wireless = [c for c in all_clients if not c.get("is_wired")]
+    all_wireless.sort(key=lambda c: c.get("health_score", 100))
+    full_rows = []
+    for c in all_wireless:
+        score = c.get("health_score", 0)
+        color = _score_color(score)
+        rssi = c.get("rssi", 0)
+        full_rows.append(
+            f'<tr><td style="color:#e8eaed">{_esc(c.get("hostname", "?")[:22])}</td>'
+            f'<td>{_esc(c.get("ap_name", "?"))}</td>'
+            f'<td>{rssi} dBm</td>'
+            f'<td style="color:{color}">{score} ({c.get("grade", "?")})</td>'
+            f'<td>{c.get("channel", 0)}</td>'
+            f'<td>{c.get("roam_count", 0)}</td></tr>'
+        )
+    full_client_expand = (
+        f'<details><summary>View all {len(all_wireless)} wireless clients</summary>'
+        f'<div class="detail-body"><table>'
+        f'<tr><th>Client</th><th>AP</th><th>Signal</th><th>Health</th><th>Channel</th><th>Roams</th></tr>'
+        f'{"".join(full_rows)}</table></div></details>'
+    ) if all_wireless else ""
+
+    # Health issues expandable
+    health_cats = analysis_data.get("health_analysis", {}).get("categories", {})
+    health_detail = ""
+    for cat_name, cat_data in health_cats.items():
+        issues = cat_data.get("issues", [])
+        if not issues:
+            continue
+        issue_cards = []
+        for issue in issues:
+            sev = issue.get("severity", "medium")
+            issue_cards.append(
+                f'<div class="health-issue {sev}">'
+                f'<div class="issue-msg">{_esc(issue.get("message", ""))}</div>'
+                f'<div class="issue-impact">{_esc(issue.get("impact", ""))}</div>'
+                f'<div class="issue-fix">{_esc(issue.get("recommendation", ""))}</div>'
+                f'</div>'
+            )
+        label = cat_name.replace("_", " ").title()
+        health_detail += (
+            f'<details><summary>{_esc(label)} — {len(issues)} issue{"s" if len(issues) > 1 else ""}</summary>'
+            f'<div class="detail-body">{"".join(issue_cards)}</div></details>'
+        )
+
     return (
         f'<div class="panel-grid">'
         f'<div class="panel-card full">'
         f'<h3>Problem Clients <span class="count">({len(problem_clients)} of {ca.get("total_clients", 0)})</span></h3>'
-        f'{client_table}</div>'
+        f'{client_table}'
+        f'{full_client_expand}</div>'
         f'<div class="panel-card full">'
         f'<h3>Client Journeys <span class="count">({total_tracked} tracked)</span></h3>'
         f'{journey_html}</div>'
+        f'<div class="panel-card full">'
+        f'<h3>Health Issues</h3>'
+        f'{health_detail if health_detail else "<span style=color:#34a853>No health issues detected.</span>"}'
+        f'</div>'
         f'</div>'
     )
 
@@ -1114,12 +1272,43 @@ def _infra_panel(analysis_data):
         active_ports = sum(1 for p in ports if (p.get("speed", 0) or 0) > 0)
         total_ports = len(ports)
 
+        # Expandable port detail table
+        port_detail_rows = []
+        for p in ports:
+            pidx = p.get("port_idx", "?")
+            pspeed = p.get("speed", 0) or 0
+            pname = p.get("name", "")
+            connected = p.get("connected_client", "")
+            rx_d = p.get("rx_dropped", 0) or 0
+            tx_d = p.get("tx_dropped", 0) or 0
+            p_is_ap = p.get("is_ap", False)
+            poe_w = p.get("poe_power")
+            speed_str = f"{pspeed}M" if pspeed else "Down"
+            drops_str = f"{_fmt(rx_d + tx_d)}" if (rx_d + tx_d) > 0 else "0"
+            label = pname if pname and pname != f"Port {pidx}" else connected or ""
+            if p_is_ap:
+                label += " [AP]"
+            try:
+                poe_str = f"{float(poe_w):.1f}W" if poe_w else ""
+            except (ValueError, TypeError):
+                poe_str = str(poe_w) if poe_w else ""
+            port_detail_rows.append(
+                f'<tr><td>{pidx}</td><td style="color:#e8eaed">{_esc(label[:24])}</td>'
+                f'<td>{speed_str}</td><td>{drops_str}</td><td>{poe_str}</td></tr>'
+            )
+        port_detail = (
+            f'<details><summary>Port details</summary>'
+            f'<div class="detail-body"><table>'
+            f'<tr><th>#</th><th>Device</th><th>Speed</th><th>Drops</th><th>PoE</th></tr>'
+            f'{"".join(port_detail_rows)}</table></div></details>'
+        )
+
         cards.append(
             f'<div class="panel-card">'
             f'<h3>{_esc(name)} <span class="count">{model}</span></h3>'
             f'<div style="font-size:12px;color:#9aa0a6;margin-bottom:8px">{active_ports}/{total_ports} ports active</div>'
             f'<div class="port-grid">{"".join(port_cells)}</div>'
-            f'{poe_html}{issue_html}'
+            f'{poe_html}{issue_html}{port_detail}'
             f'</div>'
         )
 
