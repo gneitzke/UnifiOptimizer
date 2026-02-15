@@ -100,7 +100,9 @@ def analyze_network(client, site="default", lookback_days=3, min_rssi_strategy="
 
         # Display client summary
         client_analysis = analysis["client_analysis"]
-        console.print(f"\n[green]✓[/green] Analyzed {client_analysis['total_clients']} clients")
+        wired_count = sum(1 for c in client_analysis["clients"] if c.get("is_wired"))
+        wireless_count = client_analysis["total_clients"] - wired_count
+        console.print(f"\n[green]✓[/green] Analyzed {client_analysis['total_clients']} clients ({wireless_count} wireless, {wired_count} wired)")
 
         if client_analysis["weak_signal"]:
             console.print(

@@ -398,24 +398,35 @@ class ExpertNetworkAnalyzer:
         client_analysis = []
 
         for client in self.clients:
-            # Skip wired clients — they don't have wireless metrics
-            if client.get("is_wired", False):
-                continue
-
             mac = client.get("mac")
             hostname = client.get("hostname", "Unknown")
+            is_wired = client.get("is_wired", False)
             rssi = client.get("rssi")
+            ap_mac = client.get("ap_mac")
+            channel = client.get("channel", 0)
 
-            # Skip clients with no RSSI (likely wired or offline)
-            if rssi is None:
+            # Wired clients: include in total count with perfect wireless score
+            if is_wired or rssi is None:
+                client_analysis.append({
+                    "mac": mac,
+                    "hostname": hostname,
+                    "ip": client.get("ip", "Unknown"),
+                    "rssi": 0,
+                    "ap_name": "Wired",
+                    "ap_mac": ap_mac,
+                    "channel": 0,
+                    "signal_quality": 100,
+                    "disconnect_count": len(client_disconnects.get(mac, [])),
+                    "roam_count": 0,
+                    "health_score": 100,
+                    "grade": "A+",
+                    "is_wired": True,
+                })
                 continue
 
             # Some UniFi controllers return positive RSSI values
             if rssi > 0:
                 rssi = -rssi
-
-            ap_mac = client.get("ap_mac")
-            channel = client.get("channel", 0)
 
             # Find AP name
             ap_name = "Unknown"
@@ -519,9 +530,9 @@ class ExpertNetworkAnalyzer:
         return {
             "clients": client_analysis,
             "total_clients": len(client_analysis),
-            "weak_signal": [c for c in client_analysis if c["rssi"] < self.RSSI_FAIR],
+            "weak_signal": [c for c in client_analysis if not c.get("is_wired") and c["rssi"] < self.RSSI_FAIR],
             "frequent_disconnects": [c for c in client_analysis if c["disconnect_count"] >= 3],
-            "poor_health": [c for c in client_analysis if c["health_score"] < 60],
+            "poor_health": [c for c in client_analysis if not c.get("is_wired") and c["health_score"] < 60],
             "signal_distribution": signal_distribution,
         }
 
