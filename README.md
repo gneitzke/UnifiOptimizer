@@ -269,10 +269,11 @@ options:
 - **Power Levels**: Optimized for roaming and coverage
 
 ### Client Health (3-Day History)
-- **Signal Strength**: RSSI categorized (Excellent/Good/Fair/Poor/Critical)
-- **Disconnections**: Pattern tracking and frequency analysis
-- **Roaming**: Behavior analysis and sticky client detection
-- **Health Scores**: A-F grades for each client
+- **Signal Strength**: Continuous RSSI curve (not step-function) for accurate scoring
+- **Disconnections**: Exponential-decay stability scoring (first disconnects matter most)
+- **Roaming Health**: Rewards healthy roaming, penalizes sticky clients stuck on poor signal
+- **Health Scores**: Weighted composite (signal 40%, stability 25%, roaming 20%, throughput 15%)
+- **Per-Client Findings**: Wrong-band detection, dead-zone identification
 
 ### Expert Recommendations
 

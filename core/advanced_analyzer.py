@@ -388,7 +388,7 @@ class AdvancedNetworkAnalyzer:
 
                 # Check if AP is tri-band (has 6GHz radio)
                 radio_table = device.get("radio_table", [])
-                has_6ghz = any(radio.get("radio") in ["6e", "ax", "6g"] for radio in radio_table)
+                has_6ghz = any(radio.get("radio") in ["6e", "6g"] for radio in radio_table)
 
                 # Band steering is considered enabled if mode is not "off"
                 # Valid modes: "prefer_5g", "equal", "prefer_2g", etc.
@@ -1543,7 +1543,7 @@ class AdvancedNetworkAnalyzer:
                         band = "2.4GHz"
                     elif radio == "na":
                         band = "5GHz"
-                    elif radio in ["6e", "ax", "6g"]:
+                    elif radio in ["6e", "6g"]:
                         band = "6GHz"
                     else:
                         band = "Unknown"
@@ -1659,7 +1659,7 @@ class AdvancedNetworkAnalyzer:
                         band = "2.4GHz"
                     elif radio_stats == "na":
                         band = "5GHz"
-                    elif radio_stats in ["6e", "ax", "6g"]:
+                    elif radio_stats in ["6e", "6g"]:
                         band = "6GHz"
                     else:
                         band = "Unknown"
@@ -1787,7 +1787,7 @@ class AdvancedNetworkAnalyzer:
                         band = "2.4GHz"
                     elif radio_name == "na":
                         band = "5GHz"
-                    elif radio_name in ["6e", "ax", "6g"]:
+                    elif radio_name in ["6e", "6g"]:
                         band = "6GHz"
                     else:
                         band = "Unknown"
@@ -2028,7 +2028,7 @@ class AdvancedNetworkAnalyzer:
                     radio_name = radio.get("radio", "unknown")
 
                     # Only analyze 6GHz radios
-                    if radio_name not in ["6e", "ax", "6g"]:
+                    if radio_name not in ["6e", "6g"]:
                         continue
 
                     results["radios_6ghz"] += 1
@@ -2167,7 +2167,7 @@ class AdvancedNetworkAnalyzer:
                     radio_name = radio.get("radio", "unknown")
 
                     # Only analyze 6GHz radios
-                    if radio_name not in ["6e", "ax", "6g"]:
+                    if radio_name not in ["6e", "6g"]:
                         continue
 
                     results["radios_6ghz"] += 1
