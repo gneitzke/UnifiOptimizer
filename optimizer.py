@@ -45,8 +45,19 @@ Examples:
         )
         return 0
 
+    args = sys.argv[1:]
+
+    # If no subcommand given (first arg starts with -), infer one:
+    #   --dry-run present → optimize --dry-run
+    #   otherwise         → analyze (safe default)
+    if args[0].startswith("-"):
+        if "--dry-run" in args:
+            args = ["optimize"] + args
+        else:
+            args = ["analyze"] + args
+
     # Forward all arguments to core/optimize_network.py
-    cmd = ["python3", "core/optimize_network.py"] + sys.argv[1:]
+    cmd = ["python3", "core/optimize_network.py"] + args
     return subprocess.run(cmd).returncode
 
 
