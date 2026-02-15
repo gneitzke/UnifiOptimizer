@@ -259,14 +259,18 @@ class ClientHealthAnalyzer:
 
         return distribution
 
-    @staticmethod
-    def _rssi_to_quality(rssi):
+    def _rssi_to_quality(self, rssi):
         """Convert RSSI to continuous 0-100 quality score.
 
-        Uses a linear mapping: -95 dBm → 0, -50 dBm → 100.
-        Values outside the range are clamped.
+        Uses a linear mapping from config thresholds:
+        worst_rssi → 0, best_rssi → 100.
         """
-        return max(0, min(100, (rssi + 95) * (100 / 45)))
+        worst = self.RSSI_POOR - 15  # e.g., -95 for default -80
+        best = self.RSSI_EXCELLENT    # e.g., -50
+        span = best - worst
+        if span == 0:
+            return 50
+        return max(0, min(100, int((rssi - worst) / span * 100)))
 
     @staticmethod
     def _stability_score(disconnect_count, lookback_days=3):
@@ -663,10 +667,10 @@ def display_client_health_report(analysis):
             issues = []
             if client.get("is_wired", False):
                 issues.append("[green]Wired[/green]")
-            if client["disconnect_penalty"] > 0:
-                issues.append(f"Disconnects: {client['disconnect_penalty']//5}")
-            if client["roam_penalty"] > 0:
-                issues.append(f"Roams: {client['roam_penalty']//2}")
+            if client.get("disconnect_count", 0) > 0:
+                issues.append(f"Disconnects: {client['disconnect_count']}")
+            if client.get("roam_count", 0) > 0:
+                issues.append(f"Roams: {client['roam_count']}")
 
             table.add_row(
                 client["hostname"][:20],

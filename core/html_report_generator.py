@@ -10,18 +10,26 @@ from datetime import datetime
 from pathlib import Path
 
 
-def make_collapsible(section_id, section_title, section_content, start_collapsed=False):
-    """Wrap a section in collapsible HTML structure"""
+def make_collapsible(section_id, section_title, section_content, start_collapsed=False, summary=""):
+    """Wrap a section in collapsible HTML structure with optional summary visible when collapsed."""
     if not section_content or section_content.strip() == "":
         return ""
 
     collapsed_class = " collapsed" if start_collapsed else ""
     toggle_class = " collapsed" if start_collapsed else ""
 
+    summary_html = ""
+    if summary:
+        # Summary is always visible; fades when section is expanded
+        summary_html = f'<p class="section-summary" style="margin: 4px 0 0 0; font-size: 13px; color: #a6adc8; font-style: italic;">{summary}</p>'
+
     return f"""
         <div class="collapsible-section">
             <div class="section-header" onclick="toggleSection('{section_id}')">
-                <h2>{section_title}</h2>
+                <div style="flex: 1;">
+                    <h2 style="margin: 0;">{section_title}</h2>
+                    {summary_html}
+                </div>
                 <span class="section-toggle{toggle_class}">▼</span>
             </div>
             <div id="{section_id}" class="section-content{collapsed_class}">
@@ -330,6 +338,103 @@ def _generate_event_timeline_chart(timeline):
         }});
     }});
     </script>
+"""
+
+
+def _generate_client_journeys_html(journeys_data):
+    """Generate HTML for per-client journey profiles."""
+    if not journeys_data or not journeys_data.get("clients"):
+        return ""
+
+    clients = journeys_data["clients"]
+    top_issues = journeys_data.get("top_issues", [])
+
+    # Behavior badge colors
+    badge_colors = {
+        "stable": ("#a6e3a1", "Stable"),
+        "healthy_roamer": ("#94e2d5", "Healthy Roamer"),
+        "sticky": ("#f9e2af", "Sticky"),
+        "pattern": ("#fab387", "Pattern"),
+        "unstable": ("#f38ba8", "Unstable"),
+        "flapping": ("#f38ba8", "Flapping"),
+    }
+
+    # Top issues summary
+    issues_html = ""
+    if top_issues:
+        issue_rows = ""
+        for iss in top_issues[:10]:
+            sev_color = "#f38ba8" if iss["severity"] == "high" else "#f9e2af"
+            issue_rows += f"""
+            <tr>
+                <td style="padding: 6px 12px; color: #cdd6f4;">{iss['client']}</td>
+                <td style="padding: 6px 12px; color: {sev_color};">{iss['issue']}</td>
+            </tr>"""
+        issues_html = f"""
+        <div style="margin-bottom: 20px;">
+            <h3 style="color: #f38ba8; margin-bottom: 8px;">⚠️ Clients Needing Attention</h3>
+            <table style="width: 100%; border-collapse: collapse;">
+                <tr style="border-bottom: 1px solid #313244;">
+                    <th style="text-align: left; padding: 6px 12px; color: #6c7086;">Client</th>
+                    <th style="text-align: left; padding: 6px 12px; color: #6c7086;">Issue</th>
+                </tr>
+                {issue_rows}
+            </table>
+        </div>"""
+
+    # Per-client cards (show top 30 most interesting clients — sorted by event count)
+    sorted_clients = sorted(
+        clients.values(),
+        key=lambda c: c["disconnect_count"] + c["roam_count"],
+        reverse=True,
+    )
+
+    cards_html = ""
+    for cl in sorted_clients[:30]:
+        color, label = badge_colors.get(cl["behavior"], ("#6c7086", cl["behavior"]))
+        badge = f'<span style="background: {color}22; color: {color}; padding: 2px 8px; border-radius: 4px; font-size: 11px;">{label}</span>'
+
+        detail = f' — {cl["behavior_detail"]}' if cl["behavior_detail"] else ""
+
+        # AP path visualization (last 5 transitions)
+        path_html = ""
+        if cl["ap_path"]:
+            path_items = []
+            for hop in cl["ap_path"][-5:]:
+                path_items.append(f'{hop["from_ap"]} → {hop["to_ap"]}')
+            path_html = f'<div style="color: #6c7086; font-size: 11px; margin-top: 4px;">Path: {" → ".join(path_items[-3:])}</div>'
+
+        # Stats row
+        stats = []
+        stats.append(f"📶 {cl['current_rssi']} dBm")
+        stats.append(f"🔄 {cl['roam_count']} roams")
+        stats.append(f"❌ {cl['disconnect_count']} disconnects")
+        if cl["avg_session_min"] is not None:
+            if cl["avg_session_min"] > 60:
+                stats.append(f"⏱️ {cl['avg_session_min']/60:.1f}h avg session")
+            else:
+                stats.append(f"⏱️ {cl['avg_session_min']:.0f}m avg session")
+        if cl["visited_aps"]:
+            stats.append(f"📍 {len(cl['visited_aps'])} APs visited")
+        stats_str = " &nbsp;|&nbsp; ".join(stats)
+
+        cards_html += f"""
+        <div style="background: #1e1e2e; border-radius: 8px; padding: 12px 16px; margin-bottom: 8px; border-left: 3px solid {color};">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <strong style="color: #cdd6f4;">{cl['hostname']}</strong>
+                <div>{badge} <span style="color: #6c7086; font-size: 11px; margin-left: 8px;">@ {cl['current_ap']}</span></div>
+            </div>
+            <div style="color: #a6adc8; font-size: 12px; margin-top: 6px;">{stats_str}</div>
+            {f'<div style="color: #a6adc8; font-size: 12px; margin-top: 2px;">{detail}</div>' if detail else ''}
+            {path_html}
+        </div>"""
+
+    return f"""
+    {issues_html}
+    <div>
+        <h3 style="color: #cdd6f4; margin-bottom: 12px;">Client Profiles ({len(clients)} wireless clients tracked)</h3>
+        {cards_html}
+    </div>
 """
 
 
@@ -1114,43 +1219,64 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
     dfs_analysis = analysis_data.get("dfs_analysis")
     if dfs_analysis:
         dfs_content = generate_dfs_analysis_html(dfs_analysis)
-        html_content += make_collapsible("section-dfs", "📡 DFS Radar Events", dfs_content, start_collapsed=True)
+        dfs_events = dfs_analysis.get("events", [])
+        dfs_summary = f"{len(dfs_events)} radar events detected" if dfs_events else "No DFS radar events in lookback period"
+        html_content += make_collapsible("section-dfs", "📡 DFS Radar Events", dfs_content, start_collapsed=True, summary=dfs_summary)
 
     # Band Steering Analysis Section (collapsible, starts collapsed)
     band_steering = analysis_data.get("band_steering_analysis")
     if band_steering:
         bs_content = generate_band_steering_html(band_steering)
-        html_content += make_collapsible("section-band-steering", "🔄 Band Steering", bs_content, start_collapsed=True)
+        bs_recs = band_steering.get("recommendations", [])
+        bs_status = band_steering.get("status", "unknown")
+        bs_summary = f"{len(bs_recs)} APs need band steering changes" if bs_recs else f"Band steering: {bs_status}"
+        html_content += make_collapsible("section-band-steering", "🔄 Band Steering", bs_content, start_collapsed=True, summary=bs_summary)
 
     # Mesh Necessity Analysis Section (collapsible, starts collapsed)
     mesh_necessity = analysis_data.get("mesh_necessity_analysis")
     if mesh_necessity:
         mesh_nec_content = generate_mesh_necessity_html(mesh_necessity)
-        html_content += make_collapsible("section-mesh-necessity", "🔗 Mesh Configuration", mesh_nec_content, start_collapsed=True)
+        mesh_recs = mesh_necessity.get("recommendations", [])
+        mesh_summary = f"{len(mesh_recs)} mesh configuration suggestions" if mesh_recs else "Mesh configuration looks optimal"
+        html_content += make_collapsible("section-mesh-necessity", "🔗 Mesh Configuration", mesh_nec_content, start_collapsed=True, summary=mesh_summary)
 
     # Min RSSI Analysis Section (collapsible, starts collapsed)
     min_rssi = analysis_data.get("min_rssi_analysis")
     if min_rssi:
         min_rssi_content = generate_min_rssi_html(min_rssi)
-        html_content += make_collapsible("section-min-rssi", "📡 Minimum RSSI", min_rssi_content, start_collapsed=True)
+        mr_recs = min_rssi.get("recommendations", [])
+        mr_summary = f"{len(mr_recs)} APs could benefit from min RSSI tuning" if mr_recs else "Min RSSI settings are well-configured"
+        html_content += make_collapsible("section-min-rssi", "📡 Minimum RSSI", min_rssi_content, start_collapsed=True, summary=mr_summary)
 
     # Airtime Analysis Section (collapsible, starts collapsed)
     airtime_analysis = analysis_data.get("airtime_analysis")
     if airtime_analysis:
         airtime_content = generate_airtime_analysis_html(airtime_analysis)
-        html_content += make_collapsible("section-airtime", "⏱️ Airtime Utilization", airtime_content, start_collapsed=True)
+        at_status = airtime_analysis.get("status", "unknown")
+        at_summary = f"Airtime utilization: {at_status}"
+        html_content += make_collapsible("section-airtime", "⏱️ Airtime Utilization", airtime_content, start_collapsed=True, summary=at_summary)
 
     # Firmware Analysis Section (collapsible, starts collapsed)
     firmware_analysis = analysis_data.get("firmware_analysis")
     if firmware_analysis and firmware_analysis.get("total_aps") > 0:
         fw_content = generate_firmware_analysis_html(firmware_analysis)
-        html_content += make_collapsible("section-firmware", "🔧 Firmware Status", fw_content, start_collapsed=True)
+        fw_up = firmware_analysis.get("up_to_date", 0)
+        fw_total = firmware_analysis.get("total_aps", 0)
+        fw_summary = f"{fw_up}/{fw_total} devices on latest firmware" if fw_total else "No firmware data"
+        html_content += make_collapsible("section-firmware", "🔧 Firmware Status", fw_content, start_collapsed=True, summary=fw_summary)
 
     # Client Capabilities Section (collapsible, starts collapsed)
     client_capabilities = analysis_data.get("client_capabilities")
     if client_capabilities:
         cap_content = generate_client_capabilities_html(client_capabilities)
-        html_content += make_collapsible("section-capabilities", "📊 Client Capabilities", cap_content, start_collapsed=True)
+        cap_dist = client_capabilities.get("capability_distribution", {})
+        ax_pct = 0
+        cap_total = sum(cap_dist.values())
+        if cap_total > 0:
+            ax_pct = int(cap_dist.get("802.11ax", 0) / cap_total * 100)
+        legacy_count = cap_dist.get("legacy", 0) + cap_dist.get("802.11n", 0)
+        cap_summary = f"{ax_pct}% WiFi 6 clients" + (f", {legacy_count} legacy devices" if legacy_count else "")
+        html_content += make_collapsible("section-capabilities", "📊 Client Capabilities", cap_content, start_collapsed=True, summary=cap_summary)
 
     # Client Security Section (collapsible, starts collapsed)
     client_security = analysis_data.get("client_security")
@@ -1158,7 +1284,10 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
         client_security.get("blocked_clients") or client_security.get("isolated_clients")
     ):
         sec_content = generate_client_security_html(client_security)
-        html_content += make_collapsible("section-security", "🔒 Client Security", sec_content, start_collapsed=True)
+        blocked = len(client_security.get("blocked_clients", []))
+        isolated = len(client_security.get("isolated_clients", []))
+        sec_summary = f"{blocked} blocked, {isolated} isolated clients"
+        html_content += make_collapsible("section-security", "🔒 Client Security", sec_content, start_collapsed=True, summary=sec_summary)
 
     # Manufacturer Analysis Section (collapsible, starts collapsed)
     manufacturer_analysis = analysis_data.get("manufacturer_analysis")
@@ -1166,7 +1295,10 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
         from core.manufacturer_analyzer import generate_manufacturer_insights_html
 
         mfr_content = generate_manufacturer_insights_html(manufacturer_analysis)
-        html_content += make_collapsible("section-manufacturers", "🏭 Manufacturers", mfr_content, start_collapsed=True)
+        mfr_count = len(manufacturer_analysis.get("manufacturers", {}))
+        top_mfr = manufacturer_analysis.get("top_manufacturer", "Unknown")
+        mfr_summary = f"{mfr_count} manufacturers detected, top: {top_mfr}"
+        html_content += make_collapsible("section-manufacturers", "🏭 Manufacturers", mfr_content, start_collapsed=True, summary=mfr_summary)
 
     # Switch Analysis Section (Collapsible)
     switch_port_history = analysis_data.get("switch_port_history")
@@ -1212,10 +1344,27 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
             disconnected_content,
         )
 
+    # Client Journey Profiles Section (collapsible, starts collapsed)
+    client_journeys = analysis_data.get("client_journeys", {})
+    if client_journeys and client_journeys.get("clients"):
+        journey_content = _generate_client_journeys_html(client_journeys)
+        issue_count = len(client_journeys.get("top_issues", []))
+        tracked = client_journeys.get("total_tracked", 0)
+        journey_summary = f"{tracked} clients tracked"
+        if issue_count:
+            journey_summary += f", {issue_count} need attention"
+        html_content += make_collapsible(
+            "section-client-journeys", "🗺️ Client Journeys", journey_content,
+            start_collapsed=True, summary=journey_summary
+        )
+
     # Findings Section (collapsible, starts collapsed)
     findings_content = generate_findings_html(analysis_data)
     if findings_content:
-        html_content += make_collapsible("section-findings", "🔍 Detailed Findings", findings_content, start_collapsed=True)
+        client_findings = analysis_data.get("client_findings", {})
+        cf_total = client_findings.get("total_findings", 0)
+        findings_summary = f"{cf_total} client-level findings detected" if cf_total else "Per-client analysis details"
+        html_content += make_collapsible("section-findings", "🔍 Detailed Findings", findings_content, start_collapsed=True, summary=findings_summary)
 
     # Footer
     html_content += f"""

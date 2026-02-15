@@ -750,8 +750,8 @@ class NetworkHealthAnalyzer:
                         }
                     )
 
-                # Check for TX power = 0 (error state) - only for wired APs with enabled radios
-                # If we got here, the radio is enabled (has channel) but reports 0 power - that's unusual
+                # TX power = 0 with radio enabled is unusual — may indicate config issue
+                # (disabled radios already filtered out above)
                 elif tx_power == 0:
                     # Only flag as critical if the radio is actually in use (has channel and clients)
                     # Otherwise it might just be an AP with disabled radio (like U7 Pro with 6GHz off)
