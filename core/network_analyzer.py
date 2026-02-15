@@ -56,24 +56,37 @@ class ExpertNetworkAnalyzer:
         clients_response = self.client.get(f"s/{self.site}/stat/sta")
         self.clients = clients_response.get("data", []) if clients_response else []
 
-        # Get recent events (default is usually last 1 hour)
-        events_response = self.client.post(f"s/{self.site}/stat/event", {})
-        self.events = events_response.get("data", []) if events_response else []
+        # Get events — fetch all available from controller
+        import time as _time
 
-        # Get historical events (last N days)
-        # UniFi stat/event requires POST with {"within": hours} in body
-        try:
-            within_hours = lookback_days * 24
-            historical_response = self.client.post(
-                f"s/{self.site}/stat/event",
-                {"within": within_hours, "_limit": 5000},
-            )
-            self.historical_events = (
-                historical_response.get("data", []) if historical_response else []
-            )
-        except Exception:
-            # Fallback to regular events if historical query fails
-            self.historical_events = self.events
+        events_response = self.client.get(f"s/{self.site}/stat/event")
+        all_events = events_response.get("data", []) if events_response else []
+
+        # If GET returned nothing, try POST as fallback
+        if not all_events:
+            events_response = self.client.post(f"s/{self.site}/stat/event", {})
+            all_events = events_response.get("data", []) if events_response else []
+
+        self.events = all_events
+
+        # Try filtering to lookback window; if that yields nothing, use all events
+        cutoff_ms = (_time.time() - lookback_days * 86400) * 1000
+        recent_events = [e for e in all_events if e.get("time", 0) >= cutoff_ms]
+        if recent_events:
+            self.historical_events = recent_events
+        else:
+            # No events in lookback window — use all available events
+            self.historical_events = all_events
+            if all_events:
+                from datetime import datetime
+                oldest = min(e.get("time", 0) for e in all_events)
+                newest = max(e.get("time", 0) for e in all_events)
+                oldest_dt = datetime.fromtimestamp(oldest / 1000).strftime("%Y-%m-%d")
+                newest_dt = datetime.fromtimestamp(newest / 1000).strftime("%Y-%m-%d")
+                console.print(
+                    f"[yellow]  ℹ No events in last {lookback_days} days — "
+                    f"using all {len(all_events)} events ({oldest_dt} to {newest_dt})[/yellow]"
+                )
 
         console.print(
             f"[green]✓ {len(self.devices)} devices, {len(self.clients)} clients, "

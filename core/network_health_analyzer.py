@@ -131,17 +131,20 @@ class NetworkHealthAnalyzer:
         }
 
         try:
-            within_hours = lookback_days * 24
-            events_response = self.client.post(
-                f"s/{self.site}/stat/event",
-                {"within": within_hours, "_limit": 1000},
-            )
+            # Fetch all events, filter by lookback client-side
+            import time as _time
+
+            events_response = self.client.get(f"s/{self.site}/stat/event")
 
             if not events_response or "data" not in events_response:
                 return result
 
-            events = events_response.get("data", [])
-
+            all_events = events_response.get("data", [])
+            cutoff_ms = (_time.time() - lookback_days * 86400) * 1000
+            events = [e for e in all_events if e.get("time", 0) >= cutoff_ms]
+            # If no recent events, use all available
+            if not events:
+                events = all_events
             # Look for restart-related events for this device
             # NOTE: "disconnected" is NOT included - that's for client disconnections, not device restarts
             restart_keywords = [

@@ -80,17 +80,18 @@ class AdvancedNetworkAnalyzer:
         }
 
         try:
-            # Get events from controller (POST required for UniFi stat/event)
-            within_hours = lookback_days * 24
-            events_response = self.client.post(
-                f"s/{self.site}/stat/event",
-                {"within": within_hours, "_limit": 1000},
-            )
+            # Get events — fetch all, filter by lookback client-side
+            import time as _time
 
+            events_response = self.client.get(f"s/{self.site}/stat/event")
             if not events_response:
                 return results
 
-            events = events_response.get("data", [])
+            all_events = events_response.get("data", [])
+            cutoff_ms = (_time.time() - lookback_days * 86400) * 1000
+            events = [e for e in all_events if e.get("time", 0) >= cutoff_ms]
+            if not events:
+                events = all_events  # Use all available if none in lookback
             if not events:
                 return results
 
