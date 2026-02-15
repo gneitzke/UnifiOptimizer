@@ -16,13 +16,14 @@ console = Console()
 class ClientHealthAnalyzer:
     """Analyzes client connection health and signal quality"""
 
-    # RSSI thresholds
-    RSSI_EXCELLENT = -50
-    RSSI_GOOD = -60
-    RSSI_FAIR = -70
-    RSSI_POOR = -80
-
     def __init__(self):
+        from utils.config import get_threshold
+
+        self.RSSI_EXCELLENT = get_threshold("rssi.excellent", -50)
+        self.RSSI_GOOD = get_threshold("rssi.good", -60)
+        self.RSSI_FAIR = get_threshold("rssi.fair", -70)
+        self.RSSI_POOR = get_threshold("rssi.poor", -80)
+
         self.clients = []
         self.disconnection_events = []
         self.roaming_events = []
@@ -258,8 +259,70 @@ class ClientHealthAnalyzer:
 
         return distribution
 
+    @staticmethod
+    def _rssi_to_quality(rssi):
+        """Convert RSSI to continuous 0-100 quality score.
+
+        Uses a linear mapping: -95 dBm → 0, -50 dBm → 100.
+        Values outside the range are clamped.
+        """
+        return max(0, min(100, (rssi + 95) * (100 / 45)))
+
+    @staticmethod
+    def _stability_score(disconnect_count, lookback_days=3):
+        """Score connection stability 0-100.
+
+        Uses exponential decay — first few disconnects matter most,
+        additional ones have diminishing impact. Normalized by lookback period.
+        """
+        if disconnect_count == 0:
+            return 100
+        # Normalize to per-day rate
+        rate = disconnect_count / max(lookback_days, 1)
+        # Exponential decay: 1 disconnect/day ≈ 70, 3/day ≈ 35, 5+/day → ~15
+        import math
+
+        return max(0, min(100, 100 * math.exp(-0.35 * rate)))
+
+    @staticmethod
+    def _roaming_health(roam_count, rssi, lookback_days=3):
+        """Score roaming health 0-100.
+
+        Healthy roaming (good signal + moderate roaming) = high score.
+        Sticky client (poor signal + no roaming) = low score.
+        Excessive roaming (>20/day) = low score (likely flapping).
+        """
+        daily_roams = roam_count / max(lookback_days, 1)
+
+        if daily_roams == 0:
+            # No roaming — fine if signal is good, bad if signal is poor
+            if rssi > -65:
+                return 95  # Good signal, no need to roam
+            elif rssi > -75:
+                return 70  # Marginal — might benefit from roaming
+            else:
+                return 30  # Sticky client — should be roaming but isn't
+        elif daily_roams <= 10:
+            # Moderate roaming — healthy behavior
+            if rssi > -75:
+                return 90  # Good signal after roaming = working well
+            else:
+                return 60  # Roaming but still poor signal
+        else:
+            # Excessive roaming — possible flapping between APs
+            import math
+
+            return max(10, int(90 * math.exp(-0.05 * daily_roams)))
+
     def _calculate_health_scores(self):
-        """Calculate overall health score for each client"""
+        """Calculate weighted composite health score for each client.
+
+        Components:
+          - Signal quality (40%): Continuous RSSI curve
+          - Stability (25%): Disconnect frequency with exponential decay
+          - Roaming health (20%): Rewards healthy roaming, penalizes sticky clients
+          - Throughput efficiency (15%): TX rate vs expected for protocol
+        """
         scores = []
 
         for client in self.clients:
@@ -267,53 +330,71 @@ class ClientHealthAnalyzer:
             rssi = client.get("rssi", 0)
             is_wired = client.get("is_wired", False)
 
-            # FIX: Some UniFi controllers return positive RSSI values
+            # Normalize RSSI
             if rssi > 0:
                 rssi = -rssi
 
-            # Wired clients get perfect signal score (no wireless)
+            # Skip wired clients from wireless health scoring
             if is_wired:
-                signal_score = 100
-            # Base score from signal strength (0-100) for wireless clients
-            elif rssi > self.RSSI_EXCELLENT:
-                signal_score = 100
-            elif rssi > self.RSSI_GOOD:
-                signal_score = 80
-            elif rssi > self.RSSI_FAIR:
-                signal_score = 60
-            elif rssi > self.RSSI_POOR:
-                signal_score = 40
-            elif rssi < -90:  # Very weak or no signal
-                signal_score = 20
-            else:
-                signal_score = 20
-
-            # Penalty for disconnections
-            disconnect_penalty = (
-                len(
-                    [
-                        e
-                        for e in self.disconnection_events
-                        if e.get("user", "") == mac or e.get("client_mac", "") == mac
-                    ]
+                scores.append(
+                    {
+                        "mac": mac,
+                        "hostname": client.get("hostname", "Unknown"),
+                        "ip": client.get("ip", "Unknown"),
+                        "score": 100,
+                        "signal_score": 100,
+                        "stability_score": 100,
+                        "roaming_score": 100,
+                        "throughput_score": 100,
+                        "disconnect_count": 0,
+                        "roam_count": 0,
+                        "grade": "A",
+                        "is_wired": True,
+                    }
                 )
-                * 5
-            )
+                continue
 
-            # Penalty for excessive roaming
-            roam_penalty = (
-                len(
-                    [
-                        e
-                        for e in self.roaming_events
-                        if e.get("user", "") == mac or e.get("client_mac", "") == mac
-                    ]
-                )
-                * 2
-            )
+            # Signal quality (continuous curve)
+            signal = self._rssi_to_quality(rssi)
 
-            # Calculate final score
-            final_score = max(0, signal_score - disconnect_penalty - roam_penalty)
+            # Stability (disconnect frequency)
+            disconnect_count = len(
+                [
+                    e
+                    for e in self.disconnection_events
+                    if e.get("user", "") == mac or e.get("client_mac", "") == mac
+                ]
+            )
+            stability = self._stability_score(disconnect_count)
+
+            # Roaming health
+            roam_count = len(
+                [
+                    e
+                    for e in self.roaming_events
+                    if e.get("user", "") == mac or e.get("client_mac", "") == mac
+                ]
+            )
+            roaming = self._roaming_health(roam_count, rssi)
+
+            # Throughput efficiency (TX rate vs expected)
+            tx_rate = client.get("tx_rate", 0) or 0
+            radio_proto = client.get("radio_proto", "")
+            expected_max = 1200  # 802.11ax default
+            if "ac" in radio_proto.lower():
+                expected_max = 867
+            elif "n" in radio_proto.lower():
+                expected_max = 300
+            throughput = min(100, (tx_rate / max(expected_max, 1)) * 100) if tx_rate > 0 else 50
+
+            # Weighted composite
+            final_score = int(
+                signal * 0.40
+                + stability * 0.25
+                + roaming * 0.20
+                + throughput * 0.15
+            )
+            final_score = max(0, min(100, final_score))
 
             scores.append(
                 {
@@ -321,9 +402,12 @@ class ClientHealthAnalyzer:
                     "hostname": client.get("hostname", "Unknown"),
                     "ip": client.get("ip", "Unknown"),
                     "score": final_score,
-                    "signal_score": signal_score,
-                    "disconnect_penalty": disconnect_penalty,
-                    "roam_penalty": roam_penalty,
+                    "signal_score": int(signal),
+                    "stability_score": int(stability),
+                    "roaming_score": int(roaming),
+                    "throughput_score": int(throughput),
+                    "disconnect_count": disconnect_count,
+                    "roam_count": roam_count,
                     "grade": self._get_grade(final_score),
                     "is_wired": is_wired,
                 }

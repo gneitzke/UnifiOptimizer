@@ -17,33 +17,67 @@ class NetworkHealthAnalyzer:
 
     def analyze_network_health(self, devices, clients):
         """
-        Comprehensive health analysis covering all network aspects
+        Comprehensive health analysis using category-weighted scoring.
+
+        Categories and weights:
+          - RF Health (35%): Channel plan, power balance, interference
+          - Client Health (30%): Aggregate wireless client signal quality
+          - Infrastructure (20%): Device stability, firmware, uplinks
+          - Security (15%): VLAN segmentation, network hygiene
         """
+        categories = {
+            "device_stability": self._analyze_device_stability(devices),
+            "broadcast_traffic": self._analyze_broadcast_traffic(devices),
+            "channel_health": self._analyze_channel_health(devices),
+            "radio_health": self._analyze_radio_health(devices),
+            "vlan_segmentation": self._analyze_vlan_segmentation(clients),
+            "firmware_status": self._analyze_firmware_status(devices),
+        }
+
         results = {
             "severity": "low",
-            "overall_score": 100,  # Start at 100, deduct for issues
-            "categories": {
-                "device_stability": self._analyze_device_stability(devices),
-                "broadcast_traffic": self._analyze_broadcast_traffic(devices),
-                "channel_health": self._analyze_channel_health(devices),
-                "radio_health": self._analyze_radio_health(devices),
-                "vlan_segmentation": self._analyze_vlan_segmentation(clients),
-                "firmware_status": self._analyze_firmware_status(devices),
-            },
+            "overall_score": 0,
+            "categories": categories,
             "issues": [],
             "recommendations": [],
         }
 
-        # Aggregate issues and calculate overall score
-        for category, analysis in results["categories"].items():
+        # Collect all issues and recommendations
+        for category, analysis in categories.items():
             if analysis.get("issues"):
                 results["issues"].extend(analysis["issues"])
             if analysis.get("recommendations"):
                 results["recommendations"].extend(analysis["recommendations"])
 
-            # Deduct from overall score based on severity
-            score_penalty = analysis.get("score_penalty", 0)
-            results["overall_score"] -= score_penalty
+        # Category-weighted scoring (each sub-score is 0-100)
+        rf_score = self._compute_category_score(
+            categories["channel_health"], categories["radio_health"]
+        )
+        infra_score = self._compute_category_score(
+            categories["device_stability"],
+            categories["broadcast_traffic"],
+            categories["firmware_status"],
+        )
+        security_score = self._compute_category_score(
+            categories["vlan_segmentation"]
+        )
+        client_score = self._compute_client_aggregate(clients)
+
+        results["overall_score"] = int(
+            rf_score * 0.35
+            + client_score * 0.30
+            + infra_score * 0.20
+            + security_score * 0.15
+        )
+        results["overall_score"] = max(0, min(100, results["overall_score"]))
+
+        # Store component scores for reporting
+        results["component_scores"] = {
+            "rf_health": int(rf_score),
+            "client_health": int(client_score),
+            "infrastructure": int(infra_score),
+            "security": int(security_score),
+        }
 
         # Determine overall severity
         if results["overall_score"] < 50:
@@ -53,10 +87,32 @@ class NetworkHealthAnalyzer:
         else:
             results["severity"] = "low"
 
-        # Ensure score doesn't go below 0
-        results["overall_score"] = max(0, results["overall_score"])
-
         return results
+
+    @staticmethod
+    def _compute_category_score(*analyses):
+        """Compute 0-100 score from penalty-based category analyses."""
+        total_penalty = sum(a.get("score_penalty", 0) for a in analyses)
+        return max(0, 100 - total_penalty)
+
+    @staticmethod
+    def _compute_client_aggregate(clients):
+        """Compute aggregate wireless client health 0-100 from RSSI distribution."""
+        if not clients:
+            return 100
+        rssi_values = []
+        for c in clients:
+            if c.get("is_wired", False):
+                continue
+            rssi = c.get("rssi", -100)
+            if rssi > 0:
+                rssi = -rssi
+            rssi_values.append(rssi)
+        if not rssi_values:
+            return 100
+        # Continuous RSSI-to-quality mapping, averaged across all wireless clients
+        qualities = [max(0, min(100, (r + 95) * (100 / 45))) for r in rssi_values]
+        return int(sum(qualities) / len(qualities))
 
     def _get_device_restart_events(self, device_mac, lookback_days=7):
         """
@@ -77,7 +133,8 @@ class NetworkHealthAnalyzer:
         try:
             within_hours = lookback_days * 24
             events_response = self.client.get(
-                f"s/{self.site}/stat/event?within={within_hours}&_limit=1000"
+                f"s/{self.site}/stat/event",
+                params={"within": within_hours, "_limit": 1000},
             )
 
             if not events_response or "data" not in events_response:
@@ -525,27 +582,51 @@ class NetworkHealthAnalyzer:
                     }
                 )
 
-        # Analyze 2.4GHz channel overlap (only channels 1, 6, 11 are non-overlapping)
+        # Analyze 2.4GHz channel overlap
+        # With N APs and 3 non-overlapping channels, floor(N/3) per channel is expected
         ng_channels = analysis["channel_assignments"].get("ng", {})
+        total_24_aps = sum(len(aps) for aps in ng_channels.values())
+        expected_per_channel = max(1, total_24_aps / 3) if total_24_aps > 0 else 1
 
         for channel, ap_list in ng_channels.items():
-            if len(ap_list) > 1:
+            # Only flag if channel has significantly MORE than expected share
+            # (2+ above expected is genuine imbalance)
+            if len(ap_list) > expected_per_channel + 1.5:
                 analysis["status"] = "warning"
-                analysis["score_penalty"] += 5
+                analysis["score_penalty"] += 3
 
                 ap_names = [ap["ap"] for ap in ap_list]
 
                 analysis["issues"].append(
                     {
-                        "severity": "medium",
-                        "type": "channel_overlap",
+                        "severity": "low",
+                        "type": "channel_imbalance",
                         "band": "2.4GHz",
                         "channel": channel,
                         "ap_count": len(ap_list),
+                        "expected": round(expected_per_channel, 1),
                         "aps": ap_names,
-                        "message": f"2.4GHz Channel {channel}: {len(ap_list)} APs causing co-channel interference",
-                        "impact": f"Reduced WiFi performance for {len(ap_list)} APs and their clients due to airtime contention",
-                        "recommendation": f"Redistribute APs across channels 1, 6, 11 to minimize interference",
+                        "message": f"2.4GHz Channel {channel}: {len(ap_list)} APs (expected ~{expected_per_channel:.0f}) — imbalanced",
+                        "impact": f"Uneven AP distribution increases contention on channel {channel}",
+                        "recommendation": f"Redistribute APs more evenly across channels 1, 6, 11",
+                    }
+                )
+
+            # Flag non-standard channels (not 1, 6, 11) — always a real problem
+            if channel not in [1, 6, 11]:
+                analysis["status"] = "warning"
+                analysis["score_penalty"] += 5
+
+                analysis["issues"].append(
+                    {
+                        "severity": "medium",
+                        "type": "non_standard_channel",
+                        "band": "2.4GHz",
+                        "channel": channel,
+                        "ap_count": len(ap_list),
+                        "message": f"2.4GHz Channel {channel}: overlapping channel in use ({len(ap_list)} APs)",
+                        "impact": "Overlapping channels cause adjacent-channel interference (worse than co-channel)",
+                        "recommendation": "Move to non-overlapping channels: 1, 6, or 11",
                     }
                 )
 
@@ -619,7 +700,7 @@ class NetworkHealthAnalyzer:
                     band = "2.4GHz"
                 elif radio_name == "na":
                     band = "5GHz"
-                elif radio_name in ["6e", "ax", "6g"]:  # 6GHz radio names
+                elif radio_name in ["6e", "6g"]:  # 6GHz radio names
                     band = "6GHz"
                 else:
                     band = "Unknown"

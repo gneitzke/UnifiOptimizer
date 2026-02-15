@@ -287,13 +287,19 @@ class ExpertNetworkAnalyzer:
         recommendations = analyze_channels_smart(ap_analysis, tracker)
 
         # Check 5GHz channel width (40MHz is often better than 80MHz in dense environments)
+        # NOTE: Skip 6GHz — wide channels (80/160/320MHz) are standard and desirable on 6GHz
+        from utils.config import get_threshold
+
+        cw_ap_threshold = get_threshold("channel_width.prefer_40mhz_when_aps_gt", 4)
+        cw_client_threshold = get_threshold("channel_width.narrow_when_clients_lt", 5)
+
         for ap_info in ap_analysis["ap_details"]:
             if "5GHz" in ap_info["radios"]:
                 radio = ap_info["radios"]["5GHz"]
                 width = radio["width"]
                 client_count = ap_info["client_count"]
 
-                if width == 80 and len(ap_analysis["ap_details"]) > 2 and client_count < 5:
+                if width == 80 and len(ap_analysis["ap_details"]) > cw_ap_threshold and client_count < cw_client_threshold:
                     recommendations.append(
                         {
                             "ap": ap_info,

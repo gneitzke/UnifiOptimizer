@@ -224,6 +224,10 @@ def analyze_network(client, site="default", lookback_days=3, min_rssi_strategy="
         health_score = adv_health_analyzer.calculate_network_health_score(analysis)
         analysis["health_score"] = health_score
 
+        # Generate per-client findings
+        client_findings = generate_client_findings(clients, devices)
+        analysis["client_findings"] = client_findings
+
         # Check for API errors and add to analysis
         error_summary = client.get_error_summary()
         analysis["api_errors"] = error_summary
@@ -539,6 +543,28 @@ def analyze_network(client, site="default", lookback_days=3, min_rssi_strategy="
                 )
 
         console.print()
+
+        # Display Client-Level Findings
+        client_findings = analysis.get("client_findings", [])
+        if client_findings:
+            wrong_band = [f for f in client_findings if f["type"] == "wrong_band"]
+            dead_zone = [f for f in client_findings if f["type"] == "dead_zone"]
+
+            if wrong_band or dead_zone:
+                console.print("[bold cyan]👤 Per-Client Findings:[/bold cyan]")
+                if dead_zone:
+                    console.print(
+                        f"  [red]📍 {len(dead_zone)} client(s) in possible dead zone(s)[/red]"
+                    )
+                    for f in dead_zone[:5]:
+                        console.print(f"     • {f['message']}")
+                if wrong_band:
+                    console.print(
+                        f"  [yellow]📡 {len(wrong_band)} client(s) on 2.4GHz that support 5GHz[/yellow]"
+                    )
+                    for f in wrong_band[:5]:
+                        console.print(f"     • {f['message']}")
+                console.print()
 
         # Display Network Health Analysis - use the Grade-based scoring for consistency
         health_score = analysis.get("health_score", {})
@@ -1115,13 +1141,14 @@ def _get_parent_ap_info(mesh_ap, all_aps):
     return parent_ap, parent_name, parent_power_status
 
 
-def _generate_basic_recommendations(aps, all_devices=None):
+def _generate_basic_recommendations(aps, all_devices=None, clients=None):
     """
     Generate basic recommendations without client health data
 
     Args:
         aps: List of access point devices
         all_devices: List of all devices (APs, switches, gateways, etc.) for mesh parent detection
+        clients: Optional list of client dicts for coverage gap analysis
 
     Returns:
         list: Basic recommendations
@@ -1130,6 +1157,8 @@ def _generate_basic_recommendations(aps, all_devices=None):
 
     if all_devices is None:
         all_devices = aps
+    if clients is None:
+        clients = []
 
     console.print("[dim]Using basic analysis mode (client health data not available)[/dim]\n")
 
@@ -1298,17 +1327,49 @@ def _generate_basic_recommendations(aps, all_devices=None):
             is_mesh_parent = _is_mesh_parent(ap, aps)
 
             if power == "high" and not is_mesh and not is_mesh_parent:
-                recommendations.append(
-                    {
-                        "device": ap,
-                        "action": "power_change",
-                        "radio": radio_name,
-                        "current_power": power,
-                        "new_power": "medium",
-                        "reason": "Reduce co-channel interference and improve roaming",
-                        "priority": "low",
-                    }
+                # Check if power reduction is actually safe:
+                # 1. Count clients at this AP with marginal RSSI (-70 to -80)
+                # 2. Count how many other APs could serve those clients
+                ap_mac = ap.get("mac", "")
+                ap_clients = [c for c in clients if c.get("ap_mac") == ap_mac and not c.get("is_wired")]
+                marginal_clients = 0
+                for c in ap_clients:
+                    c_rssi = c.get("rssi", -100)
+                    if c_rssi > 0:
+                        c_rssi = -c_rssi
+                    if -80 <= c_rssi <= -70:
+                        marginal_clients += 1
+
+                # Count nearby APs (same band) as alternatives
+                same_band_aps = sum(
+                    1 for other_ap in aps
+                    if other_ap.get("mac") != ap_mac
+                    and any(r.get("radio") == radio_name for r in other_ap.get("radio_table", []))
                 )
+
+                if marginal_clients > 0 and same_band_aps < 2:
+                    # Coverage gap risk — don't recommend reduction
+                    console.print(
+                        f"  [yellow]⚠️  HIGH power with {marginal_clients} edge client(s) "
+                        f"and {same_band_aps} nearby AP(s) — keeping power[/yellow]"
+                    )
+                else:
+                    reason = "Reduce co-channel interference and improve roaming"
+                    if same_band_aps >= 2:
+                        reason += f" ({same_band_aps} nearby APs provide coverage overlap)"
+                    recommendations.append(
+                        {
+                            "device": ap,
+                            "action": "power_change",
+                            "radio": radio_name,
+                            "current_power": power,
+                            "new_power": "medium",
+                            "reason": reason,
+                            "priority": "low",
+                            "affected_clients": len(ap_clients),
+                            "marginal_clients": marginal_clients,
+                        }
+                    )
             elif is_mesh_parent:
                 console.print(
                     f"  [green]🛡️  Mesh Parent - Maintaining HIGH power (TX → children)[/green]"
@@ -1317,6 +1378,65 @@ def _generate_basic_recommendations(aps, all_devices=None):
         console.print()
 
     return recommendations
+
+
+def generate_client_findings(clients, devices):
+    """Generate per-client actionable findings.
+
+    Identifies:
+    - Clients on wrong band (2.4GHz but supports 5GHz+)
+    - Sticky clients (poor signal, no roaming)
+    - Dead-zone clients (persistently poor signal)
+    """
+    findings = []
+    if not clients:
+        return findings
+
+    # Build AP name lookup
+    ap_names = {}
+    for d in (devices or []):
+        if d.get("type") == "uap":
+            ap_names[d.get("mac", "")] = d.get("name", "Unknown AP")
+
+    for client in clients:
+        if client.get("is_wired", False):
+            continue
+
+        mac = client.get("mac", "")
+        hostname = client.get("hostname", client.get("name", mac))
+        rssi = client.get("rssi", -100)
+        if rssi > 0:
+            rssi = -rssi
+        radio = client.get("radio", "")
+        radio_proto = client.get("radio_proto", "")
+        ap_mac = client.get("ap_mac", "")
+        ap_name = ap_names.get(ap_mac, "Unknown AP")
+
+        # Wrong band: client on 2.4GHz but supports 5GHz
+        if radio == "ng" and ("ac" in radio_proto.lower() or "ax" in radio_proto.lower()):
+            findings.append({
+                "client": hostname,
+                "mac": mac,
+                "ap": ap_name,
+                "type": "wrong_band",
+                "severity": "medium",
+                "message": f"{hostname} on 2.4GHz but supports {radio_proto} — band steering could move to 5GHz",
+                "rssi": rssi,
+            })
+
+        # Dead-zone client: persistently very poor signal
+        if rssi < -80:
+            findings.append({
+                "client": hostname,
+                "mac": mac,
+                "ap": ap_name,
+                "type": "dead_zone",
+                "severity": "high" if rssi < -85 else "medium",
+                "message": f"{hostname} at {rssi} dBm on {ap_name} — possible dead zone or needs AP placement change",
+                "rssi": rssi,
+            })
+
+    return findings
 
 
 def display_recommendations(recommendations):
