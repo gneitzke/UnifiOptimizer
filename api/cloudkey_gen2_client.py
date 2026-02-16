@@ -479,7 +479,12 @@ class CloudKeyGen2Client:
                 return None
 
             # Parse response
-            json_data = response.json()
+            try:
+                json_data = response.json()
+            except (ValueError, Exception):
+                if self.verbose:
+                    console.print(f"[yellow]⚠ GET {path} returned non-JSON response[/yellow]")
+                return None
 
             # Log success
             if self.logger:
@@ -687,7 +692,12 @@ class CloudKeyGen2Client:
                 return None
 
             # Parse response
-            json_data = response.json()
+            try:
+                json_data = response.json()
+            except (ValueError, Exception):
+                if self.verbose:
+                    console.print(f"[yellow]⚠ PUT {path} returned non-JSON response[/yellow]")
+                return None
 
             if self.logger:
                 self.logger.info(f"✓ PUT {path} successful")
@@ -870,7 +880,12 @@ class CloudKeyGen2Client:
                 return None
 
             # Parse response
-            json_data = response.json()
+            try:
+                json_data = response.json()
+            except (ValueError, Exception):
+                if self.verbose:
+                    console.print(f"[yellow]⚠ POST {path} returned non-JSON response[/yellow]")
+                return None
 
             if self.logger:
                 self.logger.info(f"✓ POST {path} successful")

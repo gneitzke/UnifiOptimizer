@@ -1347,7 +1347,7 @@ def _rf_panel(analysis_data):
             rssi = c.get("rssi", 0)
             if rssi and rssi > 0:
                 rssi = -rssi
-            hostname = c.get("hostname", c.get("mac", "?")[:12])
+            hostname = c.get("hostname") or (c.get("mac") or "?")[:12]
             signal = c.get("signal", rssi)
             proto = c.get("radio_proto", "?")
             ch_w = c.get("channel_width", "?")

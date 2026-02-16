@@ -1129,7 +1129,7 @@ def _build_client_journeys(events, clients, devices, lookback_days):
         elif daily_roams == 0 and rssi < -75:
             behavior = "sticky"
             behavior_detail = f"Poor signal ({rssi} dBm) but not roaming — may be stuck"
-        elif disconnect_count > 0 and peak_count >= disconnect_count * 0.5 and peak_hour is not None:
+        elif disconnect_count >= 3 and peak_count >= disconnect_count * 0.5 and peak_hour is not None:
             behavior = "pattern"
             behavior_detail = f"Disconnects cluster at {peak_hour}:00 UTC"
 
