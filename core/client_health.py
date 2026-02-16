@@ -132,7 +132,7 @@ class ClientHealthAnalyzer:
             if client.get("is_wired", False):
                 continue
 
-            rssi = client.get("rssi", 0)
+            rssi = client.get("rssi", -100)
 
             # FIX: Some UniFi controllers return positive RSSI values
             if rssi > 0:
@@ -180,7 +180,7 @@ class ClientHealthAnalyzer:
                         "hostname": client.get("hostname", "Unknown"),
                         "ip": client.get("ip", "Unknown"),
                         "disconnect_count": count,
-                        "rssi": client.get("rssi", 0),
+                        "rssi": client.get("rssi", -100),
                         "ap_mac": client.get("ap_mac", "Unknown"),
                     }
                 )
@@ -204,10 +204,12 @@ class ClientHealthAnalyzer:
         for client in self.clients:
             mac = client.get("mac", "")
             count = roam_count.get(mac, 0)
-            rssi = client.get("rssi", 0)
+            rssi = client.get("rssi", -100)
 
-            # Excessive roaming or roaming while signal is good
-            if count >= 5 or (count >= 2 and rssi > self.RSSI_GOOD):
+            # Excessive roaming or roaming while signal is good (shouldn't need to roam)
+            if rssi > 0:
+                rssi = -rssi
+            if count >= 5 or (count >= 2 and rssi != -100 and rssi > self.RSSI_GOOD):
                 issues.append(
                     {
                         "mac": mac,
@@ -331,7 +333,7 @@ class ClientHealthAnalyzer:
 
         for client in self.clients:
             mac = client.get("mac", "")
-            rssi = client.get("rssi", 0)
+            rssi = client.get("rssi", -100)
             is_wired = client.get("is_wired", False)
 
             # Normalize RSSI
