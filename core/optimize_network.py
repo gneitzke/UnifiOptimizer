@@ -19,8 +19,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from api.cloudkey_gen2_client import CloudKeyGen2Client, get_devices
 from core.advanced_analyzer import AdvancedNetworkAnalyzer, run_advanced_analysis
 from core.change_applier import ChangeApplier
-from core.html_report_generator import generate_html_report
-from core.html_report_generator_share import generate_html_report as generate_share_html_report
 from core.network_analyzer import run_expert_analysis
 from core.network_health_analyzer import NetworkHealthAnalyzer
 from utils.keychain import (
@@ -2166,11 +2164,6 @@ Examples:
         default="optimal",
         help="Min RSSI recommendation strategy: 'optimal' (aggressive roaming for performance) or 'max_connectivity' (conservative for reliability)",
     )
-    parser.add_argument(
-        "--newReport",
-        action="store_true",
-        help="Generate premium V2 report (visual topology, grouped actions, deep dive tabs)",
-    )
 
     args = parser.parse_args()
 
@@ -2334,32 +2327,15 @@ Examples:
         if full_analysis:
             display_executive_summary(full_analysis, recommendations, args.lookback)
 
-            # Generate HTML reports (both versions)
+            # Generate HTML report
             try:
-                report_path = generate_html_report(full_analysis, recommendations, site)
+                from core.report_v2 import generate_v2_report
+                report_path, _ = generate_v2_report(full_analysis, recommendations, site)
                 console.print(
-                    f"\n[green]📄 HTML Report generated:[/green] [cyan]{report_path}[/cyan]"
+                    f"\n[green]📄 Report generated:[/green] [cyan]{report_path}[/cyan]"
                 )
-
-                # Also generate sharing-friendly version with static images
-                share_report_path = generate_share_html_report(full_analysis, recommendations, site)
-                console.print(
-                    f"[green]📱 Sharing version:[/green] [cyan]{share_report_path}[/cyan]"
-                )
-                console.print(f"[dim]   (Works in email/iMessage - uses static images)[/dim]")
             except Exception as e:
-                console.print(f"\n[yellow]⚠️  Could not generate HTML report: {e}[/yellow]")
-
-            # Generate V2 premium report if requested
-            if getattr(args, "newReport", False):
-                try:
-                    from core.report_v2 import generate_v2_report
-                    v2_path, _ = generate_v2_report(full_analysis, recommendations, site)
-                    console.print(
-                        f"[green]✨ Premium Report:[/green] [cyan]{v2_path}[/cyan]"
-                    )
-                except Exception as e:
-                    console.print(f"\n[yellow]⚠️  Could not generate V2 report: {e}[/yellow]")
+                console.print(f"\n[yellow]⚠️  Could not generate report: {e}[/yellow]")
 
             # Cache analysis results for regenerate_report.py
             try:
@@ -2425,32 +2401,15 @@ Examples:
             console.print()  # Extra space before summary
             display_executive_summary(full_analysis, recommendations, args.lookback)
 
-            # Generate HTML reports (both versions)
+            # Generate HTML report
             try:
-                report_path = generate_html_report(full_analysis, recommendations, site)
+                from core.report_v2 import generate_v2_report
+                report_path, _ = generate_v2_report(full_analysis, recommendations, site)
                 console.print(
-                    f"\n[green]📄 HTML Report generated:[/green] [cyan]{report_path}[/cyan]"
+                    f"\n[green]📄 Report generated:[/green] [cyan]{report_path}[/cyan]"
                 )
-
-                # Also generate sharing-friendly version with static images
-                share_report_path = generate_share_html_report(full_analysis, recommendations, site)
-                console.print(
-                    f"[green]📱 Sharing version:[/green] [cyan]{share_report_path}[/cyan]"
-                )
-                console.print(f"[dim]   (Works in email/iMessage - uses static images)[/dim]")
             except Exception as e:
-                console.print(f"\n[yellow]⚠️  Could not generate HTML report: {e}[/yellow]")
-
-            # Generate V2 premium report if requested
-            if getattr(args, "newReport", False):
-                try:
-                    from core.report_v2 import generate_v2_report
-                    v2_path, _ = generate_v2_report(full_analysis, recommendations, site)
-                    console.print(
-                        f"[green]✨ Premium Report:[/green] [cyan]{v2_path}[/cyan]"
-                    )
-                except Exception as e:
-                    console.print(f"\n[yellow]⚠️  Could not generate V2 report: {e}[/yellow]")
+                console.print(f"\n[yellow]⚠️  Could not generate report: {e}[/yellow]")
 
             # Cache analysis results for regenerate_report.py
             try:
