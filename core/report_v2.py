@@ -656,47 +656,26 @@ def _svg_device_timeline(analysis_data, width=860):
                     bins[bi] += val
         return bins
 
-    # Build rows: one per event category + one per top AP
+    # Build rows: one per event category
     rows = []
 
     roam_bins = bin_hourly(roaming)
     if sum(roam_bins):
-        rows.append(("Roaming", roam_bins, "#006fff", sum(roaming)))
+        rows.append(("Roaming", roam_bins, "#006fff", sum(roaming), None))
 
     restart_bins = bin_hourly(restarts)
+    restart_last_h = max((i for i, v in enumerate(restarts) if v > 0), default=0)
+    restart_coverage = (restart_last_h / n_hours) if n_hours else 0
     if sum(restart_bins):
-        rows.append(("Restarts", restart_bins, "#ea4335", sum(restarts)))
+        rows.append(("Restarts", restart_bins, "#ea4335", sum(restarts),
+                      restart_coverage if restart_coverage < 0.9 else None))
 
     dfs_bins = bin_hourly(dfs)
+    dfs_last_h = max((i for i, v in enumerate(dfs) if v > 0), default=0)
+    dfs_coverage = (dfs_last_h / n_hours) if n_hours else 0
     if sum(dfs_bins):
-        rows.append(("DFS Radar", dfs_bins, "#fbbc04", sum(dfs)))
-
-    # Per-AP rows for top 5 APs by roaming volume
-    top_aps = sorted(ap_events.items(), key=lambda x: x[1].get("roaming", 0) if isinstance(x[1], dict) else 0, reverse=True)[:5]
-    # We don't have per-AP hourly data, but we CAN reconstruct from client journeys
-    jc = analysis_data.get("client_journeys", {}).get("clients", {})
-    ap_hourly = {}
-    for mac, jdata in jc.items():
-        for evt in jdata.get("ap_path", []):
-            ts = evt.get("ts", 0)
-            to_ap = evt.get("to_ap", "")
-            if ts and to_ap:
-                # Convert ts to hour offset from t_first
-                offset_h = int((ts - t_first.timestamp()) / 3600)
-                if 0 <= offset_h < total_span_h:
-                    ap_hourly.setdefault(to_ap, [0] * total_span_h)
-                    if offset_h < len(ap_hourly[to_ap]):
-                        ap_hourly[to_ap][offset_h] += 1
-
-    for ap_name, ecounts in top_aps:
-        total = ecounts.get("roaming", 0) if isinstance(ecounts, dict) else 0
-        if total < 5:
-            continue
-        if ap_name in ap_hourly:
-            bins = bin_hourly(ap_hourly[ap_name])
-        else:
-            bins = [0] * n_blocks
-        rows.append((ap_name[:14], bins, "#34a853", total))
+        rows.append(("DFS Radar", dfs_bins, "#fbbc04", sum(dfs),
+                      dfs_coverage if dfs_coverage < 0.9 else None))
 
     if not rows:
         return ""
@@ -735,13 +714,28 @@ def _svg_device_timeline(analysis_data, width=860):
         f'stroke="#006fff" stroke-width="0.8" opacity="0.5"/>'
     )
 
-    for row_idx, (row_label, bins, color, total) in enumerate(rows):
+    for row_idx, (row_label, bins, color, total, coverage) in enumerate(rows):
         y_center = top_pad + row_idx * row_h + row_h // 2
 
         parts.append(
             f'<text x="{label_w - 6}" y="{y_center + 3}" fill="#9aa0a6" '
             f'font-size="10" text-anchor="end" font-family="sans-serif">{_esc(row_label)}</text>'
         )
+
+        # If partial coverage, shade the "no data" region
+        if coverage is not None and coverage < 0.95:
+            no_data_x = label_w + coverage * chart_w
+            no_data_w = chart_w * (1 - coverage)
+            parts.append(
+                f'<rect x="{no_data_x:.1f}" y="{y_center - row_h/2 + 2:.1f}" '
+                f'width="{no_data_w:.1f}" height="{row_h - 4:.1f}" rx="1" '
+                f'fill="#1e2d4a" opacity="0.3"/>'
+            )
+            parts.append(
+                f'<text x="{no_data_x + no_data_w/2:.1f}" y="{y_center + 3}" '
+                f'fill="#5f6368" font-size="8" text-anchor="middle" '
+                f'font-family="sans-serif">event log only</text>'
+            )
 
         max_bin = max(bins) if bins else 1
         bw = max(2, chart_w / n_blocks)
@@ -784,12 +778,14 @@ def _svg_device_timeline(analysis_data, width=860):
                 f'{gap_days}-day gap to today (no recent events on controller)</div>'
             )
 
+    legend_items = ['<span style="color:#006fff">■</span> Roaming']
+    if sum(restart_bins):
+        legend_items.append('<span style="color:#ea4335;margin-left:8px">■</span> Restarts')
+    if sum(dfs_bins):
+        legend_items.append('<span style="color:#fbbc04;margin-left:8px">■</span> DFS Radar')
     legend = (
         '<div style="display:flex;gap:14px;justify-content:center;margin-top:6px;font-size:11px;color:#5f6368">'
-        '<span style="color:#006fff">■</span> Roaming'
-        '<span style="color:#ea4335;margin-left:8px">■</span> Restarts'
-        '<span style="color:#fbbc04;margin-left:8px">■</span> DFS Radar'
-        '<span style="color:#34a853;margin-left:8px">■</span> Per-AP Roaming'
+        + ''.join(legend_items) +
         '</div>'
     )
 
