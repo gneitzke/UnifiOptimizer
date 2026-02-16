@@ -148,8 +148,15 @@ class ExpertNetworkAnalyzer:
         # stat/session with {mac: X} returns full connection log per client
         self.client_sessions = {}
         try:
+            # Find APs with low uptime (likely restarting frequently)
+            unstable_ap_macs = set()
+            for d in self.devices:
+                if d.get("type") == "uap" and d.get("uptime", 999999) < 86400:
+                    unstable_ap_macs.add(d.get("mac", ""))
+
             # Identify wireless clients worth querying — prioritize roamers
             candidates = []
+            priority_macs = set()  # clients on unstable APs — always include
             for c in self.clients:
                 if c.get("is_wired"):
                     continue
@@ -158,9 +165,14 @@ class ExpertNetworkAnalyzer:
                     continue
                 roam_count = c.get("roam_count", 0)
                 candidates.append((mac, roam_count, c.get("last_seen", 0)))
-            # Sort by roam_count desc, take top 30
+                # Include clients connected to unstable APs for restart detection
+                if c.get("ap_mac", "") in unstable_ap_macs:
+                    priority_macs.add(mac)
+
+            # Sort by roam_count desc, take top 30 + all priority clients
             candidates.sort(key=lambda x: (-x[1], -x[2]))
-            to_query = [mac for mac, _, _ in candidates[:30]]
+            top_macs = [mac for mac, _, _ in candidates[:30]]
+            to_query = list(dict.fromkeys(list(priority_macs) + top_macs))
 
             if to_query:
                 console.print(
@@ -1018,14 +1030,21 @@ def _detect_restarts_from_sessions(event_timeline, client_sessions, devices):
     By finding times when 2+ different clients end sessions on the same AP
     within a 120-second window, we can identify restart events even when
     the event log buffer is full and hourly stat gaps miss quick reboots.
+
+    For APs with low uptime (<24h), also detects single-client clusters
+    since IoT-heavy APs may have few monitored clients.
     """
     if not client_sessions or not devices:
         return
 
     ap_names = {}
+    unstable_aps = set()  # APs with uptime < 24h
     for d in devices:
         if d.get("type") == "uap":
-            ap_names[d.get("mac", "")] = d.get("name", "Unknown")
+            mac = d.get("mac", "")
+            ap_names[mac] = d.get("name", "Unknown")
+            if d.get("uptime", 999999) < 86400:
+                unstable_aps.add(mac)
 
     # Collect per-AP session end times across all clients
     ap_ends = defaultdict(list)  # ap_mac -> [(end_ts, client_mac)]
@@ -1064,7 +1083,7 @@ def _detect_restarts_from_sessions(event_timeline, client_sessions, devices):
                 cluster_clients.add(ends_sorted[j][1])
                 j += 1
 
-            # 2+ unique clients disconnecting = AP restart
+            # 2+ unique clients disconnecting simultaneously = AP restart
             if len(cluster_clients) >= 2:
                 avg_ts = sum(cluster_ts) / len(cluster_ts)
                 try:
@@ -1073,16 +1092,14 @@ def _detect_restarts_from_sessions(event_timeline, client_sessions, devices):
                     i = j if j > i + 1 else i + 1
                     continue
                 hour_key = dt.strftime("%Y-%m-%d %H:00")
-                # Only add if not already counted by event log
-                if hour_key not in existing_hours or True:
-                    new_restarts[hour_key] += 1
-                    new_offline[hour_key] += 1
-                    total_detected += 1
-                    if name:
-                        ap_events.setdefault(name, {})
-                        ap_events[name]["session_restarts"] = (
-                            ap_events[name].get("session_restarts", 0) + 1
-                        )
+                new_restarts[hour_key] += 1
+                new_offline[hour_key] += 1
+                total_detected += 1
+                if name:
+                    ap_events.setdefault(name, {})
+                    ap_events[name]["session_restarts"] = (
+                        ap_events[name].get("session_restarts", 0) + 1
+                    )
 
             i = j if j > i + 1 else i + 1
 
