@@ -367,16 +367,16 @@ class TestEventTimeline(unittest.TestCase):
         self.assertEqual(result["ap_events"]["AP-1"]["disconnect"], 1)
 
     def test_dfs_disconnect_correlation(self):
-        """DFS events coinciding with disconnects should generate insight."""
+        """DFS events coinciding with roaming spikes should generate insight."""
         import time
         from core.network_analyzer import _build_event_timeline
         now_ms = time.time() * 1000
         events = [
             {"time": now_ms, "key": "EVT_AP_RadarDetected", "ap_name": "AP-1"},
         ]
-        # Add 4 disconnects at same time
-        for _ in range(4):
-            events.append({"time": now_ms, "key": "EVT_WU_Disconnected", "ap_name": "AP-1"})
+        # Add 8 roaming events at same time (triggers >5 threshold)
+        for _ in range(8):
+            events.append({"time": now_ms, "key": "EVT_WU_RoamRadio", "ap_name": "AP-1"})
         result = _build_event_timeline(events, 1)
         self.assertTrue(any("DFS radar" in i for i in result["insights"]))
 
