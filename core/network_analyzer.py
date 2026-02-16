@@ -876,6 +876,54 @@ def _merge_hourly_ap_stats(event_timeline, hourly_ap_stats, daily_ap_stats, devi
                 new_hourly[hour_key]["roaming"] += amount
                 daily_added += amount
 
+    # --- Pass 3: Detect offline/restarts from hourly AP stat gaps ---
+    # If an AP is missing from an hourly time slot where others are present, it was offline
+    ap_presence = defaultdict(set)  # ap_mac -> set of hour_keys present
+    all_stat_hours = set()
+    for record in hourly_ap_stats:
+        ts = record.get("time", 0)
+        if not ts:
+            continue
+        ts_sec = ts / 1000 if ts > 1e12 else ts
+        try:
+            dt = datetime.fromtimestamp(ts_sec, tz=timezone.utc)
+        except (ValueError, OSError):
+            continue
+        hour_key = dt.strftime("%Y-%m-%d %H:00")
+        all_stat_hours.add(hour_key)
+        ap_mac = record.get("ap", "")
+        if ap_mac:
+            ap_presence[ap_mac].add(hour_key)
+
+    # For each AP, find hours where it was absent (= offline)
+    if all_stat_hours and ap_presence:
+        for ap_mac, present_hours in ap_presence.items():
+            missing = all_stat_hours - present_hours
+            ap_name = mac_to_name.get(ap_mac, "")
+            for hour_key in missing:
+                new_hourly[hour_key]["device_offline"] += 1
+                new_hourly[hour_key]["device_restart"] += 1
+
+    # --- Pass 4: Detect recent restarts from device uptime ---
+    import time as _time_mod
+    now_ts = _time_mod.time()
+    for dev in devices:
+        if dev.get("type") != "uap":
+            continue
+        uptime = dev.get("uptime", 0)
+        if not uptime or uptime <= 0:
+            continue
+        restart_ts = now_ts - uptime
+        restart_dt = datetime.fromtimestamp(restart_ts, tz=timezone.utc)
+        hour_key = restart_dt.strftime("%Y-%m-%d %H:00")
+        # Only add if within our timeline range and not already in event log
+        if hour_key not in existing_hours:
+            new_hourly[hour_key]["device_restart"] += 1
+            ap_name = dev.get("name", "")
+            if ap_name:
+                ap_events.setdefault(ap_name, {})
+                ap_events[ap_name]["restart_uptime"] = uptime
+
     if not new_hourly:
         return
 
@@ -903,6 +951,10 @@ def _merge_hourly_ap_stats(event_timeline, hourly_ap_stats, daily_ap_stats, devi
     # Update totals
     added_roams = sum(new_hourly[h].get("roaming", 0) for h in new_hours_sorted)
     totals["roaming"] = totals.get("roaming", 0) + added_roams
+    added_restarts = sum(new_hourly[h].get("device_restart", 0) for h in new_hours_sorted)
+    totals["device_restart"] = totals.get("device_restart", 0) + added_restarts
+    added_offline = sum(new_hourly[h].get("device_offline", 0) for h in new_hours_sorted)
+    totals["device_offline"] = totals.get("device_offline", 0) + added_offline
 
     # Update per-AP roaming totals
     for ap_name, count in new_ap_roams.items():
