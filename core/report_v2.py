@@ -639,10 +639,10 @@ def _svg_device_timeline(analysis_data, width=860):
         return ""
 
     now = _dt.now()
-    # Total hours from first event to now
-    total_span_h = max(1, int((now - t_first).total_seconds() / 3600))
+    # Use the actual data span — hourly arrays already extend to "now"
+    total_span_h = n_hours
 
-    # Bin into 6-hour blocks for the entire range (data + gap to now)
+    # Bin into 6-hour blocks across the data range
     block_h = 6
     n_blocks = max(1, total_span_h // block_h + 1)
 
@@ -744,7 +744,7 @@ def _svg_device_timeline(analysis_data, width=860):
         )
 
         max_bin = max(bins) if bins else 1
-        bw = max(2, chart_w / n_blocks - 0.5)
+        bw = max(2, chart_w / n_blocks)
         for bi, count in enumerate(bins):
             if count == 0:
                 continue
