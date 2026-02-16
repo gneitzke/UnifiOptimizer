@@ -693,6 +693,12 @@ def _build_event_timeline(events, lookback_days):
         "EVT_GW_RestartedUnknown": "device_restart",
         "EVT_SW_Connected": "device_restart",
         "EVT_AP_Connected": "device_restart",
+        "EVT_AP_Lost": "device_offline",
+        "EVT_AP_Isolated": "device_offline",
+        "EVT_SW_Lost": "device_offline",
+        "EVT_GW_Lost": "device_offline",
+        "EVT_SW_Disconnected": "device_offline",
+        "EVT_AP_Disconnected": "device_offline",
     }
 
     # Build hourly buckets
@@ -719,14 +725,14 @@ def _build_event_timeline(events, lookback_days):
 
         # Track per-AP events for detective insights
         ap_name = event.get("ap_name", event.get("ap", ""))
-        if ap_name and category in ("disconnect", "roaming", "dfs_radar"):
+        if ap_name and category in ("disconnect", "roaming", "dfs_radar", "device_offline"):
             ap_event_counts[ap_name][category] += 1
 
     # Sort hours chronologically
     sorted_hours = sorted(hourly.keys())
 
     # Build per-category arrays aligned to sorted hours
-    categories = ["disconnect", "roaming", "dfs_radar", "device_restart"]
+    categories = ["disconnect", "roaming", "dfs_radar", "device_restart", "device_offline"]
     series = {}
     for cat in categories:
         series[cat] = [hourly[h].get(cat, 0) for h in sorted_hours]
@@ -879,7 +885,7 @@ def _merge_hourly_ap_stats(event_timeline, hourly_ap_stats, daily_ap_stats, devi
 
     # Rebuild category arrays aligned to all_hours
     old_hour_idx = {h: i for i, h in enumerate(hours_list)}
-    for cat_name in ["disconnect", "roaming", "dfs_radar", "device_restart"]:
+    for cat_name in ["disconnect", "roaming", "dfs_radar", "device_restart", "device_offline"]:
         old_arr = categories.get(cat_name, [])
         new_arr = []
         for h in all_hours:

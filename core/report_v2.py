@@ -625,6 +625,7 @@ def _svg_device_timeline(analysis_data, width=860):
     roaming = cats.get("roaming", [])
     restarts = cats.get("device_restart", [])
     dfs = cats.get("dfs_radar", [])
+    offline = cats.get("device_offline", [])
 
     if not hours or not roaming:
         return ""
@@ -676,6 +677,13 @@ def _svg_device_timeline(analysis_data, width=860):
     if sum(dfs_bins):
         rows.append(("DFS Radar", dfs_bins, "#fbbc04", sum(dfs),
                       dfs_coverage if dfs_coverage < 0.9 else None))
+
+    offline_bins = bin_hourly(offline) if offline else []
+    if offline_bins and sum(offline_bins):
+        offline_last_h = max((i for i, v in enumerate(offline) if v > 0), default=0)
+        offline_coverage = (offline_last_h / n_hours) if n_hours else 0
+        rows.append(("Went Offline", offline_bins, "#ff6d00", sum(offline),
+                      offline_coverage if offline_coverage < 0.9 else None))
 
     if not rows:
         return ""
@@ -783,6 +791,8 @@ def _svg_device_timeline(analysis_data, width=860):
         legend_items.append('<span style="color:#ea4335;margin-left:8px">■</span> Restarts')
     if sum(dfs_bins):
         legend_items.append('<span style="color:#fbbc04;margin-left:8px">■</span> DFS Radar')
+    if offline_bins and sum(offline_bins):
+        legend_items.append('<span style="color:#ff6d00;margin-left:8px">■</span> Went Offline')
     legend = (
         '<div style="display:flex;gap:14px;justify-content:center;margin-top:6px;font-size:11px;color:#5f6368">'
         + ''.join(legend_items) +
