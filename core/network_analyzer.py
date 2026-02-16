@@ -144,6 +144,44 @@ class ExpertNetworkAnalyzer:
         except Exception:
             pass
 
+        # Collect per-client session history for top roamers/problem clients
+        # stat/session with {mac: X} returns full connection log per client
+        self.client_sessions = {}
+        try:
+            # Identify wireless clients worth querying — prioritize roamers
+            candidates = []
+            for c in self.clients:
+                if c.get("is_wired"):
+                    continue
+                mac = c.get("mac", "")
+                if not mac:
+                    continue
+                roam_count = c.get("roam_count", 0)
+                candidates.append((mac, roam_count, c.get("last_seen", 0)))
+            # Sort by roam_count desc, take top 30
+            candidates.sort(key=lambda x: (-x[1], -x[2]))
+            to_query = [mac for mac, _, _ in candidates[:30]]
+
+            if to_query:
+                console.print(
+                    f"[cyan]  ↳ Fetching session history for {len(to_query)} clients...[/cyan]"
+                )
+                total_sessions = 0
+                for mac in to_query:
+                    resp_s = self.client.post(
+                        f"s/{self.site}/stat/session", {"mac": mac}
+                    )
+                    sess = resp_s.get("data", []) if resp_s else []
+                    if sess:
+                        self.client_sessions[mac] = sess
+                        total_sessions += len(sess)
+                console.print(
+                    f"[green]  ↳ {total_sessions} sessions across "
+                    f"{len(self.client_sessions)} clients[/green]"
+                )
+        except Exception:
+            pass
+
     def analyze_aps(self):
         """
         Analyze access points with expert-level recommendations
@@ -1083,17 +1121,18 @@ def _enrich_client_satisfaction(client_journeys, daily_user_stats, clients):
         )
 
 
-def _build_client_journeys(events, clients, devices, lookback_days):
-    """Build per-client journey profiles from historical events and current state.
+def _build_client_journeys(events, clients, devices, lookback_days, client_sessions=None):
+    """Build per-client journey profiles from session history and events.
 
-    For each active client, reconstruct:
-    - AP transition path (roaming history)
-    - Disconnect pattern (time-of-day clustering)
-    - Session quality indicators
-    - Connection RSSI at roam events
+    Data sources (in priority order):
+    1. stat/session per-client: Full connection log with roaming sub-sessions.
+       Spans months. Provides connect/disconnect times, AP transitions, satisfaction.
+    2. stat/event: Roaming events (EVT_WU_RoamRadio). Fixed buffer, often stale.
     """
     if not events and not clients:
         return {"clients": {}, "top_issues": []}
+    if client_sessions is None:
+        client_sessions = {}
 
     # Build device name lookup
     ap_names = {}
@@ -1155,32 +1194,93 @@ def _build_client_journeys(events, clients, devices, lookback_days):
             rssi = -rssi
         current_ap = ap_names.get(client.get("ap_mac", ""), "Unknown")
 
-        # Reconstruct AP transitions
+        # --- Build AP path from session data (preferred) or event log (fallback) ---
         ap_path = []
         disconnects = []
         connects = []
-        for evt in events_list:
-            if evt["type"] == "roam":
-                from_name = evt.get("ap_name") or ap_names.get(evt.get("ap_from", ""), "?")
-                to_name = ap_names.get(evt.get("ap_to", ""), evt.get("ap_name", "?"))
-                ap_path.append({
-                    "ts": evt["ts"],
-                    "from_ap": from_name,
-                    "to_ap": to_name,
-                    "channel_from": evt.get("channel_from"),
-                    "channel_to": evt.get("channel_to"),
+        session_list = []
+        session_sats = []
+
+        sess_data = client_sessions.get(mac, [])
+        if sess_data:
+            # Build journey from stat/session — much richer than event log
+            # Sort sessions by assoc_time ascending
+            sorted_sess = sorted(sess_data, key=lambda s: s.get("assoc_time", 0))
+            prev_end = 0
+            for sess in sorted_sess:
+                assoc = sess.get("assoc_time", 0)
+                dur = sess.get("duration", 0)
+                end_ts = assoc + dur if dur else assoc
+                sess_ap = ap_names.get(sess.get("ap_mac", ""), sess.get("ap_mac", "?")[:8])
+                sat = sess.get("satisfaction")
+                sat_avg = sess.get("satisfaction_avg")
+
+                if sat is not None and isinstance(sat, (int, float)) and sat >= 0:
+                    session_sats.append(sat)
+
+                # Record connect event
+                connects.append({"ts": assoc, "ap": sess_ap})
+
+                # If gap between sessions > 60s, count as disconnect
+                if prev_end and assoc - prev_end > 60:
+                    disconnects.append({
+                        "ts": prev_end,
+                        "ap": session_list[-1]["ap"] if session_list else "?",
+                        "reason": "session_gap",
+                    })
+
+                session_list.append({
+                    "ts": assoc,
+                    "duration": dur,
+                    "ap": sess_ap,
+                    "satisfaction": sat_avg if sat_avg is not None else sat,
                 })
-            elif evt["type"] == "disconnect":
-                disconnects.append({
-                    "ts": evt["ts"],
-                    "ap": evt.get("ap_name") or ap_names.get(evt.get("ap", ""), "?"),
-                    "reason": evt.get("reason", ""),
-                })
-            elif evt["type"] == "connect":
-                connects.append({
-                    "ts": evt["ts"],
-                    "ap": evt.get("ap_name") or ap_names.get(evt.get("ap", ""), "?"),
-                })
+
+                # Extract AP transitions from roaming_sessions (detailed sub-sessions)
+                roaming = sess.get("roaming_sessions", [])
+                for i, rsess in enumerate(roaming):
+                    r_ap = ap_names.get(rsess.get("ap_mac", ""), rsess.get("ap_mac", "?")[:8])
+                    r_start = rsess.get("start_time", assoc)
+                    r_band = rsess.get("radio_band", "")
+                    r_sat = rsess.get("satisfaction")
+                    if i > 0:
+                        prev_rsess = roaming[i - 1]
+                        from_ap = ap_names.get(
+                            prev_rsess.get("ap_mac", ""), prev_rsess.get("ap_mac", "?")[:8]
+                        )
+                        ap_path.append({
+                            "ts": r_start,
+                            "from_ap": from_ap,
+                            "to_ap": r_ap,
+                            "band": r_band,
+                            "satisfaction": r_sat,
+                        })
+
+                prev_end = end_ts
+        else:
+            # Fallback: use event log data (may be stale)
+            for evt in events_list:
+                if evt["type"] == "roam":
+                    from_name = evt.get("ap_name") or ap_names.get(evt.get("ap_from", ""), "?")
+                    to_name = ap_names.get(evt.get("ap_to", ""), evt.get("ap_name", "?"))
+                    ap_path.append({
+                        "ts": evt["ts"],
+                        "from_ap": from_name,
+                        "to_ap": to_name,
+                        "channel_from": evt.get("channel_from"),
+                        "channel_to": evt.get("channel_to"),
+                    })
+                elif evt["type"] == "disconnect":
+                    disconnects.append({
+                        "ts": evt["ts"],
+                        "ap": evt.get("ap_name") or ap_names.get(evt.get("ap", ""), "?"),
+                        "reason": evt.get("reason", ""),
+                    })
+                elif evt["type"] == "connect":
+                    connects.append({
+                        "ts": evt["ts"],
+                        "ap": evt.get("ap_name") or ap_names.get(evt.get("ap", ""), "?"),
+                    })
 
         # Detect patterns
         disconnect_count = len(disconnects)
@@ -1207,29 +1307,44 @@ def _build_client_journeys(events, clients, devices, lookback_days):
         visited_aps.discard("?")
         visited_aps.discard("")
 
-        # Build session estimate (connect → disconnect pairs)
-        sessions = []
-        conn_stack = list(connects)
-        for disc in disconnects:
-            # Find closest connect before this disconnect
-            best_conn = None
-            for c in conn_stack:
-                if c["ts"] < disc["ts"]:
-                    best_conn = c
-            if best_conn:
-                duration_min = (disc["ts"] - best_conn["ts"]) / 60
-                sessions.append({"duration_min": duration_min, "ap": best_conn["ap"]})
-                conn_stack.remove(best_conn)
-
-        avg_session_min = (
-            sum(s["duration_min"] for s in sessions) / len(sessions) if sessions else None
-        )
+        # Build session estimate
+        if session_list:
+            durations = [s["duration"] for s in session_list if s.get("duration")]
+            avg_session_min = (
+                sum(durations) / len(durations) / 60 if durations else None
+            )
+        else:
+            sessions_pairs = []
+            conn_stack = list(connects)
+            for disc in disconnects:
+                best_conn = None
+                for c in conn_stack:
+                    if c["ts"] < disc["ts"]:
+                        best_conn = c
+                if best_conn:
+                    duration_min = (disc["ts"] - best_conn["ts"]) / 60
+                    sessions_pairs.append({"duration_min": duration_min, "ap": best_conn["ap"]})
+                    conn_stack.remove(best_conn)
+            avg_session_min = (
+                sum(s["duration_min"] for s in sessions_pairs) / len(sessions_pairs)
+                if sessions_pairs else None
+            )
 
         # Classify client behavior
         behavior = "stable"
         behavior_detail = ""
-        daily_roams = roam_count / max(lookback_days, 1)
-        daily_disc = disconnect_count / max(lookback_days, 1)
+        # Calculate actual data span from ALL event timestamps (sessions span months)
+        path_times = [e.get("ts", 0) for e in ap_path if e.get("ts")]
+        disc_times = [d.get("ts", 0) for d in disconnects if d.get("ts")]
+        conn_times = [c.get("ts", 0) for c in connects if c.get("ts")]
+        sess_times = [s.get("ts", 0) for s in session_list if s.get("ts")]
+        all_event_times = [t for t in (path_times + disc_times + conn_times + sess_times) if t > 0]
+        if all_event_times:
+            data_span_days = max(1, (max(all_event_times) - min(all_event_times)) / 86400)
+        else:
+            data_span_days = max(lookback_days, 1)
+        daily_roams = roam_count / data_span_days
+        daily_disc = disconnect_count / data_span_days
 
         if daily_disc > 5:
             behavior = "unstable"
@@ -1257,13 +1372,18 @@ def _build_client_journeys(events, clients, devices, lookback_days):
             "disconnect_count": disconnect_count,
             "roam_count": roam_count,
             "visited_aps": sorted(visited_aps),
-            "ap_path": ap_path[-20:],  # Last 20 transitions
-            "disconnects": disconnects[-20:],  # Last 20 disconnects
+            "ap_path": ap_path[-50:],  # Last 50 transitions (session data is richer)
+            "disconnects": disconnects[-20:],
             "peak_disconnect_hour": peak_hour,
             "avg_session_min": round(avg_session_min, 1) if avg_session_min else None,
             "daily_disconnect_rate": round(daily_disc, 2),
             "daily_roam_rate": round(daily_roams, 2),
+            "session_count": len(session_list) if session_list else len(connects),
+            "has_session_data": bool(sess_data),
         }
+        if session_sats:
+            journeys[mac]["avg_satisfaction"] = sum(session_sats) / len(session_sats)
+            journeys[mac]["min_satisfaction"] = min(session_sats)
 
     # Find top issues across all clients
     top_issues = []
@@ -1341,9 +1461,10 @@ def run_expert_analysis(client, site="default", lookback_days=3):
         event_timeline, getattr(analyzer, "hourly_ap_stats", [])
     )
 
-    # Build per-client journey profiles
+    # Build per-client journey profiles (uses session data when available)
     client_journeys = _build_client_journeys(
-        analyzer.historical_events, analyzer.clients, analyzer.devices, lookback_days
+        analyzer.historical_events, analyzer.clients, analyzer.devices, lookback_days,
+        client_sessions=getattr(analyzer, "client_sessions", {}),
     )
 
     # Enrich client journeys with per-client satisfaction from daily stats
