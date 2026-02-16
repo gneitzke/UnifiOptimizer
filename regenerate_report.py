@@ -34,14 +34,22 @@ def find_latest_analysis_cache():
 def regenerate_report():
     """Regenerate HTML report from cached analysis data"""
     import json
+    import sys as _sys
 
-    from core.html_report_generator import generate_html_report
-    from core.html_report_generator_share import generate_html_report as generate_share_html_report
+    from core.report_v2 import generate_v2_report
 
     console.print("\n[bold cyan]HTML Report Regenerator[/bold cyan]\n")
 
-    # Try to load from cache first
-    cache_file = find_latest_analysis_cache()
+    # Accept --cache <file> argument
+    cache_file = None
+    args = _sys.argv[1:]
+    for i, arg in enumerate(args):
+        if arg == "--cache" and i + 1 < len(args):
+            cache_file = Path(args[i + 1])
+            break
+
+    if not cache_file:
+        cache_file = find_latest_analysis_cache()
 
     if cache_file:
         console.print(f"[green]Found cached analysis:[/green] {cache_file}")
@@ -65,30 +73,18 @@ def regenerate_report():
         console.print("[red]Cached analysis data is empty.[/red]")
         return False
 
-    # Generate reports (both versions)
-    console.print("[yellow]Generating HTML report...[/yellow]")
+    # Generate report
+    console.print("[yellow]Generating report...[/yellow]")
 
-    report_path = generate_html_report(
+    report_path, _ = generate_v2_report(
         analysis_data=analysis,
         recommendations=recommendations,
         site_name=site_name,
-        output_dir="reports",
     )
 
     console.print(f"[green]✓[/green] Report generated: {report_path}")
 
-    # Generate sharing-friendly version
-    share_report_path = generate_share_html_report(
-        analysis_data=analysis,
-        recommendations=recommendations,
-        site_name=site_name,
-        output_dir="reports",
-    )
-
-    console.print(f"[green]✓[/green] Sharing version: {share_report_path}")
-    console.print(f"[dim]   (Works in email/iMessage - uses static images)[/dim]\n")
-
-    # Open main report in browser
+    # Open report in browser
     import subprocess
 
     subprocess.run(["open", report_path])
