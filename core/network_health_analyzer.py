@@ -128,6 +128,7 @@ class NetworkHealthAnalyzer:
             "restart_count": 0,
             "manual_restart": False,
             "events": [],
+            "event_span_days": lookback_days,
         }
 
         try:
@@ -142,9 +143,13 @@ class NetworkHealthAnalyzer:
             all_events = events_response.get("data", [])
             cutoff_ms = (_time.time() - lookback_days * 86400) * 1000
             events = [e for e in all_events if e.get("time", 0) >= cutoff_ms]
-            # If no recent events, use all available
-            if not events:
+            # If no recent events, use all available but track actual span
+            if not events and all_events:
                 events = all_events
+                times = [e.get("time", 0) for e in all_events if e.get("time", 0)]
+                if times:
+                    span_ms = max(times) - min(times)
+                    result["event_span_days"] = max(1, span_ms / (86400 * 1000))
             # Look for restart-related events for this device
             # NOTE: "disconnected" is NOT included - that's for client disconnections, not device restarts
             restart_keywords = [
@@ -283,15 +288,34 @@ class NetworkHealthAnalyzer:
                 restart_info = self._get_device_restart_events(device_mac, lookback_days=7)
                 restart_count = restart_info["restart_count"]
                 is_manual = restart_info["manual_restart"]
+                event_span = restart_info.get("event_span_days", 7)
+
+                # Estimate restart rate from uptime when event log is stale
+                # If uptime < 24h and event log is old, use uptime to estimate daily rate
+                estimated_daily = None
+                if event_span > 14 and uptime_hours > 0 and uptime_hours < 48:
+                    # Event log is stale. Use historical event rate as best estimate
+                    historical_rate = restart_count / max(event_span, 1)
+                    estimated_daily = round(max(historical_rate, 1), 1)
 
                 device_info["restart_count"] = restart_count
                 device_info["manual_restart"] = is_manual
+                device_info["event_span_days"] = round(event_span, 1)
+                device_info["estimated_daily_restarts"] = estimated_daily
 
                 # CYCLIC RESTARTS: Multiple restarts = stability issue (HIGH PRIORITY)
-                if restart_count >= 3:
+                if restart_count >= 3 or (estimated_daily and estimated_daily >= 2):
                     analysis["devices"]["cyclic_restart"].append(device_info)
                     analysis["status"] = "critical"
                     analysis["score_penalty"] += 15
+
+                    # Build accurate message
+                    if estimated_daily and event_span > 14:
+                        msg = (f"{device_name} restarts ~{estimated_daily}x/day "
+                               f"(uptime {uptime_hours:.1f}h, {restart_count} events over {event_span:.0f} days)")
+                    else:
+                        span_str = f"{event_span:.0f} days" if event_span != 7 else "7 days"
+                        msg = f"{device_name} has restarted {restart_count} times in {span_str} - CYCLIC BEHAVIOR"
 
                     analysis["issues"].append(
                         {
@@ -301,7 +325,8 @@ class NetworkHealthAnalyzer:
                             "device_type": device_type,
                             "restart_count": restart_count,
                             "uptime_hours": uptime_hours,
-                            "message": f"{device_name} has restarted {restart_count} times in 7 days - CYCLIC BEHAVIOR",
+                            "estimated_daily_restarts": estimated_daily,
+                            "message": msg,
                             "impact": "Repeated restarts indicate serious stability problem (power, hardware, firmware)",
                             "recommendation": "URGENT: Check power supply, thermal issues, firmware bugs, or hardware failure",
                         }
