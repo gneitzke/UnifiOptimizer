@@ -1335,6 +1335,22 @@ def _rf_panel(analysis_data):
         airtime_items.append((key[:18], pct, color))
     airtime_chart = _svg_hbar(airtime_items[:10], max_val=100) if airtime_items else ""
 
+    # Channel utilization from live device stats (more current than airtime analysis)
+    devices = analysis_data.get("devices", [])
+    cu_items = []
+    for dev in devices:
+        if dev.get("type") != "uap":
+            continue
+        name = dev.get("name", "?")
+        for rs in dev.get("radio_table_stats", []):
+            cu = rs.get("cu_total", 0)
+            if cu and cu > 10:
+                band = "2.4" if rs.get("radio") == "ng" else "5" if rs.get("radio") == "na" else "6"
+                color = "#ea4335" if cu > 70 else "#fbbc04" if cu > 40 else "#34a853"
+                cu_items.append((f"{name[:12]} {band}G", cu, color))
+    cu_items.sort(key=lambda x: -x[1])
+    cu_chart = _svg_hbar(cu_items[:8], max_val=100) if cu_items else ""
+
     # Per-AP detail expand (clients per AP)
     ap_client_detail = ""
     for ap in ap_details:
@@ -1380,6 +1396,8 @@ def _rf_panel(analysis_data):
         f'<div class="panel-card">'
         f'<h3>Airtime Utilization <span class="count">(%)</span></h3>'
         f'{airtime_chart if airtime_chart else "<span style=color:#5f6368>No airtime data</span>"}</div>'
+        # Channel utilization
+        f'{f"""<div class="panel-card"><h3>Channel Utilization <span class="count">(%)</span></h3>{cu_chart}</div>""" if cu_chart else ""}'
         # Power/Channel matrix
         f'<div class="panel-card full">'
         f'<h3>Channel &amp; Power Map</h3>'
@@ -1536,10 +1554,61 @@ def _clients_panel(analysis_data):
 # ---------------------------------------------------------------------------
 
 def _infra_panel(analysis_data):
+    # --- Device Overview: Uptime, Firmware, WiFi Score ---
+    devices = analysis_data.get("devices", [])
+    dev_rows = []
+    firmware_set = set()
+    for dev in sorted(devices, key=lambda d: d.get("uptime", 0)):
+        name = dev.get("name", "?")
+        dtype = dev.get("type", "?")
+        uptime_s = dev.get("uptime", 0) or 0
+        fw = dev.get("version", dev.get("displayable_version", ""))
+        sat = dev.get("satisfaction", "")
+        if fw:
+            firmware_set.add(fw)
+
+        # Format uptime
+        if uptime_s < 3600:
+            up_str = f"{uptime_s // 60}m"
+        elif uptime_s < 86400:
+            up_str = f"{uptime_s // 3600}h"
+        else:
+            up_str = f"{uptime_s // 86400}d {(uptime_s % 86400) // 3600}h"
+
+        # Color code uptime (short = warning)
+        up_color = "#ea4335" if uptime_s < 3600 else "#ea8600" if uptime_s < 86400 else "#9aa0a6"
+
+        # WiFi score color
+        sat_str = ""
+        if sat and dtype == "uap":
+            sat_color = "#34a853" if sat >= 90 else "#fbbc04" if sat >= 70 else "#ea4335"
+            sat_str = f'<span style="color:{sat_color}">{sat}%</span>'
+
+        icon = "📡" if dtype == "uap" else "🔌"
+        dev_rows.append(
+            f'<tr><td>{icon} {_esc(name)}</td>'
+            f'<td style="color:{up_color}">{up_str}</td>'
+            f'<td style="font-size:11px">{_esc(fw[:12])}</td>'
+            f'<td>{sat_str}</td></tr>'
+        )
+
+    fw_note = ""
+    if len(firmware_set) > 1:
+        fw_note = f'<div style="font-size:11px;color:#ea8600;margin-top:6px">⚠ {len(firmware_set)} different firmware versions — consider updating for consistency</div>'
+
+    device_table = (
+        f'<div class="panel-card full">'
+        f'<h3>Device Health <span class="count">({len(devices)} devices)</span></h3>'
+        f'<table class="matrix-table">'
+        f'<tr><th>Device</th><th>Uptime</th><th>Firmware</th><th>WiFi Score</th></tr>'
+        f'{"".join(dev_rows)}</table>'
+        f'{fw_note}</div>'
+    ) if dev_rows else ""
+
     sw_analysis = analysis_data.get("switch_analysis", {})
     switches = sw_analysis.get("switches", [])
-    if not switches:
-        return '<div class="panel-card"><p style="color:#5f6368">No switches detected.</p></div>'
+    if not switches and not dev_rows:
+        return '<div class="panel-card"><p style="color:#5f6368">No infrastructure data.</p></div>'
 
     cards = []
     for sw in switches:
@@ -1644,19 +1713,20 @@ def _infra_panel(analysis_data):
             f'</div>'
         )
 
-    # Port health legend
-    legend = (
-        '<div style="display:flex;gap:16px;margin-top:4px;font-size:11px;color:#5f6368">'
-        '<span>🟢 1Gbps</span><span>🟡 Slow</span><span>🔴 Drops</span><span>⚪ Inactive</span>'
-        '<span style="color:#006fff">◎ AP port</span>'
-        '</div>'
-    )
+    switch_html = ""
+    if cards:
+        legend = (
+            '<div style="display:flex;gap:16px;margin-top:4px;font-size:11px;color:#5f6368">'
+            '<span>🟢 1Gbps</span><span>🟡 Slow</span><span>🔴 Drops</span><span>⚪ Inactive</span>'
+            '<span style="color:#006fff">◎ AP port</span>'
+            '</div>'
+        )
+        switch_html = (
+            f'{"".join(cards)}'
+            f'<div class="panel-card full" style="padding:12px 20px">{legend}</div>'
+        )
 
-    return (
-        f'<div class="panel-grid">{"".join(cards)}'
-        f'<div class="panel-card full" style="padding:12px 20px">{legend}</div>'
-        f'</div>'
-    )
+    return f'<div class="panel-grid">{device_table}{switch_html}</div>'
 
 
 # ---------------------------------------------------------------------------
