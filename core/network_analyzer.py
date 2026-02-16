@@ -98,9 +98,10 @@ class ExpertNetworkAnalyzer:
         # Hourly: ~7 day retention on CloudKey. Daily: months of data.
         self.hourly_ap_stats = []
         self.daily_ap_stats = []
+        self.daily_user_stats = []
         try:
             now_ms = int(_time.time() * 1000)
-            report_attrs = ["bytes", "num_sta", "num_wifi_roam_to_events", "time"]
+            report_attrs = ["bytes", "num_sta", "num_wifi_roam_to_events", "satisfaction", "time"]
 
             # Hourly AP stats (request full lookback; controller returns what it has)
             hourly_start = now_ms - max(lookback_days, 7) * 86400 * 1000
@@ -120,11 +121,22 @@ class ExpertNetworkAnalyzer:
             })
             self.daily_ap_stats = resp_d.get("data", []) if resp_d else []
 
+            # Daily per-client stats (satisfaction, usage) — 7 day window
+            user_attrs = ["bytes", "rx_bytes", "tx_bytes", "satisfaction", "time"]
+            resp_du = self.client.post(f"s/{self.site}/stat/report/daily.user", {
+                "attrs": user_attrs,
+                "start": now_ms - 7 * 86400 * 1000,
+                "end": now_ms,
+            })
+            self.daily_user_stats = resp_du.get("data", []) if resp_du else []
+
             parts = []
             if self.hourly_ap_stats:
                 parts.append(f"{len(self.hourly_ap_stats)} hourly")
             if self.daily_ap_stats:
                 parts.append(f"{len(self.daily_ap_stats)} daily")
+            if self.daily_user_stats:
+                parts.append(f"{len(self.daily_user_stats)} client-daily")
             if parts:
                 console.print(
                     f"[green]  ↳ AP stat records: {', '.join(parts)}[/green]"
@@ -732,7 +744,7 @@ def _build_event_timeline(events, lookback_days):
     sorted_hours = sorted(hourly.keys())
 
     # Build per-category arrays aligned to sorted hours
-    categories = ["disconnect", "roaming", "dfs_radar", "device_restart", "device_offline"]
+    categories = ["roaming", "dfs_radar", "device_restart", "device_offline"]
     series = {}
     for cat in categories:
         series[cat] = [hourly[h].get(cat, 0) for h in sorted_hours]
@@ -740,35 +752,27 @@ def _build_event_timeline(events, lookback_days):
     # Detective insights: find peak hours and problem APs
     insights = []
     if sorted_hours:
-        # Find peak disconnect hour
-        disconnect_by_hour = {h: hourly[h].get("disconnect", 0) for h in sorted_hours}
-        peak_hour = max(disconnect_by_hour, key=disconnect_by_hour.get, default=None)
-        if peak_hour and disconnect_by_hour[peak_hour] > 3:
-            insights.append(
-                f"Peak disconnects: {disconnect_by_hour[peak_hour]} events at {peak_hour}"
-            )
-
-        # Find AP with most disconnects
-        if ap_event_counts:
-            worst_ap = max(
-                ap_event_counts.keys(),
-                key=lambda a: ap_event_counts[a].get("disconnect", 0),
-                default=None,
-            )
-            if worst_ap and ap_event_counts[worst_ap]["disconnect"] > 5:
-                insights.append(
-                    f"Most disconnects: {worst_ap} ({ap_event_counts[worst_ap]['disconnect']} events)"
-                )
-
-        # DFS correlation
+        # DFS correlation with roaming spikes
         dfs_hours = [h for h in sorted_hours if hourly[h].get("dfs_radar", 0) > 0]
         if dfs_hours:
             for dfs_h in dfs_hours:
-                disc_count = hourly[dfs_h].get("disconnect", 0)
-                if disc_count > 2:
+                roam_count = hourly[dfs_h].get("roaming", 0)
+                if roam_count > 5:
                     insights.append(
-                        f"DFS radar at {dfs_h} coincided with {disc_count} disconnects"
+                        f"DFS radar at {dfs_h} coincided with {roam_count} roaming events"
                     )
+
+        # Find AP with most offline events
+        if ap_event_counts:
+            worst_ap = max(
+                ap_event_counts.keys(),
+                key=lambda a: ap_event_counts[a].get("device_offline", 0),
+                default=None,
+            )
+            if worst_ap and ap_event_counts[worst_ap].get("device_offline", 0) > 3:
+                insights.append(
+                    f"Most offline events: {worst_ap} ({ap_event_counts[worst_ap]['device_offline']} events)"
+                )
 
     return {
         "hours": sorted_hours,
@@ -933,7 +937,7 @@ def _merge_hourly_ap_stats(event_timeline, hourly_ap_stats, daily_ap_stats, devi
 
     # Rebuild category arrays aligned to all_hours
     old_hour_idx = {h: i for i, h in enumerate(hours_list)}
-    for cat_name in ["disconnect", "roaming", "dfs_radar", "device_restart", "device_offline"]:
+    for cat_name in ["roaming", "dfs_radar", "device_restart", "device_offline"]:
         old_arr = categories.get(cat_name, [])
         new_arr = []
         for h in all_hours:
@@ -967,6 +971,116 @@ def _merge_hourly_ap_stats(event_timeline, hourly_ap_stats, daily_ap_stats, devi
     event_timeline["stat_report_hours"] = len(new_hours_sorted)
     event_timeline["stat_report_roams"] = added_roams
     event_timeline["daily_gap_fill"] = daily_added
+
+
+def _build_satisfaction_timeline(event_timeline, hourly_ap_stats):
+    """Build WiFi quality timeline from per-AP hourly satisfaction data.
+
+    Creates a 'wifi_quality' category in the event timeline showing hours where
+    average AP satisfaction dropped below normal (< 90). This replaces the always-empty
+    'disconnect' category with actionable WiFi health data.
+    """
+    if not hourly_ap_stats:
+        return
+
+    hours_list = event_timeline.get("hours", [])
+    if not hours_list:
+        return
+
+    # Build per-hour average satisfaction from AP stats
+    hour_sats = defaultdict(list)
+    for record in hourly_ap_stats:
+        sat = record.get("satisfaction")
+        if sat is None or not isinstance(sat, (int, float)):
+            continue
+        ts = record.get("time", 0)
+        if not ts:
+            continue
+        ts_sec = ts / 1000 if ts > 1e12 else ts
+        try:
+            dt = datetime.fromtimestamp(ts_sec, tz=timezone.utc)
+        except (ValueError, OSError):
+            continue
+        hour_key = dt.strftime("%Y-%m-%d %H:00")
+        hour_sats[hour_key].append(sat)
+
+    if not hour_sats:
+        return
+
+    # Build array aligned to timeline hours: count of "quality dip" events per hour
+    # A dip is when any AP's satisfaction drops below 85 (normal is 95-100)
+    wifi_quality = []
+    for h in hours_list:
+        sats = hour_sats.get(h, [])
+        if not sats:
+            wifi_quality.append(0)
+            continue
+        # Count APs with satisfaction below threshold
+        low_count = sum(1 for s in sats if s < 85)
+        wifi_quality.append(low_count)
+
+    categories = event_timeline.setdefault("categories", {})
+    # Replace the always-empty disconnect category with wifi_quality
+    categories.pop("disconnect", None)
+    categories["wifi_quality"] = wifi_quality
+    event_timeline["totals"] = event_timeline.get("totals", {})
+    event_timeline["totals"].pop("disconnect", None)
+    event_timeline["totals"]["wifi_quality"] = sum(wifi_quality)
+
+    # Also store raw satisfaction averages for tooltip/detail use
+    sat_averages = {}
+    for h, sats in hour_sats.items():
+        sat_averages[h] = sum(sats) / len(sats)
+    event_timeline["satisfaction_by_hour"] = sat_averages
+
+
+def _enrich_client_satisfaction(client_journeys, daily_user_stats, clients):
+    """Enrich client journey data with per-client WiFi satisfaction from daily stats."""
+    if not daily_user_stats or not client_journeys:
+        return
+
+    # Build mac→hostname lookup
+    mac_to_name = {}
+    for c in clients:
+        mac = c.get("mac", "")
+        name = c.get("hostname") or c.get("name") or mac[:12]
+        if mac:
+            mac_to_name[mac] = name
+
+    # Aggregate per-client satisfaction
+    client_sats = defaultdict(list)
+    for record in daily_user_stats:
+        user_mac = record.get("user", "")
+        sat = record.get("satisfaction")
+        if user_mac and isinstance(sat, (int, float)):
+            client_sats[user_mac].append(sat)
+
+    # Enrich client journey profiles
+    journey_clients = client_journeys.get("clients", {})
+    for mac, data in journey_clients.items():
+        sats = client_sats.get(mac, [])
+        if sats:
+            data["avg_satisfaction"] = sum(sats) / len(sats)
+            data["min_satisfaction"] = min(sats)
+            data["satisfaction_days"] = len(sats)
+
+    # Flag clients with consistently low satisfaction
+    low_sat_clients = []
+    for mac, sats in client_sats.items():
+        if len(sats) >= 2:
+            avg = sum(sats) / len(sats)
+            if avg < 80:
+                name = mac_to_name.get(mac, mac[:12])
+                low_sat_clients.append({
+                    "client": name,
+                    "mac": mac,
+                    "avg_satisfaction": round(avg, 1),
+                    "days_tracked": len(sats),
+                })
+    if low_sat_clients:
+        client_journeys["low_satisfaction_clients"] = sorted(
+            low_sat_clients, key=lambda x: x["avg_satisfaction"]
+        )
 
 
 def _build_client_journeys(events, clients, devices, lookback_days):
@@ -1222,9 +1336,19 @@ def run_expert_analysis(client, site="default", lookback_days=3):
             analyzer.devices,
         )
 
+    # Build WiFi quality timeline from hourly AP satisfaction data
+    _build_satisfaction_timeline(
+        event_timeline, getattr(analyzer, "hourly_ap_stats", [])
+    )
+
     # Build per-client journey profiles
     client_journeys = _build_client_journeys(
         analyzer.historical_events, analyzer.clients, analyzer.devices, lookback_days
+    )
+
+    # Enrich client journeys with per-client satisfaction from daily stats
+    _enrich_client_satisfaction(
+        client_journeys, getattr(analyzer, "daily_user_stats", []), analyzer.clients
     )
 
     return {

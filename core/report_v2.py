@@ -492,16 +492,79 @@ def _svg_hbar(items, max_val=None):
 def _svg_swim_lane(client_name, client_data, width=700):
     """Client journey swim lane visualization with time axis."""
     from datetime import datetime as _dt
+    import time as _time_mod
 
     ap_path = client_data.get("ap_path", [])
     visited_aps = client_data.get("visited_aps", [])
-    if not ap_path or not visited_aps:
-        return ""
-
-    behavior = client_data.get("behavior", "unknown")
     roams = client_data.get("roam_count", 0)
     daily = client_data.get("daily_roam_rate", 0)
+    behavior = client_data.get("behavior", "unknown")
+
+    bclass = _behavior_css_class(behavior)
+    behavior_display = _behavior_display(behavior)
+
+    # If no path data, show summary card only
+    if not ap_path or not visited_aps:
+        if roams:
+            return (
+                f'<div class="swim-lane-wrap">'
+                f'<div class="swim-lane-title">{_esc(client_name)} '
+                f'<span class="behavior-badge {bclass}">{_esc(behavior_display)}</span></div>'
+                f'<div class="swim-lane-subtitle">{roams} roams ({daily:.0f}/day) across {len(visited_aps)} APs</div>'
+                f'<div style="font-size:11px;color:#5f6368;padding:4px 0">No per-event path data available.</div></div>'
+            )
+        return ""
+
     path_count = len(ap_path)
+
+    # Check if path data is stale (>7 days old)
+    times = [e.get("ts", 0) for e in ap_path if e.get("ts")]
+    if not times:
+        return ""
+    t_min, t_max = min(times), max(times)
+    now_ts = _time_mod.time()
+    data_age_days = (now_ts - t_max) / 86400
+
+    # If data is very stale, show a summary card with AP distribution instead
+    if data_age_days > 7 and roams > path_count * 2:
+        t_first = _dt.fromtimestamp(t_min)
+        t_last = _dt.fromtimestamp(t_max)
+        # Show AP distribution bar
+        ap_visits = {}
+        for e in ap_path:
+            ap = e.get("to_ap", "")
+            if ap:
+                ap_visits[ap] = ap_visits.get(ap, 0) + 1
+        ap_items = sorted(ap_visits.items(), key=lambda x: -x[1])
+        ap_colors = ["#006fff", "#34a853", "#fbbc04", "#ea8600", "#9c27b0", "#00bcd4"]
+        ap_bar = ""
+        if ap_items:
+            total = sum(v for _, v in ap_items)
+            bars = []
+            for i, (ap, cnt) in enumerate(ap_items[:6]):
+                pct = cnt / total * 100
+                color = ap_colors[i % len(ap_colors)]
+                bars.append(
+                    f'<div style="flex:{pct:.0f};background:{color};height:18px;border-radius:2px;'
+                    f'min-width:20px;display:flex;align-items:center;justify-content:center;'
+                    f'font-size:9px;color:#fff;white-space:nowrap;overflow:hidden" '
+                    f'title="{_esc(ap)}: {cnt} roams ({pct:.0f}%)">{_esc(ap[:10])}</div>'
+                )
+            ap_bar = f'<div style="display:flex;gap:2px;margin:6px 0">{"".join(bars)}</div>'
+
+        return (
+            f'<div class="swim-lane-wrap">'
+            f'<div class="swim-lane-title">{_esc(client_name)} '
+            f'<span class="behavior-badge {bclass}">{_esc(behavior_display)}</span></div>'
+            f'<div class="swim-lane-subtitle">{roams} roams ({daily:.0f}/day) across {len(visited_aps)} APs</div>'
+            f'{ap_bar}'
+            f'<div style="font-size:10px;color:#5f6368;margin-top:2px">'
+            f'Path sample: {t_first.strftime("%b %d")} – {t_last.strftime("%b %d %Y")} '
+            f'({path_count} events of {roams} total — controller event buffer limit)</div></div>'
+        )
+
+    # --- Recent data: render full swim lane ---
+    t_span = t_max - t_min or 1
 
     # Limit APs shown to most visited (top 6)
     visited_aps = visited_aps[:6]
@@ -509,13 +572,6 @@ def _svg_swim_lane(client_name, client_data, width=700):
     label_w = 85
     time_axis_h = 18
     h = len(visited_aps) * row_h + 30 + time_axis_h
-
-    # Time range
-    times = [e.get("ts", 0) for e in ap_path if e.get("ts")]
-    if not times:
-        return ""
-    t_min, t_max = min(times), max(times)
-    t_span = t_max - t_min or 1
     chart_w = width - label_w - 10
 
     ap_colors = ["#006fff", "#34a853", "#fbbc04", "#ea8600", "#9c27b0", "#00bcd4", "#ff5722"]
@@ -534,16 +590,11 @@ def _svg_swim_lane(client_name, client_data, width=700):
             f'<text x="{x:.0f}" y="12" fill="#5f6368" font-size="8" '
             f'text-anchor="middle" font-family="sans-serif">{label}</text>'
         )
-        parts.append(
-            f'<line x1="{x:.0f}" y1="16" x2="{x:.0f}" y2="{h - 4}" '
-            f'stroke="#1e2d4a" stroke-width="0.5" stroke-dasharray="2 3"/>'
-        )
 
-    # Grid lines and AP labels
+    # AP labels and rows
     for i, ap in enumerate(visited_aps):
         y = i * row_h + 20 + time_axis_h
         parts.append(f'<text x="2" y="{y + 4}" fill="#9aa0a6" font-size="9.5" font-family="sans-serif">{_esc(ap[:12])}</text>')
-        parts.append(f'<line x1="{label_w}" y1="{y - 6}" x2="{width}" y2="{y - 6}" stroke="#1e2d4a" stroke-width="0.5"/>')
 
     # Build segments from path
     for i, event in enumerate(ap_path):
@@ -561,24 +612,14 @@ def _svg_swim_lane(client_name, client_data, width=700):
         w = max(2, x2 - x1)
         parts.append(f'<rect x="{x1:.1f}" y="{y}" width="{w:.1f}" height="{row_h - 6}" rx="2" fill="{color}" opacity="0.65"/>')
 
-        # Roam transition marker
-        if i > 0:
-            parts.append(
-                f'<circle cx="{x1:.1f}" cy="{y + (row_h - 6)/2}" r="3" '
-                f'fill="#e8eaed" stroke="{color}" stroke-width="1"/>'
-            )
-
     parts.append("</svg>")
-
-    bclass = _behavior_css_class(behavior)
-    behavior_display = _behavior_display(behavior)
 
     # Data completeness note
     data_note = ""
     if roams > path_count:
         data_note = (
             f'<div style="font-size:10px;color:#5f6368;margin-top:2px">'
-            f'Showing {path_count} of {roams} roam events (most recent sampled from controller)</div>'
+            f'Showing {path_count} of {roams} roam events (controller event buffer limit)</div>'
         )
 
     return (
@@ -626,6 +667,7 @@ def _svg_device_timeline(analysis_data, width=860):
     restarts = cats.get("device_restart", [])
     dfs = cats.get("dfs_radar", [])
     offline = cats.get("device_offline", [])
+    wifi_quality = cats.get("wifi_quality", [])
 
     if not hours or not roaming:
         return ""
@@ -684,6 +726,10 @@ def _svg_device_timeline(analysis_data, width=860):
         offline_coverage = (offline_last_h / n_hours) if n_hours else 0
         rows.append(("Went Offline", offline_bins, "#ff6d00", sum(offline),
                       offline_coverage if offline_coverage < 0.9 else None))
+
+    wq_bins = bin_hourly(wifi_quality) if wifi_quality else []
+    if wq_bins and sum(wq_bins):
+        rows.append(("WiFi Quality Dips", wq_bins, "#9c27b0", sum(wifi_quality), None))
 
     if not rows:
         return ""
@@ -1490,22 +1536,32 @@ def _clients_panel(analysis_data):
     all_wireless = [c for c in all_clients if not c.get("is_wired")]
     all_wireless.sort(key=lambda c: c.get("health_score", 100))
     full_rows = []
+    # Build mac→satisfaction lookup from journey data
+    journey_sats = {}
+    for mac, jd in journey_clients.items():
+        if "avg_satisfaction" in jd:
+            journey_sats[mac] = jd["avg_satisfaction"]
+
     for c in all_wireless:
         score = c.get("health_score", 0)
         color = _score_color(score)
         rssi = c.get("rssi", 0)
+        sat = journey_sats.get(c.get("mac", ""), None)
+        sat_str = f'{sat:.0f}%' if sat is not None else "—"
+        sat_color = "#ea4335" if sat is not None and sat < 60 else "#fbbc04" if sat is not None and sat < 80 else "#9aa0a6"
         full_rows.append(
             f'<tr><td style="color:#e8eaed">{_esc(c.get("hostname", "?")[:22])}</td>'
             f'<td>{_esc(c.get("ap_name", "?"))}</td>'
             f'<td>{rssi} dBm</td>'
             f'<td style="color:{color}">{score} ({c.get("grade", "?")})</td>'
             f'<td>{c.get("channel", 0)}</td>'
-            f'<td>{c.get("roam_count", 0)}</td></tr>'
+            f'<td>{c.get("roam_count", 0)}</td>'
+            f'<td style="color:{sat_color}">{sat_str}</td></tr>'
         )
     full_client_expand = (
         f'<details><summary>View all {len(all_wireless)} wireless clients</summary>'
         f'<div class="detail-body"><table>'
-        f'<tr><th>Client</th><th>AP</th><th>Signal</th><th>Health</th><th>Channel</th><th>Roams</th></tr>'
+        f'<tr><th>Client</th><th>AP</th><th>Signal</th><th>Health</th><th>Channel</th><th>Roams</th><th>WiFi Sat</th></tr>'
         f'{"".join(full_rows)}</table></div></details>'
     ) if all_wireless else ""
 
@@ -1532,6 +1588,28 @@ def _clients_panel(analysis_data):
             f'<div class="detail-body">{"".join(issue_cards)}</div></details>'
         )
 
+    # Low-satisfaction clients from daily stats
+    low_sat_html = ""
+    low_sat_clients = journeys.get("low_satisfaction_clients", [])
+    if low_sat_clients:
+        low_sat_rows = []
+        for lsc in low_sat_clients:
+            sat = lsc.get("avg_satisfaction", 0)
+            sat_color = "#ea4335" if sat < 60 else "#fbbc04" if sat < 80 else "#34a853"
+            low_sat_rows.append(
+                f'<tr><td style="color:#e8eaed">{_esc(lsc.get("client", "?"))}</td>'
+                f'<td style="color:{sat_color}">{sat:.0f}%</td>'
+                f'<td>{lsc.get("days_tracked", 0)} days</td></tr>'
+            )
+        low_sat_html = (
+            f'<div class="panel-card full">'
+            f'<h3>Low WiFi Satisfaction <span class="count">({len(low_sat_clients)} clients)</span></h3>'
+            f'<div style="font-size:11px;color:#9aa0a6;margin-bottom:6px">'
+            f'Clients with average satisfaction below 80% over the past week</div>'
+            f'<table><tr><th>Client</th><th>Avg Satisfaction</th><th>Tracked</th></tr>'
+            f'{"".join(low_sat_rows)}</table></div>'
+        )
+
     return (
         f'<div class="panel-grid">'
         f'<div class="panel-card full">'
@@ -1541,6 +1619,7 @@ def _clients_panel(analysis_data):
         f'<div class="panel-card full">'
         f'<h3>Client Journeys <span class="count">({total_tracked} tracked)</span></h3>'
         f'{journey_html}</div>'
+        f'{low_sat_html}'
         f'<div class="panel-card full">'
         f'<h3>Health Issues</h3>'
         f'{health_detail if health_detail else "<span style=color:#34a853>No health issues detected.</span>"}'
