@@ -1011,6 +1011,128 @@ def _merge_hourly_ap_stats(event_timeline, hourly_ap_stats, daily_ap_stats, devi
     event_timeline["daily_gap_fill"] = daily_added
 
 
+def _detect_restarts_from_sessions(event_timeline, client_sessions, devices):
+    """Detect AP restarts from multi-client session disconnect clustering.
+
+    When an AP restarts, multiple clients disconnect simultaneously.
+    By finding times when 2+ different clients end sessions on the same AP
+    within a 120-second window, we can identify restart events even when
+    the event log buffer is full and hourly stat gaps miss quick reboots.
+    """
+    if not client_sessions or not devices:
+        return
+
+    ap_names = {}
+    for d in devices:
+        if d.get("type") == "uap":
+            ap_names[d.get("mac", "")] = d.get("name", "Unknown")
+
+    # Collect per-AP session end times across all clients
+    ap_ends = defaultdict(list)  # ap_mac -> [(end_ts, client_mac)]
+    for client_mac, sessions in client_sessions.items():
+        for s in sessions:
+            ap_mac = s.get("ap_mac", "")
+            assoc = s.get("assoc_time", 0)
+            dur = s.get("duration", 0)
+            if ap_mac in ap_names and assoc and dur:
+                ap_ends[ap_mac].append((assoc + dur, client_mac))
+
+    hours_list = event_timeline.get("hours", [])
+    categories = event_timeline.setdefault("categories", {})
+    existing_hours = set(hours_list)
+    totals = event_timeline.setdefault("totals", {})
+    ap_events = event_timeline.setdefault("ap_events", {})
+
+    new_restarts = defaultdict(int)
+    new_offline = defaultdict(int)
+    total_detected = 0
+
+    for ap_mac, ends in ap_ends.items():
+        if len(ends) < 2:
+            continue
+        ends_sorted = sorted(ends)
+        name = ap_names.get(ap_mac, "")
+
+        # Cluster end times within 120-second windows
+        i = 0
+        while i < len(ends_sorted):
+            cluster_ts = [ends_sorted[i][0]]
+            cluster_clients = {ends_sorted[i][1]}
+            j = i + 1
+            while j < len(ends_sorted) and ends_sorted[j][0] - ends_sorted[i][0] < 120:
+                cluster_ts.append(ends_sorted[j][0])
+                cluster_clients.add(ends_sorted[j][1])
+                j += 1
+
+            # 2+ unique clients disconnecting = AP restart
+            if len(cluster_clients) >= 2:
+                avg_ts = sum(cluster_ts) / len(cluster_ts)
+                try:
+                    dt = datetime.fromtimestamp(avg_ts, tz=timezone.utc)
+                except (ValueError, OSError):
+                    i = j if j > i + 1 else i + 1
+                    continue
+                hour_key = dt.strftime("%Y-%m-%d %H:00")
+                # Only add if not already counted by event log
+                if hour_key not in existing_hours or True:
+                    new_restarts[hour_key] += 1
+                    new_offline[hour_key] += 1
+                    total_detected += 1
+                    if name:
+                        ap_events.setdefault(name, {})
+                        ap_events[name]["session_restarts"] = (
+                            ap_events[name].get("session_restarts", 0) + 1
+                        )
+
+            i = j if j > i + 1 else i + 1
+
+    if not new_restarts:
+        return
+
+    # Merge new restart hours into timeline
+    new_hours = sorted(set(new_restarts.keys()) - existing_hours)
+    if new_hours:
+        all_hours = sorted(set(hours_list) | set(new_hours))
+        old_hour_idx = {h: i for i, h in enumerate(hours_list)}
+
+        for cat_name in list(categories.keys()):
+            old_arr = categories[cat_name]
+            new_arr = []
+            for h in all_hours:
+                if h in old_hour_idx:
+                    idx = old_hour_idx[h]
+                    val = old_arr[idx] if idx < len(old_arr) else 0
+                else:
+                    val = 0
+                # Add session-detected restarts
+                if cat_name == "device_restart":
+                    val += new_restarts.get(h, 0)
+                elif cat_name == "device_offline":
+                    val += new_offline.get(h, 0)
+                new_arr.append(val)
+            categories[cat_name] = new_arr
+
+        event_timeline["hours"] = all_hours
+    else:
+        # Just add to existing hour counts
+        hour_idx = {h: i for i, h in enumerate(hours_list)}
+        restart_arr = categories.get("device_restart", [0] * len(hours_list))
+        offline_arr = categories.get("device_offline", [0] * len(hours_list))
+        for h, count in new_restarts.items():
+            if h in hour_idx:
+                idx = hour_idx[h]
+                if idx < len(restart_arr):
+                    restart_arr[idx] += count
+                if idx < len(offline_arr):
+                    offline_arr[idx] += count
+        categories["device_restart"] = restart_arr
+        categories["device_offline"] = offline_arr
+
+    totals["device_restart"] = totals.get("device_restart", 0) + sum(new_restarts.values())
+    totals["device_offline"] = totals.get("device_offline", 0) + sum(new_offline.values())
+    event_timeline["session_detected_restarts"] = total_detected
+
+
 def _build_satisfaction_timeline(event_timeline, hourly_ap_stats):
     """Build WiFi quality timeline from per-AP hourly satisfaction data.
 
@@ -1459,6 +1581,13 @@ def run_expert_analysis(client, site="default", lookback_days=3):
     # Build WiFi quality timeline from hourly AP satisfaction data
     _build_satisfaction_timeline(
         event_timeline, getattr(analyzer, "hourly_ap_stats", [])
+    )
+
+    # Detect AP restarts from multi-client session disconnect clustering
+    _detect_restarts_from_sessions(
+        event_timeline,
+        getattr(analyzer, "client_sessions", {}),
+        analyzer.devices,
     )
 
     # Build per-client journey profiles (uses session data when available)
