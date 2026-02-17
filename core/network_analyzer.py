@@ -490,6 +490,9 @@ class ExpertNetworkAnalyzer:
             client_mac = event.get("user") or event.get("client")
             timestamp = event.get("time", 0)
 
+            if not client_mac:
+                continue
+
             if "disconnect" in event_key.lower():
                 client_disconnects[client_mac].append(timestamp)
             elif "roam" in event_key.lower():

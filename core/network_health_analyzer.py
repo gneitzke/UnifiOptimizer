@@ -271,6 +271,8 @@ class NetworkHealthAnalyzer:
             device_type = device.get("type", "unknown")
             device_mac = device.get("mac", "")
             uptime_seconds = device.get("uptime", 0)
+            if not uptime_seconds:
+                continue  # Skip devices with no uptime data
             uptime_days = uptime_seconds / 86400
             uptime_hours = uptime_seconds / 3600
 
@@ -893,10 +895,13 @@ class NetworkHealthAnalyzer:
 
         # Check for proper segmentation
         elif len(analysis["vlans"]) > 1:
-            default_vlan_pct = (
-                analysis["vlans"].get(1, {}).get("count", 0)
-                / sum(v["count"] for v in analysis["vlans"].values())
-            ) * 100
+            vlan_total = sum(v["count"] for v in analysis["vlans"].values())
+            if vlan_total > 0:
+                default_vlan_pct = (
+                    analysis["vlans"].get(1, {}).get("count", 0) / vlan_total
+                ) * 100
+            else:
+                default_vlan_pct = 0
 
             if default_vlan_pct > 80:
                 analysis["recommendations"].append(

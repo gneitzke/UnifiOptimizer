@@ -579,13 +579,13 @@ def analyze_network(client, site="default", lookback_days=3, min_rssi_strategy="
             console.print()
 
         # Display Network Health Analysis - use the Grade-based scoring for consistency
-        health_score = analysis.get("health_score", {})
+        health_score = analysis.get("health_score") or {}
         health_analysis = analysis.get("health_analysis", {})
 
         # Use the comprehensive health score with Grade
-        overall_score = health_score.get("score", 0)
-        grade = health_score.get("grade", "N/A")
-        status = health_score.get("status", "Unknown")
+        overall_score = health_score.get("score") or 0
+        grade = health_score.get("grade") or "N/A"
+        status = health_score.get("status") or "Unknown"
 
         if overall_score and health_analysis:
             # Color code based on grade for consistency
@@ -1726,9 +1726,9 @@ def display_quick_health_dashboard(analysis, recommendations):
     from rich.table import Table
 
     # Get health score
-    health_score = analysis.get("health_score", {})
-    score = health_score.get("score", 0)
-    grade = health_score.get("grade", "N/A")
+    health_score = analysis.get("health_score") or {}
+    score = health_score.get("score") or 0
+    grade = health_score.get("grade") or "N/A"
 
     # Grade-based color
     if grade == "A":
@@ -1859,11 +1859,11 @@ def display_executive_summary(analysis, recommendations, lookback_days):
     console.print()
 
     # Display Network Health Score prominently
-    health_score = analysis.get("health_score", {})
+    health_score = analysis.get("health_score") or {}
     if health_score:
-        score = health_score.get("score", 0)
-        grade = health_score.get("grade", "N/A")
-        status = health_score.get("status", "Unknown")
+        score = health_score.get("score") or 0
+        grade = health_score.get("grade") or "N/A"
+        status = health_score.get("status") or "Unknown"
 
         # Color code by grade
         if grade == "A":
