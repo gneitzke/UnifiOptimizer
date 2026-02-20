@@ -4,15 +4,15 @@ Premium consultant-grade network analysis report.
 Self-contained HTML5 — no external dependencies.
 """
 
-import os
-import math
 import html as _html
+import math
+import os
 from datetime import datetime
-
 
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
+
 
 def _esc(text):
     """HTML-escape text safely."""
@@ -58,6 +58,7 @@ def _priority_label(priority):
 # ---------------------------------------------------------------------------
 # CSS — plain string, no f-string (braces are literal)
 # ---------------------------------------------------------------------------
+
 
 def _css():
     return """
@@ -348,6 +349,7 @@ details .detail-body td { padding: 4px 8px; border-bottom: 1px solid #1e2d4a15; 
 # JavaScript — plain string
 # ---------------------------------------------------------------------------
 
+
 def _js():
     return """
 document.addEventListener('DOMContentLoaded', function() {
@@ -401,13 +403,22 @@ function printReport() {
 # SVG Generators
 # ---------------------------------------------------------------------------
 
+
 def _svg_ring(score, size=180):
     """Animated health ring with score in center."""
     r = 72
     circumference = 2 * math.pi * r
     target_offset = circumference * (1 - score / 100)
     color = _score_color(score)
-    grade = "A+" if score >= 95 else "A" if score >= 90 else "B" if score >= 80 else "C" if score >= 70 else "D" if score >= 60 else "F"
+    grade = (
+        "A+"
+        if score >= 95
+        else (
+            "A"
+            if score >= 90
+            else "B" if score >= 80 else "C" if score >= 70 else "D" if score >= 60 else "F"
+        )
+    )
 
     return f"""<svg viewBox="0 0 {size} {size}" width="{size}" height="{size}">
   <circle cx="{size/2}" cy="{size/2}" r="{r}" fill="none"
@@ -459,7 +470,7 @@ def _svg_donut(segments, size=140):
         legend_items.append(
             f'<span class="donut-legend-item">'
             f'<span class="donut-legend-dot" style="background:{color}"></span>'
-            f'{_esc(label)} ({value}, {pct:.0f}%)</span>'
+            f"{_esc(label)} ({value}, {pct:.0f}%)</span>"
         )
 
     return (
@@ -484,15 +495,15 @@ def _svg_hbar(items, max_val=None):
             f'<span class="bar-label">{_esc(label)}</span>'
             f'<div class="bar-track"><div class="bar-fill" style="width:{pct:.1f}%;background:{color}"></div></div>'
             f'<span class="bar-value">{_fmt(value)}</span>'
-            f'</div>'
+            f"</div>"
         )
     return "\n".join(rows)
 
 
 def _svg_swim_lane(client_name, client_data, width=700):
     """Client journey swim lane visualization with time axis."""
-    from datetime import datetime as _dt
     import time as _time_mod
+    from datetime import datetime as _dt
 
     ap_path = client_data.get("ap_path", [])
     visited_aps = client_data.get("visited_aps", [])
@@ -513,11 +524,11 @@ def _svg_swim_lane(client_name, client_data, width=700):
         sat_color = "#ea4335" if avg_sat < 70 else "#fbbc04" if avg_sat < 85 else "#34a853"
         sat_badge = f' <span style="color:{sat_color};font-size:10px">WiFi {avg_sat:.0f}%</span>'
 
-    subtitle = f'{roams} roams ({daily:.0f}/day) across {len(visited_aps)} APs'
+    subtitle = f"{roams} roams ({daily:.0f}/day) across {len(visited_aps)} APs"
     if session_count:
-        subtitle += f' · {session_count} sessions'
+        subtitle += f" · {session_count} sessions"
     if disconnects:
-        subtitle += f' · {len(disconnects)} disconnects'
+        subtitle += f" · {len(disconnects)} disconnects"
 
     # If no path data, show summary card only
     if not ap_path or not visited_aps:
@@ -561,7 +572,7 @@ def _svg_swim_lane(client_name, client_data, width=700):
                 color = ap_colors[i % len(ap_colors)]
                 bars.append(
                     f'<div style="flex:{pct:.0f};background:{color};height:18px;border-radius:2px;'
-                    f'min-width:20px;display:flex;align-items:center;justify-content:center;'
+                    f"min-width:20px;display:flex;align-items:center;justify-content:center;"
                     f'font-size:9px;color:#fff;white-space:nowrap;overflow:hidden" '
                     f'title="{_esc(ap)}: {cnt} roams ({pct:.0f}%)">{_esc(ap[:10])}</div>'
                 )
@@ -572,10 +583,10 @@ def _svg_swim_lane(client_name, client_data, width=700):
             f'<div class="swim-lane-title">{_esc(client_name)} '
             f'<span class="behavior-badge {bclass}">{_esc(behavior_display)}</span>{sat_badge}</div>'
             f'<div class="swim-lane-subtitle">{subtitle}</div>'
-            f'{ap_bar}'
+            f"{ap_bar}"
             f'<div style="font-size:10px;color:#5f6368;margin-top:2px">'
             f'Path sample: {t_first.strftime("%b %d")} – {t_last.strftime("%b %d %Y")} '
-            f'({path_count} events — controller event buffer limit)</div></div>'
+            f"({path_count} events — controller event buffer limit)</div></div>"
         )
 
     # --- Render full swim lane ---
@@ -600,9 +611,20 @@ def _svg_swim_lane(client_name, client_data, width=700):
     h = len(ordered_aps) * row_h + 30 + time_axis_h
     chart_w = width - label_w - 10
 
-    ap_colors = ["#006fff", "#34a853", "#fbbc04", "#ea8600", "#9c27b0", "#00bcd4", "#ff5722", "#795548"]
+    ap_colors = [
+        "#006fff",
+        "#34a853",
+        "#fbbc04",
+        "#ea8600",
+        "#9c27b0",
+        "#00bcd4",
+        "#ff5722",
+        "#795548",
+    ]
 
-    parts = [f'<svg viewBox="0 0 {width} {h}" width="100%" preserveAspectRatio="xMinYMin meet" style="max-width:{width}px">']
+    parts = [
+        f'<svg viewBox="0 0 {width} {h}" width="100%" preserveAspectRatio="xMinYMin meet" style="max-width:{width}px">'
+    ]
 
     # Time axis labels
     n_ticks = min(8, max(2, int(t_span / 3600 / 4)))
@@ -625,7 +647,9 @@ def _svg_swim_lane(client_name, client_data, width=700):
     # AP labels
     for i, ap in enumerate(ordered_aps):
         y = i * row_h + 20 + time_axis_h
-        parts.append(f'<text x="2" y="{y + 4}" fill="#9aa0a6" font-size="9.5" font-family="sans-serif">{_esc(ap[:12])}</text>')
+        parts.append(
+            f'<text x="2" y="{y + 4}" fill="#9aa0a6" font-size="9.5" font-family="sans-serif">{_esc(ap[:12])}</text>'
+        )
 
     # Build segments from path
     for i, event in enumerate(ap_path):
@@ -643,8 +667,12 @@ def _svg_swim_lane(client_name, client_data, width=700):
         w = max(2, x2 - x1)
         # Satisfaction-based opacity if available
         sat = event.get("satisfaction")
-        opacity = "0.45" if (sat is not None and isinstance(sat, (int, float)) and sat < 70) else "0.65"
-        parts.append(f'<rect x="{x1:.1f}" y="{y}" width="{w:.1f}" height="{row_h - 6}" rx="2" fill="{color}" opacity="{opacity}"/>')
+        opacity = (
+            "0.45" if (sat is not None and isinstance(sat, (int, float)) and sat < 70) else "0.65"
+        )
+        parts.append(
+            f'<rect x="{x1:.1f}" y="{y}" width="{w:.1f}" height="{row_h - 6}" rx="2" fill="{color}" opacity="{opacity}"/>'
+        )
 
     # Mark disconnects with red tick marks at bottom
     if disconnects:
@@ -668,12 +696,12 @@ def _svg_swim_lane(client_name, client_data, width=700):
         t_last_dt = _dt.fromtimestamp(t_max).strftime("%b %d %Y")
         data_note = (
             f'<div style="font-size:10px;color:#5f6368;margin-top:2px">'
-            f'{path_count} roam transitions · {t_first_dt} – {t_last_dt} · from session history</div>'
+            f"{path_count} roam transitions · {t_first_dt} – {t_last_dt} · from session history</div>"
         )
     elif roams > path_count:
         data_note = (
             f'<div style="font-size:10px;color:#5f6368;margin-top:2px">'
-            f'Showing {path_count} of {roams} roam events (controller event buffer limit)</div>'
+            f"Showing {path_count} of {roams} roam events (controller event buffer limit)</div>"
         )
 
     return (
@@ -706,11 +734,12 @@ def _behavior_css_class(behavior):
 # SVG: Device Activity Timeline
 # ---------------------------------------------------------------------------
 
+
 def _svg_device_timeline(analysis_data, width=860):
     """Network event timeline using accurate hourly event data.
     Rows: Roaming, Restarts, DFS Radar. X-axis: hours, ending at today."""
-    from datetime import datetime as _dt
     import time
+    from datetime import datetime as _dt
 
     et = analysis_data.get("event_timeline", {})
     hours = et.get("hours", [])
@@ -764,22 +793,43 @@ def _svg_device_timeline(analysis_data, width=860):
     restart_last_h = max((i for i, v in enumerate(restarts) if v > 0), default=0)
     restart_coverage = (restart_last_h / n_hours) if n_hours else 0
     if sum(restart_bins):
-        rows.append(("Restarts", restart_bins, "#ea4335", sum(restarts),
-                      restart_coverage if restart_coverage < 0.9 else None))
+        rows.append(
+            (
+                "Restarts",
+                restart_bins,
+                "#ea4335",
+                sum(restarts),
+                restart_coverage if restart_coverage < 0.9 else None,
+            )
+        )
 
     dfs_bins = bin_hourly(dfs)
     dfs_last_h = max((i for i, v in enumerate(dfs) if v > 0), default=0)
     dfs_coverage = (dfs_last_h / n_hours) if n_hours else 0
     if sum(dfs_bins):
-        rows.append(("DFS Radar", dfs_bins, "#fbbc04", sum(dfs),
-                      dfs_coverage if dfs_coverage < 0.9 else None))
+        rows.append(
+            (
+                "DFS Radar",
+                dfs_bins,
+                "#fbbc04",
+                sum(dfs),
+                dfs_coverage if dfs_coverage < 0.9 else None,
+            )
+        )
 
     offline_bins = bin_hourly(offline) if offline else []
     if offline_bins and sum(offline_bins):
         offline_last_h = max((i for i, v in enumerate(offline) if v > 0), default=0)
         offline_coverage = (offline_last_h / n_hours) if n_hours else 0
-        rows.append(("Went Offline", offline_bins, "#ff6d00", sum(offline),
-                      offline_coverage if offline_coverage < 0.9 else None))
+        rows.append(
+            (
+                "Went Offline",
+                offline_bins,
+                "#ff6d00",
+                sum(offline),
+                offline_coverage if offline_coverage < 0.9 else None,
+            )
+        )
 
     wq_bins = bin_hourly(wifi_quality) if wifi_quality else []
     if wq_bins and sum(wq_bins):
@@ -794,7 +844,9 @@ def _svg_device_timeline(analysis_data, width=860):
     h = len(rows) * row_h + top_pad + 20
     chart_w = width - label_w - 10
 
-    parts = [f'<svg viewBox="0 0 {width} {h}" width="100%" preserveAspectRatio="xMinYMin meet" style="max-width:{width}px">']
+    parts = [
+        f'<svg viewBox="0 0 {width} {h}" width="100%" preserveAspectRatio="xMinYMin meet" style="max-width:{width}px">'
+    ]
 
     # X-axis labels (no grid lines)
     n_labels = min(8, n_blocks)
@@ -802,6 +854,7 @@ def _svg_device_timeline(analysis_data, width=860):
     for i in range(0, n_blocks + 1, label_every):
         x = label_w + (i / n_blocks) * chart_w
         from datetime import timedelta
+
         block_dt = t_first + timedelta(hours=i * block_h)
         if block_dt > now:
             block_dt = now
@@ -883,7 +936,7 @@ def _svg_device_timeline(analysis_data, width=860):
             data_note = (
                 f'<div style="font-size:11px;color:#5f6368;margin-top:4px;text-align:center">'
                 f'Event data covers {t_first.strftime("%b %d")} – {t_last.strftime("%b %d %Y")} · '
-                f'{gap_days}-day gap to today (no recent events on controller)</div>'
+                f"{gap_days}-day gap to today (no recent events on controller)</div>"
             )
 
     legend_items = ['<span style="color:#006fff">■</span> Roaming']
@@ -895,8 +948,8 @@ def _svg_device_timeline(analysis_data, width=860):
         legend_items.append('<span style="color:#ff6d00;margin-left:8px">■</span> Went Offline')
     legend = (
         '<div style="display:flex;gap:14px;justify-content:center;margin-top:6px;font-size:11px;color:#5f6368">'
-        + ''.join(legend_items) +
-        '</div>'
+        + "".join(legend_items)
+        + "</div>"
     )
 
     return (
@@ -906,21 +959,21 @@ def _svg_device_timeline(analysis_data, width=860):
     )
 
 
-
 def _header(site_name, analysis_data):
     now = datetime.now().strftime("%B %d, %Y at %H:%M")
     lookback = analysis_data.get("lookback_days", 3)
     return (
         f'<div class="report-header">'
-        f'<h1><span>UniFi</span> Network Analysis</h1>'
+        f"<h1><span>UniFi</span> Network Analysis</h1>"
         f'<div class="meta">Site: {_esc(site_name)}<br>{now}<br>{lookback}-day lookback</div>'
-        f'</div>'
+        f"</div>"
     )
 
 
 # ---------------------------------------------------------------------------
 # Section: Hero Dashboard
 # ---------------------------------------------------------------------------
+
 
 def _hero(analysis_data, recommendations, site_name="default"):
     hs = analysis_data.get("health_score", {})
@@ -943,7 +996,9 @@ def _hero(analysis_data, recommendations, site_name="default"):
     # Top issue
     issues = analysis_data.get("health_analysis", {}).get("issues", [])
     critical = [i for i in issues if i.get("severity") in ("high", "critical")]
-    top_issue_text = critical[0].get("message", "No critical issues")[:60] if critical else "No critical issues"
+    top_issue_text = (
+        critical[0].get("message", "No critical issues")[:60] if critical else "No critical issues"
+    )
 
     # Action count
     actions = _group_recs(recommendations, analysis_data)
@@ -968,13 +1023,15 @@ def _hero(analysis_data, recommendations, site_name="default"):
     action_text = ""
     if actions:
         action_names = [a["title"].lower() for a in actions[:4]]
-        action_text = f"{action_count} fix{'es' if action_count > 1 else ''}: {', '.join(action_names)}."
+        action_text = (
+            f"{action_count} fix{'es' if action_count > 1 else ''}: {', '.join(action_names)}."
+        )
 
     exec_html = (
         f'<div class="exec-inline">'
         f'<div class="exec-findings">{_esc(finding_text)}</div>'
         f'{f"<div class=exec-actions>{_esc(action_text)}</div>" if action_text else ""}'
-        f'</div>'
+        f"</div>"
     )
 
     return (
@@ -997,15 +1054,16 @@ def _hero(analysis_data, recommendations, site_name="default"):
         f'<div class="label">Actions</div>'
         f'<div class="value">{action_count}</div>'
         f'<div class="detail">optimization{"s" if action_count != 1 else ""} available</div></div>'
-        f'</div>'
-        f'{exec_html}'
-        f'</div></div>'
+        f"</div>"
+        f"{exec_html}"
+        f"</div></div>"
     )
 
 
 # ---------------------------------------------------------------------------
 # Section: Network Topology
 # ---------------------------------------------------------------------------
+
 
 def _topology(analysis_data):
     devices = analysis_data.get("devices", [])
@@ -1090,7 +1148,9 @@ def _topology(analysis_data):
         cursor = x_start
         for kid in kids:
             kid_w = subtree_width(kid.get("mac", ""))
-            share = (kid_w / total_w) * (x_end - x_start) if total_w else (x_end - x_start) / len(kids)
+            share = (
+                (kid_w / total_w) * (x_end - x_start) if total_w else (x_end - x_start) / len(kids)
+            )
             layout(kid, cursor, cursor + share, depth + 1)
             cursor += share
 
@@ -1105,7 +1165,9 @@ def _topology(analysis_data):
 
     svg_h = 55 + (max_depth + 1) * level_gap + 20
 
-    svg = [f'<svg viewBox="0 0 {svg_w} {svg_h}" class="topology-svg" xmlns="http://www.w3.org/2000/svg">']
+    svg = [
+        f'<svg viewBox="0 0 {svg_w} {svg_h}" class="topology-svg" xmlns="http://www.w3.org/2000/svg">'
+    ]
 
     # --- Draw edges (parent→child) ---
     for parent_mac, kids in children_of.items():
@@ -1152,20 +1214,28 @@ def _topology(analysis_data):
         if dtype == "usw":
             # Switch: rounded rectangle
             stroke = "#ea4335" if has_issue else "#1e2d4a"
-            active_ports = len([p for p in dev.get("port_table", []) if (p.get("speed", 0) or 0) > 0]) if dev.get("port_table") else "?"
+            active_ports = (
+                len([p for p in dev.get("port_table", []) if (p.get("speed", 0) or 0) > 0])
+                if dev.get("port_table")
+                else "?"
+            )
             svg.append(
                 f'<g transform="translate({x:.0f},{y:.0f})">'
                 f'<rect x="-58" y="-24" width="116" height="48" rx="6" '
                 f'class="topo-node-rect" style="stroke:{stroke}"/>'
                 f'<text y="-4" class="topo-label">{_esc(name)}</text>'
                 f'<text y="12" class="topo-sublabel">Switch</text>'
-                f'</g>'
+                f"</g>"
             )
         else:
             # AP: circle
             stroke = "#ea4335" if has_issue else "#006fff" if is_mesh else "#34a853"
             circle_class = "topo-mesh-circle" if is_mesh else "topo-ap-circle"
-            sublabel = f'{clients} client{"s" if clients != 1 else ""}' if clients else "mesh" if is_mesh else "0 clients"
+            sublabel = (
+                f'{clients} client{"s" if clients != 1 else ""}'
+                if clients
+                else "mesh" if is_mesh else "0 clients"
+            )
 
             svg.append(
                 f'<g transform="translate({x:.0f},{y:.0f})">'
@@ -1190,7 +1260,7 @@ def _topology(analysis_data):
         f'<span class="legend-item"><span class="legend-dot" style="background:#34a853"></span>Wired AP</span>'
         f'<span class="legend-item"><span class="legend-dot" style="background:#006fff;border:1px dashed #006fff"></span>Mesh AP</span>'
         f'<span class="legend-item"><span class="legend-dot" style="background:#ea4335"></span>Issue detected</span>'
-        f'</div></div>'
+        f"</div></div>"
     )
 
 
@@ -1199,12 +1269,36 @@ def _topology(analysis_data):
 # ---------------------------------------------------------------------------
 
 _GROUP_META = {
-    "mesh_power": ("Optimize Mesh AP Power", "important", "MEDIUM power improves mesh link stability and reduces co-channel interference"),
-    "power_optimization": ("Reduce Transmit Power", "important", "Lower power reduces interference and helps clients roam to closer APs"),
-    "band_steering": ("Enable Band Steering", "important", "Move capable clients to faster 5GHz/6GHz bands automatically"),
-    "band_steering_critical": ("Enable Band Steering", "important", "Clients stuck on 2.4GHz need band steering to use faster bands"),
-    "min_rssi_disabled": ("Enable Minimum RSSI", "recommended", "Force weak clients to roam to a closer AP for better performance"),
-    "channel_width": ("Optimize Channel Widths", "recommended", "Match channel width to environment for best throughput"),
+    "mesh_power": (
+        "Optimize Mesh AP Power",
+        "important",
+        "MEDIUM power improves mesh link stability and reduces co-channel interference",
+    ),
+    "power_optimization": (
+        "Reduce Transmit Power",
+        "important",
+        "Lower power reduces interference and helps clients roam to closer APs",
+    ),
+    "band_steering": (
+        "Enable Band Steering",
+        "important",
+        "Move capable clients to faster 5GHz/6GHz bands automatically",
+    ),
+    "band_steering_critical": (
+        "Enable Band Steering",
+        "important",
+        "Clients stuck on 2.4GHz need band steering to use faster bands",
+    ),
+    "min_rssi_disabled": (
+        "Enable Minimum RSSI",
+        "recommended",
+        "Force weak clients to roam to a closer AP for better performance",
+    ),
+    "channel_width": (
+        "Optimize Channel Widths",
+        "recommended",
+        "Match channel width to environment for best throughput",
+    ),
 }
 
 
@@ -1216,14 +1310,18 @@ def _group_recs(recommendations, analysis_data):
     issues = analysis_data.get("health_analysis", {}).get("issues", [])
     for issue in issues:
         if issue.get("severity") in ("high", "critical"):
-            actions.append({
-                "priority": "critical",
-                "title": issue.get("device", "Network") + ": " + (issue.get("type", "issue")).replace("_", " ").title(),
-                "detail": issue.get("message", ""),
-                "action": issue.get("recommendation", ""),
-                "count": 1,
-                "devices": [issue.get("device", "")],
-            })
+            actions.append(
+                {
+                    "priority": "critical",
+                    "title": issue.get("device", "Network")
+                    + ": "
+                    + (issue.get("type", "issue")).replace("_", " ").title(),
+                    "detail": issue.get("message", ""),
+                    "action": issue.get("recommendation", ""),
+                    "count": 1,
+                    "devices": [issue.get("device", "")],
+                }
+            )
 
     # Group recs by type
     groups = {}
@@ -1231,16 +1329,19 @@ def _group_recs(recommendations, analysis_data):
         rtype = rec.get("type", "other")
         groups.setdefault(rtype, []).append(rec)
 
-    for rtype in ["band_steering", "band_steering_critical", "power_optimization",
-                   "mesh_power", "min_rssi_disabled", "channel_width"]:
+    for rtype in [
+        "band_steering",
+        "band_steering_critical",
+        "power_optimization",
+        "mesh_power",
+        "min_rssi_disabled",
+        "channel_width",
+    ]:
         recs = groups.pop(rtype, [])
         if not recs:
             continue
         meta = _GROUP_META.get(rtype, (rtype.replace("_", " ").title(), "recommended", ""))
-        devs = list(set(
-            r.get("ap", {}).get("name", "") or r.get("device", "")
-            for r in recs
-        ))
+        devs = list(set(r.get("ap", {}).get("name", "") or r.get("device", "") for r in recs))
         devs = [d for d in devs if d]
 
         # Merge band_steering and band_steering_critical
@@ -1256,26 +1357,34 @@ def _group_recs(recommendations, analysis_data):
                 pass  # fall through to add
             continue
 
-        actions.append({
-            "priority": meta[1],
-            "title": meta[0],
-            "detail": f"{meta[2]}. Affects: {', '.join(devs[:6])}{'...' if len(devs) > 6 else ''}." if devs else meta[2] + ".",
-            "action": recs[0].get("recommendation", ""),
-            "count": len(recs),
-            "devices": devs,
-            "recs": recs,
-        })
+        actions.append(
+            {
+                "priority": meta[1],
+                "title": meta[0],
+                "detail": (
+                    f"{meta[2]}. Affects: {', '.join(devs[:6])}{'...' if len(devs) > 6 else ''}."
+                    if devs
+                    else meta[2] + "."
+                ),
+                "action": recs[0].get("recommendation", ""),
+                "count": len(recs),
+                "devices": devs,
+                "recs": recs,
+            }
+        )
 
     # Remaining groups
     for rtype, recs in groups.items():
         meta = _GROUP_META.get(rtype, (rtype.replace("_", " ").title(), "recommended", ""))
-        actions.append({
-            "priority": meta[1] if isinstance(meta, tuple) else "recommended",
-            "title": meta[0] if isinstance(meta, tuple) else rtype.replace("_", " ").title(),
-            "detail": f"{len(recs)} recommendation{'s' if len(recs) > 1 else ''}.",
-            "count": len(recs),
-            "devices": [],
-        })
+        actions.append(
+            {
+                "priority": meta[1] if isinstance(meta, tuple) else "recommended",
+                "title": meta[0] if isinstance(meta, tuple) else rtype.replace("_", " ").title(),
+                "detail": f"{len(recs)} recommendation{'s' if len(recs) > 1 else ''}.",
+                "count": len(recs),
+                "devices": [],
+            }
+        )
 
     return actions
 
@@ -1283,6 +1392,7 @@ def _group_recs(recommendations, analysis_data):
 # ---------------------------------------------------------------------------
 # Section: Top Actions
 # ---------------------------------------------------------------------------
+
 
 def _action_detail_html(action):
     """Build expandable detail for an action card."""
@@ -1300,11 +1410,13 @@ def _action_detail_html(action):
         ap_name = r.get("ap", {}).get("name", r.get("device", "?"))
         band = r.get("band", "")
         msg = r.get("message", r.get("recommendation", ""))
-        rows.append(f'<tr><td style="color:#e8eaed;white-space:nowrap">{_esc(ap_name)}</td><td>{_esc(band)}</td><td>{_esc(msg)}</td></tr>')
+        rows.append(
+            f'<tr><td style="color:#e8eaed;white-space:nowrap">{_esc(ap_name)}</td><td>{_esc(band)}</td><td>{_esc(msg)}</td></tr>'
+        )
     return (
-        f'<details><summary>View {len(recs)} individual changes</summary>'
+        f"<details><summary>View {len(recs)} individual changes</summary>"
         f'<div class="detail-body"><table>'
-        f'<tr><th>Device</th><th>Band</th><th>Change</th></tr>'
+        f"<tr><th>Device</th><th>Band</th><th>Change</th></tr>"
         f'{"".join(rows)}</table></div></details>'
     )
 
@@ -1331,9 +1443,9 @@ def _actions(recommendations, analysis_data):
             f'<div class="action-meta">'
             f'<span class="action-badge" style="background:{color}20;color:{color}">{_priority_label(pri)}</span>'
             f'<span>{action.get("count", 1)} change{"s" if action.get("count", 1) > 1 else ""}</span>'
-            f'</div>'
-            f'{detail_expand}'
-            f'</div></div>'
+            f"</div>"
+            f"{detail_expand}"
+            f"</div></div>"
         )
 
     hidden_html = ""
@@ -1349,8 +1461,8 @@ def _actions(recommendations, analysis_data):
                 f'<div class="action-body">'
                 f'<div class="action-title">{_esc(action["title"])}</div>'
                 f'<div class="action-detail">{_esc(action.get("detail", ""))}</div>'
-                f'{detail_expand}'
-                f'</div></div>'
+                f"{detail_expand}"
+                f"</div></div>"
             )
         hidden_html = (
             f'<button class="show-more-btn" onclick="toggleMore(\'more-actions\')">Show {len(hidden)} more ▾</button>'
@@ -1367,6 +1479,7 @@ def _actions(recommendations, analysis_data):
 # Deep Dive: RF & Airtime
 # ---------------------------------------------------------------------------
 
+
 def _rf_panel(analysis_data):
     sd = analysis_data.get("client_analysis", {}).get("signal_distribution", {})
     caps = analysis_data.get("client_capabilities", {}).get("capability_distribution", {})
@@ -1381,26 +1494,36 @@ def _rf_panel(analysis_data):
         ("Critical", sd.get("critical", 0), "#ea4335"),
     ]
     total_sig = sum(v for _, v, _ in sig_items)
-    sig_chart = _svg_hbar(sig_items, max_val=total_sig) if total_sig else "<span style='color:#5f6368'>No wireless clients</span>"
+    sig_chart = (
+        _svg_hbar(sig_items, max_val=total_sig)
+        if total_sig
+        else "<span style='color:#5f6368'>No wireless clients</span>"
+    )
 
     # Band distribution from client channels
     clients = analysis_data.get("client_analysis", {}).get("clients", [])
     band_24 = sum(1 for c in clients if not c.get("is_wired") and 0 < (c.get("channel") or 0) <= 14)
     band_5 = sum(1 for c in clients if not c.get("is_wired") and 14 < (c.get("channel") or 0) < 200)
     band_6 = sum(1 for c in clients if not c.get("is_wired") and (c.get("channel") or 0) >= 200)
-    band_donut = _svg_donut([
-        (band_24, "#fbbc04", "2.4 GHz"),
-        (band_5, "#2196f3", "5 GHz"),
-        (band_6, "#9c27b0", "6 GHz"),
-    ], size=130)
+    band_donut = _svg_donut(
+        [
+            (band_24, "#fbbc04", "2.4 GHz"),
+            (band_5, "#2196f3", "5 GHz"),
+            (band_6, "#9c27b0", "6 GHz"),
+        ],
+        size=130,
+    )
 
     # Capability donut
-    cap_donut = _svg_donut([
-        (caps.get("802.11ax", 0), "#34a853", "WiFi 6"),
-        (caps.get("802.11ac", 0), "#2196f3", "WiFi 5"),
-        (caps.get("802.11n", 0), "#fbbc04", "WiFi 4"),
-        (caps.get("legacy", 0), "#ea4335", "Legacy"),
-    ], size=130)
+    cap_donut = _svg_donut(
+        [
+            (caps.get("802.11ax", 0), "#34a853", "WiFi 6"),
+            (caps.get("802.11ac", 0), "#2196f3", "WiFi 5"),
+            (caps.get("802.11n", 0), "#fbbc04", "WiFi 4"),
+            (caps.get("legacy", 0), "#ea4335", "Legacy"),
+        ],
+        size=130,
+    )
 
     # Power/Channel matrix
     matrix_rows = []
@@ -1413,7 +1536,9 @@ def _rf_panel(analysis_data):
             if radio:
                 pwr_mode = radio.get("tx_power_mode", "?")
                 ch = radio.get("channel", 0)
-                pwr_class = f"pwr-{pwr_mode}" if pwr_mode in ("high", "medium", "low", "auto") else ""
+                pwr_class = (
+                    f"pwr-{pwr_mode}" if pwr_mode in ("high", "medium", "low", "auto") else ""
+                )
                 row_cells.append(f'<td class="{pwr_class}">ch{ch} · {pwr_mode}</td>')
             else:
                 row_cells.append('<td style="color:#5f6368">—</td>')
@@ -1421,9 +1546,9 @@ def _rf_panel(analysis_data):
 
     matrix_html = (
         '<table class="matrix-table">'
-        '<tr><th>AP</th><th>2.4 GHz</th><th>5 GHz</th><th>6 GHz</th></tr>'
-        + "".join(matrix_rows) +
-        '</table>'
+        "<tr><th>AP</th><th>2.4 GHz</th><th>5 GHz</th><th>6 GHz</th></tr>"
+        + "".join(matrix_rows)
+        + "</table>"
     )
 
     # Airtime utilization
@@ -1469,12 +1594,12 @@ def _rf_panel(analysis_data):
             ch_w = c.get("channel_width", "?")
             client_rows.append(
                 f'<tr><td style="color:#e8eaed">{_esc(hostname[:20])}</td>'
-                f'<td>{signal} dBm</td><td>{proto}</td><td>{ch_w}MHz</td></tr>'
+                f"<td>{signal} dBm</td><td>{proto}</td><td>{ch_w}MHz</td></tr>"
             )
         ap_client_detail += (
-            f'<details><summary>{_esc(ap_name)} — {len(ap_clients)} clients</summary>'
+            f"<details><summary>{_esc(ap_name)} — {len(ap_clients)} clients</summary>"
             f'<div class="detail-body"><table>'
-            f'<tr><th>Client</th><th>Signal</th><th>Proto</th><th>Width</th></tr>'
+            f"<tr><th>Client</th><th>Signal</th><th>Proto</th><th>Width</th></tr>"
             f'{"".join(client_rows)}</table></div></details>'
         )
 
@@ -1483,15 +1608,15 @@ def _rf_panel(analysis_data):
         # Signal distribution
         f'<div class="panel-card">'
         f'<h3>Signal Quality <span class="count">({total_sig} wireless)</span></h3>'
-        f'{sig_chart}</div>'
+        f"{sig_chart}</div>"
         # Band distribution
         f'<div class="panel-card">'
-        f'<h3>Band Distribution</h3>'
-        f'{band_donut}</div>'
+        f"<h3>Band Distribution</h3>"
+        f"{band_donut}</div>"
         # Capability
         f'<div class="panel-card">'
-        f'<h3>Client Capabilities</h3>'
-        f'{cap_donut}</div>'
+        f"<h3>Client Capabilities</h3>"
+        f"{cap_donut}</div>"
         # Airtime
         f'<div class="panel-card">'
         f'<h3>Airtime Utilization <span class="count">(%)</span></h3>'
@@ -1500,20 +1625,21 @@ def _rf_panel(analysis_data):
         f'{f"""<div class="panel-card"><h3>Channel Utilization <span class="count">(%)</span></h3>{cu_chart}</div>""" if cu_chart else ""}'
         # Power/Channel matrix
         f'<div class="panel-card full">'
-        f'<h3>Channel &amp; Power Map</h3>'
-        f'{matrix_html}</div>'
+        f"<h3>Channel &amp; Power Map</h3>"
+        f"{matrix_html}</div>"
         # Per-AP client detail
         f'<div class="panel-card full">'
-        f'<h3>Per-AP Client Detail</h3>'
+        f"<h3>Per-AP Client Detail</h3>"
         f'{ap_client_detail if ap_client_detail else "<span style=color:#5f6368>No client data</span>"}'
-        f'</div>'
-        f'</div>'
+        f"</div>"
+        f"</div>"
     )
 
 
 # ---------------------------------------------------------------------------
 # Deep Dive: Clients
 # ---------------------------------------------------------------------------
+
 
 def _clients_panel(analysis_data):
     ca = analysis_data.get("client_analysis", {})
@@ -1522,8 +1648,10 @@ def _clients_panel(analysis_data):
     # Problem clients — only those with issues
     all_clients = ca.get("clients", [])
     problem_clients = [
-        c for c in all_clients
-        if not c.get("is_wired") and (
+        c
+        for c in all_clients
+        if not c.get("is_wired")
+        and (
             c.get("health_score", 100) < 70
             or c.get("roam_count", 0) > 20
             or c.get("disconnect_count", 0) > 5
@@ -1539,23 +1667,25 @@ def _clients_panel(analysis_data):
             color = _score_color(score)
             rssi = c.get("rssi", 0)
             rows.append(
-                f'<tr>'
+                f"<tr>"
                 f'<td>{_esc(c.get("hostname", "?")[:20])}</td>'
                 f'<td>{_esc(c.get("ap_name", "?"))}</td>'
-                f'<td>{rssi} dBm</td>'
+                f"<td>{rssi} dBm</td>"
                 f'<td style="color:{color};font-weight:600">{score} ({c.get("grade", "?")})</td>'
                 f'<td>{c.get("roam_count", 0)} roams</td>'
                 f'<td>{c.get("disconnect_count", 0)} disc</td>'
-                f'</tr>'
+                f"</tr>"
             )
         client_table = (
             '<table class="client-table">'
-            '<tr><th>Client</th><th>AP</th><th>Signal</th><th>Health</th><th>Roaming</th><th>Disconnects</th></tr>'
-            + "".join(rows) +
-            '</table>'
+            "<tr><th>Client</th><th>AP</th><th>Signal</th><th>Health</th><th>Roaming</th><th>Disconnects</th></tr>"
+            + "".join(rows)
+            + "</table>"
         )
     else:
-        client_table = '<div style="color:#34a853;padding:12px">All wireless clients are healthy.</div>'
+        client_table = (
+            '<div style="color:#34a853;padding:12px">All wireless clients are healthy.</div>'
+        )
 
     # Client journeys — top 3 issues
     journey_html = ""
@@ -1582,7 +1712,9 @@ def _clients_panel(analysis_data):
                 journey_html += lane
 
     if not journey_html:
-        journey_html = '<div style="color:#5f6368;padding:8px">No significant roaming issues detected.</div>'
+        journey_html = (
+            '<div style="color:#5f6368;padding:8px">No significant roaming issues detected.</div>'
+        )
 
     total_tracked = journeys.get("total_tracked", 0)
 
@@ -1601,23 +1733,31 @@ def _clients_panel(analysis_data):
         color = _score_color(score)
         rssi = c.get("rssi", 0)
         sat = journey_sats.get(c.get("mac", ""), None)
-        sat_str = f'{sat:.0f}%' if sat is not None else "—"
-        sat_color = "#ea4335" if sat is not None and sat < 60 else "#fbbc04" if sat is not None and sat < 80 else "#9aa0a6"
+        sat_str = f"{sat:.0f}%" if sat is not None else "—"
+        sat_color = (
+            "#ea4335"
+            if sat is not None and sat < 60
+            else "#fbbc04" if sat is not None and sat < 80 else "#9aa0a6"
+        )
         full_rows.append(
             f'<tr><td style="color:#e8eaed">{_esc(c.get("hostname", "?")[:22])}</td>'
             f'<td>{_esc(c.get("ap_name", "?"))}</td>'
-            f'<td>{rssi} dBm</td>'
+            f"<td>{rssi} dBm</td>"
             f'<td style="color:{color}">{score} ({c.get("grade", "?")})</td>'
             f'<td>{c.get("channel", 0)}</td>'
             f'<td>{c.get("roam_count", 0)}</td>'
             f'<td style="color:{sat_color}">{sat_str}</td></tr>'
         )
     full_client_expand = (
-        f'<details><summary>View all {len(all_wireless)} wireless clients</summary>'
-        f'<div class="detail-body"><table>'
-        f'<tr><th>Client</th><th>AP</th><th>Signal</th><th>Health</th><th>Channel</th><th>Roams</th><th>WiFi Sat</th></tr>'
-        f'{"".join(full_rows)}</table></div></details>'
-    ) if all_wireless else ""
+        (
+            f"<details><summary>View all {len(all_wireless)} wireless clients</summary>"
+            f'<div class="detail-body"><table>'
+            f"<tr><th>Client</th><th>AP</th><th>Signal</th><th>Health</th><th>Channel</th><th>Roams</th><th>WiFi Sat</th></tr>"
+            f'{"".join(full_rows)}</table></div></details>'
+        )
+        if all_wireless
+        else ""
+    )
 
     # Health issues expandable
     health_cats = analysis_data.get("health_analysis", {}).get("categories", {})
@@ -1634,7 +1774,7 @@ def _clients_panel(analysis_data):
                 f'<div class="issue-msg">{_esc(issue.get("message", ""))}</div>'
                 f'<div class="issue-impact">{_esc(issue.get("impact", ""))}</div>'
                 f'<div class="issue-fix">{_esc(issue.get("recommendation", ""))}</div>'
-                f'</div>'
+                f"</div>"
             )
         label = cat_name.replace("_", " ").title()
         health_detail += (
@@ -1659,8 +1799,8 @@ def _clients_panel(analysis_data):
             f'<div class="panel-card full">'
             f'<h3>Low WiFi Satisfaction <span class="count">({len(low_sat_clients)} clients)</span></h3>'
             f'<div style="font-size:11px;color:#9aa0a6;margin-bottom:6px">'
-            f'Clients with average satisfaction below 80% over the past week</div>'
-            f'<table><tr><th>Client</th><th>Avg Satisfaction</th><th>Tracked</th></tr>'
+            f"Clients with average satisfaction below 80% over the past week</div>"
+            f"<table><tr><th>Client</th><th>Avg Satisfaction</th><th>Tracked</th></tr>"
             f'{"".join(low_sat_rows)}</table></div>'
         )
 
@@ -1668,23 +1808,24 @@ def _clients_panel(analysis_data):
         f'<div class="panel-grid">'
         f'<div class="panel-card full">'
         f'<h3>Problem Clients <span class="count">({len(problem_clients)} of {ca.get("total_clients", 0)})</span></h3>'
-        f'{client_table}'
-        f'{full_client_expand}</div>'
+        f"{client_table}"
+        f"{full_client_expand}</div>"
         f'<div class="panel-card full">'
         f'<h3>Client Journeys <span class="count">({total_tracked} tracked)</span></h3>'
-        f'{journey_html}</div>'
-        f'{low_sat_html}'
+        f"{journey_html}</div>"
+        f"{low_sat_html}"
         f'<div class="panel-card full">'
-        f'<h3>Health Issues</h3>'
+        f"<h3>Health Issues</h3>"
         f'{health_detail if health_detail else "<span style=color:#34a853>No health issues detected.</span>"}'
-        f'</div>'
-        f'</div>'
+        f"</div>"
+        f"</div>"
     )
 
 
 # ---------------------------------------------------------------------------
 # Deep Dive: Infrastructure
 # ---------------------------------------------------------------------------
+
 
 def _infra_panel(analysis_data):
     # --- Device Overview: Uptime, Firmware, WiFi Score ---
@@ -1719,10 +1860,10 @@ def _infra_panel(analysis_data):
 
         icon = "📡" if dtype == "uap" else "🔌"
         dev_rows.append(
-            f'<tr><td>{icon} {_esc(name)}</td>'
+            f"<tr><td>{icon} {_esc(name)}</td>"
             f'<td style="color:{up_color}">{up_str}</td>'
             f'<td style="font-size:11px">{_esc(fw[:12])}</td>'
-            f'<td>{sat_str}</td></tr>'
+            f"<td>{sat_str}</td></tr>"
         )
 
     fw_note = ""
@@ -1730,13 +1871,17 @@ def _infra_panel(analysis_data):
         fw_note = f'<div style="font-size:11px;color:#ea8600;margin-top:6px">⚠ {len(firmware_set)} different firmware versions — consider updating for consistency</div>'
 
     device_table = (
-        f'<div class="panel-card full">'
-        f'<h3>Device Health <span class="count">({len(devices)} devices)</span></h3>'
-        f'<table class="matrix-table">'
-        f'<tr><th>Device</th><th>Uptime</th><th>Firmware</th><th>WiFi Score</th></tr>'
-        f'{"".join(dev_rows)}</table>'
-        f'{fw_note}</div>'
-    ) if dev_rows else ""
+        (
+            f'<div class="panel-card full">'
+            f'<h3>Device Health <span class="count">({len(devices)} devices)</span></h3>'
+            f'<table class="matrix-table">'
+            f"<tr><th>Device</th><th>Uptime</th><th>Firmware</th><th>WiFi Score</th></tr>"
+            f'{"".join(dev_rows)}</table>'
+            f"{fw_note}</div>"
+        )
+        if dev_rows
+        else ""
+    )
 
     sw_analysis = analysis_data.get("switch_analysis", {})
     switches = sw_analysis.get("switches", [])
@@ -1789,18 +1934,24 @@ def _infra_panel(analysis_data):
         # PoE info
         poe_html = ""
         poe = sw.get("total_max_power")
-        poe_used = sw.get("system_stats", {}).get("output_power") if sw.get("system_stats") else None
+        poe_used = (
+            sw.get("system_stats", {}).get("output_power") if sw.get("system_stats") else None
+        )
         if poe and poe > 0:
             used = poe_used or 0
             poe_html = f'<div style="font-size:12px;color:#9aa0a6;margin-top:6px">PoE: {used:.0f}W / {poe}W</div>'
 
         # Issues
         issue_html = ""
-        sw_issues = [i for i in sw_analysis.get("issues", []) if i.get("switch") == name or name in str(i)]
+        sw_issues = [
+            i for i in sw_analysis.get("issues", []) if i.get("switch") == name or name in str(i)
+        ]
         if sw_issues:
             issue_items = []
             for si in sw_issues[:5]:
-                issue_items.append(f'<div style="font-size:11px;color:#ea8600;margin:2px 0">{_esc(str(si.get("message", si.get("issue", "?")))[:80])}</div>')
+                issue_items.append(
+                    f'<div style="font-size:11px;color:#ea8600;margin:2px 0">{_esc(str(si.get("message", si.get("issue", "?")))[:80])}</div>'
+                )
             issue_html = f'<div style="margin-top:8px">{"".join(issue_items)}</div>'
 
         active_ports = sum(1 for p in ports if (p.get("speed", 0) or 0) > 0)
@@ -1828,12 +1979,12 @@ def _infra_panel(analysis_data):
                 poe_str = str(poe_w) if poe_w else ""
             port_detail_rows.append(
                 f'<tr><td>{pidx}</td><td style="color:#e8eaed">{_esc(label[:24])}</td>'
-                f'<td>{speed_str}</td><td>{drops_str}</td><td>{poe_str}</td></tr>'
+                f"<td>{speed_str}</td><td>{drops_str}</td><td>{poe_str}</td></tr>"
             )
         port_detail = (
-            f'<details><summary>Port details</summary>'
+            f"<details><summary>Port details</summary>"
             f'<div class="detail-body"><table>'
-            f'<tr><th>#</th><th>Device</th><th>Speed</th><th>Drops</th><th>PoE</th></tr>'
+            f"<tr><th>#</th><th>Device</th><th>Speed</th><th>Drops</th><th>PoE</th></tr>"
             f'{"".join(port_detail_rows)}</table></div></details>'
         )
 
@@ -1842,17 +1993,17 @@ def _infra_panel(analysis_data):
             f'<h3>{_esc(name)} <span class="count">{model}</span></h3>'
             f'<div style="font-size:12px;color:#9aa0a6;margin-bottom:8px">{active_ports}/{total_ports} ports active</div>'
             f'<div class="port-grid">{"".join(port_cells)}</div>'
-            f'{poe_html}{issue_html}{port_detail}'
-            f'</div>'
+            f"{poe_html}{issue_html}{port_detail}"
+            f"</div>"
         )
 
     switch_html = ""
     if cards:
         legend = (
             '<div style="display:flex;gap:16px;margin-top:4px;font-size:11px;color:#5f6368">'
-            '<span>🟢 1Gbps</span><span>🟡 Slow</span><span>🔴 Drops</span><span>⚪ Inactive</span>'
+            "<span>🟢 1Gbps</span><span>🟡 Slow</span><span>🔴 Drops</span><span>⚪ Inactive</span>"
             '<span style="color:#006fff">◎ AP port</span>'
-            '</div>'
+            "</div>"
         )
         switch_html = (
             f'{"".join(cards)}'
@@ -1865,6 +2016,7 @@ def _infra_panel(analysis_data):
 # ---------------------------------------------------------------------------
 # Deep Dive: Configuration
 # ---------------------------------------------------------------------------
+
 
 def _config_panel(analysis_data):
     ap_details = analysis_data.get("ap_analysis", {}).get("ap_details", [])
@@ -1879,7 +2031,11 @@ def _config_panel(analysis_data):
     for radio_info in mr.get("radios_without_min_rssi", []):
         ap_name = radio_info.get("device", "")
         mr_by_ap.setdefault(ap_name, []).append(False)
-    for radio_info in mr.get("radios_with_min_rssi", []) if isinstance(mr.get("radios_with_min_rssi"), list) else []:
+    for radio_info in (
+        mr.get("radios_with_min_rssi", [])
+        if isinstance(mr.get("radios_with_min_rssi"), list)
+        else []
+    ):
         ap_name = radio_info.get("device", "")
         mr_by_ap.setdefault(ap_name, []).append(True)
 
@@ -1892,15 +2048,17 @@ def _config_panel(analysis_data):
 
         bs_cell = '<td class="feat-yes">✓</td>' if has_bs else '<td class="feat-no">✗</td>'
         mr_cell = '<td class="feat-yes">✓</td>' if has_mr else '<td class="feat-no">✗</td>'
-        mesh_cell = '<td class="feat-yes">Mesh</td>' if is_mesh else '<td style="color:#5f6368">Wired</td>'
+        mesh_cell = (
+            '<td class="feat-yes">Mesh</td>' if is_mesh else '<td style="color:#5f6368">Wired</td>'
+        )
 
-        rows.append(f'<tr><td>{_esc(name[:18])}</td>{mesh_cell}{bs_cell}{mr_cell}</tr>')
+        rows.append(f"<tr><td>{_esc(name[:18])}</td>{mesh_cell}{bs_cell}{mr_cell}</tr>")
 
     ap_matrix = (
         '<table class="matrix-table">'
-        '<tr><th>AP</th><th>Uplink</th><th>Band Steering</th><th>Min RSSI</th></tr>'
-        + "".join(rows) +
-        '</table>'
+        "<tr><th>AP</th><th>Uplink</th><th>Band Steering</th><th>Min RSSI</th></tr>"
+        + "".join(rows)
+        + "</table>"
     )
 
     # Roaming features (per-WLAN)
@@ -1908,31 +2066,35 @@ def _config_panel(analysis_data):
     r11r = roaming.get("802.11r", {})
     r11k = roaming.get("802.11k", {})
     r11v = roaming.get("802.11v", {})
-    wlan_count = fr.get("wlan_count", 0) or (r11r.get("enabled_count", 0) + r11r.get("disabled_count", 0))
+    wlan_count = fr.get("wlan_count", 0) or (
+        r11r.get("enabled_count", 0) + r11r.get("disabled_count", 0)
+    )
 
     roaming_rows = [
-        f'<tr><td>802.11r (Fast Transition)</td>'
+        f"<tr><td>802.11r (Fast Transition)</td>"
         f'<td class="{"feat-yes" if r11r.get("enabled_count") else "feat-no"}">'
         f'{r11r.get("enabled_count", 0)}/{wlan_count} WLANs</td></tr>',
-        f'<tr><td>802.11k (Neighbor Reports)</td>'
+        f"<tr><td>802.11k (Neighbor Reports)</td>"
         f'<td class="{"feat-yes" if r11k.get("enabled_count") else "feat-no"}">'
         f'{r11k.get("enabled_count", 0)}/{wlan_count} WLANs</td></tr>',
-        f'<tr><td>802.11v (BSS Transition)</td>'
+        f"<tr><td>802.11v (BSS Transition)</td>"
         f'<td class="{"feat-yes" if r11v.get("enabled_count") else "feat-no"}">'
         f'{r11v.get("enabled_count", 0)}/{wlan_count} WLANs</td></tr>',
     ]
     roaming_table = (
         '<table class="matrix-table">'
-        '<tr><th>Feature</th><th>Status</th></tr>'
-        + "".join(roaming_rows) +
-        '</table>'
+        "<tr><th>Feature</th><th>Status</th></tr>" + "".join(roaming_rows) + "</table>"
     )
 
     # VLAN/Security
     health_cats = analysis_data.get("health_analysis", {}).get("categories", {})
     vlan = health_cats.get("vlan_segmentation", {})
     vlan_status = vlan.get("status", "unknown")
-    vlan_color = "#34a853" if vlan_status == "healthy" else "#fbbc04" if vlan_status == "warning" else "#ea4335"
+    vlan_color = (
+        "#34a853"
+        if vlan_status == "healthy"
+        else "#fbbc04" if vlan_status == "warning" else "#ea4335"
+    )
     vlan_issues = vlan.get("issues", [])
     vlan_html = f'<div style="color:{vlan_color};font-size:13px;font-weight:500">{vlan_status.title()}</div>'
     if vlan_issues:
@@ -1942,21 +2104,22 @@ def _config_panel(analysis_data):
     return (
         f'<div class="panel-grid">'
         f'<div class="panel-card">'
-        f'<h3>AP Configuration</h3>'
-        f'{ap_matrix}</div>'
+        f"<h3>AP Configuration</h3>"
+        f"{ap_matrix}</div>"
         f'<div class="panel-card">'
-        f'<h3>Roaming Features</h3>'
-        f'{roaming_table}</div>'
+        f"<h3>Roaming Features</h3>"
+        f"{roaming_table}</div>"
         f'<div class="panel-card">'
-        f'<h3>Network Segmentation</h3>'
-        f'{vlan_html}</div>'
-        f'</div>'
+        f"<h3>Network Segmentation</h3>"
+        f"{vlan_html}</div>"
+        f"</div>"
     )
 
 
 # ---------------------------------------------------------------------------
 # Deep Dive Tabs Wrapper
 # ---------------------------------------------------------------------------
+
 
 def _tabs(analysis_data):
     return (
@@ -1967,18 +2130,19 @@ def _tabs(analysis_data):
         f'<button class="tab-btn" onclick="switchTab(\'clients\', this)">Clients</button>'
         f'<button class="tab-btn" onclick="switchTab(\'infra\', this)">Infrastructure</button>'
         f'<button class="tab-btn" onclick="switchTab(\'config\', this)">Configuration</button>'
-        f'</div>'
+        f"</div>"
         f'<div id="tab-rf" class="tab-content active">{_rf_panel(analysis_data)}</div>'
         f'<div id="tab-clients" class="tab-content">{_clients_panel(analysis_data)}</div>'
         f'<div id="tab-infra" class="tab-content">{_infra_panel(analysis_data)}</div>'
         f'<div id="tab-config" class="tab-content">{_config_panel(analysis_data)}</div>'
-        f'</div>'
+        f"</div>"
     )
 
 
 # ---------------------------------------------------------------------------
 # Main Generator
 # ---------------------------------------------------------------------------
+
 
 def generate_v2_report(analysis_data, recommendations, site_name, output_dir="reports"):
     """Generate premium HTML report. Returns (report_path, share_path)."""
@@ -1993,15 +2157,17 @@ def generate_v2_report(analysis_data, recommendations, site_name, output_dir="re
     os.makedirs(output_dir, exist_ok=True)
 
     parts = [
-        '<!DOCTYPE html>',
+        "<!DOCTYPE html>",
         '<html lang="en">',
-        '<head>',
+        "<head>",
         '<meta charset="UTF-8">',
         '<meta name="viewport" content="width=device-width, initial-scale=1.0">',
-        f'<title>UniFi Network Report — {_esc(site_name)}</title>',
-        '<style>', _css(), '</style>',
-        '</head>',
-        '<body>',
+        f"<title>UniFi Network Report — {_esc(site_name)}</title>",
+        "<style>",
+        _css(),
+        "</style>",
+        "</head>",
+        "<body>",
         _header(site_name, analysis_data),
         '<div class="container">',
         _hero(analysis_data, recommendations, site_name),
@@ -2011,10 +2177,12 @@ def generate_v2_report(analysis_data, recommendations, site_name, output_dir="re
         _tabs(analysis_data),
         '<div style="text-align:center;margin:24px 0">'
         '<button class="print-btn" onclick="printReport()">🖨 Expand All &amp; Print</button>'
-        '</div>',
-        '</div>',
-        '<script>', _js(), '</script>',
-        '</body></html>',
+        "</div>",
+        "</div>",
+        "<script>",
+        _js(),
+        "</script>",
+        "</body></html>",
     ]
 
     html = "\n".join(parts)
