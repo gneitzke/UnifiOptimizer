@@ -25,6 +25,9 @@ python3 regenerate_report.py                     # rebuild report from cached an
 ```
 Line length is 100. Black and isort are configured in `pyproject.toml`. Flake8 config is in `.flake8`.
 
+### Documentation
+Always update `README.md` and `WHATS_NEW.md` when making any code changes. Include docs updates in the same commit or a follow-up docs commit immediately after.
+
 ### Testing
 ```bash
 python3 run_all_tests.py <host> <username> <password> [site_name]
