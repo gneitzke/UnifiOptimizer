@@ -55,6 +55,7 @@ optimizer.py  (CLI entry point; routes to core/optimize_network.py)
 | `core/network_analyzer.py` | First analysis pass: AP channels/power, client RSSI, mesh detection |
 | `core/advanced_analyzer.py` | Second pass: DFS events, band steering, fast roaming, airtime, WiFi 6/6E/7 |
 | `core/change_applier.py` | Impact analysis and safe application of changes; writes audit JSON |
+| `core/switch_analyzer.py` | Switch port analysis: error rates, utilization, optimization recommendations |
 | `core/client_health.py` | Per-client composite health scoring (40% signal / 25% stability / 20% roaming / 15% throughput) |
 | `core/report_v2.py` | HTML report generation with charts and dashboards |
 | `utils/config.py` | YAML config loader with dot-path access and deep-merge defaults |
