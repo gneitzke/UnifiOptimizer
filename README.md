@@ -302,7 +302,7 @@ Reports are saved to the `reports/` directory and can be viewed in any web brows
 
 ### Viewing Reports
 ```bash
-open reports/network_analysis_YYYYMMDD_HHMMSS.html
+open reports/unifi_report_{site_name}_YYYYMMDD_HHMMSS.html
 ```
 
 ---
@@ -392,7 +392,6 @@ UnifiOptimizer/
 │   ├── advanced_analyzer.py # DFS, roaming, airtime, min RSSI
 │   ├── channel_optimizer.py # Smart channel recommendations
 │   ├── change_applier.py   # Safe change application
-│   ├── html_report_generator.py
 │   └── ...
 ├── utils/                  # Utility modules
 │   ├── keychain.py         # Secure credential storage
@@ -511,7 +510,7 @@ Before committing:
 
 - **[Developer Setup Guide](docs/DEVELOPER_SETUP.md)** - Complete setup instructions
 - **[Code Quality Guide](docs/CODE_QUALITY.md)** - Detailed formatting/linting info
-- **[Quick Reference](CODE_QUALITY_QUICKREF.md)** - Common commands
+- **[Quick Reference](docs/CODE_QUALITY.md)** - Common commands
 
 ---
 

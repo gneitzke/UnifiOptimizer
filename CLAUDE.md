@@ -29,7 +29,7 @@ Line length is 100. Black and isort are configured in `pyproject.toml`. Flake8 c
 ```bash
 python3 run_all_tests.py <host> <username> <password> [site_name]
 ```
-Tests require a live UniFi controller. 48 test files live in `tests/`.
+Tests require a live UniFi controller. 24 test files live in `tests/`.
 
 ## Architecture
 
@@ -55,9 +55,9 @@ optimizer.py  (CLI entry point; routes to core/optimize_network.py)
 | `core/network_analyzer.py` | First analysis pass: AP channels/power, client RSSI, mesh detection |
 | `core/advanced_analyzer.py` | Second pass: DFS events, band steering, fast roaming, airtime, WiFi 6/6E/7 |
 | `core/change_applier.py` | Impact analysis and safe application of changes; writes audit JSON |
+| `core/switch_analyzer.py` | Switch port analysis: error rates, utilization, optimization recommendations |
 | `core/client_health.py` | Per-client composite health scoring (40% signal / 25% stability / 20% roaming / 15% throughput) |
-| `core/html_report_generator.py` | Full HTML report (~5300 lines) with charts and dashboards |
-| `core/report_v2.py` | V2 report generation engine |
+| `core/report_v2.py` | HTML report generation with charts and dashboards |
 | `utils/config.py` | YAML config loader with dot-path access and deep-merge defaults |
 | `utils/keychain.py` | macOS Keychain credential storage for saved profiles |
 | `utils/network_helpers.py` | RSSI normalization, mesh role detection, AP display names |

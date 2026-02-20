@@ -495,7 +495,7 @@ class AdvancedNetworkAnalyzer:
                         # Method 3: High data rates (>72 Mbps suggests 802.11n+ dual-band capable)
                         elif tx_rate > 72000 or rx_rate > 72000:
                             is_dual_band = True
-                            detection_reason = f"High data rate: TX={tx_rate/1000:.0f}Mbps RX={rx_rate/1000:.0f}Mbps"
+                            detection_reason = f"High data rate: TX={tx_rate / 1000:.0f}Mbps RX={rx_rate / 1000:.0f}Mbps"
 
                         # Method 4: Multiple spatial streams (>1 suggests modern dual-band device)
                         elif nss >= 2:
@@ -1260,8 +1260,9 @@ class AdvancedNetworkAnalyzer:
                                 )
                                 recommendation = (
                                     f"DISABLE min RSSI immediately! This mesh node is extending coverage to a remote area "
-                                    f"(avg client RSSI: {avg_client_rssi:.0f} dBm). Min RSSI will disconnect clients who have " if avg_client_rssi is not None else
-                                    f"(no client RSSI data available). Min RSSI will disconnect clients who have "
+                                    f"(avg client RSSI: {avg_client_rssi:.0f} dBm). Min RSSI will disconnect clients who have "
+                                    if avg_client_rssi is not None
+                                    else f"(no client RSSI data available). Min RSSI will disconnect clients who have "
                                     f"NOWHERE ELSE TO GO and can break the mesh uplink (current: {uplink_rssi} dBm). "
                                     f"Coverage extension requires MAXIMUM connectivity tolerance."
                                 )
@@ -1677,8 +1678,12 @@ class AdvancedNetworkAnalyzer:
                         # Extract radio-specific data by matching radio name
                         radio_table = stat.get("radio_table_stats", [])
                         radio_stat = next(
-                            (r for r in radio_table if r.get("radio") == radio_stats or r.get("name") == radio_stats),
-                            None
+                            (
+                                r
+                                for r in radio_table
+                                if r.get("radio") == radio_stats or r.get("name") == radio_stats
+                            ),
+                            None,
                         )
                         if radio_stat is None and radio_idx < len(radio_table):
                             radio_stat = radio_table[radio_idx]  # fallback to index

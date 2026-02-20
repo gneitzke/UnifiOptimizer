@@ -192,11 +192,11 @@ def test_advanced_features():
         console.print("  [yellow]Attempting to generate HTML report...[/yellow]")
 
         try:
-            from core.html_report_generator import generate_html_report
+            from core.report_v2 import generate_v2_report
 
             recommendations = result.get("recommendations", [])
 
-            report_path = generate_html_report(
+            report_path, _ = generate_v2_report(
                 analysis_data=analysis,
                 recommendations=recommendations,
                 site_name=site,

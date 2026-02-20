@@ -37,7 +37,7 @@ jobs:
     - name: Test Report Generation
       run: |
         echo "Testing report generation..."
-        python -c "from core.html_report_generator import generate_html_report; print('✅ HTML generator can be imported')"
+        python -c "from core.report_v2 import generate_v2_report; print('✅ HTML generator can be imported')"
 
   compatibility-check:
     name: Python Compatibility Check
@@ -92,7 +92,7 @@ jobs:
 
     - name: Check Module Load Times
       run: |
-        python -c "import time; start = time.time(); from core.advanced_analyzer import AdvancedNetworkAnalyzer; from core.switch_analyzer import SwitchAnalyzer; from core.html_report_generator import generate_html_report; end = time.time(); load_time = end - start; print(f'Module load time: {load_time:.3f}s'); print('⚠️ Module load time is slow' if load_time > 2.0 else '✅ Module load time is acceptable')"
+        python -c "import time; start = time.time(); from core.advanced_analyzer import AdvancedNetworkAnalyzer; from core.switch_analyzer import SwitchAnalyzer; from core.report_v2 import generate_v2_report; end = time.time(); load_time = end - start; print(f'Module load time: {load_time:.3f}s'); print('⚠️ Module load time is slow' if load_time > 2.0 else '✅ Module load time is acceptable')"
 
   documentation-check:
     name: Documentation Validation

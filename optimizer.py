@@ -15,8 +15,7 @@ def main():
     """Route to core/optimize_network.py with all arguments"""
     # If no arguments, show help
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
-        print(
-            """UniFi Network Optimizer
+        print("""UniFi Network Optimizer
 
 Usage:
   python3 optimizer.py analyze  [options]   Full analysis + report (safe, read-only)
@@ -41,8 +40,7 @@ Examples:
   python3 optimizer.py analyze --profile default
   python3 optimizer.py optimize --profile default --dry-run
   python3 optimizer.py optimize --profile default
-"""
-        )
+""")
         return 0
 
     args = sys.argv[1:]

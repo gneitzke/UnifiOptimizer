@@ -9,6 +9,8 @@ Provides holistic analysis of wired and wireless infrastructure including:
 - Firmware status
 """
 
+from utils.network_helpers import fix_rssi
+
 
 class NetworkHealthAnalyzer:
     def __init__(self, client, site="default"):
@@ -58,16 +60,11 @@ class NetworkHealthAnalyzer:
             categories["broadcast_traffic"],
             categories["firmware_status"],
         )
-        security_score = self._compute_category_score(
-            categories["vlan_segmentation"]
-        )
+        security_score = self._compute_category_score(categories["vlan_segmentation"])
         client_score = self._compute_client_aggregate(clients)
 
         results["overall_score"] = int(
-            rf_score * 0.35
-            + client_score * 0.30
-            + infra_score * 0.20
-            + security_score * 0.15
+            rf_score * 0.35 + client_score * 0.30 + infra_score * 0.20 + security_score * 0.15
         )
         results["overall_score"] = max(0, min(100, results["overall_score"]))
 
@@ -104,9 +101,7 @@ class NetworkHealthAnalyzer:
         for c in clients:
             if c.get("is_wired", False):
                 continue
-            rssi = c.get("rssi", -100)
-            if rssi > 0:
-                rssi = -rssi
+            rssi = fix_rssi(c.get("rssi", -100))
             rssi_values.append(rssi)
         if not rssi_values:
             return 100
@@ -313,8 +308,10 @@ class NetworkHealthAnalyzer:
 
                     # Build accurate message
                     if estimated_daily and event_span > 14:
-                        msg = (f"{device_name} restarts ~{estimated_daily}x/day "
-                               f"(uptime {uptime_hours:.1f}h, {restart_count} events over {event_span:.0f} days)")
+                        msg = (
+                            f"{device_name} restarts ~{estimated_daily}x/day "
+                            f"(uptime {uptime_hours:.1f}h, {restart_count} events over {event_span:.0f} days)"
+                        )
                     else:
                         span_str = f"{event_span:.0f} days" if event_span != 7 else "7 days"
                         msg = f"{device_name} has restarted {restart_count} times in {span_str} - CYCLIC BEHAVIOR"
@@ -897,9 +894,7 @@ class NetworkHealthAnalyzer:
         elif len(analysis["vlans"]) > 1:
             vlan_total = sum(v["count"] for v in analysis["vlans"].values())
             if vlan_total > 0:
-                default_vlan_pct = (
-                    analysis["vlans"].get(1, {}).get("count", 0) / vlan_total
-                ) * 100
+                default_vlan_pct = (analysis["vlans"].get(1, {}).get("count", 0) / vlan_total) * 100
             else:
                 default_vlan_pct = 0
 

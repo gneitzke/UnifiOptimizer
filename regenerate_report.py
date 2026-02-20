@@ -62,11 +62,15 @@ def regenerate_report():
             console.print("[green]✓[/green] Loaded from cache\n")
         except Exception as e:
             console.print(f"[red]Failed to load cache: {e}[/red]")
-            console.print("[yellow]No valid cache available. Run 'optimizer.py analyze' first.[/yellow]")
+            console.print(
+                "[yellow]No valid cache available. Run 'optimizer.py analyze' first.[/yellow]"
+            )
             return False
     else:
         console.print("[yellow]No cached analysis found.[/yellow]")
-        console.print("[yellow]Run 'python3 optimizer.py analyze' first to generate analysis data.[/yellow]")
+        console.print(
+            "[yellow]Run 'python3 optimizer.py analyze' first to generate analysis data.[/yellow]"
+        )
         return False
 
     if not analysis:

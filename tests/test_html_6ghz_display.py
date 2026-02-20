@@ -9,7 +9,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.advanced_analyzer import AdvancedNetworkAnalyzer
-from core.html_report_generator import generate_airtime_analysis_html
+from core.report_v2 import generate_airtime_analysis_html
 from unittest.mock import Mock
 
 

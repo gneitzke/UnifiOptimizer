@@ -28,6 +28,7 @@ from utils.keychain import (
     list_profiles,
     save_credentials,
 )
+from utils.network_helpers import fix_rssi
 
 console = Console()
 
@@ -100,7 +101,9 @@ def analyze_network(client, site="default", lookback_days=3, min_rssi_strategy="
         client_analysis = analysis["client_analysis"]
         wired_count = sum(1 for c in client_analysis["clients"] if c.get("is_wired"))
         wireless_count = client_analysis["total_clients"] - wired_count
-        console.print(f"\n[green]✓[/green] Analyzed {client_analysis['total_clients']} clients ({wireless_count} wireless, {wired_count} wired)")
+        console.print(
+            f"\n[green]✓[/green] Analyzed {client_analysis['total_clients']} clients ({wireless_count} wireless, {wired_count} wired)"
+        )
 
         if client_analysis["weak_signal"]:
             console.print(
@@ -308,8 +311,7 @@ def analyze_network(client, site="default", lookback_days=3, min_rssi_strategy="
                         rssi = device.get("rssi", 0)
 
                         # Format RSSI with color
-                        if rssi > 0:
-                            rssi = -rssi  # Fix positive RSSI
+                        rssi = fix_rssi(rssi)
 
                         if rssi > -60:
                             rssi_str = f"[green]{rssi} dBm[/green]"
@@ -1314,7 +1316,9 @@ def _generate_basic_recommendations(aps, all_devices=None, clients=None):
                     console.print(
                         f"  [yellow]   → TX: Parent needs HIGH power to reach child[/yellow]"
                     )
-                    console.print(f"  [green]   🛡️  Both APs protected from power reduction[/green]")
+                    console.print(
+                        f"  [green]   🛡️  Both APs protected from power reduction[/green]"
+                    )
                 else:
                     console.print(
                         f"  [green]🛡️  Power Protected - Maintaining HIGH power for reliable mesh[/green]"
@@ -1343,7 +1347,9 @@ def _generate_basic_recommendations(aps, all_devices=None, clients=None):
                 # 1. Count clients at this AP with marginal RSSI (-70 to -80)
                 # 2. Count how many other APs could serve those clients
                 ap_mac = ap.get("mac", "")
-                ap_clients = [c for c in clients if c.get("ap_mac") == ap_mac and not c.get("is_wired")]
+                ap_clients = [
+                    c for c in clients if c.get("ap_mac") == ap_mac and not c.get("is_wired")
+                ]
                 marginal_clients = 0
                 for c in ap_clients:
                     c_rssi = c.get("rssi", -100)
@@ -1354,7 +1360,8 @@ def _generate_basic_recommendations(aps, all_devices=None, clients=None):
 
                 # Count nearby APs (same band) as alternatives
                 same_band_aps = sum(
-                    1 for other_ap in aps
+                    1
+                    for other_ap in aps
                     if other_ap.get("mac") != ap_mac
                     and any(r.get("radio") == radio_name for r in other_ap.get("radio_table", []))
                 )
@@ -1406,7 +1413,7 @@ def generate_client_findings(clients, devices):
 
     # Build AP name lookup
     ap_names = {}
-    for d in (devices or []):
+    for d in devices or []:
         if d.get("type") == "uap":
             ap_names[d.get("mac", "")] = d.get("name", "Unknown AP")
 
@@ -1416,9 +1423,7 @@ def generate_client_findings(clients, devices):
 
         mac = client.get("mac", "")
         hostname = client.get("hostname", client.get("name", mac))
-        rssi = client.get("rssi", -100)
-        if rssi > 0:
-            rssi = -rssi
+        rssi = fix_rssi(client.get("rssi", -100))
         radio = client.get("radio", "")
         radio_proto = client.get("radio_proto", "")
         ap_mac = client.get("ap_mac", "")
@@ -1426,27 +1431,31 @@ def generate_client_findings(clients, devices):
 
         # Wrong band: client on 2.4GHz but supports 5GHz
         if radio == "ng" and ("ac" in radio_proto.lower() or "ax" in radio_proto.lower()):
-            findings.append({
-                "client": hostname,
-                "mac": mac,
-                "ap": ap_name,
-                "type": "wrong_band",
-                "severity": "medium",
-                "message": f"{hostname} on 2.4GHz but supports {radio_proto} — band steering could move to 5GHz",
-                "rssi": rssi,
-            })
+            findings.append(
+                {
+                    "client": hostname,
+                    "mac": mac,
+                    "ap": ap_name,
+                    "type": "wrong_band",
+                    "severity": "medium",
+                    "message": f"{hostname} on 2.4GHz but supports {radio_proto} — band steering could move to 5GHz",
+                    "rssi": rssi,
+                }
+            )
 
         # Dead-zone client: persistently very poor signal
         if rssi < -80:
-            findings.append({
-                "client": hostname,
-                "mac": mac,
-                "ap": ap_name,
-                "type": "dead_zone",
-                "severity": "high" if rssi < -85 else "medium",
-                "message": f"{hostname} at {rssi} dBm on {ap_name} — possible dead zone or needs AP placement change",
-                "rssi": rssi,
-            })
+            findings.append(
+                {
+                    "client": hostname,
+                    "mac": mac,
+                    "ap": ap_name,
+                    "type": "dead_zone",
+                    "severity": "high" if rssi < -85 else "medium",
+                    "message": f"{hostname} at {rssi} dBm on {ap_name} — possible dead zone or needs AP placement change",
+                    "rssi": rssi,
+                }
+            )
 
     return findings
 
@@ -2330,10 +2339,9 @@ Examples:
             # Generate HTML report
             try:
                 from core.report_v2 import generate_v2_report
+
                 report_path, _ = generate_v2_report(full_analysis, recommendations, site)
-                console.print(
-                    f"\n[green]📄 Report generated:[/green] [cyan]{report_path}[/cyan]"
-                )
+                console.print(f"\n[green]📄 Report generated:[/green] [cyan]{report_path}[/cyan]")
             except Exception as e:
                 console.print(f"\n[yellow]⚠️  Could not generate report: {e}[/yellow]")
 
@@ -2341,7 +2349,9 @@ Examples:
             try:
                 import json
 
-                cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                cache_dir = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                )
                 from datetime import datetime
 
                 cache_file = os.path.join(
@@ -2362,7 +2372,9 @@ Examples:
             except Exception:
                 pass  # Cache is best-effort
 
-        console.print("\n[dim]Tip: Use 'optimize --dry-run' to see detailed impact of changes[/dim]")
+        console.print(
+            "\n[dim]Tip: Use 'optimize --dry-run' to see detailed impact of changes[/dim]"
+        )
 
     elif args.command in ("optimize", "apply"):
         if not recommendations:
@@ -2404,10 +2416,9 @@ Examples:
             # Generate HTML report
             try:
                 from core.report_v2 import generate_v2_report
+
                 report_path, _ = generate_v2_report(full_analysis, recommendations, site)
-                console.print(
-                    f"\n[green]📄 Report generated:[/green] [cyan]{report_path}[/cyan]"
-                )
+                console.print(f"\n[green]📄 Report generated:[/green] [cyan]{report_path}[/cyan]")
             except Exception as e:
                 console.print(f"\n[yellow]⚠️  Could not generate report: {e}[/yellow]")
 
@@ -2415,7 +2426,9 @@ Examples:
             try:
                 import json
 
-                cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                cache_dir = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                )
                 from datetime import datetime
 
                 cache_file = os.path.join(

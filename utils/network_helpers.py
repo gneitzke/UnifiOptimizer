@@ -48,8 +48,4 @@ def get_mesh_role(device, all_devices):
 
 def ap_display_name(device):
     """Return a human-friendly AP name."""
-    return (
-        device.get("name")
-        or device.get("hostname")
-        or device.get("mac", "unknown")
-    )
+    return device.get("name") or device.get("hostname") or device.get("mac", "unknown")
