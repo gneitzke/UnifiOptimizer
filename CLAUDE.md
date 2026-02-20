@@ -29,7 +29,7 @@ Line length is 100. Black and isort are configured in `pyproject.toml`. Flake8 c
 ```bash
 python3 run_all_tests.py <host> <username> <password> [site_name]
 ```
-Tests require a live UniFi controller. 48 test files live in `tests/`.
+Tests require a live UniFi controller. 24 test files live in `tests/`.
 
 ## Architecture
 
