@@ -299,6 +299,8 @@ Generated reports include:
 - **Client Health Dashboard**: Signal strength histograms, disconnect patterns; "Needs Attention" spotlight highlights the worst clients with a primary issue badge (weak signal, wrong band, disconnects, excessive roaming)
 - **Optimization Recommendations**: Prioritized action cards with impact counts ("Affects X clients / Y APs") and anchor links from the quick actions bar
 - **Band Column**: Color-coded 2.4 / 5 / 6 GHz pill in the client table for at-a-glance band placement review
+- **DFS Radar Card**: Per-AP radar event counts with affected channel pills; identifies APs most exposed to DFS-triggered channel changes (RF tab, shown only when events exist)
+- **Data Quality Banner**: Amber/red banner at the top of the report when API calls failed during analysis, listing the affected endpoints so you know what data is missing
 
 Reports are saved to the `reports/` directory and can be viewed in any web browser.
 

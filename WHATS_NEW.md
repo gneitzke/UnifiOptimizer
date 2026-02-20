@@ -2,6 +2,20 @@
 
 ---
 
+## 2026-02-20 — Data Quality Banner & DFS Radar Exposure Card
+
+### Data Quality Warning Banner
+When the controller API returns errors during analysis (timeouts, permission failures, etc.), a banner now appears at the top of the report above the hero dashboard. Non-critical failures (timeouts) appear in amber; authentication/permission failures appear in red. The banner lists the affected endpoints and is suppressed entirely when the analysis completed cleanly.
+
+### DFS Radar Exposure Card (RF Tab)
+A new full-width card at the bottom of the RF & Airtime tab shows DFS radar events broken down by AP. Includes:
+- Horizontal bar chart of events per AP, color-coded by severity (red > 5 events, amber > 2, green ≤ 2)
+- Affected channel pills (52–144 flagged as DFS; 36–48 / 149–165 shown as safe)
+- Explanatory note on what DFS means for clients (temporary drop to 2.4 GHz)
+- Card is omitted entirely when no DFS events were detected during the lookback window
+
+---
+
 ## 2026-02-20 — Actionability & Client Insights
 
 All changes are in `core/report_v2.py` (report generation only — no analysis logic changed).

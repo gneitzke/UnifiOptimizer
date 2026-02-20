@@ -335,6 +335,20 @@ details .detail-body td { padding: 4px 8px; border-bottom: 1px solid #1e2d4a15; 
 .health-issue .issue-impact { color: #9aa0a6; font-size: 11px; margin-top: 2px; }
 .health-issue .issue-fix { color: #006fff; font-size: 11px; margin-top: 2px; }
 
+/* Data quality banner */
+.dq-banner {
+    display: flex; align-items: flex-start; gap: 12px;
+    border-radius: 10px; padding: 12px 20px; margin-bottom: 20px; border: 1px solid;
+}
+.dq-banner.warning { background: #fbbc0412; border-color: #fbbc0440; }
+.dq-banner.critical { background: #ea433512; border-color: #ea433540; }
+.dq-icon { font-size: 18px; flex-shrink: 0; line-height: 1.4; }
+.dq-body { flex: 1; }
+.dq-title { font-size: 13px; font-weight: 600; }
+.dq-banner.warning .dq-title { color: #fbbc04; }
+.dq-banner.critical .dq-title { color: #ea4335; }
+.dq-detail { font-size: 11px; color: #9aa0a6; margin-top: 3px; line-height: 1.5; }
+
 /* Quick actions bar */
 .quick-actions-bar {
     display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
@@ -1015,6 +1029,46 @@ def _header(site_name, analysis_data):
 
 
 # ---------------------------------------------------------------------------
+# Section: Data Quality Banner
+# ---------------------------------------------------------------------------
+
+
+def _data_quality_banner(analysis_data):
+    """Warn when API errors caused incomplete analysis data."""
+    api_errors = analysis_data.get("api_errors")
+    if not api_errors or not isinstance(api_errors, dict):
+        return ""
+    total = api_errors.get("total_errors", 0)
+    if not total:
+        return ""
+    is_critical = bool(api_errors.get("critical_errors"))
+    failed = api_errors.get("failed_endpoints", [])
+    level = "critical" if is_critical else "warning"
+    icon = "✗" if is_critical else "⚠"
+    if is_critical:
+        title = f"{total} critical API error{'s' if total != 1 else ''} — analysis incomplete"
+        subtitle = "Authentication or permission failure. Grade and recommendations may be missing."
+    else:
+        title = f"{total} API call{'s' if total != 1 else ''} failed — some data may be missing"
+        subtitle = "Partial data: retry may resolve transient controller timeouts."
+    endpoints_str = ""
+    if failed:
+        shown = [e.get("endpoint", str(e)) if isinstance(e, dict) else str(e) for e in failed[:5]]
+        endpoints_str = "Failed endpoints: " + ", ".join(shown)
+        if len(failed) > 5:
+            endpoints_str += f" (+{len(failed) - 5} more)"
+    detail = " · ".join(filter(None, [subtitle, endpoints_str]))
+    return (
+        f'<div class="dq-banner {level}">'
+        f'<span class="dq-icon">{icon}</span>'
+        f'<div class="dq-body">'
+        f'<div class="dq-title">{_esc(title)}</div>'
+        f'<div class="dq-detail">{_esc(detail)}</div>'
+        f"</div></div>"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Section: Hero Dashboard
 # ---------------------------------------------------------------------------
 
@@ -1569,6 +1623,66 @@ def _actions(recommendations, analysis_data):
 # Deep Dive: RF & Airtime
 # ---------------------------------------------------------------------------
 
+_DFS_CHANNELS = set(range(52, 145))  # 5GHz DFS channels (52–144)
+
+
+def _dfs_card(analysis_data):
+    """Panel card showing DFS radar events per AP. Returns '' when no events."""
+    dfs = analysis_data.get("dfs_analysis", {})
+    if not dfs or not isinstance(dfs, dict):
+        return ""
+    total = dfs.get("total_events", 0)
+    if not total:
+        return ""
+
+    events_by_ap = dfs.get("events_by_ap", {})
+    affected_channels = sorted(dfs.get("affected_channels", []))
+    severity = dfs.get("severity", "ok")
+    title_color = "#ea4335" if severity == "high" else "#fbbc04"
+
+    # Bar chart: AP → event count
+    ap_items = sorted(events_by_ap.items(), key=lambda x: -len(x[1]))
+    bar_data = []
+    for ap_name, events in ap_items:
+        n = len(events)
+        color = "#ea4335" if n > 5 else "#fbbc04" if n > 2 else "#34a853"
+        bar_data.append((ap_name[:20], n, color))
+    bar_html = _svg_hbar(bar_data) if bar_data else ""
+
+    # Affected channels row
+    ch_pills = []
+    for ch in affected_channels:
+        is_dfs = ch in _DFS_CHANNELS
+        style = (
+            "background:#fbbc0420;color:#fbbc04" if is_dfs else "background:#34a85320;color:#34a853"
+        )
+        ch_pills.append(
+            f'<span style="{style};padding:2px 7px;border-radius:3px;font-size:11px">ch{ch}</span>'
+        )
+    ch_row = (
+        (
+            f'<div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:5px;align-items:center">'
+            f'<span style="font-size:11px;color:#5f6368;margin-right:4px">Affected:</span>'
+            f'{"".join(ch_pills)}'
+            f'<span style="font-size:11px;color:#5f6368;margin-left:8px">'
+            f"— switch to ch 36–48 or 149–165 to avoid DFS</span></div>"
+        )
+        if ch_pills
+        else ""
+    )
+
+    return (
+        f'<div class="panel-card full">'
+        f'<h3 style="color:{title_color}">DFS Radar Events '
+        f'<span class="count" style="color:{title_color}60">({total} event{"s" if total != 1 else ""}, '
+        f'{len(events_by_ap)} AP{"s" if len(events_by_ap) != 1 else ""})</span></h3>'
+        f'<div style="font-size:12px;color:#9aa0a6;margin-bottom:10px">'
+        f"5 GHz DFS channels (52–144) are temporarily vacated when radar is detected. "
+        f"Clients drop to 2.4 GHz until the channel clears.</div>"
+        f"{bar_html}{ch_row}"
+        f"</div>"
+    )
+
 
 def _rf_panel(analysis_data):
     sd = analysis_data.get("client_analysis", {}).get("signal_distribution", {})
@@ -1722,6 +1836,7 @@ def _rf_panel(analysis_data):
         f"<h3>Per-AP Client Detail</h3>"
         f'{ap_client_detail if ap_client_detail else "<span style=color:#5f6368>No client data</span>"}'
         f"</div>"
+        f"{_dfs_card(analysis_data)}"
         f"</div>"
     )
 
@@ -2320,6 +2435,7 @@ def generate_v2_report(analysis_data, recommendations, site_name, output_dir="re
         "<body>",
         _header(site_name, analysis_data),
         '<div class="container">',
+        _data_quality_banner(analysis_data),
         _hero(analysis_data, recommendations, site_name),
         _quick_actions_card(analysis_data, recommendations),
         _topology(analysis_data),
