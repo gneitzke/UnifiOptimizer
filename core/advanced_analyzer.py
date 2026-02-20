@@ -495,7 +495,7 @@ class AdvancedNetworkAnalyzer:
                         # Method 3: High data rates (>72 Mbps suggests 802.11n+ dual-band capable)
                         elif tx_rate > 72000 or rx_rate > 72000:
                             is_dual_band = True
-                            detection_reason = f"High data rate: TX={tx_rate/1000:.0f}Mbps RX={rx_rate/1000:.0f}Mbps"
+                            detection_reason = f"High data rate: TX={tx_rate / 1000:.0f}Mbps RX={rx_rate / 1000:.0f}Mbps"
 
                         # Method 4: Multiple spatial streams (>1 suggests modern dual-band device)
                         elif nss >= 2:

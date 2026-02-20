@@ -307,7 +307,7 @@ class SwitchAnalyzer:
                             "tx_errors": port_info["tx_errors"],
                             "total_errors": total_errors,
                             "error_rate": error_rate,
-                            "message": f"High error rate: {error_rate*100:.2f}% (RX={port_info['rx_errors']:,}, TX={port_info['tx_errors']:,})",
+                            "message": f"High error rate: {error_rate * 100:.2f}% (RX={port_info['rx_errors']:,}, TX={port_info['tx_errors']:,})",
                             "impact": "Corrupted data transmission, potential data loss",
                             "recommendation": "Replace cable immediately or check for electromagnetic interference",
                         }

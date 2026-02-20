@@ -421,19 +421,19 @@ def _svg_ring(score, size=180):
     )
 
     return f"""<svg viewBox="0 0 {size} {size}" width="{size}" height="{size}">
-  <circle cx="{size/2}" cy="{size/2}" r="{r}" fill="none"
+  <circle cx="{size / 2}" cy="{size / 2}" r="{r}" fill="none"
     stroke="#1e2d4a" stroke-width="10"/>
-  <circle cx="{size/2}" cy="{size/2}" r="{r}" fill="none"
+  <circle cx="{size / 2}" cy="{size / 2}" r="{r}" fill="none"
     stroke="{color}" stroke-width="10" stroke-linecap="round"
     stroke-dasharray="{circumference:.1f}"
     stroke-dashoffset="{circumference:.1f}"
     data-target="{target_offset:.1f}"
-    transform="rotate(-90 {size/2} {size/2})"
+    transform="rotate(-90 {size / 2} {size / 2})"
     class="ring-progress"
     style="filter: drop-shadow(0 0 6px {color}40);"/>
-  <text x="{size/2}" y="{size/2 - 8}" class="ring-score" text-anchor="middle">{score}</text>
-  <text x="{size/2}" y="{size/2 + 14}" class="ring-grade" text-anchor="middle">{grade}</text>
-  <text x="{size/2}" y="{size/2 + 30}" class="ring-label" text-anchor="middle">HEALTH SCORE</text>
+  <text x="{size / 2}" y="{size / 2 - 8}" class="ring-score" text-anchor="middle">{score}</text>
+  <text x="{size / 2}" y="{size / 2 + 14}" class="ring-grade" text-anchor="middle">{grade}</text>
+  <text x="{size / 2}" y="{size / 2 + 30}" class="ring-label" text-anchor="middle">HEALTH SCORE</text>
 </svg>"""
 
 
@@ -738,7 +738,6 @@ def _behavior_css_class(behavior):
 def _svg_device_timeline(analysis_data, width=860):
     """Network event timeline using accurate hourly event data.
     Rows: Roaming, Restarts, DFS Radar. X-axis: hours, ending at today."""
-    import time
     from datetime import datetime as _dt
 
     et = analysis_data.get("event_timeline", {})
@@ -888,12 +887,12 @@ def _svg_device_timeline(analysis_data, width=860):
             no_data_x = label_w + coverage * chart_w
             no_data_w = chart_w * (1 - coverage)
             parts.append(
-                f'<rect x="{no_data_x:.1f}" y="{y_center - row_h/2 + 2:.1f}" '
+                f'<rect x="{no_data_x:.1f}" y="{y_center - row_h / 2 + 2:.1f}" '
                 f'width="{no_data_w:.1f}" height="{row_h - 4:.1f}" rx="1" '
                 f'fill="#1e2d4a" opacity="0.3"/>'
             )
             parts.append(
-                f'<text x="{no_data_x + no_data_w/2:.1f}" y="{y_center + 3}" '
+                f'<text x="{no_data_x + no_data_w / 2:.1f}" y="{y_center + 3}" '
                 f'fill="#5f6368" font-size="8" text-anchor="middle" '
                 f'font-family="sans-serif">event log only</text>'
             )
@@ -908,7 +907,7 @@ def _svg_device_timeline(analysis_data, width=860):
             opacity = 0.2 + intensity * 0.7
             bar_h = row_h - 4
             parts.append(
-                f'<rect x="{x:.1f}" y="{y_center - bar_h/2:.1f}" '
+                f'<rect x="{x:.1f}" y="{y_center - bar_h / 2:.1f}" '
                 f'width="{bw:.1f}" height="{bar_h:.1f}" rx="1" '
                 f'fill="{color}" opacity="{opacity:.2f}"/>'
             )
@@ -2158,6 +2157,7 @@ def generate_v2_report(analysis_data, recommendations, site_name, output_dir="re
 
     parts = [
         "<!DOCTYPE html>",
+        "<!-- DBC was here -->",
         '<html lang="en">',
         "<head>",
         '<meta charset="UTF-8">',
