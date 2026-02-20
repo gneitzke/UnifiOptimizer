@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 
 from rich.console import Console
 
+from utils.network_helpers import fix_rssi
+
 console = Console()
 
 
@@ -79,6 +81,7 @@ class ExpertNetworkAnalyzer:
             self.historical_events = all_events
             if all_events:
                 from datetime import datetime
+
                 oldest = min(e.get("time", 0) for e in all_events)
                 newest = max(e.get("time", 0) for e in all_events)
                 oldest_dt = datetime.fromtimestamp(oldest / 1000).strftime("%Y-%m-%d")
@@ -105,29 +108,38 @@ class ExpertNetworkAnalyzer:
 
             # Hourly AP stats (request full lookback; controller returns what it has)
             hourly_start = now_ms - max(lookback_days, 7) * 86400 * 1000
-            resp = self.client.post(f"s/{self.site}/stat/report/hourly.ap", {
-                "attrs": report_attrs,
-                "start": hourly_start,
-                "end": now_ms,
-            })
+            resp = self.client.post(
+                f"s/{self.site}/stat/report/hourly.ap",
+                {
+                    "attrs": report_attrs,
+                    "start": hourly_start,
+                    "end": now_ms,
+                },
+            )
             self.hourly_ap_stats = resp.get("data", []) if resp else []
 
             # Daily AP stats (request 90 days to cover any event log gap)
             daily_start = now_ms - 90 * 86400 * 1000
-            resp_d = self.client.post(f"s/{self.site}/stat/report/daily.ap", {
-                "attrs": report_attrs,
-                "start": daily_start,
-                "end": now_ms,
-            })
+            resp_d = self.client.post(
+                f"s/{self.site}/stat/report/daily.ap",
+                {
+                    "attrs": report_attrs,
+                    "start": daily_start,
+                    "end": now_ms,
+                },
+            )
             self.daily_ap_stats = resp_d.get("data", []) if resp_d else []
 
             # Daily per-client stats (satisfaction, usage) — 7 day window
             user_attrs = ["bytes", "rx_bytes", "tx_bytes", "satisfaction", "time"]
-            resp_du = self.client.post(f"s/{self.site}/stat/report/daily.user", {
-                "attrs": user_attrs,
-                "start": now_ms - 7 * 86400 * 1000,
-                "end": now_ms,
-            })
+            resp_du = self.client.post(
+                f"s/{self.site}/stat/report/daily.user",
+                {
+                    "attrs": user_attrs,
+                    "start": now_ms - 7 * 86400 * 1000,
+                    "end": now_ms,
+                },
+            )
             self.daily_user_stats = resp_du.get("data", []) if resp_du else []
 
             parts = []
@@ -138,9 +150,7 @@ class ExpertNetworkAnalyzer:
             if self.daily_user_stats:
                 parts.append(f"{len(self.daily_user_stats)} client-daily")
             if parts:
-                console.print(
-                    f"[green]  ↳ AP stat records: {', '.join(parts)}[/green]"
-                )
+                console.print(f"[green]  ↳ AP stat records: {', '.join(parts)}[/green]")
         except Exception:
             pass
 
@@ -180,9 +190,7 @@ class ExpertNetworkAnalyzer:
                 )
                 total_sessions = 0
                 for mac in to_query:
-                    resp_s = self.client.post(
-                        f"s/{self.site}/stat/session", {"mac": mac}
-                    )
+                    resp_s = self.client.post(f"s/{self.site}/stat/session", {"mac": mac})
                     sess = resp_s.get("data", []) if resp_s else []
                     if sess:
                         self.client_sessions[mac] = sess
@@ -420,7 +428,11 @@ class ExpertNetworkAnalyzer:
                 width = radio["width"]
                 client_count = ap_info["client_count"]
 
-                if width == 80 and len(ap_analysis["ap_details"]) > cw_ap_threshold and client_count < cw_client_threshold:
+                if (
+                    width == 80
+                    and len(ap_analysis["ap_details"]) > cw_ap_threshold
+                    and client_count < cw_client_threshold
+                ):
                     recommendations.append(
                         {
                             "ap": ap_info,
@@ -511,26 +523,26 @@ class ExpertNetworkAnalyzer:
 
             # Wired clients: include in total count with perfect wireless score
             if is_wired or rssi is None:
-                client_analysis.append({
-                    "mac": mac,
-                    "hostname": hostname,
-                    "ip": client.get("ip", "Unknown"),
-                    "rssi": 0,
-                    "ap_name": "Wired",
-                    "ap_mac": ap_mac,
-                    "channel": 0,
-                    "signal_quality": 100,
-                    "disconnect_count": len(client_disconnects.get(mac, [])),
-                    "roam_count": 0,
-                    "health_score": 100,
-                    "grade": "A+",
-                    "is_wired": True,
-                })
+                client_analysis.append(
+                    {
+                        "mac": mac,
+                        "hostname": hostname,
+                        "ip": client.get("ip", "Unknown"),
+                        "rssi": 0,
+                        "ap_name": "Wired",
+                        "ap_mac": ap_mac,
+                        "channel": 0,
+                        "signal_quality": 100,
+                        "disconnect_count": len(client_disconnects.get(mac, [])),
+                        "roam_count": 0,
+                        "health_score": 100,
+                        "grade": "A+",
+                        "is_wired": True,
+                    }
+                )
                 continue
 
-            # Some UniFi controllers return positive RSSI values
-            if rssi > 0:
-                rssi = -rssi
+            rssi = fix_rssi(rssi)
 
             # Find AP name
             ap_name = "Unknown"
@@ -548,9 +560,11 @@ class ExpertNetworkAnalyzer:
             import math
 
             worst_rssi = self.RSSI_POOR - 15  # e.g., -95 for default -80
-            best_rssi = self.RSSI_EXCELLENT    # e.g., -50
+            best_rssi = self.RSSI_EXCELLENT  # e.g., -50
             rssi_span = best_rssi - worst_rssi
-            signal_quality = max(0, min(100, int((rssi - worst_rssi) / rssi_span * 100))) if rssi_span else 50
+            signal_quality = (
+                max(0, min(100, int((rssi - worst_rssi) / rssi_span * 100))) if rssi_span else 50
+            )
 
             if disconnect_count == 0:
                 stability = 100
@@ -573,10 +587,7 @@ class ExpertNetworkAnalyzer:
             throughput_eff = min(100, (tx_rate / max_rate) * 100) if max_rate > 0 else 50
 
             health_score = int(
-                signal_quality * 0.40
-                + stability * 0.25
-                + roaming * 0.20
-                + throughput_eff * 0.15
+                signal_quality * 0.40 + stability * 0.25 + roaming * 0.20 + throughput_eff * 0.15
             )
 
             client_analysis.append(
@@ -615,10 +626,7 @@ class ExpertNetworkAnalyzer:
             else:
                 rssi = client.get("rssi", -100)
 
-                # FIX: Some UniFi controllers return positive RSSI values
-                # RSSI should always be negative in dBm for WiFi
-                if rssi > 0:
-                    rssi = -rssi
+                rssi = fix_rssi(rssi)
 
                 if rssi > self.RSSI_EXCELLENT:
                     signal_distribution["excellent"] += 1
@@ -634,9 +642,13 @@ class ExpertNetworkAnalyzer:
         return {
             "clients": client_analysis,
             "total_clients": len(client_analysis),
-            "weak_signal": [c for c in client_analysis if not c.get("is_wired") and c["rssi"] < self.RSSI_FAIR],
+            "weak_signal": [
+                c for c in client_analysis if not c.get("is_wired") and c["rssi"] < self.RSSI_FAIR
+            ],
             "frequent_disconnects": [c for c in client_analysis if c["disconnect_count"] >= 3],
-            "poor_health": [c for c in client_analysis if not c.get("is_wired") and c["health_score"] < 60],
+            "poor_health": [
+                c for c in client_analysis if not c.get("is_wired") and c["health_score"] < 60
+            ],
             "signal_distribution": signal_distribution,
         }
 
@@ -963,6 +975,7 @@ def _merge_hourly_ap_stats(event_timeline, hourly_ap_stats, daily_ap_stats, devi
 
     # --- Pass 4: Detect recent restarts from device uptime ---
     import time as _time_mod
+
     now_ts = _time_mod.time()
     for dev in devices:
         if dev.get("type") != "uap":
@@ -1251,12 +1264,14 @@ def _enrich_client_satisfaction(client_journeys, daily_user_stats, clients):
             avg = sum(sats) / len(sats)
             if avg < 80:
                 name = mac_to_name.get(mac, mac[:12])
-                low_sat_clients.append({
-                    "client": name,
-                    "mac": mac,
-                    "avg_satisfaction": round(avg, 1),
-                    "days_tracked": len(sats),
-                })
+                low_sat_clients.append(
+                    {
+                        "client": name,
+                        "mac": mac,
+                        "avg_satisfaction": round(avg, 1),
+                        "days_tracked": len(sats),
+                    }
+                )
     if low_sat_clients:
         client_journeys["low_satisfaction_clients"] = sorted(
             low_sat_clients, key=lambda x: x["avg_satisfaction"]
@@ -1331,9 +1346,7 @@ def _build_client_journeys(events, clients, devices, lookback_days, client_sessi
             continue
 
         events_list = client_events.get(mac, [])
-        rssi = client.get("rssi", -100)
-        if rssi > 0:
-            rssi = -rssi
+        rssi = fix_rssi(client.get("rssi", -100))
         current_ap = ap_names.get(client.get("ap_mac", ""), "Unknown")
 
         # --- Build AP path from session data (preferred) or event log (fallback) ---
@@ -1365,18 +1378,22 @@ def _build_client_journeys(events, clients, devices, lookback_days, client_sessi
 
                 # If gap between sessions > 60s, count as disconnect
                 if prev_end and assoc - prev_end > 60:
-                    disconnects.append({
-                        "ts": prev_end,
-                        "ap": session_list[-1]["ap"] if session_list else "?",
-                        "reason": "session_gap",
-                    })
+                    disconnects.append(
+                        {
+                            "ts": prev_end,
+                            "ap": session_list[-1]["ap"] if session_list else "?",
+                            "reason": "session_gap",
+                        }
+                    )
 
-                session_list.append({
-                    "ts": assoc,
-                    "duration": dur,
-                    "ap": sess_ap,
-                    "satisfaction": sat_avg if sat_avg is not None else sat,
-                })
+                session_list.append(
+                    {
+                        "ts": assoc,
+                        "duration": dur,
+                        "ap": sess_ap,
+                        "satisfaction": sat_avg if sat_avg is not None else sat,
+                    }
+                )
 
                 # Extract AP transitions from roaming_sessions (detailed sub-sessions)
                 roaming = sess.get("roaming_sessions", [])
@@ -1390,13 +1407,15 @@ def _build_client_journeys(events, clients, devices, lookback_days, client_sessi
                         from_ap = ap_names.get(
                             prev_rsess.get("ap_mac", ""), prev_rsess.get("ap_mac", "?")[:8]
                         )
-                        ap_path.append({
-                            "ts": r_start,
-                            "from_ap": from_ap,
-                            "to_ap": r_ap,
-                            "band": r_band,
-                            "satisfaction": r_sat,
-                        })
+                        ap_path.append(
+                            {
+                                "ts": r_start,
+                                "from_ap": from_ap,
+                                "to_ap": r_ap,
+                                "band": r_band,
+                                "satisfaction": r_sat,
+                            }
+                        )
 
                 prev_end = end_ts
         else:
@@ -1405,24 +1424,30 @@ def _build_client_journeys(events, clients, devices, lookback_days, client_sessi
                 if evt["type"] == "roam":
                     from_name = evt.get("ap_name") or ap_names.get(evt.get("ap_from", ""), "?")
                     to_name = ap_names.get(evt.get("ap_to", ""), evt.get("ap_name", "?"))
-                    ap_path.append({
-                        "ts": evt["ts"],
-                        "from_ap": from_name,
-                        "to_ap": to_name,
-                        "channel_from": evt.get("channel_from"),
-                        "channel_to": evt.get("channel_to"),
-                    })
+                    ap_path.append(
+                        {
+                            "ts": evt["ts"],
+                            "from_ap": from_name,
+                            "to_ap": to_name,
+                            "channel_from": evt.get("channel_from"),
+                            "channel_to": evt.get("channel_to"),
+                        }
+                    )
                 elif evt["type"] == "disconnect":
-                    disconnects.append({
-                        "ts": evt["ts"],
-                        "ap": evt.get("ap_name") or ap_names.get(evt.get("ap", ""), "?"),
-                        "reason": evt.get("reason", ""),
-                    })
+                    disconnects.append(
+                        {
+                            "ts": evt["ts"],
+                            "ap": evt.get("ap_name") or ap_names.get(evt.get("ap", ""), "?"),
+                            "reason": evt.get("reason", ""),
+                        }
+                    )
                 elif evt["type"] == "connect":
-                    connects.append({
-                        "ts": evt["ts"],
-                        "ap": evt.get("ap_name") or ap_names.get(evt.get("ap", ""), "?"),
-                    })
+                    connects.append(
+                        {
+                            "ts": evt["ts"],
+                            "ap": evt.get("ap_name") or ap_names.get(evt.get("ap", ""), "?"),
+                        }
+                    )
 
         # Detect patterns
         disconnect_count = len(disconnects)
@@ -1452,9 +1477,7 @@ def _build_client_journeys(events, clients, devices, lookback_days, client_sessi
         # Build session estimate
         if session_list:
             durations = [s["duration"] for s in session_list if s.get("duration")]
-            avg_session_min = (
-                sum(durations) / len(durations) / 60 if durations else None
-            )
+            avg_session_min = sum(durations) / len(durations) / 60 if durations else None
         else:
             sessions_pairs = []
             conn_stack = list(connects)
@@ -1469,7 +1492,8 @@ def _build_client_journeys(events, clients, devices, lookback_days, client_sessi
                     conn_stack.remove(best_conn)
             avg_session_min = (
                 sum(s["duration_min"] for s in sessions_pairs) / len(sessions_pairs)
-                if sessions_pairs else None
+                if sessions_pairs
+                else None
             )
 
         # Classify client behavior
@@ -1500,7 +1524,9 @@ def _build_client_journeys(events, clients, devices, lookback_days, client_sessi
         elif daily_roams == 0 and rssi < -75:
             behavior = "sticky"
             behavior_detail = f"Poor signal ({rssi} dBm) but not roaming — may be stuck"
-        elif disconnect_count >= 3 and peak_count >= disconnect_count * 0.5 and peak_hour is not None:
+        elif (
+            disconnect_count >= 3 and peak_count >= disconnect_count * 0.5 and peak_hour is not None
+        ):
             behavior = "pattern"
             behavior_detail = f"Disconnects cluster at {peak_hour}:00 UTC"
 
@@ -1531,26 +1557,32 @@ def _build_client_journeys(events, clients, devices, lookback_days, client_sessi
     top_issues = []
     for mac, j in journeys.items():
         if j["behavior"] == "unstable":
-            top_issues.append({
-                "client": j["hostname"],
-                "mac": mac,
-                "issue": f"Unstable: {j['behavior_detail']}",
-                "severity": "high",
-            })
+            top_issues.append(
+                {
+                    "client": j["hostname"],
+                    "mac": mac,
+                    "issue": f"Unstable: {j['behavior_detail']}",
+                    "severity": "high",
+                }
+            )
         elif j["behavior"] == "flapping":
-            top_issues.append({
-                "client": j["hostname"],
-                "mac": mac,
-                "issue": f"Flapping: {j['behavior_detail']}",
-                "severity": "high",
-            })
+            top_issues.append(
+                {
+                    "client": j["hostname"],
+                    "mac": mac,
+                    "issue": f"Flapping: {j['behavior_detail']}",
+                    "severity": "high",
+                }
+            )
         elif j["behavior"] == "sticky":
-            top_issues.append({
-                "client": j["hostname"],
-                "mac": mac,
-                "issue": f"Sticky: {j['behavior_detail']}",
-                "severity": "medium",
-            })
+            top_issues.append(
+                {
+                    "client": j["hostname"],
+                    "mac": mac,
+                    "issue": f"Sticky: {j['behavior_detail']}",
+                    "severity": "medium",
+                }
+            )
     top_issues.sort(key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x["severity"], 3))
 
     return {
@@ -1599,9 +1631,7 @@ def run_expert_analysis(client, site="default", lookback_days=3):
         )
 
     # Build WiFi quality timeline from hourly AP satisfaction data
-    _build_satisfaction_timeline(
-        event_timeline, getattr(analyzer, "hourly_ap_stats", [])
-    )
+    _build_satisfaction_timeline(event_timeline, getattr(analyzer, "hourly_ap_stats", []))
 
     # Detect AP restarts from multi-client session disconnect clustering
     _detect_restarts_from_sessions(
@@ -1612,7 +1642,10 @@ def run_expert_analysis(client, site="default", lookback_days=3):
 
     # Build per-client journey profiles (uses session data when available)
     client_journeys = _build_client_journeys(
-        analyzer.historical_events, analyzer.clients, analyzer.devices, lookback_days,
+        analyzer.historical_events,
+        analyzer.clients,
+        analyzer.devices,
+        lookback_days,
         client_sessions=getattr(analyzer, "client_sessions", {}),
     )
 

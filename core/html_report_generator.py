@@ -9,6 +9,8 @@ recommendations, RSSI data, and executive summaries.
 from datetime import datetime
 from pathlib import Path
 
+from utils.network_helpers import fix_rssi
+
 
 def make_collapsible(section_id, section_title, section_content, start_collapsed=False, summary=""):
     """Wrap a section in collapsible HTML structure with optional summary visible when collapsed."""
@@ -1226,8 +1228,18 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
     if dfs_analysis:
         dfs_content = generate_dfs_analysis_html(dfs_analysis)
         dfs_events = dfs_analysis.get("events", [])
-        dfs_summary = f"{len(dfs_events)} radar events detected" if dfs_events else "No DFS radar events in lookback period"
-        html_content += make_collapsible("section-dfs", "📡 DFS Radar Events", dfs_content, start_collapsed=True, summary=dfs_summary)
+        dfs_summary = (
+            f"{len(dfs_events)} radar events detected"
+            if dfs_events
+            else "No DFS radar events in lookback period"
+        )
+        html_content += make_collapsible(
+            "section-dfs",
+            "📡 DFS Radar Events",
+            dfs_content,
+            start_collapsed=True,
+            summary=dfs_summary,
+        )
 
     # Band Steering Analysis Section (collapsible, starts collapsed)
     band_steering = analysis_data.get("band_steering_analysis")
@@ -1235,24 +1247,54 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
         bs_content = generate_band_steering_html(band_steering)
         bs_recs = band_steering.get("recommendations", [])
         bs_status = band_steering.get("status", "unknown")
-        bs_summary = f"{len(bs_recs)} APs need band steering changes" if bs_recs else f"Band steering: {bs_status}"
-        html_content += make_collapsible("section-band-steering", "🔄 Band Steering", bs_content, start_collapsed=True, summary=bs_summary)
+        bs_summary = (
+            f"{len(bs_recs)} APs need band steering changes"
+            if bs_recs
+            else f"Band steering: {bs_status}"
+        )
+        html_content += make_collapsible(
+            "section-band-steering",
+            "🔄 Band Steering",
+            bs_content,
+            start_collapsed=True,
+            summary=bs_summary,
+        )
 
     # Mesh Necessity Analysis Section (collapsible, starts collapsed)
     mesh_necessity = analysis_data.get("mesh_necessity_analysis")
     if mesh_necessity:
         mesh_nec_content = generate_mesh_necessity_html(mesh_necessity)
         mesh_recs = mesh_necessity.get("recommendations", [])
-        mesh_summary = f"{len(mesh_recs)} mesh configuration suggestions" if mesh_recs else "Mesh configuration looks optimal"
-        html_content += make_collapsible("section-mesh-necessity", "🔗 Mesh Configuration", mesh_nec_content, start_collapsed=True, summary=mesh_summary)
+        mesh_summary = (
+            f"{len(mesh_recs)} mesh configuration suggestions"
+            if mesh_recs
+            else "Mesh configuration looks optimal"
+        )
+        html_content += make_collapsible(
+            "section-mesh-necessity",
+            "🔗 Mesh Configuration",
+            mesh_nec_content,
+            start_collapsed=True,
+            summary=mesh_summary,
+        )
 
     # Min RSSI Analysis Section (collapsible, starts collapsed)
     min_rssi = analysis_data.get("min_rssi_analysis")
     if min_rssi:
         min_rssi_content = generate_min_rssi_html(min_rssi)
         mr_recs = min_rssi.get("recommendations", [])
-        mr_summary = f"{len(mr_recs)} APs could benefit from min RSSI tuning" if mr_recs else "Min RSSI settings are well-configured"
-        html_content += make_collapsible("section-min-rssi", "📡 Minimum RSSI", min_rssi_content, start_collapsed=True, summary=mr_summary)
+        mr_summary = (
+            f"{len(mr_recs)} APs could benefit from min RSSI tuning"
+            if mr_recs
+            else "Min RSSI settings are well-configured"
+        )
+        html_content += make_collapsible(
+            "section-min-rssi",
+            "📡 Minimum RSSI",
+            min_rssi_content,
+            start_collapsed=True,
+            summary=mr_summary,
+        )
 
     # Airtime Analysis Section (collapsible, starts collapsed)
     airtime_analysis = analysis_data.get("airtime_analysis")
@@ -1260,7 +1302,13 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
         airtime_content = generate_airtime_analysis_html(airtime_analysis)
         at_status = airtime_analysis.get("status", "unknown")
         at_summary = f"Airtime utilization: {at_status}"
-        html_content += make_collapsible("section-airtime", "⏱️ Airtime Utilization", airtime_content, start_collapsed=True, summary=at_summary)
+        html_content += make_collapsible(
+            "section-airtime",
+            "⏱️ Airtime Utilization",
+            airtime_content,
+            start_collapsed=True,
+            summary=at_summary,
+        )
 
     # Firmware Analysis Section (collapsible, starts collapsed)
     firmware_analysis = analysis_data.get("firmware_analysis")
@@ -1268,8 +1316,16 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
         fw_content = generate_firmware_analysis_html(firmware_analysis)
         fw_up = firmware_analysis.get("up_to_date", 0)
         fw_total = firmware_analysis.get("total_aps", 0)
-        fw_summary = f"{fw_up}/{fw_total} devices on latest firmware" if fw_total else "No firmware data"
-        html_content += make_collapsible("section-firmware", "🔧 Firmware Status", fw_content, start_collapsed=True, summary=fw_summary)
+        fw_summary = (
+            f"{fw_up}/{fw_total} devices on latest firmware" if fw_total else "No firmware data"
+        )
+        html_content += make_collapsible(
+            "section-firmware",
+            "🔧 Firmware Status",
+            fw_content,
+            start_collapsed=True,
+            summary=fw_summary,
+        )
 
     # Client Capabilities Section (collapsible, starts collapsed)
     client_capabilities = analysis_data.get("client_capabilities")
@@ -1281,8 +1337,16 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
         if cap_total > 0:
             ax_pct = int(cap_dist.get("802.11ax", 0) / cap_total * 100)
         legacy_count = cap_dist.get("legacy", 0) + cap_dist.get("802.11n", 0)
-        cap_summary = f"{ax_pct}% WiFi 6 clients" + (f", {legacy_count} legacy devices" if legacy_count else "")
-        html_content += make_collapsible("section-capabilities", "📊 Client Capabilities", cap_content, start_collapsed=True, summary=cap_summary)
+        cap_summary = f"{ax_pct}% WiFi 6 clients" + (
+            f", {legacy_count} legacy devices" if legacy_count else ""
+        )
+        html_content += make_collapsible(
+            "section-capabilities",
+            "📊 Client Capabilities",
+            cap_content,
+            start_collapsed=True,
+            summary=cap_summary,
+        )
 
     # Client Security Section (collapsible, starts collapsed)
     client_security = analysis_data.get("client_security")
@@ -1293,7 +1357,13 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
         blocked = len(client_security.get("blocked_clients", []))
         isolated = len(client_security.get("isolated_clients", []))
         sec_summary = f"{blocked} blocked, {isolated} isolated clients"
-        html_content += make_collapsible("section-security", "🔒 Client Security", sec_content, start_collapsed=True, summary=sec_summary)
+        html_content += make_collapsible(
+            "section-security",
+            "🔒 Client Security",
+            sec_content,
+            start_collapsed=True,
+            summary=sec_summary,
+        )
 
     # Manufacturer Analysis Section (collapsible, starts collapsed)
     manufacturer_analysis = analysis_data.get("manufacturer_analysis")
@@ -1304,7 +1374,13 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
         mfr_count = len(manufacturer_analysis.get("manufacturers", {}))
         top_mfr = manufacturer_analysis.get("top_manufacturer", "Unknown")
         mfr_summary = f"{mfr_count} manufacturers detected, top: {top_mfr}"
-        html_content += make_collapsible("section-manufacturers", "🏭 Manufacturers", mfr_content, start_collapsed=True, summary=mfr_summary)
+        html_content += make_collapsible(
+            "section-manufacturers",
+            "🏭 Manufacturers",
+            mfr_content,
+            start_collapsed=True,
+            summary=mfr_summary,
+        )
 
     # Switch Analysis Section (Collapsible)
     switch_port_history = analysis_data.get("switch_port_history")
@@ -1360,8 +1436,11 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
         if issue_count:
             journey_summary += f", {issue_count} need attention"
         html_content += make_collapsible(
-            "section-client-journeys", "🗺️ Client Journeys", journey_content,
-            start_collapsed=True, summary=journey_summary
+            "section-client-journeys",
+            "🗺️ Client Journeys",
+            journey_content,
+            start_collapsed=True,
+            summary=journey_summary,
         )
 
     # Findings Section (collapsible, starts collapsed)
@@ -1369,8 +1448,18 @@ def generate_html_report(analysis_data, recommendations, site_name, output_dir="
     if findings_content:
         client_findings = analysis_data.get("client_findings", {})
         cf_total = client_findings.get("total_findings", 0)
-        findings_summary = f"{cf_total} client-level findings detected" if cf_total else "Per-client analysis details"
-        html_content += make_collapsible("section-findings", "🔍 Detailed Findings", findings_content, start_collapsed=True, summary=findings_summary)
+        findings_summary = (
+            f"{cf_total} client-level findings detected"
+            if cf_total
+            else "Per-client analysis details"
+        )
+        html_content += make_collapsible(
+            "section-findings",
+            "🔍 Detailed Findings",
+            findings_content,
+            start_collapsed=True,
+            summary=findings_summary,
+        )
 
     # Footer
     html_content += f"""
@@ -2832,9 +2921,7 @@ def generate_recommendations_html(recommendations):
                     "2.4GHz"
                     if radio == "ng"
                     else (
-                        "5GHz"
-                        if radio == "na"
-                        else "6GHz" if radio in ["6e", "6g"] else "Unknown"
+                        "5GHz" if radio == "na" else "6GHz" if radio in ["6e", "6g"] else "Unknown"
                     )
                 )
                 recommendation = f"Change {band} channel from {current} to {new}"
@@ -2846,9 +2933,7 @@ def generate_recommendations_html(recommendations):
                     "2.4GHz"
                     if radio == "ng"
                     else (
-                        "5GHz"
-                        if radio == "na"
-                        else "6GHz" if radio in ["6e", "6g"] else "Unknown"
+                        "5GHz" if radio == "na" else "6GHz" if radio in ["6e", "6g"] else "Unknown"
                     )
                 )
                 recommendation = f"Change {band} transmit power from {current} to {new}"
@@ -3017,9 +3102,7 @@ def generate_disconnected_clients_html(client_health):
         rssi = client.get("rssi", 0)
         ap_mac = client.get("ap_mac", "Unknown")
 
-        # Fix RSSI if positive
-        if rssi > 0:
-            rssi = -rssi
+        rssi = fix_rssi(rssi)
 
         # Determine signal quality
         if rssi > -50:

@@ -10,6 +10,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from utils.network_helpers import fix_rssi
+
 console = Console()
 
 
@@ -85,12 +87,7 @@ class ClientHealthAnalyzer:
                 categories["wired"].append(client)
                 continue
 
-            rssi = client.get("rssi", -100)
-
-            # FIX: Some UniFi controllers return positive RSSI values
-            # RSSI should always be negative in dBm for WiFi
-            if rssi > 0:
-                rssi = -rssi
+            rssi = fix_rssi(client.get("rssi", -100))
 
             if rssi > self.RSSI_EXCELLENT:
                 categories["excellent"].append(client)
@@ -132,11 +129,7 @@ class ClientHealthAnalyzer:
             if client.get("is_wired", False):
                 continue
 
-            rssi = client.get("rssi", -100)
-
-            # FIX: Some UniFi controllers return positive RSSI values
-            if rssi > 0:
-                rssi = -rssi
+            rssi = fix_rssi(client.get("rssi", -100))
 
             if rssi < self.RSSI_FAIR:
                 client_info = {
@@ -204,11 +197,9 @@ class ClientHealthAnalyzer:
         for client in self.clients:
             mac = client.get("mac", "")
             count = roam_count.get(mac, 0)
-            rssi = client.get("rssi", -100)
+            rssi = fix_rssi(client.get("rssi", -100))
 
             # Excessive roaming or roaming while signal is good (shouldn't need to roam)
-            if rssi > 0:
-                rssi = -rssi
             if count >= 5 or (count >= 2 and rssi != -100 and rssi > self.RSSI_GOOD):
                 issues.append(
                     {
@@ -234,11 +225,7 @@ class ClientHealthAnalyzer:
                 distribution["wired"] += 1
                 continue
 
-            rssi = client.get("rssi", -100)
-
-            # FIX: Some UniFi controllers return positive RSSI values
-            if rssi > 0:
-                rssi = -rssi
+            rssi = fix_rssi(client.get("rssi", -100))
 
             rssi_values.append(rssi)
 
@@ -268,7 +255,7 @@ class ClientHealthAnalyzer:
         worst_rssi → 0, best_rssi → 100.
         """
         worst = self.RSSI_POOR - 15  # e.g., -95 for default -80
-        best = self.RSSI_EXCELLENT    # e.g., -50
+        best = self.RSSI_EXCELLENT  # e.g., -50
         span = best - worst
         if span == 0:
             return 50
@@ -333,12 +320,8 @@ class ClientHealthAnalyzer:
 
         for client in self.clients:
             mac = client.get("mac", "")
-            rssi = client.get("rssi", -100)
+            rssi = fix_rssi(client.get("rssi", -100))
             is_wired = client.get("is_wired", False)
-
-            # Normalize RSSI
-            if rssi > 0:
-                rssi = -rssi
 
             # Skip wired clients from wireless health scoring
             if is_wired:
@@ -394,12 +377,7 @@ class ClientHealthAnalyzer:
             throughput = min(100, (tx_rate / max(expected_max, 1)) * 100) if tx_rate > 0 else 50
 
             # Weighted composite
-            final_score = int(
-                signal * 0.40
-                + stability * 0.25
-                + roaming * 0.20
-                + throughput * 0.15
-            )
+            final_score = int(signal * 0.40 + stability * 0.25 + roaming * 0.20 + throughput * 0.15)
             final_score = max(0, min(100, final_score))
 
             scores.append(
@@ -470,10 +448,7 @@ class ClientHealthAnalyzer:
         # Collect RSSI values and fix positive values
         rssi_values = []
         for c in clients:
-            rssi = c.get("rssi", -100)
-            # FIX: Some UniFi controllers return positive RSSI values
-            if rssi > 0:
-                rssi = -rssi
+            rssi = fix_rssi(c.get("rssi", -100))
             rssi_values.append(rssi)
 
         # Create bins
