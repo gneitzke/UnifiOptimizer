@@ -294,9 +294,11 @@ Prioritized by severity:
 
 Generated reports include:
 - **Network Health Overview**: Overall score and key metrics
+- **Quick Actions Bar**: Top 3 recommended actions visible above the fold — click to jump straight to the full action card
 - **Access Point Analysis**: Per-AP performance and recommendations
-- **Client Health Dashboard**: Signal strength histograms, disconnect patterns
-- **Optimization Recommendations**: Prioritized action items with explanations
+- **Client Health Dashboard**: Signal strength histograms, disconnect patterns; "Needs Attention" spotlight highlights the worst clients with a primary issue badge (weak signal, wrong band, disconnects, excessive roaming)
+- **Optimization Recommendations**: Prioritized action cards with impact counts ("Affects X clients / Y APs") and anchor links from the quick actions bar
+- **Band Column**: Color-coded 2.4 / 5 / 6 GHz pill in the client table for at-a-glance band placement review
 
 Reports are saved to the `reports/` directory and can be viewed in any web browser.
 
