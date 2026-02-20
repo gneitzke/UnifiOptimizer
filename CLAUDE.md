@@ -28,6 +28,18 @@ Line length is 100. Black and isort are configured in `pyproject.toml`. Flake8 c
 ### Documentation
 Always update `README.md` and `WHATS_NEW.md` when making any code changes. Include docs updates in the same commit or a follow-up docs commit immediately after.
 
+### Git Workflow
+Always work on a feature branch, never commit directly to `main`:
+```bash
+git fetch upstream
+git rebase upstream/main main   # keep fork in sync first
+git checkout -b feature/short-description
+# ... make changes, commit ...
+git push -u origin feature/short-description
+# open PR from feature branch to upstream main
+```
+After a PR merges: `git fetch upstream && git rebase upstream/main main && git push origin main`, then delete the feature branch.
+
 ### Versioning
 Version is stored in `version.py` (`__version__`) and mirrored in `pyproject.toml` (`[project] version`). Keep both in sync. Use semantic versioning: bump **patch** for bug fixes, **minor** for new features, **major** for breaking changes. Tag releases with `git tag v{version}` after committing.
 
