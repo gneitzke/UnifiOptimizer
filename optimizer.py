@@ -10,12 +10,19 @@ Two modes:
 import subprocess
 import sys
 
+from version import __version__
+
 
 def main():
     """Route to core/optimize_network.py with all arguments"""
+    # Version flag
+    if len(sys.argv) > 1 and sys.argv[1] in ("--version", "-V"):
+        print(f"UnifiOptimizer v{__version__}")
+        return 0
+
     # If no arguments, show help
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
-        print("""UniFi Network Optimizer
+        print(f"""UniFi Network Optimizer v{__version__}
 
 Usage:
   python3 optimizer.py analyze  [options]   Full analysis + report (safe, read-only)

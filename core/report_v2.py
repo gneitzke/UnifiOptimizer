@@ -7,7 +7,11 @@ Self-contained HTML5 — no external dependencies.
 import html as _html
 import math
 import os
+import sys
 from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from version import __version__  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -1023,7 +1027,8 @@ def _header(site_name, analysis_data):
     return (
         f'<div class="report-header">'
         f"<h1><span>UniFi</span> Network Analysis</h1>"
-        f'<div class="meta">Site: {_esc(site_name)}<br>{now}<br>{lookback}-day lookback</div>'
+        f'<div class="meta">Site: {_esc(site_name)}<br>{now}<br>{lookback}-day lookback'
+        f'<br><span style="color:#5f6368;font-size:11px">v{__version__}</span></div>'
         f"</div>"
     )
 

@@ -28,6 +28,9 @@ Line length is 100. Black and isort are configured in `pyproject.toml`. Flake8 c
 ### Documentation
 Always update `README.md` and `WHATS_NEW.md` when making any code changes. Include docs updates in the same commit or a follow-up docs commit immediately after.
 
+### Versioning
+Version is stored in `version.py` (`__version__`) and mirrored in `pyproject.toml` (`[project] version`). Keep both in sync. Use semantic versioning: bump **patch** for bug fixes, **minor** for new features, **major** for breaking changes. Tag releases with `git tag v{version}` after committing.
+
 ### Testing
 ```bash
 python3 run_all_tests.py <host> <username> <password> [site_name]

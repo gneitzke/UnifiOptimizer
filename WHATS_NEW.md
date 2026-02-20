@@ -2,7 +2,14 @@
 
 ---
 
-## 2026-02-20 — Data Quality Banner & DFS Radar Exposure Card
+## v0.9.0 — 2026-02-20
+
+### Versioning
+- Added semantic versioning (`version.py` + `pyproject.toml`)
+- Version shown in CLI (`--version` / `-V`) and in every HTML report header
+- Starting at v0.9.0; will reach v1.0.0 once the feature set is considered stable
+
+### Data Quality Banner & DFS Radar Exposure Card
 
 ### Data Quality Warning Banner
 When the controller API returns errors during analysis (timeouts, permission failures, etc.), a banner now appears at the top of the report above the hero dashboard. Non-critical failures (timeouts) appear in amber; authentication/permission failures appear in red. The banner lists the affected endpoints and is suppressed entirely when the analysis completed cleanly.
@@ -16,7 +23,7 @@ A new full-width card at the bottom of the RF & Airtime tab shows DFS radar even
 
 ---
 
-## 2026-02-20 — Actionability & Client Insights
+## v0.8.x — 2026-02-20 — Actionability & Client Insights
 
 All changes are in `core/report_v2.py` (report generation only — no analysis logic changed).
 
@@ -47,9 +54,7 @@ The Problem Clients table now includes a Band column with color-coded pills:
 
 ---
 
-## Earlier Changes
-
-### 2026-02-XX — Consolidation & Cleanup (PR #11)
+## v0.7.x — Consolidation & Cleanup (PR #11)
 - Merged duplicate analysis passes; unified recommendation pipeline
 - Added `core/switch_analyzer.py` for switch port error/utilization analysis
 - Fixed all Flake8 E226 and F401 warnings

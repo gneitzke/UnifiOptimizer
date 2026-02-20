@@ -1,3 +1,8 @@
+[project]
+name = "UnifiOptimizer"
+version = "0.9.0"  # keep in sync with version.py
+requires-python = ">=3.7"
+
 [tool.black]
 line-length = 100
 target-version = ['py37', 'py38', 'py39', 'py310']
