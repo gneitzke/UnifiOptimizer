@@ -392,7 +392,6 @@ UnifiOptimizer/
 │   ├── advanced_analyzer.py # DFS, roaming, airtime, min RSSI
 │   ├── channel_optimizer.py # Smart channel recommendations
 │   ├── change_applier.py   # Safe change application
-│   ├── html_report_generator.py
 │   └── ...
 ├── utils/                  # Utility modules
 │   ├── keychain.py         # Secure credential storage

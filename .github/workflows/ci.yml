@@ -72,7 +72,7 @@ jobs:
         echo "Verifying module imports..."
         python -c "from core.advanced_analyzer import AdvancedNetworkAnalyzer; print('✅ AdvancedNetworkAnalyzer imports successfully')"
         python -c "from core.switch_analyzer import SwitchAnalyzer; print('✅ SwitchAnalyzer imports successfully')"
-        python -c "from core.html_report_generator import generate_html_report; print('✅ HTML generator imports successfully')"
+        python -c "from core.report_v2 import generate_v2_report; print('✅ HTML generator imports successfully')"
         python -c "from api.cloudkey_gen2_client import CloudKeyGen2Client; print('✅ CloudKey client imports successfully')"
 
     - name: Check for Mesh RSSI Protection
@@ -185,7 +185,7 @@ jobs:
     - name: Verify Recommendation Format Handler
       run: |
         echo "Checking recommendation format handling..."
-        grep -A 10 "if \"reason\" in rec and not rec.get(\"message\")" core/html_report_generator.py && echo "✅ Format handler found"
+        grep -A 10 "if \"reason\" in rec and not rec.get(\"message\")" core/report_v2.py && echo "✅ Format handler found"
 
   build-validation:
     name: Build Validation
@@ -214,7 +214,7 @@ jobs:
         modules_to_test = [
             'core.advanced_analyzer',
             'core.switch_analyzer',
-            'core.html_report_generator',
+            'core.report_v2',
             'core.optimize_network',
             'core.channel_optimizer',
             'core.network_analyzer',
