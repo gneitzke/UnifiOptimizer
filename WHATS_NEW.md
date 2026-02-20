@@ -4,6 +4,9 @@
 
 ## v0.9.0 — 2026-02-20
 
+### Bug Fix: Recommendation Format Handler
+- Added `_rec_msg()` helper in `report_v2.py` to handle recommendation dicts that use `"reason"` instead of `"message"` — ensures action card detail rows render correctly regardless of which field name the data source uses
+
 ### Versioning
 - Added semantic versioning (`version.py` + `pyproject.toml`)
 - Version shown in CLI (`--version` / `-V`) and in every HTML report header
