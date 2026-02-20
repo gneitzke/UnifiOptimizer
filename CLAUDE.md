@@ -35,7 +35,7 @@ Tests require a live UniFi controller. 48 test files live in `tests/`.
 
 ### Entry Point Flow
 ```
-optimizer.py  (argparse CLI router)
+optimizer.py  (CLI entry point; routes to core/optimize_network.py)
   └── core/optimize_network.py  (main orchestrator, ~2500 lines)
         ├── analyze_network()
         │     ├── network_analyzer.py      → ExpertNetworkAnalyzer
