@@ -23,6 +23,15 @@ def _esc(text):
     return _html.escape(str(text)) if text else ""
 
 
+def _rec_msg(rec):
+    """Return display message from a recommendation dict.
+    Handles both 'message' and 'reason' field names across different data sources.
+    """
+    if "reason" in rec and not rec.get("message"):
+        return rec.get("reason", rec.get("recommendation", ""))
+    return rec.get("message", rec.get("recommendation", ""))
+
+
 def _score_color(score):
     """Map health score to color."""
     if score >= 90:
@@ -1512,7 +1521,7 @@ def _action_detail_html(action):
     for r in recs:
         ap_name = r.get("ap", {}).get("name", r.get("device", "?"))
         band = r.get("band", "")
-        msg = r.get("message", r.get("recommendation", ""))
+        msg = _rec_msg(r)
         rows.append(
             f'<tr><td style="color:#e8eaed;white-space:nowrap">{_esc(ap_name)}</td><td>{_esc(band)}</td><td>{_esc(msg)}</td></tr>'
         )
