@@ -77,7 +77,7 @@ lookback = get_option("lookback_days", 3)
 
 **Mesh detection** — `is_mesh_child()` checks `uplink.type == "wireless"`. Power reduction changes skip mesh APs to preserve uplink reliability.
 
-**Change audit trail** — every applied change is appended to `changes_YYYYMMDD_HHMMSS.json` in the working directory. The untracked `changes_20251009_203308.json` in the repo root is an example of this.
+**Change audit trail** — every applied change is appended to timestamped JSON files named like `changes_YYYYMMDD_HHMMSS.json` in the working directory (for example, `changes_20250101_120000.json`).
 
 **Analysis cache** — full analysis results are saved to `analysis_cache_YYYYMMDD_HHMMSS.json` so `regenerate_report.py` can rebuild reports without re-querying the controller.
 
