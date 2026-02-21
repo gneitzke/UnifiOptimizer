@@ -94,25 +94,48 @@ export async function discover(): Promise<
 export async function runAnalysis(): Promise<
   AnalysisJob
 > {
-  return request<AnalysisJob>(
-    '/api/analysis',
-    { method: 'POST' },
+  const raw = await request<Record<string, unknown>>(
+    '/api/analysis/run',
+    {
+      method: 'POST',
+      body: JSON.stringify({}),
+    },
   );
+  return {
+    jobId: raw.job_id as string,
+    status: raw.status as AnalysisJob['status'],
+    progress: raw.progress as number,
+    startedAt: (raw.started_at as string) ?? '',
+    completedAt: raw.completed_at as string | undefined,
+    error: raw.error as string | undefined,
+  };
+}
+
+function mapJob(raw: Record<string, unknown>): AnalysisJob {
+  return {
+    jobId: (raw.job_id ?? raw.jobId) as string,
+    status: raw.status as AnalysisJob['status'],
+    progress: raw.progress as number,
+    startedAt: (raw.started_at as string) ?? '',
+    completedAt: raw.completed_at as string | undefined,
+    error: raw.error as string | undefined,
+  };
 }
 
 export async function getAnalysisStatus(
   jobId: string,
 ): Promise<AnalysisJob> {
-  return request<AnalysisJob>(
-    `/api/analysis/${jobId}`,
+  const raw = await request<Record<string, unknown>>(
+    `/api/analysis/status/${jobId}`,
   );
+  return mapJob(raw);
 }
 
 export async function getAnalysisResults(
   jobId: string,
 ): Promise<AnalysisResult> {
   return request<AnalysisResult>(
-    `/api/analysis/${jobId}/results`,
+    `/api/analysis/results/${jobId}`,
   );
 }
 

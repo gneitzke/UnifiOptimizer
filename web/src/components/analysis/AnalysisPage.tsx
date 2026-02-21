@@ -830,7 +830,7 @@ export default function AnalysisPage() {
     useState<Tab>('overview');
 
   const poll = useCallback(async () => {
-    if (!id) return;
+    if (!id || id === 'new') return;
     try {
       const j = await api.getAnalysisStatus(id);
       setJob(j);
@@ -852,17 +852,38 @@ export default function AnalysisPage() {
   }, [id]);
 
   useEffect(() => {
-    void poll();
-    const iv = setInterval(() => {
-      if (
-        !result &&
-        !error
-      ) {
-        void poll();
+    if (id !== 'new') {
+      void poll();
+      const iv = setInterval(() => {
+        if (!result && !error) {
+          void poll();
+        }
+      }, 2000);
+      return () => clearInterval(iv);
+    }
+
+    // Auto-start analysis when id is "new"
+    let cancelled = false;
+    (async () => {
+      try {
+        const j = await api.runAnalysis();
+        if (!cancelled) {
+          navigate(`/analysis/${j.jobId}`, {
+            replace: true,
+          });
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setError(
+            e instanceof Error
+              ? e.message
+              : 'Failed to start analysis',
+          );
+        }
       }
-    }, 2000);
-    return () => clearInterval(iv);
-  }, [poll, result, error]);
+    })();
+    return () => { cancelled = true; };
+  }, [id, poll, result, error, navigate]);
 
   /* Loading skeleton */
   if (!result && !error) {
