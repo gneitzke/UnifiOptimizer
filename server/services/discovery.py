@@ -34,12 +34,12 @@ async def scan_network(
         progress_callback: Optional async callback(progress_pct, message).
 
     Returns:
-        List of discovered devices.
+        List of discovered devices (deduplicated by IP, preferring port 443).
     """
     if port_list is None:
         port_list = UNIFI_PORTS
 
-    devices = []
+    raw_devices = []
     total = 254 * len(port_list)
     checked = 0
 
@@ -62,13 +62,19 @@ async def scan_network(
         for result in results:
             checked += 1
             if isinstance(result, DiscoveredDevice):
-                devices.append(result)
+                raw_devices.append(result)
 
         if progress_callback:
             pct = int((checked / total) * 100)
             await progress_callback(pct, f"Scanned {checked}/{total} endpoints")
 
-    return devices
+    # Deduplicate: keep one entry per IP, prefer port 443
+    ip_map: dict[str, DiscoveredDevice] = {}
+    for d in raw_devices:
+        clean = d.host.replace("https://", "").replace("http://", "")
+        if clean not in ip_map or d.port == 443:
+            ip_map[clean] = d
+    return list(ip_map.values())
 
 
 async def _probe_host(ip: str, port: int, timeout: float):

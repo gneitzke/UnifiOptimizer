@@ -118,6 +118,7 @@ export interface ChangePreview {
 
 export interface ChangeResult {
   changeId: string;
+  realChangeId?: string;
   success: boolean;
   appliedAt: string;
   revertible: boolean;
@@ -126,8 +127,10 @@ export interface ChangeResult {
 
 export interface ChangeHistoryEntry {
   changeId: string;
+  change_id?: string;
   description: string;
   deviceName: string;
+  device_name?: string;
   setting: string;
   previousValue: string;
   newValue: string;
@@ -135,4 +138,8 @@ export interface ChangeHistoryEntry {
   appliedBy: string;
   reverted: boolean;
   revertedAt?: string;
+  action?: string;
+  status?: string;
+  timestamp?: string;
+  device_mac?: string;
 }

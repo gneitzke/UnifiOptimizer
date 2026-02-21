@@ -67,44 +67,7 @@ test.describe('Sidebar navigation', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 3. LOGOUT
-// ---------------------------------------------------------------------------
-
-test.describe('Logout flow', () => {
-  test('logout button navigates to login', async ({ page }) => {
-    await page.goto(`${BASE}/dashboard`);
-    await page.waitForURL('**/dashboard', { timeout: 15000 });
-    const logoutBtn = page.locator('button[aria-label="Logout"]');
-    await expect(logoutBtn).toBeVisible();
-    await logoutBtn.click();
-    await page.waitForURL(BASE + '/', { timeout: 5000 });
-    await expect(page.getByText('Enter Manually')).toBeVisible();
-  });
-
-  test('after logout, protected routes redirect to login', async ({ page }) => {
-    await page.goto(`${BASE}/dashboard`);
-    await page.waitForURL('**/dashboard', { timeout: 15000 });
-    await page.locator('button[aria-label="Logout"]').click();
-    await page.waitForURL(BASE + '/');
-    await page.goto(`${BASE}/dashboard`);
-    await page.waitForTimeout(2000);
-    expect(page.url()).toBe(`${BASE}/`);
-  });
-
-  test('token is cleared after logout', async ({ page }) => {
-    await page.goto(`${BASE}/dashboard`);
-    await page.waitForURL('**/dashboard', { timeout: 15000 });
-    await page.locator('button[aria-label="Logout"]').click();
-    await page.waitForURL(BASE + '/');
-    const token = await page.evaluate(() =>
-      localStorage.getItem('unifi_token'),
-    );
-    expect(token).toBeNull();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 4. HISTORY PAGE
+// 3. HISTORY PAGE
 // ---------------------------------------------------------------------------
 
 test.describe('History page', () => {
@@ -125,7 +88,7 @@ test.describe('History page', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 5. REPAIR PAGE
+// 4. REPAIR PAGE
 // ---------------------------------------------------------------------------
 
 test.describe('Repair page', () => {
@@ -146,7 +109,7 @@ test.describe('Repair page', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 6. ANALYSIS PAGE
+// 5. ANALYSIS PAGE
 // ---------------------------------------------------------------------------
 
 test.describe('Analysis page', () => {
@@ -166,7 +129,7 @@ test.describe('Analysis page', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 7. SESSION PERSISTENCE
+// 6. SESSION PERSISTENCE
 // ---------------------------------------------------------------------------
 
 test.describe('Session persistence', () => {
@@ -195,5 +158,74 @@ test.describe('Session persistence', () => {
       localStorage.getItem('unifi_token'),
     );
     expect(token).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. LOGOUT (must be LAST — destroys server-side session)
+// ---------------------------------------------------------------------------
+
+test.describe('Logout flow', () => {
+  test('logout button navigates to login', async ({ page }) => {
+    await page.goto(`${BASE}/dashboard`);
+    await page.waitForURL('**/dashboard', { timeout: 15000 });
+    const logoutBtn = page.locator('button[aria-label="Logout"]');
+    await expect(logoutBtn).toBeVisible();
+    await logoutBtn.click();
+    await page.waitForURL(BASE + '/', { timeout: 5000 });
+    await expect(page.getByText('Enter Manually')).toBeVisible();
+  });
+
+  test('after logout, protected routes redirect to login', async ({ page }) => {
+    // Fresh login so we have a valid session to test with
+    await page.goto(BASE);
+    await page.evaluate(() => localStorage.clear());
+    await page.goto(BASE);
+    await page.getByText('Enter Manually').click();
+    await page.getByPlaceholder('https://192.168.1.1:8443').fill('https://192.168.1.1');
+    await page.getByRole('button', { name: 'Continue' }).click();
+    await expect(page.getByText('Connecting to')).toBeVisible();
+    const usernameInput = page.locator(
+      'input:not([type="password"]):not([type="checkbox"])',
+    );
+    await usernameInput.fill('audit');
+    await page.locator('input[type="password"]').fill('CHANGE_ME');
+    await page.getByRole('button', { name: /Sign In/i }).click();
+    await page.waitForURL('**/dashboard', { timeout: 15000 });
+
+    // Now logout
+    await page.locator('button[aria-label="Logout"]').click();
+    await page.waitForURL(BASE + '/');
+
+    // Protected route should redirect
+    await page.goto(`${BASE}/dashboard`);
+    await page.waitForTimeout(2000);
+    expect(page.url()).toBe(`${BASE}/`);
+  });
+
+  test('token is cleared after logout', async ({ page }) => {
+    // Fresh login
+    await page.goto(BASE);
+    await page.evaluate(() => localStorage.clear());
+    await page.goto(BASE);
+    await page.getByText('Enter Manually').click();
+    await page.getByPlaceholder('https://192.168.1.1:8443').fill('https://192.168.1.1');
+    await page.getByRole('button', { name: 'Continue' }).click();
+    await expect(page.getByText('Connecting to')).toBeVisible();
+    const usernameInput = page.locator(
+      'input:not([type="password"]):not([type="checkbox"])',
+    );
+    await usernameInput.fill('audit');
+    await page.locator('input[type="password"]').fill('CHANGE_ME');
+    await page.getByRole('button', { name: /Sign In/i }).click();
+    await page.waitForURL('**/dashboard', { timeout: 15000 });
+
+    // Logout
+    await page.locator('button[aria-label="Logout"]').click();
+    await page.waitForURL(BASE + '/');
+    const token = await page.evaluate(() =>
+      localStorage.getItem('unifi_token'),
+    );
+    expect(token).toBeNull();
   });
 });

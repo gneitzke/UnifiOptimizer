@@ -355,7 +355,9 @@ export default function RepairPage() {
     );
     const jobId = params.get('jobId');
     if (!jobId) return;
-    const p = await api.previewRepair(jobId);
+    const ids = [...selectedIds].map(Number);
+    const { previews: p } =
+      await api.previewRepair(jobId, ids);
     setPreviews(p);
     setStep(1);
   }
@@ -364,6 +366,14 @@ export default function RepairPage() {
   async function applyChanges() {
     setShowConfirm(false);
     setStep(3);
+
+    const params = new URLSearchParams(
+      window.location.search,
+    );
+    const jobId = params.get('jobId');
+    if (!jobId) return;
+
+    const ids = [...selectedIds].map(Number);
 
     const statusMap = new Map<
       string,
@@ -374,35 +384,24 @@ export default function RepairPage() {
     );
     setApplyStatus(new Map(statusMap));
 
-    for (const preview of previews) {
-      statusMap.set(
-        preview.changeId,
-        'running',
+    try {
+      const res = await api.applyRepair(
+        jobId,
+        ids,
+        dryRun,
       );
-      setApplyStatus(new Map(statusMap));
-
-      try {
-        const r = await api.applyRepair(
-          preview.changeId,
-        );
+      for (const r of res.results) {
+        statusMap.set(r.changeId, r.success ? 'done' : 'err');
         setResults((prev) =>
-          new Map(prev).set(
-            preview.changeId,
-            r,
-          ),
-        );
-        statusMap.set(
-          preview.changeId,
-          r.success ? 'done' : 'err',
-        );
-      } catch {
-        statusMap.set(
-          preview.changeId,
-          'err',
+          new Map(prev).set(r.changeId, r),
         );
       }
-      setApplyStatus(new Map(statusMap));
+    } catch {
+      previews.forEach((p) =>
+        statusMap.set(p.changeId, 'err'),
+      );
     }
+    setApplyStatus(new Map(statusMap));
 
     setStep(4);
     loadHistory();
@@ -413,7 +412,7 @@ export default function RepairPage() {
     entry: ChangeHistoryEntry,
   ) {
     setRevertTarget(null);
-    await api.revertChange(entry.changeId);
+    await api.revertChange(entry.changeId ?? (entry as Record<string, unknown>).change_id as string);
     loadHistory();
   }
 
@@ -790,7 +789,7 @@ export default function RepairPage() {
                     <button
                       onClick={() => {
                         setRevertTarget({
-                          changeId: p.changeId,
+                          changeId: r?.realChangeId || p.changeId,
                           description:
                             p.description,
                           deviceName:

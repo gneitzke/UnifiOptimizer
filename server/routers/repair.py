@@ -107,9 +107,12 @@ async def apply_changes(
     all_recs = result.get("recommendations", [])
 
     selected = []
+    idx_map = {}  # map from rec id() to original recommendation index
     for idx in req.recommendation_ids:
         if 0 <= idx < len(all_recs):
-            selected.append(all_recs[idx])
+            rec = all_recs[idx]
+            selected.append(rec)
+            idx_map[id(rec)] = idx
 
     if not selected:
         raise HTTPException(status_code=400, detail="No valid recommendations selected")
@@ -151,6 +154,7 @@ async def apply_changes(
                 device_name=device.get("name", "Unknown"),
                 action=rec.get("action", "unknown"),
                 status="dry_run" if req.dry_run else "applied",
+                recommendation_index=idx_map.get(id(rec)),
                 before_config=before_config,
                 after_config=after_config,
                 timestamp=datetime.utcnow().isoformat() + "Z",

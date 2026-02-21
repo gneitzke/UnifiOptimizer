@@ -95,6 +95,8 @@ async def login(req: LoginRequest):
         expires_in=JWT_EXPIRY_DAYS * 86400,
         controller_type="cloudkey_gen2",
         site=req.site,
+        host=req.host,
+        username=req.username,
     )
 
 
@@ -137,6 +139,16 @@ async def auth_status(authorization: str = Header(None)):
     token = authorization[7:]
     payload = session_pool.validate_token(token)
     if payload is None:
+        return AuthStatus(authenticated=False)
+
+    # Also verify that a server-side session exists (survives restart check)
+    entry = session_pool.get_session(token)
+    if entry is None:
+        # JWT is valid but no session — try re-authenticating from stored creds
+        if session_pool.re_authenticate(token):
+            entry = session_pool.get_session(token)
+
+    if entry is None:
         return AuthStatus(authenticated=False)
 
     return AuthStatus(

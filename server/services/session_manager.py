@@ -15,16 +15,26 @@ from jose import jwt
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-# JWT configuration
+# JWT configuration — persist secret to file so sessions survive restarts
 JWT_SECRET = os.environ.get("JWT_SECRET")
 if not JWT_SECRET:
-    import secrets
-
-    JWT_SECRET = secrets.token_hex(32)
-    print(
-        "WARNING: JWT_SECRET not set — using random secret. "
-        "Sessions will not survive restarts. Set JWT_SECRET env var in production."
+    _secret_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        ".jwt_secret",
     )
+    if os.path.exists(_secret_path):
+        with open(_secret_path) as _f:
+            JWT_SECRET = _f.read().strip()
+    if not JWT_SECRET:
+        import secrets
+
+        JWT_SECRET = secrets.token_hex(32)
+        try:
+            with open(_secret_path, "w") as _f:
+                _f.write(JWT_SECRET)
+            os.chmod(_secret_path, 0o600)
+        except OSError:
+            pass
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_DAYS = 90
 
@@ -112,25 +122,42 @@ class SessionPool:
             return None
 
     def re_authenticate(self, token: str) -> bool:
-        """Re-authenticate a session using stored credentials.
+        """Re-authenticate a session using stored credentials or JWT payload.
 
+        Works even after a restart when no session exists in the pool.
         Returns True if re-auth succeeded.
         """
         entry = self.get_session(token)
-        if not entry:
+        if entry:
+            # Session exists — re-auth with stored creds
+            from api.cloudkey_gen2_client import CloudKeyGen2Client
+
+            try:
+                new_client = CloudKeyGen2Client(
+                    entry.host, entry.username, entry.password, entry.site
+                )
+                if new_client.login():
+                    entry.client = new_client
+                    return True
+            except Exception:
+                pass
             return False
 
-        from api.cloudkey_gen2_client import CloudKeyGen2Client
-
+        # No session in pool (post-restart) — reconstruct from JWT payload
         try:
-            new_client = CloudKeyGen2Client(
-                entry.host, entry.username, entry.password, entry.site
-            )
-            if new_client.login():
-                entry.client = new_client
-                return True
+            payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         except Exception:
-            pass
+            return False
+
+        jti = payload.get("jti")
+        host = payload.get("host")
+        username = payload.get("username")
+        site = payload.get("site", "default")
+        if not jti or not host or not username:
+            return False
+
+        # We don't have the password in the JWT, so we can't re-authenticate
+        # automatically. Return False so the frontend shows the login screen.
         return False
 
     def clear_all(self):

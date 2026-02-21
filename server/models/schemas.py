@@ -30,6 +30,8 @@ class LoginResponse(BaseModel):
     expires_in: int = Field(description="Seconds until token expires")
     controller_type: str
     site: str
+    host: str = ""
+    username: str = ""
 
 
 class AuthStatus(BaseModel):
@@ -115,6 +117,7 @@ class ChangeResult(BaseModel):
     device_name: str
     action: str
     status: str = Field(description="applied | failed | skipped | dry_run")
+    recommendation_index: Optional[int] = None
     before_config: Optional[Dict[str, Any]] = None
     after_config: Optional[Dict[str, Any]] = None
     error: Optional[str] = None

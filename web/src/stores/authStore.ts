@@ -16,13 +16,15 @@ interface AuthState {
   setToken: (t: string | null) => void;
 }
 
+const storedCreds = api.getStoredCreds();
+
 export const useAuthStore = create<AuthState>()(
   (set, get) => ({
     token: localStorage.getItem('unifi_token'),
     isAuthenticated: false,
-    host: '',
-    username: '',
-    site: 'default',
+    host: storedCreds?.host ?? '',
+    username: storedCreds?.username ?? '',
+    site: storedCreds?.site ?? 'default',
     isLoading: !!localStorage.getItem('unifi_token'),
 
     setToken: (t) => {
@@ -66,12 +68,17 @@ export const useAuthStore = create<AuthState>()(
       set({ isLoading: true });
       try {
         const s = await api.validate();
+        // Guard against stale response arriving after logout
+        if (!api.getToken()) {
+          set({ isLoading: false });
+          return;
+        }
         if (s.authenticated) {
           set({
             isAuthenticated: true,
-            host: s.host ?? '',
-            username: s.username ?? '',
-            site: s.site ?? 'default',
+            host: s.host ?? get().host ?? '',
+            username: s.username ?? get().username ?? '',
+            site: s.site ?? get().site ?? 'default',
             isLoading: false,
           });
         } else {
@@ -89,6 +96,7 @@ export const useAuthStore = create<AuthState>()(
         const isAuthError =
           msg === 'Unauthorized' || msg.includes('401');
         set({
+          token: isAuthError ? null : get().token,
           isAuthenticated: isAuthError ? false : get().isAuthenticated,
           isLoading: false,
         });
