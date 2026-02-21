@@ -50,3 +50,18 @@ options:
   # Report generation
   generate_html_report: true
   generate_share_report: true
+
+ai:
+  # AI backend for the 'ask' command and optional report summary.
+  # "ollama"  — runs locally, free, no account needed (requires Ollama installed)
+  # "claude"  — Anthropic API (set ANTHROPIC_API_KEY environment variable)
+  # "openai"  — OpenAI API   (set OPENAI_API_KEY environment variable)
+  backend: ollama
+
+  # Model name override. Leave commented to use each backend's default:
+  #   ollama → llama3.2   |   claude → claude-opus-4-6   |   openai → gpt-4o
+  # model: llama3.2
+
+  # Set to true to add an AI-generated plain-English summary card to the HTML report.
+  # Requires a configured backend. Defaults to false so reports work without any AI setup.
+  summary_in_report: false

@@ -2,6 +2,36 @@
 
 ---
 
+## v0.10.0 — 2026-02-20
+
+### AI Network Advisor
+
+A new `ask` subcommand lets you query your network in plain English using the last analysis cache
+— no controller connection required:
+
+```bash
+python3 optimizer.py ask "why does my iPad keep dropping?"
+python3 optimizer.py ask "which AP is most overloaded?" --backend claude
+```
+
+**Three pluggable AI backends** (configured in `data/config.yaml → ai.backend`):
+- **Ollama** (default) — runs fully locally, free, no API key, no data leaves your network
+- **Claude** — Anthropic API via `ANTHROPIC_API_KEY` environment variable
+- **OpenAI** — OpenAI API via `OPENAI_API_KEY` environment variable
+
+**New in `core/ai_advisor.py`:**
+- `ask()` — answers a question against the analysis data
+- `generate_summary()` — generates a plain-English executive summary for embedding in the report
+- Automatic context trimming when cache JSON exceeds model context limits
+
+**Optional AI summary in the HTML report** — set `ai.summary_in_report: true` in `data/config.yaml`
+to add a "✦ AI Network Summary" card between the data quality banner and the hero dashboard.
+
+**No breaking changes** — all AI features are opt-in. Reports and analysis work exactly as before
+when no AI backend is configured.
+
+---
+
 ## v0.9.0 — 2026-02-20
 
 ### Bug Fix: Recommendation Format Handler

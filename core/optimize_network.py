@@ -1730,6 +1730,16 @@ def display_airtime_trends(analysis):
     console.print()
 
 
+def _try_ai_summary(full_analysis, recommendations):
+    """Attempt to generate an AI summary for the report; return None silently if unavailable."""
+    try:
+        from core.ai_advisor import generate_summary
+
+        return generate_summary(full_analysis, recommendations)
+    except Exception:
+        return None
+
+
 def display_quick_health_dashboard(analysis, recommendations):
     """Display a quick, scannable health dashboard at the top"""
     from rich.table import Table
@@ -2340,7 +2350,10 @@ Examples:
             try:
                 from core.report_v2 import generate_v2_report
 
-                report_path, _ = generate_v2_report(full_analysis, recommendations, site)
+                ai_summary = _try_ai_summary(full_analysis, recommendations)
+                report_path, _ = generate_v2_report(
+                    full_analysis, recommendations, site, ai_summary=ai_summary
+                )
                 console.print(f"\n[green]📄 Report generated:[/green] [cyan]{report_path}[/cyan]")
             except Exception as e:
                 console.print(f"\n[yellow]⚠️  Could not generate report: {e}[/yellow]")
@@ -2417,7 +2430,10 @@ Examples:
             try:
                 from core.report_v2 import generate_v2_report
 
-                report_path, _ = generate_v2_report(full_analysis, recommendations, site)
+                ai_summary = _try_ai_summary(full_analysis, recommendations)
+                report_path, _ = generate_v2_report(
+                    full_analysis, recommendations, site, ai_summary=ai_summary
+                )
                 console.print(f"\n[green]📄 Report generated:[/green] [cyan]{report_path}[/cyan]")
             except Exception as e:
                 console.print(f"\n[yellow]⚠️  Could not generate report: {e}[/yellow]")

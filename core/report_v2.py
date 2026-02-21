@@ -362,6 +362,18 @@ details .detail-body td { padding: 4px 8px; border-bottom: 1px solid #1e2d4a15; 
 .dq-banner.critical .dq-title { color: #ea4335; }
 .dq-detail { font-size: 11px; color: #9aa0a6; margin-top: 3px; line-height: 1.5; }
 
+/* AI summary card */
+.ai-summary {
+    display: flex; align-items: flex-start; gap: 12px;
+    border-radius: 10px; padding: 14px 20px; margin-bottom: 20px;
+    border: 1px solid #2196f340; background: #2196f310;
+}
+.ai-summary-icon { font-size: 18px; flex-shrink: 0; line-height: 1.4; }
+.ai-summary-body { flex: 1; }
+.ai-summary-title { font-size: 12px; font-weight: 600; color: #2196f3;
+    text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+.ai-summary-text { font-size: 13px; color: #e8eaed; line-height: 1.6; }
+
 /* Quick actions bar */
 .quick-actions-bar {
     display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
@@ -1045,6 +1057,20 @@ def _header(site_name, analysis_data):
 # ---------------------------------------------------------------------------
 # Section: Data Quality Banner
 # ---------------------------------------------------------------------------
+
+
+def _ai_summary_card(ai_summary):
+    """Render an AI-generated plain-English summary card. Returns '' when no summary."""
+    if not ai_summary:
+        return ""
+    return (
+        '<div class="ai-summary">'
+        '<span class="ai-summary-icon">✦</span>'
+        '<div class="ai-summary-body">'
+        '<div class="ai-summary-title">AI Network Summary</div>'
+        f'<div class="ai-summary-text">{_esc(ai_summary)}</div>'
+        "</div></div>"
+    )
 
 
 def _data_quality_banner(analysis_data):
@@ -2422,7 +2448,9 @@ def _tabs(analysis_data):
 # ---------------------------------------------------------------------------
 
 
-def generate_v2_report(analysis_data, recommendations, site_name, output_dir="reports"):
+def generate_v2_report(
+    analysis_data, recommendations, site_name, output_dir="reports", ai_summary=None
+):
     """Generate premium HTML report. Returns (report_path, share_path)."""
     # Prefer typed recommendations from analysis_data (have 'type' field for grouping)
     typed_recs = analysis_data.get("recommendations", [])
@@ -2436,7 +2464,6 @@ def generate_v2_report(analysis_data, recommendations, site_name, output_dir="re
 
     parts = [
         "<!DOCTYPE html>",
-        "<!-- DBC was here -->",
         '<html lang="en">',
         "<head>",
         '<meta charset="UTF-8">',
@@ -2450,6 +2477,7 @@ def generate_v2_report(analysis_data, recommendations, site_name, output_dir="re
         _header(site_name, analysis_data),
         '<div class="container">',
         _data_quality_banner(analysis_data),
+        _ai_summary_card(ai_summary),
         _hero(analysis_data, recommendations, site_name),
         _quick_actions_card(analysis_data, recommendations),
         _topology(analysis_data),

@@ -40,6 +40,11 @@ DEFAULTS = {
         "generate_html_report": True,
         "generate_share_report": True,
     },
+    "ai": {
+        "backend": "ollama",
+        "model": None,
+        "summary_in_report": False,
+    },
 }
 
 
