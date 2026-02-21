@@ -15,9 +15,13 @@ A comprehensive toolkit for analyzing and optimizing Ubiquiti UniFi networks. Pr
 - [Installation](#installation)
 - [CloudKey User Setup](#cloudkey-user-setup)
 - [Quick Start](#quick-start)
+- [Web Dashboard](#web-dashboard)
 - [Usage Examples](#usage-examples)
 - [What Gets Analyzed](#what-gets-analyzed)
 - [Reports](#reports)
+- [Deployment](#deployment)
+- [Environment Variables](#environment-variables)
+- [Testing](#testing)
 - [Troubleshooting](#troubleshooting)
 - [Security](#security)
 
@@ -198,6 +202,35 @@ python3 optimizer.py analyze --profile default
 
 ---
 
+## 🌐 Web Dashboard
+
+UnifiOptimizer includes a full web dashboard with a FastAPI backend and React frontend for browser-based analysis and optimization.
+
+### Starting the Web Stack
+
+**1. Start the backend API server:**
+```bash
+uvicorn server.main:app --reload --port 8000
+```
+
+**2. Start the frontend dev server** (in a second terminal):
+```bash
+cd web
+npm install    # first time only
+npm run dev    # starts on http://localhost:5173
+```
+
+The frontend proxies `/api` requests to the backend at `localhost:8000`.
+
+### Web Features
+- **Controller Discovery**: Auto-scan your network for UniFi controllers
+- **Live Analysis**: Run full network analysis from the browser
+- **Interactive Recommendations**: Preview and apply changes with one click
+- **Change History**: Track all applied changes with revert capability
+- **Real-time Updates**: WebSocket support for live analysis progress
+
+---
+
 ## 💡 Usage Examples
 
 ### Analyze Network (Safe, Read-Only)
@@ -256,6 +289,14 @@ thresholds:
       2.4ghz: -75
       5ghz: -72
       6ghz: -70
+    max_connectivity:
+      2.4ghz: -80
+      5ghz: -77
+      6ghz: -75
+    ios_friendly:       # Auto-used when >20% iOS clients detected
+      2.4ghz: -78
+      5ghz: -75
+      6ghz: -72
 options:
   lookback_days: 3
   min_rssi_strategy: optimal  # or "max_connectivity"
@@ -304,6 +345,116 @@ Reports are saved to the `reports/` directory and can be viewed in any web brows
 ```bash
 open reports/network_analysis_YYYYMMDD_HHMMSS.html
 ```
+
+---
+
+## 🚢 Deployment
+
+### Local Development
+
+```bash
+# CLI only
+pip3 install -r requirements.txt
+python3 optimizer.py analyze --host https://YOUR_CONTROLLER_IP --username admin
+
+# Full web stack
+pip3 install -r requirements.txt
+uvicorn server.main:app --reload --port 8000 &
+cd web && npm install && npm run dev
+```
+
+### Production (Systemd)
+
+**1. Create a systemd service for the API:**
+```ini
+# /etc/systemd/system/unifi-optimizer.service
+[Unit]
+Description=UniFi Optimizer API
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/unifi-optimizer
+Environment=JWT_SECRET=your-secret-here
+ExecStart=/usr/bin/uvicorn server.main:app --host 0.0.0.0 --port 8000
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**2. Build the frontend for production:**
+```bash
+cd web
+npm run build          # outputs to web/dist/
+```
+
+**3. Serve `web/dist/` with Nginx or have FastAPI serve it:**
+```bash
+# FastAPI already serves static files if web/dist/ exists
+uvicorn server.main:app --host 0.0.0.0 --port 8000
+```
+
+### Docker
+
+```bash
+# Build
+docker build -t unifi-optimizer .
+
+# Run (set JWT_SECRET for session persistence across restarts)
+docker run -d \
+  -p 8000:8000 \
+  -e JWT_SECRET=$(openssl rand -hex 32) \
+  --name unifi-optimizer \
+  unifi-optimizer
+```
+
+---
+
+## 🔐 Environment Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `JWT_SECRET` | **Yes** (production) | Random per-restart | Secret key for signing session JWTs. Set a stable value so sessions survive restarts. |
+
+**Example:**
+```bash
+export JWT_SECRET=$(openssl rand -hex 32)
+uvicorn server.main:app --port 8000
+```
+
+> ⚠️ If `JWT_SECRET` is not set, a random secret is generated at startup. This means all sessions are invalidated on every restart.
+
+---
+
+## 🧪 Testing
+
+### Running Tests
+
+```bash
+# Run all tests
+python -m pytest tests/ -v
+
+# Run with coverage
+python -m pytest tests/ --cov=core --cov=api --cov=utils -v
+
+# Run a specific test file
+python -m pytest tests/test_health_scoring.py -v
+```
+
+### Test Status
+
+The test suite has **138 passing tests** across:
+- Client health scoring (RSSI, stability, roaming, throughput)
+- Network analysis and recommendations
+- Configuration loading and thresholds
+- Mesh AP detection and protection
+- 6GHz/WiFi 7 feature detection
+- Service layer (analysis, recommendations)
+- Verbose mode and logging
+
+> **Note:** Some test files reference legacy modules from pre-refactoring and will show collection errors. These do not affect the passing tests.
 
 ---
 
@@ -375,6 +526,8 @@ The tool disables SSL verification by default for self-signed certificates. If y
 3. Enable 2FA if your controller supports it
 4. Review recommendations before applying changes
 5. Start with dry-run mode to understand impact
+6. **Set `JWT_SECRET` environment variable** in production deployments
+7. Run the web backend behind a reverse proxy (Nginx) with HTTPS in production
 
 ---
 
@@ -383,29 +536,51 @@ The tool disables SSL verification by default for self-signed certificates. If y
 ```
 UnifiOptimizer/
 ├── api/                    # API modules for controller communication
-│   ├── cloudkey_gen2_client.py
-│   ├── csrf_token_manager.py
-│   └── ...
+│   ├── cloudkey_gen2_client.py   # CloudKey Gen2/UDM client
+│   ├── csrf_token_manager.py     # CSRF token handling
+│   └── cloudkey_jwt_helper.py    # JWT parsing for CSRF extraction
 ├── core/                   # Core analysis modules
-│   ├── optimize_network.py # Main orchestrator (CLI, analysis, apply)
-│   ├── network_analyzer.py # Expert analysis & data collection
-│   ├── advanced_analyzer.py # DFS, roaming, airtime, min RSSI
-│   ├── channel_optimizer.py # Smart channel recommendations
-│   ├── change_applier.py   # Safe change application
-│   ├── html_report_generator.py
-│   └── ...
+│   ├── optimize_network.py       # Main orchestrator (CLI, analysis, apply)
+│   ├── network_analyzer.py       # Expert analysis & data collection
+│   ├── advanced_analyzer.py      # DFS, roaming, airtime, min RSSI, WiFi 7
+│   ├── client_health.py          # Per-client health scoring
+│   ├── network_health_analyzer.py # Network-wide health scoring
+│   ├── channel_optimizer.py      # Smart channel recommendations
+│   ├── change_applier.py         # Safe change application with revert
+│   ├── html_report_generator.py  # HTML report generation
+│   └── services/                 # Headless service layer for web backend
+│       ├── analysis_service.py
+│       ├── recommendation_service.py
+│       └── apply_service.py
+├── server/                 # FastAPI web backend
+│   ├── main.py                   # App entry point, CORS, lifespan
+│   ├── routers/
+│   │   ├── auth.py               # Login, discovery, session management
+│   │   ├── analysis.py           # Run/poll/retrieve analyses
+│   │   └── repair.py             # Preview, apply, revert changes
+│   ├── services/
+│   │   ├── session_manager.py    # JWT sessions & controller pool
+│   │   ├── change_tracker.py     # Change history & revert tracking
+│   │   └── discovery.py          # Network scanning for controllers
+│   └── models/
+│       └── schemas.py            # Pydantic request/response models
+├── web/                    # React frontend (Vite + TypeScript + Tailwind)
+│   ├── src/
+│   ├── package.json
+│   └── vite.config.ts            # Proxies /api → localhost:8000
 ├── utils/                  # Utility modules
-│   ├── keychain.py         # Secure credential storage
-│   ├── config.py           # Customizable threshold loader
-│   └── network_helpers.py  # Shared mesh/RSSI helpers
+│   ├── keychain.py               # Secure credential storage (macOS Keychain)
+│   ├── config.py                 # Customizable threshold loader
+│   └── network_helpers.py        # Shared mesh/RSSI helpers
 ├── data/
-│   ├── config.yaml         # User-customizable thresholds & options
+│   ├── config.yaml               # User-customizable thresholds & options
 │   └── wifi_device_capabilities.json
-├── tests/                  # Test modules
-├── reports/                # Generated HTML reports (gitignored)
+├── tests/                  # Test suite (pytest)
+├── docs/                   # Additional documentation
 ├── optimizer.py            # CLI entry point (analyze / optimize)
 ├── regenerate_report.py    # Rebuild report from cached analysis
-├── requirements.txt        # Python dependencies
+├── requirements.txt        # Python dependencies (includes FastAPI/uvicorn)
+├── requirements-dev.txt    # Development tools (pytest, black, flake8)
 └── README.md
 ```
 

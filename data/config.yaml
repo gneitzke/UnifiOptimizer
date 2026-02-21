@@ -20,6 +20,11 @@ thresholds:
       2.4ghz: -80
       5ghz: -77
       6ghz: -75
+    # iOS-friendly: auto-used when >20% of clients are iOS devices
+    ios_friendly:
+      2.4ghz: -78
+      5ghz: -75
+      6ghz: -72
 
   # Mesh AP thresholds
   mesh:
