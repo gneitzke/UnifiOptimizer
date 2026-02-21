@@ -40,8 +40,11 @@ class ChangeTracker:
 
     def _save(self):
         os.makedirs(os.path.dirname(self._path), exist_ok=True)
-        with open(self._path, "w") as f:
+        # Atomic write: write to temp file first, then rename
+        tmp_path = self._path + ".tmp"
+        with open(tmp_path, "w") as f:
             json.dump(self._history, f, indent=2, default=str)
+        os.replace(tmp_path, self._path)
 
     # ------------------------------------------------------------------
     # Record

@@ -50,7 +50,10 @@ async def preview_changes(
     authorization: str = Header(None),
 ):
     """Preview the impact of selected recommendations before applying."""
-    _get_token(authorization)
+    token = _get_token(authorization)
+    entry = session_pool.get_session(token)
+    if entry is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
     result = _get_cached_results(job_id)
     recs = result.get("recommendations", [])
 
@@ -195,10 +198,16 @@ async def revert_change(req: RevertRequest, authorization: str = Header(None)):
 
     try:
         # Re-fetch current device state
-        devices = entry.client.get(f"s/{entry.site}/stat/device")
+        devices_response = entry.client.get(f"s/{entry.site}/stat/device")
         device = None
-        if isinstance(devices, list):
-            device = next((d for d in devices if d.get("mac") == device_mac), None)
+        devices_data = (
+            devices_response.get("data", [])
+            if isinstance(devices_response, dict)
+            else devices_response
+            if isinstance(devices_response, list)
+            else []
+        )
+        device = next((d for d in devices_data if d.get("mac") == device_mac), None)
 
         if device is None:
             raise HTTPException(status_code=404, detail="Device not found on controller")
@@ -223,15 +232,17 @@ async def revert_change(req: RevertRequest, authorization: str = Header(None)):
 
 
 @router.get("/history")
-async def change_history(limit: int = 100):
+async def change_history(limit: int = 100, authorization: str = Header(None)):
     """List recent change history."""
+    _get_token(authorization)
     history = change_tracker.get_history(limit=limit)
     return {"changes": history}
 
 
 @router.get("/revertable")
-async def revertable_changes():
+async def revertable_changes(authorization: str = Header(None)):
     """List changes that can still be reverted."""
+    _get_token(authorization)
     return {"changes": change_tracker.get_revertable()}
 
 

@@ -570,7 +570,11 @@ class ExpertNetworkAnalyzer:
             proto_max = {"ax": 1200, "ac": 867, "n": 300, "a": 54, "b": 11, "g": 54}
             wifi_proto = client.get("radio_proto", "n")
             max_rate = proto_max.get(wifi_proto, 300)
-            throughput_eff = min(100, (tx_rate / max_rate) * 100) if max_rate > 0 else 50
+            # tx_rate from UniFi API is in kbps, convert to Mbps for comparison
+            tx_rate_mbps = tx_rate / 1000 if tx_rate > 0 else 0
+            throughput_eff = (
+                min(100, (tx_rate_mbps / max_rate) * 100) if max_rate > 0 else 50
+            )
 
             health_score = int(
                 signal_quality * 0.40
@@ -924,8 +928,8 @@ def _merge_hourly_ap_stats(event_timeline, hourly_ap_stats, daily_ap_stats, devi
             new_ap_roams[ap_name] += roams
 
         # Distribute roams across active hours (8am-11pm = 15 hours)
-        per_hour = max(1, roams // 15)
-        remainder = roams - per_hour * 15
+        per_hour = roams // 15
+        remainder = roams % 15
         for hour in range(8, 23):
             hour_key = f"{day_key} {hour:02d}:00"
             amount = per_hour + (1 if hour - 8 < remainder else 0)

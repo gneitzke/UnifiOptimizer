@@ -672,12 +672,24 @@ class ChangeApplier:
 
         console.print(f"\n[bold cyan]Applying Min RSSI to all bands on {device_name}[/bold cyan]")
 
+        # Build all radio changes in a single pass to avoid overwrite bug
+        # (each apply_min_rssi re-reads the original radio_table, so sequential
+        #  PUTs would overwrite previous changes). Update device dict in memory
+        # after each successful apply so subsequent calls see the latest state.
         for radio in radio_table:
             radio_name = radio.get("radio", "unknown")
             band = "2.4GHz" if radio_name == "ng" else "5GHz" if radio_name == "na" else "6GHz"
             value = values.get(radio_name, default_values.get(radio_name, -75))
 
             if self.apply_min_rssi(device, radio_name, new_enabled, value):
+                # Update the in-memory device radio_table so the next call
+                # sees the already-applied change instead of the stale original
+                for r in device.get("radio_table", []):
+                    if r.get("radio") == radio_name:
+                        r["min_rssi_enabled"] = new_enabled
+                        if new_enabled:
+                            r["min_rssi"] = value
+                        break
                 success_count += 1
 
         if success_count == total_radios:

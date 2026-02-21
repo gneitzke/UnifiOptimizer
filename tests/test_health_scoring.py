@@ -127,7 +127,7 @@ class TestWeightedComposite(unittest.TestCase):
     def test_excellent_wireless_client(self):
         self.analyzer.clients = [
             {"mac": "11:22:33:44:55:66", "rssi": -45, "hostname": "Phone",
-             "is_wired": False, "radio_proto": "ax", "tx_rate": 1000},
+             "is_wired": False, "radio_proto": "ax", "tx_rate": 1000000},
         ]
         scores = self.analyzer._calculate_health_scores()
         self.assertGreater(scores[0]["score"], 85)
@@ -135,7 +135,7 @@ class TestWeightedComposite(unittest.TestCase):
     def test_poor_wireless_client(self):
         self.analyzer.clients = [
             {"mac": "11:22:33:44:55:66", "rssi": -85, "hostname": "Camera",
-             "is_wired": False, "radio_proto": "n", "tx_rate": 10},
+             "is_wired": False, "radio_proto": "n", "tx_rate": 10000},
         ]
         scores = self.analyzer._calculate_health_scores()
         self.assertLessEqual(scores[0]["score"], 40)
@@ -143,7 +143,7 @@ class TestWeightedComposite(unittest.TestCase):
     def test_positive_rssi_normalized(self):
         self.analyzer.clients = [
             {"mac": "11:22:33:44:55:66", "rssi": 65, "hostname": "Phone",
-             "is_wired": False, "radio_proto": "ax", "tx_rate": 500},
+             "is_wired": False, "radio_proto": "ax", "tx_rate": 500000},
         ]
         scores = self.analyzer._calculate_health_scores()
         # rssi=65 should be normalized to -65 → ~66 signal quality

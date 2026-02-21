@@ -34,7 +34,7 @@ def parse_jwt(token):
         # Decode the payload (middle part)
         # Add padding if needed
         payload = parts[1]
-        padding = "=" * (4 - len(payload) % 4)
+        padding = "=" * (-len(payload) % 4)
         payload = payload + padding
 
         # Base64 decode and parse JSON

@@ -5,6 +5,7 @@ Loads settings from data/config.yaml with fallback defaults.
 All thresholds and options can be customized without code changes.
 """
 
+import copy
 from pathlib import Path
 
 # Default configuration (used when config.yaml is missing or incomplete)
@@ -89,7 +90,7 @@ def load_config(config_path=None):
         except Exception:
             pass
 
-    return DEFAULTS.copy()
+    return copy.deepcopy(DEFAULTS)
 
 
 # Singleton instance loaded once

@@ -108,15 +108,20 @@ class ClientHealthAnalyzer:
     def _categorize_by_band(self):
         """Categorize clients by frequency band"""
         bands = {"2.4GHz": [], "5GHz": [], "6GHz": [], "unknown": []}
+        # 6GHz UNII channels used by WiFi 6E/7 (1-233 in 6GHz band)
+        sixghz_channels = set(range(1, 234, 4))  # PSC: 1,5,9,...233
 
         for client in self.clients:
             channel = client.get("channel", 0)
+            radio = (client.get("radio") or "").lower()
 
-            if 1 <= channel <= 14:
+            if "6e" in radio or "6ghz" in radio or channel in sixghz_channels and channel > 14:
+                bands["6GHz"].append(client)
+            elif 1 <= channel <= 14:
                 bands["2.4GHz"].append(client)
-            elif 36 <= channel <= 165:
+            elif 36 <= channel <= 177:
                 bands["5GHz"].append(client)
-            elif channel > 165:
+            elif channel > 177:
                 bands["6GHz"].append(client)
             else:
                 bands["unknown"].append(client)
@@ -386,12 +391,18 @@ class ClientHealthAnalyzer:
             # Throughput efficiency (TX rate vs expected)
             tx_rate = client.get("tx_rate", 0) or 0
             radio_proto = client.get("radio_proto", "")
-            expected_max = 1200  # 802.11ax default
+            expected_max = 1200  # 802.11ax default (Mbps)
             if "ac" in radio_proto.lower():
                 expected_max = 867
             elif "n" in radio_proto.lower():
                 expected_max = 300
-            throughput = min(100, (tx_rate / max(expected_max, 1)) * 100) if tx_rate > 0 else 50
+            # tx_rate from UniFi API is in kbps, convert to Mbps for comparison
+            tx_rate_mbps = tx_rate / 1000 if tx_rate > 0 else 0
+            throughput = (
+                min(100, (tx_rate_mbps / max(expected_max, 1)) * 100)
+                if tx_rate_mbps > 0
+                else 50
+            )
 
             # Weighted composite
             final_score = int(

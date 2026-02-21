@@ -211,10 +211,10 @@ class AdvancedNetworkAnalyzer:
 
         # Categorize each client
         for client in clients:
-            hostname = client.get("hostname", "").lower()
-            name = client.get("name", "").lower()
-            oui = client.get("oui", "").lower()
-            radio_proto = client.get("radio_proto", "").lower()
+            hostname = (client.get("hostname") or "").lower()
+            name = (client.get("name") or "").lower()
+            oui = (client.get("oui") or "").lower()
+            radio_proto = (client.get("radio_proto") or "").lower()
 
             # Detect OS/Device Type
             is_ios = (
@@ -1044,19 +1044,30 @@ class AdvancedNetworkAnalyzer:
         total_clients = len(clients) if clients else 0
         ios_percentage = (ios_count / total_clients * 100) if total_clients > 0 else 0
 
-        # Choose thresholds based on STRATEGY parameter (user's choice)
+        # iOS-friendly thresholds: gentler to prevent iPhone disconnect issues
+        IOS_FRIENDLY_MIN_RSSI_24GHZ = get_threshold("min_rssi.ios_friendly.2.4ghz", -78)
+        IOS_FRIENDLY_MIN_RSSI_5GHZ = get_threshold("min_rssi.ios_friendly.5ghz", -75)
+        IOS_FRIENDLY_MIN_RSSI_6GHZ = get_threshold("min_rssi.ios_friendly.6ghz", -72)
+
+        # Choose thresholds based on strategy and iOS client percentage
         if strategy == "max_connectivity":
             # CONSERVATIVE: Stay connected as long as possible
             recommended_24 = CONSERVATIVE_MIN_RSSI_24GHZ
             recommended_5 = CONSERVATIVE_MIN_RSSI_5GHZ
             recommended_6 = CONSERVATIVE_MIN_RSSI_6GHZ
             threshold_type = "conservative"
-        else:  # strategy == "optimal" (default)
-            # AGGRESSIVE: Force early roaming for better performance
+        elif ios_percentage > 20:
+            # iOS-FRIENDLY: Gentler thresholds to prevent iPhone disconnects
+            recommended_24 = IOS_FRIENDLY_MIN_RSSI_24GHZ
+            recommended_5 = IOS_FRIENDLY_MIN_RSSI_5GHZ
+            recommended_6 = IOS_FRIENDLY_MIN_RSSI_6GHZ
+            threshold_type = "iOS-friendly"
+        else:
+            # STANDARD: Balanced thresholds for mixed/non-iOS networks
             recommended_24 = OPTIMAL_MIN_RSSI_24GHZ
             recommended_5 = OPTIMAL_MIN_RSSI_5GHZ
             recommended_6 = OPTIMAL_MIN_RSSI_6GHZ
-            threshold_type = "optimal"
+            threshold_type = "standard"
 
         results["threshold_type"] = threshold_type
         results["ios_percentage"] = ios_percentage
@@ -1144,14 +1155,14 @@ class AdvancedNetworkAnalyzer:
 
                             # Check if client has ever seen any other AP
                             # If client has no radio_table_stats or only sees this AP, they have no alternative
-                            radio_table = client.get("radio_table_stats", [])
-                            if not radio_table:
+                            client_radio_stats = client.get("radio_table_stats", [])
+                            if not client_radio_stats:
                                 # Client has never reported seeing any other AP
                                 clients_with_no_alternative += 1
                             else:
                                 # Check if client has ever seen another AP with decent signal
                                 has_alternative = False
-                                for radio_entry in radio_table:
+                                for radio_entry in client_radio_stats:
                                     radio_ap_mac = radio_entry.get("ap_mac")
                                     radio_rssi = radio_entry.get("signal")
                                     # Alternative AP must have at least -80 dBm (barely usable)
@@ -1384,7 +1395,6 @@ class AdvancedNetworkAnalyzer:
                                 }
                             )
                     else:
-                        results["disabled_count"] += 1
                         results["radios_without_min_rssi"].append(radio_info)
 
                         # **Skip recommendation to enable min RSSI on mesh APs**
@@ -1464,6 +1474,9 @@ class AdvancedNetworkAnalyzer:
                                     }
                                 )
                             continue
+
+                        # Only count non-mesh radios toward disabled_count for severity
+                        results["disabled_count"] += 1
 
                         if radio_name == "ng":
                             recommended = recommended_24
@@ -2618,7 +2631,7 @@ class AdvancedNetworkAnalyzer:
                     signal_dist.get("good", 0),
                     signal_dist.get("fair", 0),
                     signal_dist.get("poor", 0),
-                    signal_dist.get("very_poor", 0),
+                    signal_dist.get("critical", 0),
                 ]
             )
 
@@ -2629,7 +2642,7 @@ class AdvancedNetworkAnalyzer:
                         + signal_dist.get("good", 0) * 0.8
                         + signal_dist.get("fair", 0) * 0.6
                         + signal_dist.get("poor", 0) * 0.3
-                        + signal_dist.get("very_poor", 0) * 0.0
+                        + signal_dist.get("critical", 0) * 0.0
                     )
                     / total_clients
                     * 30

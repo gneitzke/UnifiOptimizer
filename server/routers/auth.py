@@ -40,7 +40,22 @@ def _get_token(authorization: str = Header(None)) -> str:
 @router.post("/discover", response_model=DiscoverResponse)
 async def discover_controllers(subnet: str = "192.168.1"):
     """Scan the local network for UniFi controllers."""
+    import re
     import time
+
+    # Validate subnet format to prevent SSRF (must be a.b.c pattern)
+    if not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}$", subnet):
+        raise HTTPException(status_code=400, detail="Invalid subnet format. Expected: x.x.x")
+    octets = [int(o) for o in subnet.split(".")]
+    if not all(0 <= o <= 255 for o in octets):
+        raise HTTPException(status_code=400, detail="Subnet octets must be 0-255")
+    # Restrict to private RFC1918 ranges
+    if not (
+        octets[0] == 10
+        or (octets[0] == 172 and 16 <= octets[1] <= 31)
+        or (octets[0] == 192 and octets[1] == 168)
+    ):
+        raise HTTPException(status_code=400, detail="Only private network subnets allowed")
 
     start = time.time()
     devices = await scan_network(subnet=subnet, timeout=0.8)

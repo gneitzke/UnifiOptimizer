@@ -101,8 +101,9 @@ async def run_analysis_endpoint(req: AnalysisRequest, authorization: str = Heade
 
 
 @router.get("/status/{job_id}", response_model=AnalysisJob)
-async def analysis_status(job_id: str):
+async def analysis_status(job_id: str, authorization: str = Header(None)):
     """Poll the status of a running analysis job."""
+    _get_token(authorization)
     with _lock:
         job = _jobs.get(job_id)
     if job is None:
@@ -111,8 +112,9 @@ async def analysis_status(job_id: str):
 
 
 @router.get("/results/{job_id}", response_model=AnalysisResult)
-async def analysis_results(job_id: str):
+async def analysis_results(job_id: str, authorization: str = Header(None)):
     """Retrieve completed analysis results."""
+    _get_token(authorization)
     with _lock:
         job = _jobs.get(job_id)
         result = _results.get(job_id)
@@ -136,8 +138,9 @@ async def analysis_results(job_id: str):
 
 
 @router.get("/cache")
-async def list_cached_analyses():
+async def list_cached_analyses(authorization: str = Header(None)):
     """List available cached analysis files on disk."""
+    _get_token(authorization)
     import glob
 
     cache_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -148,6 +151,6 @@ async def list_cached_analyses():
     for fpath in files[:20]:
         fname = os.path.basename(fpath)
         size = os.path.getsize(fpath)
-        entries.append({"filename": fname, "size_bytes": size, "path": fpath})
+        entries.append({"filename": fname, "size_bytes": size})
 
     return {"caches": entries}

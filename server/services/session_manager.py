@@ -16,7 +16,15 @@ from jose import jwt
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 # JWT configuration
-JWT_SECRET = os.environ.get("JWT_SECRET", "unifi-optimizer-dev-secret-change-in-prod")
+JWT_SECRET = os.environ.get("JWT_SECRET")
+if not JWT_SECRET:
+    import secrets
+
+    JWT_SECRET = secrets.token_hex(32)
+    print(
+        "WARNING: JWT_SECRET not set — using random secret. "
+        "Sessions will not survive restarts. Set JWT_SECRET env var in production."
+    )
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_DAYS = 90
 
