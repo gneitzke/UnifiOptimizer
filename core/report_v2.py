@@ -2483,12 +2483,12 @@ def generate_v2_report(
         '<div class="container">',
         _data_quality_banner(analysis_data),
         _ai_summary_card(ai_summary),
-        _trend_summary_card(analysis_data.get("trend_analysis")),
         _hero(analysis_data, recommendations, site_name),
         _quick_actions_card(analysis_data, recommendations),
         _topology(analysis_data),
         _svg_device_timeline(analysis_data),
         _actions(recommendations, analysis_data),
+        _trend_summary_card(analysis_data.get("trend_analysis")),
         _tabs(analysis_data),
         '<div style="text-align:center;margin:24px 0">'
         '<button class="print-btn" onclick="printReport()">🖨 Expand All &amp; Print</button>'
