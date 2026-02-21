@@ -1663,4 +1663,8 @@ def run_expert_analysis(client, site="default", lookback_days=3):
         "clients": analyzer.clients,
         "event_timeline": event_timeline,
         "client_journeys": client_journeys,
+        # Raw time-series stats for trend analysis
+        "hourly_ap_stats": getattr(analyzer, "hourly_ap_stats", []),
+        "daily_ap_stats": getattr(analyzer, "daily_ap_stats", []),
+        "daily_user_stats": getattr(analyzer, "daily_user_stats", []),
     }

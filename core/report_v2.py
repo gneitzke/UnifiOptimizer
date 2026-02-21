@@ -10,6 +10,8 @@ import os
 import sys
 from datetime import datetime
 
+from core.trend_report import TREND_CSS, _trend_summary_card, _trend_tab_panel
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from version import __version__  # noqa: E402
 
@@ -2434,11 +2436,13 @@ def _tabs(analysis_data):
         f'<button class="tab-btn" onclick="switchTab(\'clients\', this)">Clients</button>'
         f'<button class="tab-btn" onclick="switchTab(\'infra\', this)">Infrastructure</button>'
         f'<button class="tab-btn" onclick="switchTab(\'config\', this)">Configuration</button>'
+        f'<button class="tab-btn" onclick="switchTab(\'trends\', this)">&#x1F4C8; Trends</button>'
         f"</div>"
         f'<div id="tab-rf" class="tab-content active">{_rf_panel(analysis_data)}</div>'
         f'<div id="tab-clients" class="tab-content">{_clients_panel(analysis_data)}</div>'
         f'<div id="tab-infra" class="tab-content">{_infra_panel(analysis_data)}</div>'
         f'<div id="tab-config" class="tab-content">{_config_panel(analysis_data)}</div>'
+        f'<div id="tab-trends" class="tab-content">{_trend_tab_panel(analysis_data)}</div>'
         f"</div>"
     )
 
@@ -2471,6 +2475,7 @@ def generate_v2_report(
         f"<title>UniFi Network Report — {_esc(site_name)}</title>",
         "<style>",
         _css(),
+        TREND_CSS,
         "</style>",
         "</head>",
         "<body>",
@@ -2483,6 +2488,7 @@ def generate_v2_report(
         _topology(analysis_data),
         _svg_device_timeline(analysis_data),
         _actions(recommendations, analysis_data),
+        _trend_summary_card(analysis_data.get("trend_analysis")),
         _tabs(analysis_data),
         '<div style="text-align:center;margin:24px 0">'
         '<button class="print-btn" onclick="printReport()">🖨 Expand All &amp; Print</button>'

@@ -65,3 +65,20 @@ ai:
   # Set to true to add an AI-generated plain-English summary card to the HTML report.
   # Requires a configured backend. Defaults to false so reports work without any AI setup.
   summary_in_report: false
+
+trends:
+  # Enable historical trend analysis (requires collected AP stats data)
+  enabled: true
+
+  # Standard deviations outside the mean to flag as an anomaly
+  anomaly_sigma: 2.0
+
+  # Number of data points used in the rolling average for sparklines
+  rolling_window: 3
+
+  # Slope thresholds for trend classification (units: change per day)
+  # Slope below degrading_threshold  → "degrading"
+  # Slope above improving_threshold  → "improving"
+  # Between the two                  → "stable"
+  degrading_threshold: -0.5
+  improving_threshold: 0.5

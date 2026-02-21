@@ -55,6 +55,14 @@ A comprehensive toolkit for analyzing and optimizing Ubiquiti UniFi networks. Pr
 - **🔌 Pluggable Backends**: Switch to Claude or OpenAI via a one-line config change
 - **📝 AI Report Summary**: Optional plain-English summary card in the HTML report (`ai.summary_in_report: true`)
 
+### Historical Trend Analysis
+- **📈 Trend Engine**: Per-AP and network-wide satisfaction & client-count trends using pure stdlib least-squares regression (no numpy/scipy)
+- **🔴 Anomaly Detection**: Statistical outlier detection (mean ± Nσ) flags unusual satisfaction drops or spikes
+- **✨ Sparklines**: Inline SVG sparklines per AP colored by trend direction (green improving, red degrading)
+- **👥 Flagged Clients**: Automatically surfaces clients whose satisfaction is consistently declining
+- **📋 Trends Tab**: Dedicated 5th report tab with per-AP trend table, anomaly timeline, and flagged client list
+- **⚙️ Configurable**: Sigma, rolling window, and slope thresholds all tunable in `data/config.yaml`
+
 ### WiFi 7 & 6E Support
 - **📡 WiFi 7 Detection**: Identifies 802.11be capable devices (iPhone 16, Galaxy S25, etc.)
 - **🔮 WiFi 6E Support**: Detects 6GHz capable devices for optimal band placement
@@ -355,6 +363,13 @@ thresholds:
 options:
   lookback_days: 3
   min_rssi_strategy: optimal  # or "max_connectivity"
+
+trends:
+  enabled: true
+  anomaly_sigma: 2.0       # std deviations outside mean → anomaly
+  rolling_window: 3        # data points for sparkline smoothing
+  degrading_threshold: -0.5   # slope/day below this → "degrading"
+  improving_threshold: 0.5    # slope/day above this → "improving"
 ```
 
 ---
@@ -397,6 +412,7 @@ Generated reports include:
 - **Band Column**: Color-coded 2.4 / 5 / 6 GHz pill in the client table for at-a-glance band placement review
 - **DFS Radar Card**: Per-AP radar event counts with affected channel pills; identifies APs most exposed to DFS-triggered channel changes (RF tab, shown only when events exist)
 - **Data Quality Banner**: Amber/red banner at the top of the report when API calls failed during analysis, listing the affected endpoints so you know what data is missing
+- **Trends Tab**: Historical trend analysis with per-AP sparklines, satisfaction slope badges (improving/stable/degrading), anomaly timeline, and a flagged-clients list for devices with declining satisfaction
 
 Reports are saved to the `reports/` directory and can be viewed in any web browser.
 

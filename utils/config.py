@@ -45,6 +45,13 @@ DEFAULTS = {
         "model": None,
         "summary_in_report": False,
     },
+    "trends": {
+        "enabled": True,
+        "anomaly_sigma": 2.0,
+        "rolling_window": 3,
+        "degrading_threshold": -0.5,
+        "improving_threshold": 0.5,
+    },
 }
 
 

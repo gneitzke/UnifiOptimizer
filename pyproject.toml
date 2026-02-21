@@ -1,6 +1,6 @@
 [project]
 name = "UnifiOptimizer"
-version = "0.10.0"  # keep in sync with version.py
+version = "0.11.0"  # keep in sync with version.py
 requires-python = ">=3.7"
 
 [tool.black]
