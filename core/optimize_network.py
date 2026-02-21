@@ -2326,6 +2326,15 @@ Examples:
     recommendations = result["recommendations"]
     full_analysis = result.get("full_analysis")
 
+    # Run historical trend analysis (pure stdlib — safe to fail silently)
+    if full_analysis:
+        try:
+            from core.trend_analyzer import run_trend_analysis
+
+            full_analysis["trend_analysis"] = run_trend_analysis(full_analysis)
+        except Exception:
+            pass
+
     if args.command == "analyze":
         # Show quick health dashboard FIRST for immediate visibility
         if full_analysis:

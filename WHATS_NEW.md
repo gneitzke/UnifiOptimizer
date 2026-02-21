@@ -2,6 +2,46 @@
 
 ---
 
+## v0.11.0 — 2026-02-21
+
+### Historical Trend Analysis & Anomaly Detection
+
+UnifiOptimizer now tracks how your network is changing over time — not just what it looks like right
+now.
+
+**`core/trend_analyzer.py`** — pure-stdlib trend engine (Python 3.7+, no numpy/scipy):
+- `linear_slope()` — least-squares regression over any time series
+- `detect_anomalies()` — mean ± Nσ outlier detection
+- `rolling_average()` — smoothed series for sparklines
+- `classify_trend()` — maps a slope to `"improving"` / `"degrading"` / `"stable"`
+- High-level functions: `analyze_ap_trends()`, `analyze_network_trends()`, `analyze_client_trends()`,
+  `build_trend_summary()`, `run_trend_analysis()`
+
+**New Trends Tab in HTML reports:**
+- Per-AP trend table: satisfaction slope + badge + inline SVG sparkline per AP
+- Sparklines color-coded green (improving), red (degrading), blue (stable)
+- Anomaly timeline: points flagged as statistically unusual (> 2σ from mean)
+- Flagged clients: devices whose satisfaction is consistently declining
+- Network-level summary card (above the hero) with satisfaction, client-count, and DFS event trend
+  badges
+
+**`data/config.yaml` — new `trends:` section:**
+```yaml
+trends:
+  enabled: true
+  anomaly_sigma: 2.0        # std deviations for anomaly detection
+  rolling_window: 3         # data points for sparkline smoothing
+  degrading_threshold: -0.5 # slope/day below this → "degrading"
+  improving_threshold: 0.5  # slope/day above this → "improving"
+```
+
+**53 new unit tests** in `tests/test_trend_analyzer.py` — no controller required.
+
+**No breaking changes** — trend tab shows a "no trend data" message gracefully when the analysis
+cache predates this feature.
+
+---
+
 ## v0.10.0 — 2026-02-20
 
 ### AI Network Advisor
