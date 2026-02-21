@@ -69,7 +69,7 @@ class SessionPool:
             "host": host,
             "username": username,
             "site": site,
-            "iat": datetime.utcnow().isoformat(),
+            "iat": datetime.utcnow(),
             "exp": datetime.utcnow() + timedelta(days=JWT_EXPIRY_DAYS),
         }
         token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)

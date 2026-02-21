@@ -9,8 +9,14 @@ import {
 } from 'lucide-react';
 import { useAuthStore } from '../../stores/authStore';
 import { useNavigate } from 'react-router-dom';
+import { discover } from '../../services/api';
+import type { DiscoveredDevice } from '../../types/api';
 
-type Mode = 'choose' | 'manual' | 'credentials';
+type Mode =
+  | 'choose'
+  | 'manual'
+  | 'scan'
+  | 'credentials';
 
 export default function LoginPage() {
   const { login, isLoading } = useAuthStore();
@@ -22,6 +28,28 @@ export default function LoginPage() {
   const [password, setPassword] = useState('');
   const [remember, setRemember] = useState(true);
   const [error, setError] = useState('');
+  const [scanning, setScanning] = useState(false);
+  const [devices, setDevices] = useState<
+    DiscoveredDevice[]
+  >([]);
+
+  async function handleScan() {
+    setError('');
+    setScanning(true);
+    setMode('scan');
+    try {
+      const found = await discover();
+      setDevices(found);
+    } catch (err) {
+      const msg =
+        err instanceof Error
+          ? err.message
+          : String(err);
+      setError(msg);
+    } finally {
+      setScanning(false);
+    }
+  }
 
   async function handleSubmit(
     e: React.FormEvent,
@@ -36,11 +64,10 @@ export default function LoginPage() {
         remember,
       });
       navigate('/dashboard');
-    } catch {
-      setError(
-        'Authentication failed. '
-        + 'Check your credentials.',
-      );
+    } catch (err) {
+      const msg =
+        err instanceof Error ? err.message : String(err);
+      setError(msg);
     }
   }
 
@@ -159,10 +186,7 @@ export default function LoginPage() {
               </button>
 
               <button
-                onClick={() => {
-                  setHost('https://unifi.local');
-                  setMode('credentials');
-                }}
+                onClick={() => void handleScan()}
                 className="flex items-center gap-3
                   px-4 py-3 rounded-xl
                   cursor-pointer transition-all
@@ -193,6 +217,209 @@ export default function LoginPage() {
                   </div>
                 </div>
               </button>
+            </motion.div>
+          )}
+
+          {/* ── Scan results ─────────────── */}
+          {mode === 'scan' && (
+            <motion.div
+              key="scan"
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -20 }}
+            >
+              <button
+                onClick={() => setMode('choose')}
+                className="flex items-center gap-1
+                  text-xs mb-4 cursor-pointer"
+                style={{
+                  background: 'transparent',
+                  border: 'none',
+                  color: 'var(--text-muted)',
+                }}
+              >
+                <ArrowLeft size={14} /> Back
+              </button>
+
+              {scanning && (
+                <div
+                  className="flex flex-col
+                    items-center gap-3 py-8"
+                >
+                  <Loader2
+                    size={24}
+                    className="animate-spin"
+                    style={{
+                      color: 'var(--primary)',
+                    }}
+                  />
+                  <p
+                    className="text-sm"
+                    style={{
+                      color:
+                        'var(--text-muted)',
+                    }}
+                  >
+                    Scanning network…
+                  </p>
+                </div>
+              )}
+
+              {!scanning && error && (
+                <div
+                  className="flex items-center
+                    gap-2 text-xs mb-3 px-3
+                    py-2 rounded-lg"
+                  style={{
+                    background:
+                      'rgba(255,71,87,0.12)',
+                    color: 'var(--error)',
+                  }}
+                >
+                  <AlertCircle size={14} />
+                  {error}
+                </div>
+              )}
+
+              {!scanning
+                && !error
+                && devices.length === 0 && (
+                <p
+                  className="text-sm text-center
+                    py-6"
+                  style={{
+                    color:
+                      'var(--text-muted)',
+                  }}
+                >
+                  No controllers found on the
+                  network.
+                </p>
+              )}
+
+              {!scanning
+                && devices.length > 0 && (
+                <div
+                  className="flex flex-col gap-2"
+                >
+                  <p
+                    className="text-xs mb-1"
+                    style={{
+                      color:
+                        'var(--text-muted)',
+                    }}
+                  >
+                    Found {devices.length}{' '}
+                    controller
+                    {devices.length > 1
+                      ? 's'
+                      : ''}
+                    — choose a connection:
+                  </p>
+                  {devices.flatMap((d) => {
+                    const ip = d.host;
+                    const portSuffix =
+                      d.port && d.port !== 443
+                        ? `:${d.port}`
+                        : '';
+                    const ipLabel =
+                      `${ip}${portSuffix}`;
+                    const options: {
+                      label: string;
+                      url: string;
+                      sub: string;
+                    }[] = [
+                      {
+                        label: ipLabel,
+                        url: `${ip}${portSuffix ? `:${d.port}` : ''}`,
+                        sub: `IP address · ${d.device_type}`,
+                      },
+                    ];
+                    if (d.hostname) {
+                      options.push({
+                        label: `${d.hostname}${portSuffix}`,
+                        url: `${d.hostname}${portSuffix ? `:${d.port}` : ''}`,
+                        sub: `Hostname · ${d.device_type}`,
+                      });
+                    }
+                    return options.map((opt) => (
+                      <button
+                        key={opt.url}
+                        onClick={() => {
+                          setHost(opt.url);
+                          setError('');
+                          setMode('credentials');
+                        }}
+                        className="flex
+                          items-center gap-3
+                          px-4 py-3 rounded-xl
+                          cursor-pointer
+                          transition-all
+                          hover:scale-[1.02]
+                          text-left"
+                        style={{
+                          background:
+                            'var(--bg-elevated)',
+                          border:
+                            '1px solid var(--border)',
+                          color: 'var(--text)',
+                          width: '100%',
+                        }}
+                      >
+                        <Server size={16} />
+                        <div>
+                          <div
+                            className="text-sm
+                              font-medium"
+                          >
+                            {opt.label}
+                          </div>
+                          <div
+                            className="text-xs"
+                            style={{
+                              color:
+                                'var(--text-muted)',
+                            }}
+                          >
+                            {opt.sub}
+                          </div>
+                        </div>
+                      </button>
+                    ));
+                  })}
+                </div>
+              )}
+
+              {/* Always show manual entry option */}
+              {!scanning && (
+                <button
+                  onClick={() => setMode('manual')}
+                  className="flex items-center gap-3
+                    px-4 py-3 rounded-xl w-full
+                    cursor-pointer transition-all
+                    hover:scale-[1.02] text-left
+                    mt-2"
+                  style={{
+                    background: 'transparent',
+                    border:
+                      '1px dashed var(--border)',
+                    color: 'var(--text-muted)',
+                  }}
+                >
+                  <Server size={16} />
+                  <div>
+                    <div
+                      className="text-sm
+                        font-medium"
+                    >
+                      Enter manually
+                    </div>
+                    <div className="text-xs">
+                      Use a custom URL
+                    </div>
+                  </div>
+                </button>
+              )}
             </motion.div>
           )}
 

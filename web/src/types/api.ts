@@ -25,10 +25,13 @@ export interface AuthStatus {
 
 export interface DiscoveredDevice {
   host: string;
+  port?: number;
+  device_type?: string;
   name: string;
   model: string;
   version: string;
   mac: string;
+  hostname?: string;
   informUrl?: string;
 }
 

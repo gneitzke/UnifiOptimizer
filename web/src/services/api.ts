@@ -82,9 +82,11 @@ export async function validate(): Promise<AuthStatus> {
 export async function discover(): Promise<
   DiscoveredDevice[]
 > {
-  return request<DiscoveredDevice[]>(
-    '/api/discover',
-  );
+  const res = await request<{
+    devices: DiscoveredDevice[];
+    scan_duration_ms: number;
+  }>('/api/auth/discover', { method: 'POST' });
+  return res.devices;
 }
 
 /* ── Analysis ──────────────────────────────────── */

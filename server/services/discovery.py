@@ -81,13 +81,28 @@ async def _probe_host(ip: str, port: int, timeout: float):
         await writer.wait_closed()
 
         device_type = _guess_device_type(port)
+        hostname = await _reverse_lookup(ip)
         return DiscoveredDevice(
             host=f"https://{ip}",
             port=port,
             device_type=device_type,
             name=f"UniFi Controller ({ip}:{port})",
+            hostname=f"https://{hostname}" if hostname else None,
         )
     except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
+        return None
+
+
+async def _reverse_lookup(ip: str) -> str | None:
+    """Attempt reverse DNS lookup; return hostname or None."""
+    loop = asyncio.get_running_loop()
+    try:
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, socket.gethostbyaddr, ip),
+            timeout=1.0,
+        )
+        return result[0]
+    except (socket.herror, socket.gaierror, asyncio.TimeoutError, OSError):
         return None
 
 

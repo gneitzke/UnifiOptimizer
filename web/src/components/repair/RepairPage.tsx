@@ -287,6 +287,7 @@ export default function RepairPage() {
   const [revertTarget, setRevertTarget] =
     useState<ChangeHistoryEntry | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
 
   /* Load latest analysis findings */
   useEffect(() => {
@@ -309,7 +310,13 @@ export default function RepairPage() {
           );
         }
       })
-      .catch(() => {})
+      .catch((err) => {
+        setLoadError(
+          err instanceof Error
+            ? err.message
+            : 'Failed to load analysis results',
+        );
+      })
       .finally(() => setLoading(false));
   }, []);
 
@@ -318,7 +325,13 @@ export default function RepairPage() {
     api
       .getChangeHistory()
       .then(setHistory)
-      .catch(() => {});
+      .catch((err) => {
+        setLoadError(
+          err instanceof Error
+            ? err.message
+            : 'Failed to load change history',
+        );
+      });
   }, []);
 
   useEffect(() => {
@@ -431,6 +444,27 @@ export default function RepairPage() {
           className="mx-auto animate-spin-slow"
           style={{ color: 'var(--primary)' }}
         />
+      </div>
+    );
+  }
+
+  if (loadError) {
+    return (
+      <div
+        className="max-w-4xl mx-auto
+          glass-card-solid p-8 text-center"
+      >
+        <XCircle
+          size={32}
+          className="mx-auto mb-3"
+          style={{ color: 'var(--error)' }}
+        />
+        <p
+          className="text-sm"
+          style={{ color: 'var(--error)' }}
+        >
+          {loadError}
+        </p>
       </div>
     );
   }

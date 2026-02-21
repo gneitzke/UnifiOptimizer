@@ -3,6 +3,7 @@ import {
   Outlet,
   NavLink,
   useLocation,
+  useNavigate,
 } from 'react-router-dom';
 import {
   LayoutDashboard,
@@ -46,6 +47,16 @@ export default function AppShell() {
   const { theme, toggleTheme } = useThemeStore();
   const { username, host, logout } = useAuthStore();
   const location = useLocation();
+  const navigate = useNavigate();
+
+  async function handleLogout() {
+    try {
+      await logout();
+    } catch {
+      // Logout API may fail but we still clear local state
+    }
+    navigate('/');
+  }
 
   const crumb = NAV.find((n) =>
     location.pathname.startsWith(n.to),
@@ -186,7 +197,7 @@ export default function AppShell() {
             </span>
 
             <button
-              onClick={() => void logout()}
+              onClick={() => void handleLogout()}
               className="p-1.5 rounded-lg
                 cursor-pointer transition-colors"
               style={{

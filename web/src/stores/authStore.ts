@@ -17,13 +17,13 @@ interface AuthState {
 }
 
 export const useAuthStore = create<AuthState>()(
-  (set) => ({
+  (set, get) => ({
     token: localStorage.getItem('unifi_token'),
     isAuthenticated: false,
     host: '',
     username: '',
     site: 'default',
-    isLoading: false,
+    isLoading: !!localStorage.getItem('unifi_token'),
 
     setToken: (t) => {
       api.setToken(t);
@@ -45,9 +45,9 @@ export const useAuthStore = create<AuthState>()(
           site: res.site,
           isLoading: false,
         });
-      } catch {
+      } catch (err) {
         set({ isLoading: false });
-        throw new Error('Login failed');
+        throw err;
       }
     },
 
@@ -66,16 +66,30 @@ export const useAuthStore = create<AuthState>()(
       set({ isLoading: true });
       try {
         const s = await api.validate();
+        if (s.authenticated) {
+          set({
+            isAuthenticated: true,
+            host: s.host ?? '',
+            username: s.username ?? '',
+            site: s.site ?? 'default',
+            isLoading: false,
+          });
+        } else {
+          api.setToken(null);
+          set({
+            token: null,
+            isAuthenticated: false,
+            isLoading: false,
+          });
+        }
+      } catch (err) {
+        // Network errors shouldn't log you out — only invalid tokens should
+        const msg =
+          err instanceof Error ? err.message : '';
+        const isAuthError =
+          msg === 'Unauthorized' || msg.includes('401');
         set({
-          isAuthenticated: s.authenticated,
-          host: s.host ?? '',
-          username: s.username ?? '',
-          site: s.site ?? 'default',
-          isLoading: false,
-        });
-      } catch {
-        set({
-          isAuthenticated: false,
+          isAuthenticated: isAuthError ? false : get().isAuthenticated,
           isLoading: false,
         });
       }

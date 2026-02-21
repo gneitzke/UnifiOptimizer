@@ -51,6 +51,7 @@ class DiscoveredDevice(BaseModel):
     device_type: str
     name: Optional[str] = None
     model: Optional[str] = None
+    hostname: Optional[str] = None
 
 
 class DiscoverResponse(BaseModel):
