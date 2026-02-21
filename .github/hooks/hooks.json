@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "type": "command",
+        "bash": "cat | curl -s -X POST http://127.0.0.1:62859/hook/${CLUBHOUSE_AGENT_ID}/preToolUse -H 'Content-Type: application/json' -H \"X-Clubhouse-Nonce: ${CLUBHOUSE_HOOK_NONCE}\" --data-binary @- || true",
+        "timeoutSec": 5
+      }
+    ],
+    "postToolUse": [
+      {
+        "type": "command",
+        "bash": "cat | curl -s -X POST http://127.0.0.1:62859/hook/${CLUBHOUSE_AGENT_ID}/postToolUse -H 'Content-Type: application/json' -H \"X-Clubhouse-Nonce: ${CLUBHOUSE_HOOK_NONCE}\" --data-binary @- || true",
+        "timeoutSec": 5
+      }
+    ],
+    "errorOccurred": [
+      {
+        "type": "command",
+        "bash": "cat | curl -s -X POST http://127.0.0.1:62859/hook/${CLUBHOUSE_AGENT_ID}/errorOccurred -H 'Content-Type: application/json' -H \"X-Clubhouse-Nonce: ${CLUBHOUSE_HOOK_NONCE}\" --data-binary @- || true",
+        "timeoutSec": 5
+      }
+    ]
+  }
+}

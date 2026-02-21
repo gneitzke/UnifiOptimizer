@@ -1,0 +1,113 @@
+@import "tailwindcss";
+
+/* ── Ubiquiti Dark Theme (default) ─────────────── */
+:root {
+  --bg: #1a1e2e;
+  --bg-surface: #232838;
+  --bg-elevated: #2a3042;
+  --primary: #0088ff;
+  --primary-hover: #0077e6;
+  --success: #00c48f;
+  --warning: #ffb800;
+  --error: #ff4757;
+  --text: #e8eaed;
+  --text-muted: #8b92a5;
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.14);
+  --glass-bg: rgba(35, 40, 56, 0.65);
+  --glass-blur: 12px;
+  --radius: 12px;
+  --sidebar-w: 64px;
+  --sidebar-w-expanded: 220px;
+
+  color-scheme: dark;
+  font-family:
+    "Inter", system-ui, -apple-system, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── Ubiquiti Light Theme ──────────────────────── */
+[data-theme="light"] {
+  --bg: #f4f5f7;
+  --bg-surface: #ffffff;
+  --bg-elevated: #ebedf0;
+  --primary: #006fd6;
+  --primary-hover: #005bb5;
+  --success: #00a87a;
+  --warning: #e5a600;
+  --error: #e5394a;
+  --text: #1a1e2e;
+  --text-muted: #5f6775;
+  --border: rgba(0, 0, 0, 0.08);
+  --border-strong: rgba(0, 0, 0, 0.14);
+  --glass-bg: rgba(255, 255, 255, 0.65);
+
+  color-scheme: light;
+}
+
+/* ── Base ──────────────────────────────────────── */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+/* ── Glass Card ────────────────────────────────── */
+.glass-card {
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.glass-card-solid {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+/* ── Scrollbar ─────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 3px;
+}
+
+/* ── Utility ───────────────────────────────────── */
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  20%, 60% { transform: translateX(-6px); }
+  40%, 80% { transform: translateX(6px); }
+}
+.animate-shake {
+  animation: shake 0.4s ease-in-out;
+}
+
+@keyframes spin-slow {
+  to { transform: rotate(360deg); }
+}
+.animate-spin-slow {
+  animation: spin-slow 2s linear infinite;
+}

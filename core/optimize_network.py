@@ -2,6 +2,10 @@
 """
 UniFi Network Optimizer - Safe Configuration Management
 Expert-level analysis with RSSI monitoring, historical lookback, mesh AP optimization
+
+NOTE: The headless service layer lives in core/services/ and is used by
+both this CLI module and the web backend.  This module remains the CLI
+adapter — it calls the services and renders output via Rich.
 """
 
 import argparse
