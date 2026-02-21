@@ -7,7 +7,11 @@ Self-contained HTML5 — no external dependencies.
 import html as _html
 import math
 import os
+import sys
 from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from version import __version__  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -17,6 +21,15 @@ from datetime import datetime
 def _esc(text):
     """HTML-escape text safely."""
     return _html.escape(str(text)) if text else ""
+
+
+def _rec_msg(rec):
+    """Return display message from a recommendation dict.
+    Handles both 'message' and 'reason' field names across different data sources.
+    """
+    if "reason" in rec and not rec.get("message"):
+        return rec.get("reason", rec.get("recommendation", ""))
+    return rec.get("message", rec.get("recommendation", ""))
 
 
 def _score_color(score):
@@ -335,12 +348,83 @@ details .detail-body td { padding: 4px 8px; border-bottom: 1px solid #1e2d4a15; 
 .health-issue .issue-impact { color: #9aa0a6; font-size: 11px; margin-top: 2px; }
 .health-issue .issue-fix { color: #006fff; font-size: 11px; margin-top: 2px; }
 
+/* Data quality banner */
+.dq-banner {
+    display: flex; align-items: flex-start; gap: 12px;
+    border-radius: 10px; padding: 12px 20px; margin-bottom: 20px; border: 1px solid;
+}
+.dq-banner.warning { background: #fbbc0412; border-color: #fbbc0440; }
+.dq-banner.critical { background: #ea433512; border-color: #ea433540; }
+.dq-icon { font-size: 18px; flex-shrink: 0; line-height: 1.4; }
+.dq-body { flex: 1; }
+.dq-title { font-size: 13px; font-weight: 600; }
+.dq-banner.warning .dq-title { color: #fbbc04; }
+.dq-banner.critical .dq-title { color: #ea4335; }
+.dq-detail { font-size: 11px; color: #9aa0a6; margin-top: 3px; line-height: 1.5; }
+
+/* AI summary card */
+.ai-summary {
+    display: flex; align-items: flex-start; gap: 12px;
+    border-radius: 10px; padding: 14px 20px; margin-bottom: 20px;
+    border: 1px solid #2196f340; background: #2196f310;
+}
+.ai-summary-icon { font-size: 18px; flex-shrink: 0; line-height: 1.4; }
+.ai-summary-body { flex: 1; }
+.ai-summary-title { font-size: 12px; font-weight: 600; color: #2196f3;
+    text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+.ai-summary-text { font-size: 13px; color: #e8eaed; line-height: 1.6; }
+
+/* Quick actions bar */
+.quick-actions-bar {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    background: #111d33; border-radius: 10px; padding: 12px 20px;
+    margin-bottom: 20px; border: 1px solid #1e2d4a;
+}
+.qa-label {
+    font-size: 11px; font-weight: 600; color: #5f6368;
+    text-transform: uppercase; letter-spacing: 0.5px; flex-shrink: 0;
+}
+.qa-item {
+    font-size: 13px; font-weight: 500; text-decoration: none;
+    padding: 4px 12px; border-radius: 20px; border: 1px solid;
+    transition: opacity 0.2s;
+}
+.qa-item:hover { opacity: 0.8; }
+.qa-item.critical { color: #ea4335; border-color: #ea433540; background: #ea433510; }
+.qa-item.important { color: #fbbc04; border-color: #fbbc0440; background: #fbbc0410; }
+.qa-item.recommended { color: #2196f3; border-color: #2196f340; background: #2196f310; }
+
+/* Needs attention rows */
+.attn-row {
+    display: flex; align-items: center; gap: 10px; padding: 6px 10px;
+    background: #0d1a2e; border-radius: 6px; border: 1px solid #1e2d4a15;
+}
+.attn-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #e8eaed; }
+.attn-ap { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #9aa0a6; font-size: 12px; }
+.issue-pill {
+    font-size: 10px; padding: 2px 7px; border-radius: 3px; white-space: nowrap; flex-shrink: 0;
+}
+.issue-critical { background: #ea433520; color: #ea4335; }
+.issue-high { background: #ea433510; color: #ea8600; }
+.issue-medium { background: #fbbc0415; color: #fbbc04; }
+.issue-low { background: #1e2d4a; color: #5f6368; }
+
+/* Band pills */
+.band-pill {
+    font-size: 10px; padding: 2px 6px; border-radius: 3px; font-weight: 600; white-space: nowrap;
+}
+.band-24 { background: #ea433520; color: #ea4335; }
+.band-24-ok { background: #1e2d4a; color: #9aa0a6; }
+.band-5 { background: #34a85320; color: #34a853; }
+.band-6 { background: #2196f320; color: #2196f3; }
+
 /* Responsive */
 @media (max-width: 768px) {
     .hero { flex-direction: column; padding: 24px; gap: 20px; }
     .stat-cards { grid-template-columns: repeat(2, 1fr); }
     .panel-grid { grid-template-columns: 1fr; }
     .tab-btn { padding: 8px 12px; font-size: 12px; }
+    .quick-actions-bar { gap: 8px; }
 }
 """
 
@@ -964,8 +1048,63 @@ def _header(site_name, analysis_data):
     return (
         f'<div class="report-header">'
         f"<h1><span>UniFi</span> Network Analysis</h1>"
-        f'<div class="meta">Site: {_esc(site_name)}<br>{now}<br>{lookback}-day lookback</div>'
+        f'<div class="meta">Site: {_esc(site_name)}<br>{now}<br>{lookback}-day lookback'
+        f'<br><span style="color:#5f6368;font-size:11px">v{__version__}</span></div>'
         f"</div>"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Section: Data Quality Banner
+# ---------------------------------------------------------------------------
+
+
+def _ai_summary_card(ai_summary):
+    """Render an AI-generated plain-English summary card. Returns '' when no summary."""
+    if not ai_summary:
+        return ""
+    return (
+        '<div class="ai-summary">'
+        '<span class="ai-summary-icon">✦</span>'
+        '<div class="ai-summary-body">'
+        '<div class="ai-summary-title">AI Network Summary</div>'
+        f'<div class="ai-summary-text">{_esc(ai_summary)}</div>'
+        "</div></div>"
+    )
+
+
+def _data_quality_banner(analysis_data):
+    """Warn when API errors caused incomplete analysis data."""
+    api_errors = analysis_data.get("api_errors")
+    if not api_errors or not isinstance(api_errors, dict):
+        return ""
+    total = api_errors.get("total_errors", 0)
+    if not total:
+        return ""
+    is_critical = bool(api_errors.get("critical_errors"))
+    failed = api_errors.get("failed_endpoints", [])
+    level = "critical" if is_critical else "warning"
+    icon = "✗" if is_critical else "⚠"
+    if is_critical:
+        title = f"{total} critical API error{'s' if total != 1 else ''} — analysis incomplete"
+        subtitle = "Authentication or permission failure. Grade and recommendations may be missing."
+    else:
+        title = f"{total} API call{'s' if total != 1 else ''} failed — some data may be missing"
+        subtitle = "Partial data: retry may resolve transient controller timeouts."
+    endpoints_str = ""
+    if failed:
+        shown = [e.get("endpoint", str(e)) if isinstance(e, dict) else str(e) for e in failed[:5]]
+        endpoints_str = "Failed endpoints: " + ", ".join(shown)
+        if len(failed) > 5:
+            endpoints_str += f" (+{len(failed) - 5} more)"
+    detail = " · ".join(filter(None, [subtitle, endpoints_str]))
+    return (
+        f'<div class="dq-banner {level}">'
+        f'<span class="dq-icon">{icon}</span>'
+        f'<div class="dq-body">'
+        f'<div class="dq-title">{_esc(title)}</div>'
+        f'<div class="dq-detail">{_esc(detail)}</div>'
+        f"</div></div>"
     )
 
 
@@ -1408,7 +1547,7 @@ def _action_detail_html(action):
     for r in recs:
         ap_name = r.get("ap", {}).get("name", r.get("device", "?"))
         band = r.get("band", "")
-        msg = r.get("message", r.get("recommendation", ""))
+        msg = _rec_msg(r)
         rows.append(
             f'<tr><td style="color:#e8eaed;white-space:nowrap">{_esc(ap_name)}</td><td>{_esc(band)}</td><td>{_esc(msg)}</td></tr>'
         )
@@ -1420,6 +1559,36 @@ def _action_detail_html(action):
     )
 
 
+def _quick_actions_card(analysis_data, recommendations):
+    """Compact top-3 action summary bar inserted just below the hero."""
+    actions = _group_recs(recommendations, analysis_data)
+    if not actions:
+        return ""
+    items = []
+    for i, action in enumerate(actions[:3]):
+        pri = action.get("priority", "recommended")
+        title = action["title"]
+        recs = action.get("recs", [])
+        affected = sum(r.get("affected_clients", 0) for r in recs) if recs else 0
+        devices = action.get("devices", [])
+        if affected:
+            impact = f" \u2014 {affected} client{'s' if affected != 1 else ''}"
+        elif devices:
+            impact = f" \u2014 {len(devices)} AP{'s' if len(devices) != 1 else ''}"
+        else:
+            impact = ""
+        items.append(
+            f'<a class="qa-item {pri}" href="#action-{i}">'
+            f"\u25cf {_esc(title)}{_esc(impact)}</a>"
+        )
+    return (
+        f'<div class="quick-actions-bar">'
+        f'<span class="qa-label">Top Actions</span>'
+        f'{"".join(items)}'
+        f"</div>"
+    )
+
+
 def _actions(recommendations, analysis_data):
     actions = _group_recs(recommendations, analysis_data)
     if not actions:
@@ -1428,13 +1597,25 @@ def _actions(recommendations, analysis_data):
     visible = actions[:5]
     hidden = actions[5:]
 
+    def _impact_str(action):
+        recs = action.get("recs", [])
+        affected = sum(r.get("affected_clients", 0) for r in recs) if recs else 0
+        devices = action.get("devices", [])
+        if affected:
+            return f"Affects {affected} client{'s' if affected != 1 else ''}"
+        if devices:
+            return f"{len(devices)} AP{'s' if len(devices) != 1 else ''}"
+        return ""
+
     cards = []
     for i, action in enumerate(visible):
         pri = action.get("priority", "recommended")
         color = _priority_color(pri)
         detail_expand = _action_detail_html(action)
+        impact = _impact_str(action)
+        impact_html = f"<span>{_esc(impact)}</span>" if impact else ""
         cards.append(
-            f'<div class="action-card {pri}">'
+            f'<div class="action-card {pri}" id="action-{i}">'
             f'<div class="action-num" style="background:{color}">{i + 1}</div>'
             f'<div class="action-body">'
             f'<div class="action-title">{_esc(action["title"])}</div>'
@@ -1442,6 +1623,7 @@ def _actions(recommendations, analysis_data):
             f'<div class="action-meta">'
             f'<span class="action-badge" style="background:{color}20;color:{color}">{_priority_label(pri)}</span>'
             f'<span>{action.get("count", 1)} change{"s" if action.get("count", 1) > 1 else ""}</span>'
+            f"{impact_html}"
             f"</div>"
             f"{detail_expand}"
             f"</div></div>"
@@ -1454,12 +1636,15 @@ def _actions(recommendations, analysis_data):
             pri = action.get("priority", "recommended")
             color = _priority_color(pri)
             detail_expand = _action_detail_html(action)
+            impact = _impact_str(action)
+            impact_html = f"<span>{_esc(impact)}</span>" if impact else ""
             hidden_cards.append(
-                f'<div class="action-card {pri}">'
+                f'<div class="action-card {pri}" id="action-{i + 5}">'
                 f'<div class="action-num" style="background:{color}">{i + 6}</div>'
                 f'<div class="action-body">'
                 f'<div class="action-title">{_esc(action["title"])}</div>'
                 f'<div class="action-detail">{_esc(action.get("detail", ""))}</div>'
+                f'<div class="action-meta">{impact_html}</div>'
                 f"{detail_expand}"
                 f"</div></div>"
             )
@@ -1477,6 +1662,66 @@ def _actions(recommendations, analysis_data):
 # ---------------------------------------------------------------------------
 # Deep Dive: RF & Airtime
 # ---------------------------------------------------------------------------
+
+_DFS_CHANNELS = set(range(52, 145))  # 5GHz DFS channels (52–144)
+
+
+def _dfs_card(analysis_data):
+    """Panel card showing DFS radar events per AP. Returns '' when no events."""
+    dfs = analysis_data.get("dfs_analysis", {})
+    if not dfs or not isinstance(dfs, dict):
+        return ""
+    total = dfs.get("total_events", 0)
+    if not total:
+        return ""
+
+    events_by_ap = dfs.get("events_by_ap", {})
+    affected_channels = sorted(dfs.get("affected_channels", []))
+    severity = dfs.get("severity", "ok")
+    title_color = "#ea4335" if severity == "high" else "#fbbc04"
+
+    # Bar chart: AP → event count
+    ap_items = sorted(events_by_ap.items(), key=lambda x: -len(x[1]))
+    bar_data = []
+    for ap_name, events in ap_items:
+        n = len(events)
+        color = "#ea4335" if n > 5 else "#fbbc04" if n > 2 else "#34a853"
+        bar_data.append((ap_name[:20], n, color))
+    bar_html = _svg_hbar(bar_data) if bar_data else ""
+
+    # Affected channels row
+    ch_pills = []
+    for ch in affected_channels:
+        is_dfs = ch in _DFS_CHANNELS
+        style = (
+            "background:#fbbc0420;color:#fbbc04" if is_dfs else "background:#34a85320;color:#34a853"
+        )
+        ch_pills.append(
+            f'<span style="{style};padding:2px 7px;border-radius:3px;font-size:11px">ch{ch}</span>'
+        )
+    ch_row = (
+        (
+            f'<div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:5px;align-items:center">'
+            f'<span style="font-size:11px;color:#5f6368;margin-right:4px">Affected:</span>'
+            f'{"".join(ch_pills)}'
+            f'<span style="font-size:11px;color:#5f6368;margin-left:8px">'
+            f"— switch to ch 36–48 or 149–165 to avoid DFS</span></div>"
+        )
+        if ch_pills
+        else ""
+    )
+
+    return (
+        f'<div class="panel-card full">'
+        f'<h3 style="color:{title_color}">DFS Radar Events '
+        f'<span class="count" style="color:{title_color}60">({total} event{"s" if total != 1 else ""}, '
+        f'{len(events_by_ap)} AP{"s" if len(events_by_ap) != 1 else ""})</span></h3>'
+        f'<div style="font-size:12px;color:#9aa0a6;margin-bottom:10px">'
+        f"5 GHz DFS channels (52–144) are temporarily vacated when radar is detected. "
+        f"Clients drop to 2.4 GHz until the channel clears.</div>"
+        f"{bar_html}{ch_row}"
+        f"</div>"
+    )
 
 
 def _rf_panel(analysis_data):
@@ -1631,6 +1876,7 @@ def _rf_panel(analysis_data):
         f"<h3>Per-AP Client Detail</h3>"
         f'{ap_client_detail if ap_client_detail else "<span style=color:#5f6368>No client data</span>"}'
         f"</div>"
+        f"{_dfs_card(analysis_data)}"
         f"</div>"
     )
 
@@ -1638,6 +1884,25 @@ def _rf_panel(analysis_data):
 # ---------------------------------------------------------------------------
 # Deep Dive: Clients
 # ---------------------------------------------------------------------------
+
+
+def _primary_issue(client):
+    """Return (label, detail, severity) for the client's primary issue."""
+    rssi = client.get("rssi", 0) or 0
+    if rssi > 0:
+        rssi = -rssi
+    disconnect_count = client.get("disconnect_count", 0) or 0
+    channel = client.get("channel", 0) or 0
+    roam_count = client.get("roam_count", 0) or 0
+    if rssi and rssi < -75:
+        return ("Weak signal", f"{rssi} dBm", "critical")
+    if disconnect_count > 5:
+        return ("Frequent disconnects", f"{disconnect_count} events", "high")
+    if 0 < channel <= 13:
+        return ("On 2.4GHz", "band steering may help", "medium")
+    if roam_count > 20:
+        return ("Excessive roaming", f"{roam_count} roams", "medium")
+    return ("Low health score", "", "low")
 
 
 def _clients_panel(analysis_data):
@@ -1659,6 +1924,45 @@ def _clients_panel(analysis_data):
     problem_clients.sort(key=lambda c: c.get("health_score", 100))
     problem_clients = problem_clients[:15]
 
+    # "Needs Attention" spotlight — worst 5 with health_score < 70
+    attn_clients = [c for c in problem_clients if c.get("health_score", 100) < 70][:5]
+    needs_attention_html = ""
+    if attn_clients:
+        attn_rows = []
+        for c in attn_clients:
+            score = c.get("health_score", 0)
+            grade = c.get("grade", "?")
+            color = _score_color(score)
+            label, detail, severity = _primary_issue(c)
+            issue_text = f"{label}: {detail}" if detail else label
+            attn_rows.append(
+                f'<div class="attn-row">'
+                f'<span class="attn-name">{_esc(c.get("hostname", "?")[:24])}</span>'
+                f'<span class="action-badge" style="background:{color}20;color:{color}">{_esc(grade)}</span>'
+                f'<span style="color:{color};font-weight:600;width:28px;text-align:right;flex-shrink:0">{score}</span>'
+                f'<span class="attn-ap">{_esc(c.get("ap_name", "?"))}</span>'
+                f'<span class="issue-pill issue-{severity}">{_esc(issue_text)}</span>'
+                f"</div>"
+            )
+        needs_attention_html = (
+            f'<div style="margin-bottom:14px">'
+            f'<div style="font-size:11px;font-weight:600;color:#9aa0a6;margin-bottom:8px;'
+            f'text-transform:uppercase;letter-spacing:0.5px">Needs Attention</div>'
+            f'<div style="display:flex;flex-direction:column;gap:5px">{"".join(attn_rows)}</div>'
+            f"</div>"
+        )
+
+    def _band_pill(channel, health_score):
+        ch = channel or 0
+        if 0 < ch <= 13:
+            css = "band-24" if health_score < 70 else "band-24-ok"
+            return f'<span class="band-pill {css}">2.4 GHz</span>'
+        if ch >= 36:
+            return '<span class="band-pill band-5">5 GHz</span>'
+        if ch > 13:
+            return '<span class="band-pill band-6">6 GHz</span>'
+        return '<span style="color:#5f6368;font-size:11px">—</span>'
+
     if problem_clients:
         rows = []
         for c in problem_clients:
@@ -1669,6 +1973,7 @@ def _clients_panel(analysis_data):
                 f"<tr>"
                 f'<td>{_esc(c.get("hostname", "?")[:20])}</td>'
                 f'<td>{_esc(c.get("ap_name", "?"))}</td>'
+                f'<td>{_band_pill(c.get("channel", 0), score)}</td>'
                 f"<td>{rssi} dBm</td>"
                 f'<td style="color:{color};font-weight:600">{score} ({c.get("grade", "?")})</td>'
                 f'<td>{c.get("roam_count", 0)} roams</td>'
@@ -1677,9 +1982,8 @@ def _clients_panel(analysis_data):
             )
         client_table = (
             '<table class="client-table">'
-            "<tr><th>Client</th><th>AP</th><th>Signal</th><th>Health</th><th>Roaming</th><th>Disconnects</th></tr>"
-            + "".join(rows)
-            + "</table>"
+            "<tr><th>Client</th><th>AP</th><th>Band</th><th>Signal</th>"
+            "<th>Health</th><th>Roaming</th><th>Disconnects</th></tr>" + "".join(rows) + "</table>"
         )
     else:
         client_table = (
@@ -1807,6 +2111,7 @@ def _clients_panel(analysis_data):
         f'<div class="panel-grid">'
         f'<div class="panel-card full">'
         f'<h3>Problem Clients <span class="count">({len(problem_clients)} of {ca.get("total_clients", 0)})</span></h3>'
+        f"{needs_attention_html}"
         f"{client_table}"
         f"{full_client_expand}</div>"
         f'<div class="panel-card full">'
@@ -2143,7 +2448,9 @@ def _tabs(analysis_data):
 # ---------------------------------------------------------------------------
 
 
-def generate_v2_report(analysis_data, recommendations, site_name, output_dir="reports"):
+def generate_v2_report(
+    analysis_data, recommendations, site_name, output_dir="reports", ai_summary=None
+):
     """Generate premium HTML report. Returns (report_path, share_path)."""
     # Prefer typed recommendations from analysis_data (have 'type' field for grouping)
     typed_recs = analysis_data.get("recommendations", [])
@@ -2157,7 +2464,6 @@ def generate_v2_report(analysis_data, recommendations, site_name, output_dir="re
 
     parts = [
         "<!DOCTYPE html>",
-        "<!-- DBC was here -->",
         '<html lang="en">',
         "<head>",
         '<meta charset="UTF-8">',
@@ -2170,7 +2476,10 @@ def generate_v2_report(analysis_data, recommendations, site_name, output_dir="re
         "<body>",
         _header(site_name, analysis_data),
         '<div class="container">',
+        _data_quality_banner(analysis_data),
+        _ai_summary_card(ai_summary),
         _hero(analysis_data, recommendations, site_name),
+        _quick_actions_card(analysis_data, recommendations),
         _topology(analysis_data),
         _svg_device_timeline(analysis_data),
         _actions(recommendations, analysis_data),

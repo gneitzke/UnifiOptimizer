@@ -16,6 +16,7 @@ A comprehensive toolkit for analyzing and optimizing Ubiquiti UniFi networks. Pr
 - [CloudKey User Setup](#cloudkey-user-setup)
 - [Quick Start](#quick-start)
 - [Usage Examples](#usage-examples)
+- [AI Network Advisor](#ai-network-advisor-ask)
 - [What Gets Analyzed](#what-gets-analyzed)
 - [Reports](#reports)
 - [Troubleshooting](#troubleshooting)
@@ -47,6 +48,12 @@ A comprehensive toolkit for analyzing and optimizing Ubiquiti UniFi networks. Pr
 - **🔒 Read-Only Analysis Mode**: Safe network assessment without changes
 - **💾 Profile Management**: Secure credential storage in macOS Keychain
 - **📝 Change Logging**: Complete audit trail of all modifications
+
+### AI Network Advisor
+- **🤖 Natural Language Q&A**: Ask plain-English questions about your network (`ask` command)
+- **🏠 Local-First**: Defaults to [Ollama](https://ollama.com) — runs fully on-device, no API key, no data leaves your network
+- **🔌 Pluggable Backends**: Switch to Claude or OpenAI via a one-line config change
+- **📝 AI Report Summary**: Optional plain-English summary card in the HTML report (`ai.summary_in_report: true`)
 
 ### WiFi 7 & 6E Support
 - **📡 WiFi 7 Detection**: Identifies 802.11be capable devices (iPhone 16, Galaxy S25, etc.)
@@ -170,14 +177,13 @@ The UniFi API requires **Admin** or **Full Management** role for:
 
 ## 🎯 Quick Start
 
-### Two-Command CLI
-
-The optimizer has two modes:
+### Three-Command CLI
 
 | Command | Purpose |
 |---------|---------|
 | `analyze` | Read-only analysis + HTML report (safe, no changes) |
 | `optimize` | Analysis + apply changes (with `--dry-run` option) |
+| `ask` | Ask a plain-English question about your network (no controller needed) |
 
 ```bash
 # Analyze your network (read-only, generates report)
@@ -188,6 +194,10 @@ python3 optimizer.py optimize --host https://YOUR_CONTROLLER_IP --username admin
 
 # Apply changes interactively (prompts before each change)
 python3 optimizer.py optimize --host https://YOUR_CONTROLLER_IP --username admin
+
+# Ask a question about your network using the last analysis
+python3 optimizer.py ask "why does my iPad keep dropping?"
+python3 optimizer.py ask "which AP is most overloaded?" --backend claude
 ```
 
 ### Using Saved Profiles
@@ -242,6 +252,92 @@ python3 regenerate_report.py
 ```
 Regenerates HTML report from the last cached analysis without connecting to the controller.
 
+### AI Network Advisor (`ask`)
+Ask plain-English questions about your network using the last analysis cache — no controller
+connection needed.
+
+```bash
+python3 optimizer.py ask "why does my iPad keep dropping?"
+python3 optimizer.py ask "which AP is most overloaded?"
+python3 optimizer.py ask "should I switch the office AP to channel 100?"
+python3 optimizer.py ask "what changed this week?" --backend claude
+python3 optimizer.py ask "summarize my network" --backend ollama --model llama3.1
+python3 optimizer.py ask "what's wrong?" --cache analysis_cache_20260220_140209.json
+```
+
+#### Backend: Ollama (default — local, free, private)
+
+Ollama runs models fully on your machine. No API key, no data sent anywhere.
+
+```bash
+# 1. Install Ollama
+brew install ollama
+
+# 2. Start it (runs in the background, auto-starts on login)
+brew services start ollama
+
+# 3. Pull a model
+ollama pull llama3.2
+```
+
+That's it. The `ask` command will use Ollama automatically.
+
+To use a different local model:
+```bash
+ollama pull mistral
+python3 optimizer.py ask "why is 2.4GHz slow?" --model mistral
+```
+
+Or set it permanently in `data/config.yaml`:
+```yaml
+ai:
+  backend: ollama
+  model: mistral
+```
+
+#### Backend: Claude (Anthropic API)
+
+Best answer quality. Requires an Anthropic account and API key.
+
+1. Get an API key at [console.anthropic.com](https://console.anthropic.com)
+2. Install the package: `pip install anthropic`
+3. Set the key:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+python3 optimizer.py ask "why does my iPhone drop?" --backend claude
+```
+
+To make Claude the permanent default, add to `data/config.yaml`:
+```yaml
+ai:
+  backend: claude
+```
+
+And add the export to your shell profile (`~/.zshrc` or `~/.bash_profile`) so it persists across sessions:
+```bash
+echo 'export ANTHROPIC_API_KEY=sk-ant-...' >> ~/.zshrc
+```
+
+#### Backend: OpenAI
+
+```bash
+pip install openai
+export OPENAI_API_KEY=sk-...
+python3 optimizer.py ask "what's wrong?" --backend openai
+```
+
+#### Optional: AI summary in the HTML report
+
+Set `summary_in_report: true` in `data/config.yaml` to add a plain-English "AI Network Summary"
+card to the top of every report — useful for sharing with non-technical users.
+
+```yaml
+ai:
+  backend: ollama       # or claude / openai
+  summary_in_report: true
+```
+
 ### Customize Thresholds
 Edit `data/config.yaml` to tune RSSI thresholds, min RSSI strategy, mesh tolerance, and more:
 ```yaml
@@ -294,9 +390,13 @@ Prioritized by severity:
 
 Generated reports include:
 - **Network Health Overview**: Overall score and key metrics
+- **Quick Actions Bar**: Top 3 recommended actions visible above the fold — click to jump straight to the full action card
 - **Access Point Analysis**: Per-AP performance and recommendations
-- **Client Health Dashboard**: Signal strength histograms, disconnect patterns
-- **Optimization Recommendations**: Prioritized action items with explanations
+- **Client Health Dashboard**: Signal strength histograms, disconnect patterns; "Needs Attention" spotlight highlights the worst clients with a primary issue badge (weak signal, wrong band, disconnects, excessive roaming)
+- **Optimization Recommendations**: Prioritized action cards with impact counts ("Affects X clients / Y APs") and anchor links from the quick actions bar
+- **Band Column**: Color-coded 2.4 / 5 / 6 GHz pill in the client table for at-a-glance band placement review
+- **DFS Radar Card**: Per-AP radar event counts with affected channel pills; identifies APs most exposed to DFS-triggered channel changes (RF tab, shown only when events exist)
+- **Data Quality Banner**: Amber/red banner at the top of the report when API calls failed during analysis, listing the affected endpoints so you know what data is missing
 
 Reports are saved to the `reports/` directory and can be viewed in any web browser.
 
