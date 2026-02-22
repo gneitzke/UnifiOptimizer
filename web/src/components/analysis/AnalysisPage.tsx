@@ -1021,11 +1021,65 @@ function EventSummary({ timeline }: { timeline: EventTimeline }) {
   const entries = Object.entries(timeline.totals).filter(([, v]) => v > 0).sort(([, a], [, b]) => b - a);
   if (entries.length === 0) return null;
   const max = entries[0]?.[1] ?? 1;
+
+  // Build density timeline data — one row per event category
+  const catEntries = Object.entries(timeline.categories)
+    .filter(([k]) => EVENT_COLORS[k])
+    .filter(([, arr]) => arr.some((v) => v > 0));
+  const hours = timeline.hours;
+  const hasDensity = catEntries.length > 0 && hours.length > 1;
+
+  // Derive date labels for the x-axis
+  const firstDate = hours[0]?.split(' ')[0] ?? '';
+  const lastDate = hours[hours.length - 1]?.split(' ')[0] ?? '';
+
   return (
     <div className="glass-card-solid p-6">
       <h3 className="text-sm font-semibold mb-4" style={{ color: 'var(--text)' }}>
-        Event Summary {timeline.lookbackDays > 0 && <span className="font-normal text-xs" style={{ color: 'var(--text-muted)' }}>({timeline.lookbackDays}d lookback)</span>}
+        Event Timeline {timeline.lookbackDays > 0 && <span className="font-normal text-xs" style={{ color: 'var(--text-muted)' }}>({timeline.lookbackDays}d lookback)</span>}
       </h3>
+
+      {/* Density timeline — colored ticks at each hour */}
+      {hasDensity && (
+        <div className="mb-5">
+          {catEntries.map(([name, counts]) => {
+            const catMax = Math.max(...counts);
+            if (catMax === 0) return null;
+            const color = EVENT_COLORS[name] ?? 'var(--primary)';
+            const total = timeline.totals[name] ?? 0;
+            return (
+              <div key={name} className="mb-3">
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-xs font-medium" style={{ color }}>{EVENT_LABELS[name] ?? name}</span>
+                  <span className="text-[10px] font-semibold" style={{ color: 'var(--text-muted)' }}>
+                    {total >= 1000 ? `${(total / 1000).toFixed(1)}k` : total} total
+                  </span>
+                </div>
+                {/* Tick strip — each hour is a vertical tick with opacity proportional to count */}
+                <svg viewBox={`0 0 ${counts.length} 20`} preserveAspectRatio="none"
+                  className="w-full rounded" style={{ height: 20, background: 'var(--bg-elevated)' }}>
+                  {counts.map((v, i) => {
+                    if (v === 0) return null;
+                    const opacity = Math.min(0.15 + (v / catMax) * 0.85, 1);
+                    const h = Math.max(4, (v / catMax) * 20);
+                    return (
+                      <rect key={i} x={i} y={20 - h} width={1} height={h}
+                        fill={color} opacity={opacity} />
+                    );
+                  })}
+                </svg>
+              </div>
+            );
+          })}
+          {/* Date range labels */}
+          <div className="flex justify-between text-[10px] mt-1" style={{ color: 'var(--text-muted)' }}>
+            <span>{firstDate}</span>
+            <span>{lastDate}</span>
+          </div>
+        </div>
+      )}
+
+      {/* Totals summary bars */}
       <div className="space-y-2">
         {entries.map(([name, val]) => {
           const color = EVENT_COLORS[name] ?? 'var(--primary)';
