@@ -57,6 +57,20 @@ const PIE_COLORS = [
   '#a855f7',
 ];
 
+const SIGNAL_COLORS = [
+  '#00c48f', // Excellent - green
+  '#0088ff', // Good - blue
+  '#ffb800', // Fair - yellow
+  '#ff8c00', // Poor - orange
+  '#ff4757', // Critical - red
+];
+
+const BAND_COLORS: Record<string, string> = {
+  '2.4GHz': '#ffb800',
+  '5GHz': '#0088ff',
+  '6GHz': '#a855f7',
+};
+
 /* ── Skeleton ──────────────────────────────────── */
 
 function SkeletonCard() {
@@ -105,14 +119,17 @@ function PriorityBadge({
 function HealthBar({
   label,
   value,
+  max,
 }: {
   label: string;
   value: number;
+  max?: number;
 }) {
+  const pct = max ? Math.round((value / max) * 100) : value;
   const color =
-    value > 80
+    pct >= 80
       ? 'var(--success)'
-      : value > 60
+      : pct >= 50
         ? 'var(--warning)'
         : 'var(--error)';
   return (
@@ -128,7 +145,7 @@ function HealthBar({
           className="text-xs font-semibold"
           style={{ color }}
         >
-          {value}
+          {value}{max ? `/${max}` : ''}
         </span>
       </div>
       <div
@@ -140,7 +157,7 @@ function HealthBar({
         <div
           className="h-full rounded-full"
           style={{
-            width: `${value}%`,
+            width: `${pct}%`,
             background: color,
             transition: 'width 0.8s ease',
           }}
@@ -157,43 +174,28 @@ function OverviewTab({
 }: {
   result: AnalysisResult;
 }) {
-  const { health, aps, clients } = result;
+  const { health, aps } = result;
+  const sd = result.signalDistribution;
 
+  // Use backend's pre-computed signal distribution
   const signalBuckets = [
-    { name: 'Excellent', value: 0 },
-    { name: 'Good', value: 0 },
-    { name: 'Fair', value: 0 },
-    { name: 'Poor', value: 0 },
+    { name: 'Excellent', value: sd.excellent },
+    { name: 'Good', value: sd.good },
+    { name: 'Fair', value: sd.fair },
+    { name: 'Poor', value: sd.poor },
+    { name: 'Critical', value: sd.critical },
   ];
-  clients.forEach((c) => {
-    if (c.signal >= -50) signalBuckets[0].value++;
-    else if (c.signal >= -65)
-      signalBuckets[1].value++;
-    else if (c.signal >= -75)
-      signalBuckets[2].value++;
-    else signalBuckets[3].value++;
-  });
 
-  const bandData = [
-    {
-      name: '2.4 GHz',
-      value: aps.filter(
-        (a) => a.band === '2.4GHz',
-      ).length,
-    },
-    {
-      name: '5 GHz',
-      value: aps.filter(
-        (a) => a.band === '5GHz',
-      ).length,
-    },
-    {
-      name: '6 GHz',
-      value: aps.filter(
-        (a) => a.band === '6GHz',
-      ).length,
-    },
-  ].filter((d) => d.value > 0);
+  // Count radios across all APs (each AP can have multiple bands)
+  const bandCounts: Record<string, number> = {};
+  aps.forEach((a) =>
+    a.radios.forEach((r) => {
+      bandCounts[r.band] = (bandCounts[r.band] ?? 0) + 1;
+    }),
+  );
+  const bandData = Object.entries(bandCounts)
+    .map(([name, value]) => ({ name, value }))
+    .filter((d) => d.value > 0);
 
   return (
     <div className="space-y-6">
@@ -209,18 +211,22 @@ function OverviewTab({
           <HealthBar
             label="RF Quality"
             value={health.wireless}
+            max={health.wirelessMax}
           />
           <HealthBar
-            label="Client Health"
+            label="Mesh / Coverage"
             value={health.coverage}
+            max={health.coverageMax}
           />
           <HealthBar
-            label="Infrastructure"
+            label="Distribution"
             value={health.wired}
+            max={health.wiredMax}
           />
           <HealthBar
-            label="Latency"
+            label="Airtime"
             value={health.latency}
+            max={health.latencyMax}
           />
         </div>
       </div>
@@ -255,11 +261,7 @@ function OverviewTab({
                 {signalBuckets.map((_, i) => (
                   <Cell
                     key={i}
-                    fill={
-                      PIE_COLORS[
-                        i % PIE_COLORS.length
-                      ]
-                    }
+                    fill={SIGNAL_COLORS[i]}
                   />
                 ))}
               </Pie>
@@ -288,10 +290,11 @@ function OverviewTab({
                 outerRadius={80}
                 paddingAngle={3}
               >
-                {bandData.map((_, i) => (
+                {bandData.map((d, i) => (
                   <Cell
                     key={i}
                     fill={
+                      BAND_COLORS[d.name] ??
                       PIE_COLORS[
                         i % PIE_COLORS.length
                       ]
@@ -312,8 +315,14 @@ function OverviewTab({
       >
         <StatCard
           title="Overall Health"
-          value={health.overall}
+          value={`${health.overall}/100`}
+          subtitle={health.grade ? `Grade ${health.grade} — ${health.status}` : undefined}
           icon={CheckCircle2}
+          iconColor={
+            health.overall >= 80 ? 'var(--success)'
+            : health.overall >= 60 ? 'var(--warning)'
+            : 'var(--error)'
+          }
         />
         <StatCard
           title="Access Points"
@@ -383,11 +392,9 @@ function DevicesTab({
               [
                 ['name', 'Name'],
                 ['model', 'Model'],
-                ['channel', 'Channel'],
-                ['txPower', 'Power'],
+                ['type', 'Type'],
+                ['bands', 'Bands'],
                 ['clients', 'Clients'],
-                ['band', 'Band'],
-                ['satisfaction', 'Health'],
               ] as const
             ).map(([key, label]) => (
               <th
@@ -439,21 +446,62 @@ function DevicesTab({
               >
                 {ap.model}
               </td>
-              <td
-                className="px-4 py-3"
-                style={{
-                  color: 'var(--text-muted)',
-                }}
-              >
-                {ap.channel}
+              <td className="px-4 py-3">
+                <span
+                  className="text-[10px]
+                    font-semibold px-2 py-0.5
+                    rounded-full uppercase"
+                  style={{
+                    background: ap.isMesh
+                      ? 'rgba(168,85,247,0.15)'
+                      : 'rgba(0,196,143,0.15)',
+                    color: ap.isMesh
+                      ? '#a855f7'
+                      : '#00c48f',
+                  }}
+                >
+                  {ap.isMesh ? 'Mesh' : 'Wired'}
+                </span>
               </td>
-              <td
-                className="px-4 py-3"
-                style={{
-                  color: 'var(--text-muted)',
-                }}
-              >
-                {ap.txPower} dBm
+              <td className="px-4 py-3">
+                <div className="flex flex-col gap-1">
+                  {ap.radios.map((r) => (
+                    <div
+                      key={r.band}
+                      className="flex items-center
+                        gap-2 text-xs"
+                      style={{
+                        color: 'var(--text-muted)',
+                      }}
+                    >
+                      <span
+                        className="text-[10px]
+                          font-semibold px-1.5
+                          py-0.5 rounded"
+                        style={{
+                          background:
+                            BAND_COLORS[r.band]
+                              ? `${BAND_COLORS[r.band]}22`
+                              : 'rgba(0,136,255,0.1)',
+                          color:
+                            BAND_COLORS[r.band] ??
+                            'var(--primary)',
+                        }}
+                      >
+                        {r.band}
+                      </span>
+                      <span>
+                        ch{r.channel}
+                      </span>
+                      <span>
+                        {r.width}MHz
+                      </span>
+                      <span>
+                        {r.txPowerMode || `${r.txPower}dBm`}
+                      </span>
+                    </div>
+                  ))}
+                </div>
               </td>
               <td
                 className="px-4 py-3"
@@ -462,34 +510,6 @@ function DevicesTab({
                 }}
               >
                 {ap.clients}
-              </td>
-              <td className="px-4 py-3">
-                <span
-                  className="text-[10px]
-                    font-semibold px-2 py-0.5
-                    rounded-full uppercase"
-                  style={{
-                    background:
-                      'rgba(0,136,255,0.15)',
-                    color: 'var(--primary)',
-                  }}
-                >
-                  {ap.band}
-                </span>
-              </td>
-              <td className="px-4 py-3">
-                <span
-                  style={{
-                    color:
-                      ap.satisfaction > 80
-                        ? 'var(--success)'
-                        : ap.satisfaction > 60
-                          ? 'var(--warning)'
-                          : 'var(--error)',
-                  }}
-                >
-                  {ap.satisfaction}%
-                </span>
               </td>
             </tr>
           ))}
@@ -631,87 +651,116 @@ function ClientsTab({
 
 function ChannelsTab({
   aps,
+  channelUsage,
 }: {
   aps: ApAnalysis[];
+  channelUsage: Record<string, string[]>;
 }) {
-  const channelMap = new Map<
-    number,
-    { count: number; band: string }
-  >();
-  aps.forEach((ap) => {
-    const e = channelMap.get(ap.channel);
-    if (e) e.count++;
-    else
-      channelMap.set(ap.channel, {
-        count: 1,
-        band: ap.band,
-      });
-  });
-  const channels = [...channelMap.entries()]
-    .sort(([a], [b]) => a - b);
+  // Use backend's pre-computed channel_usage if available,
+  // otherwise build from per-radio data
+  type ChEntry = { band: string; channel: number; aps: string[] };
+  const entries: ChEntry[] = [];
+
+  if (Object.keys(channelUsage).length > 0) {
+    for (const [key, apNames] of Object.entries(channelUsage)) {
+      const parts = key.split('_ch');
+      const band = parts[0] ?? '';
+      const ch = parseInt(parts[1] ?? '0', 10);
+      entries.push({ band, channel: ch, aps: apNames });
+    }
+  } else {
+    const map = new Map<string, ChEntry>();
+    aps.forEach((ap) =>
+      ap.radios.forEach((r) => {
+        const key = `${r.band}_ch${r.channel}`;
+        const e = map.get(key);
+        if (e) e.aps.push(ap.name);
+        else map.set(key, { band: r.band, channel: r.channel, aps: [ap.name] });
+      }),
+    );
+    entries.push(...map.values());
+  }
+
+  // Group by band
+  const bands = ['2.4GHz', '5GHz', '6GHz'];
+  const grouped = bands.map((band) => ({
+    band,
+    channels: entries
+      .filter((e) => e.band === band)
+      .sort((a, b) => a.channel - b.channel),
+  })).filter((g) => g.channels.length > 0);
+
+  const totalRadios = aps.reduce((n, a) => n + a.radios.length, 0);
 
   return (
-    <div className="glass-card-solid p-6">
-      <h3
-        className="text-sm font-semibold mb-4"
-        style={{ color: 'var(--text)' }}
-      >
-        Channel Distribution
-      </h3>
-      <div className="space-y-3">
-        {channels.map(([ch, { count, band }]) => (
-          <div
-            key={ch}
-            className="flex items-center gap-3"
+    <div className="space-y-6">
+      {grouped.map(({ band, channels }) => (
+        <div key={band} className="glass-card-solid p-6">
+          <h3
+            className="text-sm font-semibold mb-4
+              flex items-center gap-2"
+            style={{ color: 'var(--text)' }}
           >
             <span
-              className="text-xs w-20
-                font-mono shrink-0"
-              style={{ color: 'var(--text)' }}
-            >
-              Ch {ch}
-              <span
-                className="ml-1 text-[10px]"
-                style={{
-                  color: 'var(--text-muted)',
-                }}
-              >
-                {band}
-              </span>
-            </span>
-            <div
-              className="flex-1 h-4 rounded-full
-                overflow-hidden"
+              className="inline-block w-3 h-3
+                rounded-full"
               style={{
-                background: 'var(--bg-elevated)',
+                background:
+                  BAND_COLORS[band] ?? 'var(--primary)',
               }}
-            >
+            />
+            {band} Channels
+          </h3>
+          <div className="space-y-3">
+            {channels.map(({ channel, aps: apNames }) => (
               <div
-                className="h-full rounded-full"
-                style={{
-                  width: `${Math.min(
-                    (count / aps.length) * 100,
-                    100,
-                  )}%`,
-                  background:
-                    count > 3
-                      ? 'var(--warning)'
-                      : 'var(--primary)',
-                  transition: 'width 0.6s ease',
-                }}
-              />
-            </div>
-            <span
-              className="text-xs w-6 text-right"
-              style={{
-                color: 'var(--text-muted)',
-              }}
-            >
-              {count}
-            </span>
+                key={channel}
+                className="flex items-center gap-3"
+              >
+                <span
+                  className="text-xs w-14
+                    font-mono shrink-0
+                    font-semibold"
+                  style={{ color: 'var(--text)' }}
+                >
+                  Ch {channel}
+                </span>
+                <div
+                  className="flex-1 h-5 rounded-full
+                    overflow-hidden relative"
+                  style={{
+                    background: 'var(--bg-elevated)',
+                  }}
+                >
+                  <div
+                    className="h-full rounded-full"
+                    style={{
+                      width: `${Math.min(
+                        (apNames.length / totalRadios) * 100 * 3,
+                        100,
+                      )}%`,
+                      background:
+                        apNames.length > 3
+                          ? 'var(--warning)'
+                          : BAND_COLORS[band] ??
+                            'var(--primary)',
+                      transition: 'width 0.6s ease',
+                    }}
+                  />
+                </div>
+                <span
+                  className="text-xs shrink-0"
+                  style={{
+                    color: 'var(--text-muted)',
+                  }}
+                >
+                  {apNames.join(', ')}
+                </span>
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
+        </div>
+      ))}
     </div>
   );
 }
@@ -997,7 +1046,7 @@ export default function AnalysisPage() {
         <ClientsTab clients={result.clients} />
       )}
       {tab === 'channels' && (
-        <ChannelsTab aps={result.aps} />
+        <ChannelsTab aps={result.aps} channelUsage={result.channelUsage} />
       )}
       {tab === 'recommendations' && (
         <RecsTab

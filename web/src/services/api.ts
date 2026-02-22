@@ -10,6 +10,8 @@ import type {
   DiscoveredDevice,
   HealthScore,
   ApAnalysis,
+  RadioInfo,
+  SignalDistribution,
   ClientAnalysis,
   Finding,
 } from '../types/api';
@@ -191,53 +193,104 @@ function mapAnalysisResult(
   const recsRaw = (raw.recommendations ?? []) as Record<string, unknown>[];
 
   const health: HealthScore = {
-    overall: (healthRaw.score ?? healthRaw.overall_score ?? healthRaw.overall ?? 0) as number,
-    wireless: (healthDetails.rssi_score ?? healthRaw.wireless_score ?? healthRaw.wireless ?? 0) as number,
-    wired: (healthDetails.distribution_score ?? healthRaw.wired_score ?? healthRaw.wired ?? 0) as number,
-    latency: (healthDetails.airtime_score ?? healthRaw.latency_score ?? healthRaw.latency ?? 0) as number,
-    coverage: (healthDetails.mesh_score ?? healthRaw.coverage_score ?? healthRaw.coverage ?? 0) as number,
+    overall: (healthRaw.score ?? healthRaw.overall ?? 0) as number,
+    grade: (healthRaw.grade ?? '') as string,
+    status: (healthRaw.status ?? '') as string,
+    wireless: (healthDetails.rssi_score ?? 0) as number,
+    wirelessMax: 30,
+    wired: (healthDetails.distribution_score ?? 0) as number,
+    wiredMax: 20,
+    latency: (healthDetails.airtime_score ?? 0) as number,
+    latencyMax: 20,
+    coverage: (healthDetails.mesh_score ?? 0) as number,
+    coverageMax: 15,
+    issuesScore: (healthDetails.issues_score ?? 0) as number,
   };
 
-  const apList = (apRaw.ap_details ?? apRaw.aps ?? apRaw.devices ?? []) as Record<string, unknown>[];
+  // Map APs with full per-radio detail
+  const apList = (apRaw.ap_details ?? apRaw.aps ?? []) as Record<string, unknown>[];
   const aps: ApAnalysis[] = apList.map((a) => {
-    const radios = (a.radios ?? {}) as Record<string, Record<string, unknown>>;
-    const firstRadio = Object.values(radios)[0] ?? {};
+    const radiosRaw = (a.radios ?? {}) as Record<string, Record<string, unknown>>;
+    const radioList: RadioInfo[] = Object.entries(radiosRaw).map(([band, r]) => ({
+      band,
+      channel: (r.channel ?? 0) as number,
+      width: (r.width ?? 0) as number,
+      txPower: (r.tx_power ?? 0) as number,
+      txPowerMode: (r.tx_power_mode ?? '') as string,
+    }));
+    const firstRadio = radioList[0];
     return {
       mac: (a.mac ?? '') as string,
-      name: (a.name ?? a.hostname ?? 'Unknown') as string,
+      name: (a.name ?? 'Unknown') as string,
       model: (a.model ?? '') as string,
-      channel: (firstRadio.channel ?? a.channel ?? 0) as number,
-      band: (Object.keys(radios)[0] ?? a.band ?? a.radio ?? '') as string,
-      txPower: (firstRadio.tx_power ?? a.tx_power ?? a.txPower ?? 0) as number,
-      clients: (a.client_count ?? a.num_sta ?? a.clients ?? 0) as number,
-      satisfaction: (a.satisfaction ?? a.score ?? 0) as number,
+      isMesh: !!a.is_mesh,
+      channel: firstRadio?.channel ?? 0,
+      band: firstRadio?.band ?? '',
+      txPower: firstRadio?.txPower ?? 0,
+      clients: (a.client_count ?? 0) as number,
+      satisfaction: (a.satisfaction ?? 0) as number,
       interference: (a.interference ?? 0) as number,
+      radios: radioList,
       issues: (a.issues ?? []) as string[],
       suggestions: (a.suggestions ?? []) as string[],
     };
   });
 
-  const clientList = (clientRaw.clients ?? clientRaw.problem_clients ?? []) as Record<string, unknown>[];
-  const clients: ClientAnalysis[] = clientList.map((c) => ({
-    mac: (c.mac ?? '') as string,
-    hostname: (c.hostname ?? c.name ?? '') as string,
-    apMac: (c.ap_mac ?? c.apMac ?? '') as string,
-    signal: (c.signal ?? c.rssi ?? 0) as number,
-    noise: (c.noise ?? 0) as number,
-    txRate: (c.tx_rate ?? c.txRate ?? 0) as number,
-    rxRate: (c.rx_rate ?? c.rxRate ?? 0) as number,
-    satisfaction: (c.satisfaction ?? 0) as number,
-    issues: (c.issues ?? []) as string[],
-  }));
+  // Use backend's pre-computed signal distribution
+  const sigRaw = (clientRaw.signal_distribution ?? {}) as Record<string, number>;
+  const signalDistribution: SignalDistribution = {
+    excellent: sigRaw.excellent ?? 0,
+    good: sigRaw.good ?? 0,
+    fair: sigRaw.fair ?? 0,
+    poor: sigRaw.poor ?? 0,
+    critical: sigRaw.critical ?? 0,
+    wired: sigRaw.wired ?? 0,
+  };
 
-  const findings: Finding[] = recsRaw.map((r, i) => ({
-    id: String(r.id ?? i),
-    severity: (r.severity ?? r.priority ?? 'info') as Finding['severity'],
-    category: (r.category ?? r.action ?? 'general') as string,
-    title: (r.title ?? r.reason ?? r.action ?? 'Recommendation') as string,
-    description: (r.description ?? r.details ?? r.reason ?? '') as string,
-    affectedDevices: (r.affected_devices ?? []) as string[],
-  }));
+  // Use backend's pre-computed channel usage
+  const channelUsage = (apRaw.channel_usage ?? {}) as Record<string, string[]>;
+
+  // Map only problem clients (weak + poor health)
+  const weakClients = (clientRaw.weak_signal ?? []) as Record<string, unknown>[];
+  const poorClients = (clientRaw.poor_health ?? []) as Record<string, unknown>[];
+  const seen = new Set<string>();
+  const clients: ClientAnalysis[] = [...weakClients, ...poorClients]
+    .filter((c) => {
+      const mac = (c.mac ?? '') as string;
+      if (seen.has(mac)) return false;
+      seen.add(mac);
+      return true;
+    })
+    .map((c) => ({
+      mac: (c.mac ?? '') as string,
+      hostname: (c.hostname ?? c.name ?? '') as string,
+      apMac: (c.ap_mac ?? '') as string,
+      signal: (c.signal ?? c.rssi ?? 0) as number,
+      noise: (c.noise ?? 0) as number,
+      txRate: (c.tx_rate ?? 0) as number,
+      rxRate: (c.rx_rate ?? 0) as number,
+      satisfaction: (c.satisfaction ?? 0) as number,
+      issues: (c.issues ?? []) as string[],
+    }));
+
+  // Map recommendations with device name and proper severity
+  const findings: Finding[] = recsRaw.map((r, i) => {
+    const dev = (r.device ?? {}) as Record<string, unknown>;
+    const devName = (dev.name ?? '') as string;
+    const action = (r.action ?? '') as string;
+    const priority = (r.priority ?? 'info') as string;
+    const severity = priority === 'high' ? 'critical' : priority === 'medium' ? 'warning' : 'info';
+    return {
+      id: String(r.id ?? i),
+      severity: severity as Finding['severity'],
+      category: action,
+      title: devName
+        ? `${devName}: ${action.replace(/_/g, ' ')}`
+        : (r.reason ?? action ?? 'Recommendation') as string,
+      description: (r.reason ?? r.details ?? '') as string,
+      affectedDevices: devName ? [devName] : (r.affected_devices ?? []) as string[],
+    };
+  });
 
   return {
     jobId: (raw.job_id ?? '') as string,
@@ -245,9 +298,11 @@ function mapAnalysisResult(
     health,
     aps,
     clients,
+    signalDistribution,
+    channelUsage,
     apCount: aps.length || (apRaw.total_aps as number ?? 0),
-    clientCount: clients.length || (clientRaw.total_clients as number ?? 0),
-    summary: `${aps.length} APs, ${clients.length} clients, ${findings.length} recommendations`,
+    clientCount: (clientRaw.total_clients as number) ?? clients.length,
+    summary: `${aps.length} APs, ${clientRaw.total_clients ?? clients.length} clients, ${findings.length} recommendations`,
     findings,
   };
 }

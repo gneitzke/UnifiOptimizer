@@ -37,24 +37,50 @@ export interface DiscoveredDevice {
 
 export interface HealthScore {
   overall: number;
+  grade?: string;
+  status?: string;
   wireless: number;
+  wirelessMax: number;
   wired: number;
+  wiredMax: number;
   latency: number;
+  latencyMax: number;
   coverage: number;
+  coverageMax: number;
+  issuesScore?: number;
+}
+
+export interface RadioInfo {
+  band: string;
+  channel: number;
+  width: number;
+  txPower: number;
+  txPowerMode: string;
 }
 
 export interface ApAnalysis {
   mac: string;
   name: string;
   model: string;
+  isMesh: boolean;
   channel: number;
   band: string;
   txPower: number;
   clients: number;
   satisfaction: number;
   interference: number;
+  radios: RadioInfo[];
   issues: string[];
   suggestions: string[];
+}
+
+export interface SignalDistribution {
+  excellent: number;
+  good: number;
+  fair: number;
+  poor: number;
+  critical: number;
+  wired: number;
 }
 
 export interface ClientAnalysis {
@@ -90,6 +116,8 @@ export interface AnalysisResult {
   health: HealthScore;
   aps: ApAnalysis[];
   clients: ClientAnalysis[];
+  signalDistribution: SignalDistribution;
+  channelUsage: Record<string, string[]>;
   apCount: number;
   clientCount: number;
   summary: string;
