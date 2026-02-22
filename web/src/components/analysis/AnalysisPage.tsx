@@ -1260,21 +1260,30 @@ function DevicesTab({
                 {friendlyModel(ap.model)}
               </td>
               <td className="px-4 py-3">
-                <span
-                  className="text-[10px]
-                    font-semibold px-2 py-0.5
-                    rounded-full uppercase"
-                  style={{
-                    background: ap.isMesh
-                      ? 'rgba(168,85,247,0.15)'
-                      : 'rgba(0,196,143,0.15)',
-                    color: ap.isMesh
-                      ? '#a855f7'
-                      : '#00c48f',
-                  }}
-                >
-                  {ap.isMesh ? 'Mesh' : 'Wired'}
-                </span>
+                <div className="flex items-center gap-1.5">
+                  <span
+                    className="text-[10px]
+                      font-semibold px-2 py-0.5
+                      rounded-full uppercase"
+                    style={{
+                      background: ap.isMesh
+                        ? 'rgba(168,85,247,0.15)'
+                        : 'rgba(0,196,143,0.15)',
+                      color: ap.isMesh
+                        ? '#a855f7'
+                        : '#00c48f',
+                    }}
+                  >
+                    {ap.isMesh ? 'Mesh' : 'Wired'}
+                  </span>
+                  {ap.isOffline && (
+                    <span
+                      className="text-[10px] font-semibold px-2 py-0.5 rounded-full uppercase"
+                      style={{ background: 'rgba(255,71,87,0.15)', color: '#ff4757' }}>
+                      Offline
+                    </span>
+                  )}
+                </div>
               </td>
               <td className="px-4 py-3">
                 <div className="flex flex-col gap-1">
@@ -1351,14 +1360,23 @@ const BEHAVIOR_LABELS: Record<string, string> = {
 function ClientsTab({
   clients,
   journeys,
+  signalDistribution,
+  clientCapabilities,
+  manufacturers,
+  totalClients,
 }: {
   clients: ClientAnalysis[];
   journeys: ClientJourney[];
+  signalDistribution: SignalDistribution;
+  clientCapabilities: ClientCapabilities;
+  manufacturers: ManufacturerStats[];
+  totalClients: number;
 }) {
   const [expanded, setExpanded] = useState<string | null>(null);
   type ClientSort = 'name' | 'ap' | 'roams' | 'rssi' | 'behavior' | 'aps';
   const [sortBy, setSortBy] = useState<ClientSort>('roams');
   const [sortAsc, setSortAsc] = useState(false);
+  const [showAll, setShowAll] = useState(false);
 
   function handleSort(col: ClientSort) {
     if (sortBy === col) setSortAsc(!sortAsc);
@@ -1367,8 +1385,9 @@ function ClientsTab({
 
   const BEHAVIOR_ORDER: Record<string, number> = { flapping: 0, pattern: 1, healthy_roamer: 2, stable: 3 };
 
-  const sorted = [...journeys]
-    .filter((j) => j.roamCount > 0 || j.disconnectCount > 0)
+  const active = journeys.filter((j) => j.roamCount > 0 || j.disconnectCount > 0);
+  const display = showAll ? journeys : active;
+  const sorted = [...display]
     .sort((a, b) => {
       const dir = sortAsc ? 1 : -1;
       switch (sortBy) {
@@ -1395,12 +1414,90 @@ function ClientsTab({
 
   return (
     <div className="space-y-6">
-      {sorted.length > 0 && (
+      {/* Client Summary Stats */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div className="glass-card-solid p-4 text-center">
+          <div className="text-2xl font-bold" style={{ color: 'var(--text)' }}>{totalClients}</div>
+          <div className="text-xs" style={{ color: 'var(--text-muted)' }}>Total Clients</div>
+        </div>
+        <div className="glass-card-solid p-4 text-center">
+          <div className="text-2xl font-bold" style={{ color: 'var(--success)' }}>{signalDistribution.excellent + signalDistribution.good}</div>
+          <div className="text-xs" style={{ color: 'var(--text-muted)' }}>Good+ Signal</div>
+        </div>
+        <div className="glass-card-solid p-4 text-center">
+          <div className="text-2xl font-bold" style={{ color: active.length > 0 ? '#0088ff' : 'var(--text-muted)' }}>{active.length}</div>
+          <div className="text-xs" style={{ color: 'var(--text-muted)' }}>Active Roamers</div>
+        </div>
+        <div className="glass-card-solid p-4 text-center">
+          <div className="text-2xl font-bold" style={{ color: signalDistribution.poor + signalDistribution.critical > 0 ? 'var(--error)' : 'var(--text-muted)' }}>
+            {signalDistribution.poor + signalDistribution.critical}
+          </div>
+          <div className="text-xs" style={{ color: 'var(--text-muted)' }}>Poor/Critical Signal</div>
+        </div>
+      </div>
+
+      {/* Signal Distribution + Capabilities Row */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="glass-card-solid p-6">
+          <h3 className="text-sm font-semibold mb-4" style={{ color: 'var(--text)' }}>Signal Distribution</h3>
+          <div className="space-y-2">
+            {[
+              { name: 'Excellent', value: signalDistribution.excellent, color: '#00c48f' },
+              { name: 'Good', value: signalDistribution.good, color: '#0088ff' },
+              { name: 'Fair', value: signalDistribution.fair, color: '#ffb800' },
+              { name: 'Poor', value: signalDistribution.poor, color: '#ff8c00' },
+              { name: 'Critical', value: signalDistribution.critical, color: '#ff4757' },
+              { name: 'Wired', value: signalDistribution.wired, color: '#a855f7' },
+            ].filter(s => s.value > 0).map((s) => {
+              const total = totalClients || 1;
+              const pct = (s.value / total) * 100;
+              return (
+                <div key={s.name} className="flex items-center gap-3">
+                  <span className="text-xs w-16 shrink-0 font-medium" style={{ color: s.color }}>{s.name}</span>
+                  <div className="flex-1 h-4 rounded-full overflow-hidden" style={{ background: 'var(--bg-elevated)' }}>
+                    <div className="h-full rounded-full" style={{ width: `${pct}%`, background: s.color, transition: 'width 0.6s ease' }} />
+                  </div>
+                  <span className="text-xs w-8 text-right shrink-0 font-semibold" style={{ color: 'var(--text)' }}>{s.value}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+        <ClientCapabilitiesCard caps={clientCapabilities} />
+      </div>
+
+      {/* Manufacturer Breakdown */}
+      {manufacturers.length > 0 && (
+        <div className="glass-card-solid p-6">
+          <h3 className="text-sm font-semibold mb-4" style={{ color: 'var(--text)' }}>
+            Manufacturers ({manufacturers.length} vendors)
+          </h3>
+          <div className="flex flex-wrap gap-2">
+            {manufacturers.sort((a, b) => b.count - a.count).map((m) => (
+              <span key={m.name} className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-full"
+                style={{ background: 'var(--bg-elevated)', color: 'var(--text)' }}>
+                {m.icon && <span>{m.icon}</span>}
+                {m.name}
+                <span className="font-bold" style={{ color: 'var(--primary)' }}>{m.count}</span>
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Client Activity Table */}
+      {journeys.length > 0 && (
         <div className="glass-card-solid overflow-x-auto">
-          <div className="p-4 pb-0">
+          <div className="p-4 pb-0 flex items-center justify-between">
             <h3 className="text-sm font-semibold" style={{ color: 'var(--text)' }}>
-              Client Activity ({sorted.length} active)
+              Client Activity ({sorted.length}{showAll ? ' total' : ' active'})
             </h3>
+            <button
+              onClick={() => setShowAll(!showAll)}
+              className="text-xs font-medium px-3 py-1 rounded-lg cursor-pointer transition-colors"
+              style={{ background: 'var(--bg-elevated)', color: 'var(--primary)', border: '1px solid var(--border)' }}>
+              {showAll ? `Show Active (${active.length})` : `Show All (${journeys.length})`}
+            </button>
           </div>
           <table className="w-full text-sm">
             <thead>
@@ -1529,7 +1626,7 @@ function ClientsTab({
         </div>
       )}
 
-      {sorted.length === 0 && weakClients.length === 0 && (
+      {sorted.length === 0 && journeys.length === 0 && weakClients.length === 0 && (
         <div className="glass-card-solid p-8 text-center">
           <CheckCircle2 size={32} className="mx-auto mb-2" style={{ color: 'var(--success)' }} />
           <p style={{ color: 'var(--text-muted)' }}>No client issues detected</p>
@@ -2053,7 +2150,14 @@ export default function AnalysisPage() {
         <DevicesTab aps={result.aps} />
       )}
       {tab === 'clients' && (
-        <ClientsTab clients={result.clients} journeys={result.clientJourneys} />
+        <ClientsTab
+          clients={result.clients}
+          journeys={result.clientJourneys}
+          signalDistribution={result.signalDistribution}
+          clientCapabilities={result.clientCapabilities}
+          manufacturers={result.manufacturers}
+          totalClients={result.clientCount}
+        />
       )}
       {tab === 'channels' && (
         <ChannelsTab aps={result.aps} channelUsage={result.channelUsage} />

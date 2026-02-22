@@ -64,6 +64,7 @@ export interface ApAnalysis {
   name: string;
   model: string;
   isMesh: boolean;
+  isOffline: boolean;
   channel: number;
   band: string;
   txPower: number;

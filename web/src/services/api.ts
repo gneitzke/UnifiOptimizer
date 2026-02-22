@@ -257,6 +257,7 @@ function mapAnalysisResult(
       name: (a.name ?? 'Unknown') as string,
       model: (a.model ?? '') as string,
       isMesh: !!a.is_mesh,
+      isOffline: ((a.state ?? 1) as number) === 0,
       channel: firstRadio?.channel ?? 0,
       band: firstRadio?.band ?? '',
       txPower: firstRadio?.txPower ?? 0,
