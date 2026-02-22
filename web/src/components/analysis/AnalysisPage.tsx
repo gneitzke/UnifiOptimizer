@@ -1,4 +1,4 @@
-import {
+import React, {
   useState,
   useEffect,
   useCallback,
@@ -1321,8 +1321,8 @@ function ClientsTab({
                 const isExpanded = expanded === j.mac;
                 const behaviorColor = BEHAVIOR_COLORS[j.behavior] ?? 'var(--text-muted)';
                 return (
-                  <>
-                    <tr key={j.mac}
+                  <React.Fragment key={j.mac}>
+                    <tr
                       className="cursor-pointer hover:opacity-80 transition-opacity"
                       style={{ borderBottom: '1px solid var(--border)' }}
                       onClick={() => setExpanded(isExpanded ? null : j.mac)}>
@@ -1389,7 +1389,7 @@ function ClientsTab({
                         </td>
                       </tr>
                     )}
-                  </>
+                  </React.Fragment>
                 );
               })}
             </tbody>
