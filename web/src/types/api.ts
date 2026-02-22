@@ -105,6 +105,7 @@ export interface AnalysisJob {
   jobId: string;
   status: JobStatus;
   progress: number;
+  message: string;
   startedAt: string;
   completedAt?: string;
   error?: string;
@@ -118,10 +119,24 @@ export interface AnalysisResult {
   clients: ClientAnalysis[];
   signalDistribution: SignalDistribution;
   channelUsage: Record<string, string[]>;
+  topology: TopologyNode[];
   apCount: number;
   clientCount: number;
   summary: string;
   findings: Finding[];
+  timeline: EventTimeline;
+  componentScores: ComponentScores;
+  clientCapabilities: ClientCapabilities;
+  manufacturers: ManufacturerStats[];
+}
+
+export interface TopologyNode {
+  name: string;
+  mac: string;
+  type: 'switch' | 'ap' | 'mesh';
+  parentName: string;
+  clients: number;
+  model: string;
 }
 
 export interface Finding {
@@ -151,6 +166,35 @@ export interface ChangeResult {
   appliedAt: string;
   revertible: boolean;
   error?: string;
+}
+
+export interface EventTimeline {
+  satisfactionByHour: Record<string, number>;
+  categories: Record<string, number[]>;
+  hours: string[];
+  apEvents: Record<string, Record<string, number>>;
+  totals: Record<string, number>;
+  lookbackDays: number;
+}
+
+export interface ComponentScores {
+  rfHealth: number;
+  clientHealth: number;
+  infrastructure: number;
+  security: number;
+}
+
+export interface ClientCapabilities {
+  wifiStandards: Record<string, number>;
+  channelWidths: Record<string, number>;
+  spatialStreams: Record<string, number>;
+}
+
+export interface ManufacturerStats {
+  name: string;
+  count: number;
+  type: string;
+  icon: string;
 }
 
 export interface ChangeHistoryEntry {

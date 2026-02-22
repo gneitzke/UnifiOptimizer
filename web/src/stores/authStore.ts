@@ -58,6 +58,7 @@ export const useAuthStore = create<AuthState>()(
       set({
         token: null,
         isAuthenticated: false,
+        isLoading: false,
         host: '',
         username: '',
         site: '',

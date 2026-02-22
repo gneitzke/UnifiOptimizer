@@ -14,6 +14,11 @@ import type {
   SignalDistribution,
   ClientAnalysis,
   Finding,
+  TopologyNode,
+  EventTimeline,
+  ComponentScores,
+  ClientCapabilities,
+  ManufacturerStats,
 } from '../types/api';
 
 const BASE = import.meta.env.VITE_API_URL ?? '';
@@ -124,6 +129,7 @@ export async function logout(): Promise<void> {
   ).catch(() => {});
   setToken(null);
   clearStoredCreds();
+  sessionStorage.removeItem('unifi_last_analysis');
 }
 
 export async function validate(): Promise<AuthStatus> {
@@ -166,10 +172,11 @@ function mapJob(raw: Record<string, unknown>): AnalysisJob {
   return {
     jobId: (raw.job_id ?? raw.jobId) as string,
     status: raw.status as AnalysisJob['status'],
-    progress: raw.progress as number,
+    progress: (raw.progress ?? 0) as number,
+    message: (raw.message ?? '') as string,
     startedAt: (raw.started_at as string) ?? '',
     completedAt: raw.completed_at as string | undefined,
-    error: (raw.message as string) || (raw.error as string) || undefined,
+    error: (raw.error as string) || undefined,
   };
 }
 
@@ -292,6 +299,69 @@ function mapAnalysisResult(
     };
   });
 
+  // Extract topology from full device data
+  const rawDevices = (fullAnalysis.devices ?? []) as Record<string, unknown>[];
+  const topology: TopologyNode[] = rawDevices
+    .filter((dev) => {
+      const dtype = (dev.type ?? '') as string;
+      return dtype === 'uap' || dtype === 'usw';
+    })
+    .map((dev) => {
+      const uplink = (dev.uplink ?? {}) as Record<string, unknown>;
+      const uplinkType = (uplink.type ?? '') as string;
+      const devType = (dev.type ?? '') as string;
+      let nodeType: TopologyNode['type'] = 'ap';
+      if (devType === 'usw') nodeType = 'switch';
+      else if (uplinkType === 'wireless') nodeType = 'mesh';
+      return {
+        name: (dev.name ?? 'Unknown') as string,
+        mac: (dev.mac ?? '') as string,
+        type: nodeType,
+        parentName: (uplink.uplink_device_name ?? '') as string,
+        clients: (dev.num_sta ?? 0) as number,
+        model: (dev.model ?? '') as string,
+      };
+    });
+
+  // Extract event timeline
+  const timelineRaw = (fullAnalysis.event_timeline ?? {}) as Record<string, unknown>;
+  const timeline: EventTimeline = {
+    satisfactionByHour: (timelineRaw.satisfaction_by_hour ?? {}) as Record<string, number>,
+    categories: (timelineRaw.categories ?? {}) as Record<string, number[]>,
+    hours: (timelineRaw.hours ?? []) as string[],
+    apEvents: (timelineRaw.ap_events ?? {}) as Record<string, Record<string, number>>,
+    totals: (timelineRaw.totals ?? {}) as Record<string, number>,
+    lookbackDays: (timelineRaw.lookback_days ?? 0) as number,
+  };
+
+  // Extract health analysis component scores
+  const healthAnalysisRaw = (fullAnalysis.health_analysis ?? {}) as Record<string, unknown>;
+  const compScoresRaw = (healthAnalysisRaw.component_scores ?? {}) as Record<string, unknown>;
+  const componentScores: ComponentScores = {
+    rfHealth: (compScoresRaw.rf_health ?? 0) as number,
+    clientHealth: (compScoresRaw.client_health ?? 0) as number,
+    infrastructure: (compScoresRaw.infrastructure ?? 0) as number,
+    security: (compScoresRaw.security ?? 0) as number,
+  };
+
+  // Extract client capabilities
+  const capRaw = (fullAnalysis.client_capabilities ?? {}) as Record<string, unknown>;
+  const clientCapabilities: ClientCapabilities = {
+    wifiStandards: (capRaw.capability_distribution ?? {}) as Record<string, number>,
+    channelWidths: (capRaw.channel_width ?? {}) as Record<string, number>,
+    spatialStreams: (capRaw.spatial_streams ?? {}) as Record<string, number>,
+  };
+
+  // Extract manufacturer stats
+  const mfgRaw = (fullAnalysis.manufacturer_analysis ?? {}) as Record<string, unknown>;
+  const mfgStats = (mfgRaw.manufacturer_stats ?? {}) as Record<string, Record<string, unknown>>;
+  const manufacturers: ManufacturerStats[] = Object.entries(mfgStats).map(([name, info]) => ({
+    name,
+    count: (info.count ?? 0) as number,
+    type: (info.type ?? '') as string,
+    icon: (info.icon ?? '') as string,
+  }));
+
   return {
     jobId: (raw.job_id ?? '') as string,
     timestamp: new Date().toISOString(),
@@ -300,10 +370,15 @@ function mapAnalysisResult(
     clients,
     signalDistribution,
     channelUsage,
+    topology,
     apCount: aps.length || (apRaw.total_aps as number ?? 0),
     clientCount: (clientRaw.total_clients as number) ?? clients.length,
     summary: `${aps.length} APs, ${clientRaw.total_clients ?? clients.length} clients, ${findings.length} recommendations`,
     findings,
+    timeline,
+    componentScores,
+    clientCapabilities,
+    manufacturers,
   };
 }
 

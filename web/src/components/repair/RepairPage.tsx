@@ -356,10 +356,14 @@ export default function RepairPage() {
     const jobId = params.get('jobId');
     if (!jobId) return;
     const ids = [...selectedIds].map(Number);
-    const { previews: p } =
-      await api.previewRepair(jobId, ids);
-    setPreviews(p);
-    setStep(1);
+    try {
+      const { previews: p } =
+        await api.previewRepair(jobId, ids);
+      setPreviews(p);
+      setStep(1);
+    } catch (err) {
+      console.error('Failed to fetch previews:', err);
+    }
   }
 
   /* Apply changes */
@@ -414,15 +418,17 @@ export default function RepairPage() {
     entry: ChangeHistoryEntry,
   ) {
     setRevertTarget(null);
-    // Use realChangeId if available (for recent applies), otherwise changeId (from history)
-    // The history API returns change_id which is mapped to changeId in mapChangeEntry
     const idToRevert = (entry as any).realChangeId || entry.changeId;
     if (!idToRevert) {
        console.error("Missing change ID for revert");
        return;
     }
-    await api.revertChange(idToRevert);
-    loadHistory();
+    try {
+      await api.revertChange(idToRevert);
+      loadHistory();
+    } catch (err) {
+      console.error('Failed to revert change:', err);
+    }
   }
 
   /* ── Transition wrapper ───────────────── */

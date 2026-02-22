@@ -8,19 +8,14 @@ import {
   useNavigate,
 } from 'react-router-dom';
 import {
-  PieChart,
-  Pie,
-  Cell,
-  Tooltip,
-  ResponsiveContainer,
-} from 'recharts';
-import {
   Users,
   Radio,
   AlertTriangle,
   CheckCircle2,
   ArrowUpDown,
   Eye,
+  RefreshCw,
+  Loader2,
 } from 'lucide-react';
 import type {
   AnalysisJob,
@@ -28,6 +23,11 @@ import type {
   ApAnalysis,
   ClientAnalysis,
   Finding,
+  TopologyNode,
+  EventTimeline,
+  ComponentScores,
+  ClientCapabilities,
+  ManufacturerStats,
 } from '../../types/api';
 import * as api from '../../services/api';
 import StatCard from '../dashboard/StatCard';
@@ -51,12 +51,6 @@ const TABS: { key: Tab; label: string }[] = [
 
 /* ── Chart Colors ──────────────────────────────── */
 
-const PIE_COLORS = [
-  '#0088ff', '#00c48f',
-  '#ffb800', '#ff4757',
-  '#a855f7',
-];
-
 const SIGNAL_COLORS = [
   '#00c48f', // Excellent - green
   '#0088ff', // Good - blue
@@ -70,6 +64,58 @@ const BAND_COLORS: Record<string, string> = {
   '5GHz': '#0088ff',
   '6GHz': '#a855f7',
 };
+
+/* ── UniFi Model Friendly Names ────────────────── */
+const MODEL_NAMES: Record<string, string> = {
+  // Access Points
+  U7PG2: 'AC Pro Gen2',
+  U7MP: 'AC Mesh Pro',
+  U7MSH: 'AC Mesh',
+  U7LR: 'AC Long-Range',
+  U7LT: 'AC Lite',
+  U7P: 'AC Pro',
+  U7E: 'AC',
+  U7O: 'AC Outdoor',
+  U7Ev2: 'AC v2',
+  UAL6: 'U6 Lite',
+  UALR6: 'U6 Long-Range',
+  UAP6: 'U6 Pro',
+  UAE6: 'U6 Enterprise',
+  UAPA6A9: 'U6 Pro Max',
+  U6M: 'U6 Mesh',
+  UAM6: 'U6 Mesh',
+  U6E: 'U6 Enterprise',
+  U6IW: 'U6 In-Wall',
+  U6EW: 'U6 Enterprise IW',
+  U7IW: 'AC In-Wall',
+  U7IWP: 'AC In-Wall Pro',
+  // Switches
+  US16P150: 'Switch 16 PoE 150W',
+  US8P150: 'Switch 8 PoE 150W',
+  US8P60: 'Switch 8 PoE 60W',
+  US24P250: 'Switch 24 PoE 250W',
+  US48P750: 'Switch 48 PoE 750W',
+  USMINI: 'Flex Mini',
+  USL8LP: 'Lite 8 PoE',
+  USL16LP: 'Lite 16 PoE',
+  USPPD: 'Switch Pro 24 PoE',
+  // Gateways
+  UGW3: 'Security Gateway 3P',
+  UGW4: 'Security Gateway 4P',
+  UDMPRO: 'Dream Machine Pro',
+  UDM: 'Dream Machine',
+  UDMSE: 'Dream Machine SE',
+  UDR: 'Dream Router',
+  UXGPRO: 'Next-Gen Gateway Pro',
+  UCK: 'Cloud Key',
+  UCKP: 'Cloud Key Plus',
+  UCKGEN2: 'Cloud Key Gen2',
+  UCKGEN2P: 'Cloud Key Gen2+',
+};
+
+function friendlyModel(code: string): string {
+  return MODEL_NAMES[code] ?? code;
+}
 
 /* ── Skeleton ──────────────────────────────────── */
 
@@ -167,6 +213,266 @@ function HealthBar({
   );
 }
 
+/* ── Network Topology DAG ──────────────────────── */
+
+const NODE_COLORS: Record<TopologyNode['type'], string> = {
+  switch: '#0088ff',
+  ap: '#00c48f',
+  mesh: '#ffb800',
+};
+
+const NODE_ICONS: Record<TopologyNode['type'], string> = {
+  switch: '⬡',
+  ap: '◉',
+  mesh: '◎',
+};
+
+function NetworkDAG({
+  topology,
+}: {
+  topology: TopologyNode[];
+}) {
+  if (topology.length === 0) return null;
+
+  const switches = topology.filter(
+    (n) => n.type === 'switch',
+  );
+  const wiredAps = topology.filter(
+    (n) => n.type === 'ap',
+  );
+  const meshAps = topology.filter(
+    (n) => n.type === 'mesh',
+  );
+
+  const meshByParent = new Map<string, TopologyNode[]>();
+  meshAps.forEach((m) => {
+    const list = meshByParent.get(m.parentName) ?? [];
+    list.push(m);
+    meshByParent.set(m.parentName, list);
+  });
+
+  // Build ordered tree for layout
+  type TreeNode = {
+    node: TopologyNode;
+    children: TreeNode[];
+  };
+
+  const roots: TreeNode[] = switches.map((sw) => {
+    const children: TreeNode[] = wiredAps
+      .filter((a) => a.parentName === sw.name)
+      .sort((a, b) => b.clients - a.clients)
+      .map((ap) => ({
+        node: ap,
+        children: (meshByParent.get(ap.name) ?? [])
+          .sort((a, b) => b.clients - a.clients)
+          .map((m) => ({ node: m, children: [] })),
+      }));
+    // Also add mesh APs that connect directly to switch
+    meshAps
+      .filter(
+        (m) =>
+          m.parentName === sw.name ||
+          (!m.parentName &&
+            !wiredAps.some(
+              (a) => a.name === m.parentName,
+            )),
+      )
+      .forEach((m) =>
+        children.push({
+          node: m,
+          children: [],
+        }),
+      );
+    return { node: sw, children };
+  });
+
+  // Orphan wired APs
+  const orphanAps = wiredAps.filter(
+    (a) =>
+      !switches.some(
+        (s) => s.name === a.parentName,
+      ),
+  );
+  orphanAps.forEach((ap) =>
+    roots.push({
+      node: ap,
+      children: (meshByParent.get(ap.name) ?? []).map(
+        (m) => ({ node: m, children: [] }),
+      ),
+    }),
+  );
+
+  function NodeCard({
+    node,
+    depth,
+  }: {
+    node: TopologyNode;
+    depth: number;
+  }) {
+    const color = NODE_COLORS[node.type];
+    return (
+      <div
+        className="flex items-center gap-2.5 px-3
+          py-2 rounded-lg"
+        style={{
+          background: `${color}0c`,
+          border: `1px solid ${color}30`,
+          marginLeft: depth * 32,
+        }}
+      >
+        <div
+          className="w-8 h-8 rounded-lg
+            flex items-center justify-center
+            text-sm shrink-0"
+          style={{
+            background: `${color}20`,
+            color,
+          }}
+        >
+          {NODE_ICONS[node.type]}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span
+              className="text-sm font-semibold
+                truncate"
+              style={{ color: 'var(--text)' }}
+            >
+              {node.name}
+            </span>
+            <span
+              className="text-[10px] px-1.5
+                py-0.5 rounded font-medium
+                shrink-0"
+              style={{
+                background: `${color}18`,
+                color,
+              }}
+            >
+              {node.type === 'switch'
+                ? 'SWITCH'
+                : node.type === 'mesh'
+                  ? 'MESH'
+                  : 'WIRED'}
+            </span>
+          </div>
+          <div
+            className="text-[11px] flex
+              items-center gap-3 mt-0.5"
+            style={{
+              color: 'var(--text-muted)',
+            }}
+          >
+            <span>
+              {friendlyModel(node.model)}
+            </span>
+            {node.clients > 0 && (
+              <span>
+                {node.clients}{' '}
+                {node.clients === 1
+                  ? 'client'
+                  : 'clients'}
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  function renderTree(
+    tree: TreeNode,
+    depth: number,
+  ) {
+    return (
+      <div key={tree.node.mac || tree.node.name}>
+        <NodeCard
+          node={tree.node}
+          depth={depth}
+        />
+        {tree.children.length > 0 && (
+          <div className="relative mt-1.5 space-y-1.5">
+            {/* Vertical connector line */}
+            <div
+              className="absolute top-0 bottom-0"
+              style={{
+                left: depth * 32 + 19,
+                width: 1,
+                background: 'var(--border)',
+              }}
+            />
+            {tree.children.map((child) => (
+              <div
+                key={child.node.mac || child.node.name}
+                className="relative"
+              >
+                {/* Horizontal connector */}
+                <div
+                  className="absolute"
+                  style={{
+                    left: depth * 32 + 19,
+                    top: 20,
+                    width: 12,
+                    height: 1,
+                    background: 'var(--border)',
+                  }}
+                />
+                {renderTree(child, depth + 1)}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="glass-card-solid p-6">
+      <h3
+        className="text-sm font-semibold mb-4"
+        style={{ color: 'var(--text)' }}
+      >
+        Network Topology
+      </h3>
+      <div className="space-y-2">
+        {roots.map((root) =>
+          renderTree(root, 0),
+        )}
+      </div>
+      {/* Legend */}
+      <div
+        className="flex gap-5 mt-5 pt-3"
+        style={{
+          borderTop: '1px solid var(--border)',
+        }}
+      >
+        {(
+          [
+            ['switch', 'Switch'],
+            ['ap', 'Wired AP'],
+            ['mesh', 'Mesh AP'],
+          ] as const
+        ).map(([t, label]) => (
+          <div
+            key={t}
+            className="flex items-center gap-1.5
+              text-xs"
+            style={{ color: 'var(--text-muted)' }}
+          >
+            <span
+              className="w-2.5 h-2.5 rounded-sm"
+              style={{
+                background: NODE_COLORS[t],
+              }}
+            />
+            {label}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /* ── Overview Tab ──────────────────────────────── */
 
 function OverviewTab({
@@ -228,8 +534,18 @@ function OverviewTab({
             value={health.latency}
             max={health.latencyMax}
           />
+          {(health.issuesScore !== undefined) && (
+            <HealthBar
+              label="Issues"
+              value={health.issuesScore}
+              max={10}
+            />
+          )}
         </div>
       </div>
+
+      {/* Network Topology */}
+      <NetworkDAG topology={result.topology} />
 
       {/* Charts Row */}
       <div
@@ -238,73 +554,201 @@ function OverviewTab({
       >
         <div className="glass-card-solid p-6">
           <h3
-            className="text-sm font-semibold mb-2"
+            className="text-sm font-semibold mb-4"
             style={{ color: 'var(--text)' }}
           >
             Signal Distribution
           </h3>
-          <ResponsiveContainer
-            width="100%"
-            height={200}
-          >
-            <PieChart>
-              <Pie
-                data={signalBuckets.filter(
-                  (s) => s.value > 0,
-                )}
-                dataKey="value"
-                nameKey="name"
-                innerRadius={50}
-                outerRadius={80}
-                paddingAngle={3}
-              >
-                {signalBuckets.map((_, i) => (
-                  <Cell
-                    key={i}
-                    fill={SIGNAL_COLORS[i]}
-                  />
-                ))}
-              </Pie>
-              <Tooltip />
-            </PieChart>
-          </ResponsiveContainer>
+          {signalBuckets.filter((s) => s.value > 0)
+            .length > 0 ? (
+            <div className="space-y-2">
+              {signalBuckets.map((s, i) => {
+                if (s.value === 0) return null;
+                const total = signalBuckets.reduce(
+                  (n, b) => n + b.value, 0,
+                );
+                const pct = total > 0
+                  ? (s.value / total) * 100
+                  : 0;
+                return (
+                  <div
+                    key={s.name}
+                    className="flex items-center gap-3"
+                  >
+                    <span
+                      className="text-xs w-16
+                        shrink-0 font-medium"
+                      style={{
+                        color: SIGNAL_COLORS[i],
+                      }}
+                    >
+                      {s.name}
+                    </span>
+                    <div
+                      className="flex-1 h-4
+                        rounded-full overflow-hidden"
+                      style={{
+                        background:
+                          'var(--bg-elevated)',
+                      }}
+                    >
+                      <div
+                        className="h-full
+                          rounded-full"
+                        style={{
+                          width: `${pct}%`,
+                          background:
+                            SIGNAL_COLORS[i],
+                          transition:
+                            'width 0.6s ease',
+                        }}
+                      />
+                    </div>
+                    <span
+                      className="text-xs w-10
+                        text-right shrink-0
+                        font-semibold"
+                      style={{
+                        color: 'var(--text)',
+                      }}
+                    >
+                      {s.value}
+                    </span>
+                  </div>
+                );
+              })}
+              {sd.wired > 0 && (
+                <div
+                  className="flex items-center gap-3"
+                >
+                  <span
+                    className="text-xs w-16
+                      shrink-0 font-medium"
+                    style={{
+                      color: 'var(--text-muted)',
+                    }}
+                  >
+                    Wired
+                  </span>
+                  <div
+                    className="flex-1 h-4
+                      rounded-full overflow-hidden"
+                    style={{
+                      background:
+                        'var(--bg-elevated)',
+                    }}
+                  >
+                    <div
+                      className="h-full
+                        rounded-full"
+                      style={{
+                        width: `${(sd.wired / signalBuckets.reduce((n, b) => n + b.value, 0)) * 100}%`,
+                        background:
+                          'var(--text-muted)',
+                        transition:
+                          'width 0.6s ease',
+                      }}
+                    />
+                  </div>
+                  <span
+                    className="text-xs w-10
+                      text-right shrink-0
+                      font-semibold"
+                    style={{
+                      color: 'var(--text)',
+                    }}
+                  >
+                    {sd.wired}
+                  </span>
+                </div>
+              )}
+            </div>
+          ) : (
+            <p
+              className="text-sm"
+              style={{
+                color: 'var(--text-muted)',
+              }}
+            >
+              No signal data available
+            </p>
+          )}
         </div>
 
         <div className="glass-card-solid p-6">
           <h3
-            className="text-sm font-semibold mb-2"
+            className="text-sm font-semibold mb-4"
             style={{ color: 'var(--text)' }}
           >
             Band Usage
           </h3>
-          <ResponsiveContainer
-            width="100%"
-            height={200}
-          >
-            <PieChart>
-              <Pie
-                data={bandData}
-                dataKey="value"
-                nameKey="name"
-                innerRadius={50}
-                outerRadius={80}
-                paddingAngle={3}
-              >
-                {bandData.map((d, i) => (
-                  <Cell
-                    key={i}
-                    fill={
-                      BAND_COLORS[d.name] ??
-                      PIE_COLORS[
-                        i % PIE_COLORS.length
-                      ]
-                    }
-                  />
-                ))}
-              </Pie>
-              <Tooltip />
-            </PieChart>
-          </ResponsiveContainer>
+          {bandData.length > 0 ? (
+            <div className="space-y-2">
+              {bandData.map((d) => {
+                const total = bandData.reduce(
+                  (n, b) => n + b.value, 0,
+                );
+                const pct = total > 0
+                  ? (d.value / total) * 100
+                  : 0;
+                const color =
+                  BAND_COLORS[d.name] ??
+                  'var(--primary)';
+                return (
+                  <div
+                    key={d.name}
+                    className="flex items-center gap-3"
+                  >
+                    <span
+                      className="text-xs w-16
+                        shrink-0 font-medium"
+                      style={{ color }}
+                    >
+                      {d.name}
+                    </span>
+                    <div
+                      className="flex-1 h-4
+                        rounded-full overflow-hidden"
+                      style={{
+                        background:
+                          'var(--bg-elevated)',
+                      }}
+                    >
+                      <div
+                        className="h-full
+                          rounded-full"
+                        style={{
+                          width: `${pct}%`,
+                          background: color,
+                          transition:
+                            'width 0.6s ease',
+                        }}
+                      />
+                    </div>
+                    <span
+                      className="text-xs w-10
+                        text-right shrink-0
+                        font-semibold"
+                      style={{
+                        color: 'var(--text)',
+                      }}
+                    >
+                      {d.value}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <p
+              className="text-sm"
+              style={{
+                color: 'var(--text-muted)',
+              }}
+            >
+              No band data available
+            </p>
+          )}
         </div>
       </div>
 
@@ -341,6 +785,317 @@ function OverviewTab({
           iconColor="var(--warning)"
         />
       </div>
+
+      {/* Component Scores */}
+      <ComponentScoresCard scores={result.componentScores} />
+
+      {/* Client Capabilities */}
+      <ClientCapabilitiesCard caps={result.clientCapabilities} />
+
+      {/* Manufacturer Breakdown */}
+      <ManufacturerCard manufacturers={result.manufacturers} />
+
+      {/* Satisfaction Trend */}
+      <SatisfactionTrend timeline={result.timeline} />
+
+      {/* Event Summary */}
+      <EventSummary timeline={result.timeline} />
+
+      {/* Per-AP Events */}
+      <ApEventsCard timeline={result.timeline} />
+    </div>
+  );
+}
+
+/* ── Component Scores Card ──────────────────────── */
+
+const COMP_LABELS: Record<string, string> = {
+  rfHealth: 'RF Health',
+  clientHealth: 'Client Health',
+  infrastructure: 'Infrastructure',
+  security: 'Security',
+};
+
+const COMP_COLORS = ['#0088ff', '#00c48f', '#a855f7', '#ff8c00'];
+
+function ComponentScoresCard({ scores }: { scores: ComponentScores }) {
+  const entries = Object.entries(scores).filter(([, v]) => v > 0);
+  if (entries.length === 0) return null;
+  return (
+    <div className="glass-card-solid p-6">
+      <h3 className="text-sm font-semibold mb-4" style={{ color: 'var(--text)' }}>
+        Health Components
+      </h3>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+        {entries.map(([key, val], i) => {
+          const color = COMP_COLORS[i % COMP_COLORS.length];
+          return (
+            <div key={key} className="text-center">
+              <div className="relative w-16 h-16 mx-auto mb-2">
+                <svg viewBox="0 0 36 36" className="w-full h-full">
+                  <circle cx="18" cy="18" r="15.5" fill="none" stroke="var(--bg-elevated)" strokeWidth="3" />
+                  <circle cx="18" cy="18" r="15.5" fill="none" stroke={color} strokeWidth="3"
+                    strokeLinecap="round" strokeDasharray={`${val * 0.975} 100`}
+                    transform="rotate(-90 18 18)" style={{ transition: 'stroke-dasharray 1s ease' }} />
+                </svg>
+                <span className="absolute inset-0 flex items-center justify-center text-sm font-bold"
+                  style={{ color }}>{val}</span>
+              </div>
+              <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                {COMP_LABELS[key] ?? key}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ── Client Capabilities Card ──────────────────── */
+
+const WIFI_COLORS: Record<string, string> = {
+  '802.11ax': '#00c48f',
+  '802.11ac': '#0088ff',
+  '802.11n': '#ffb800',
+  'legacy': '#ff4757',
+};
+
+function ClientCapabilitiesCard({ caps }: { caps: ClientCapabilities }) {
+  const hasStandards = Object.values(caps.wifiStandards).some((v) => v > 0);
+  const hasWidths = Object.values(caps.channelWidths).some((v) => v > 0);
+  const hasStreams = Object.values(caps.spatialStreams).some((v) => v > 0);
+  if (!hasStandards && !hasWidths && !hasStreams) return null;
+
+  function DistBar({ items, colors }: { items: Record<string, number>; colors?: Record<string, string> }) {
+    const total = Object.values(items).reduce((a, b) => a + b, 0);
+    if (total === 0) return null;
+    return (
+      <div className="space-y-2">
+        {Object.entries(items).filter(([, v]) => v > 0).sort(([, a], [, b]) => b - a).map(([name, val]) => {
+          const pct = (val / total) * 100;
+          const color = colors?.[name] ?? 'var(--primary)';
+          return (
+            <div key={name} className="flex items-center gap-3">
+              <span className="text-xs w-16 shrink-0 font-medium" style={{ color }}>{name}</span>
+              <div className="flex-1 h-4 rounded-full overflow-hidden" style={{ background: 'var(--bg-elevated)' }}>
+                <div className="h-full rounded-full" style={{ width: `${pct}%`, background: color, transition: 'width 0.6s ease' }} />
+              </div>
+              <span className="text-xs w-8 text-right shrink-0 font-semibold" style={{ color: 'var(--text)' }}>{val}</span>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
+  return (
+    <div className="glass-card-solid p-6">
+      <h3 className="text-sm font-semibold mb-4" style={{ color: 'var(--text)' }}>Client Capabilities</h3>
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+        {hasStandards && (
+          <div>
+            <h4 className="text-xs font-medium mb-3" style={{ color: 'var(--text-muted)' }}>WiFi Standard</h4>
+            <DistBar items={caps.wifiStandards} colors={WIFI_COLORS} />
+          </div>
+        )}
+        {hasWidths && (
+          <div>
+            <h4 className="text-xs font-medium mb-3" style={{ color: 'var(--text-muted)' }}>Channel Width</h4>
+            <DistBar items={caps.channelWidths} />
+          </div>
+        )}
+        {hasStreams && (
+          <div>
+            <h4 className="text-xs font-medium mb-3" style={{ color: 'var(--text-muted)' }}>Spatial Streams</h4>
+            <DistBar items={caps.spatialStreams} />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ── Manufacturer Card ─────────────────────────── */
+
+function ManufacturerCard({ manufacturers }: { manufacturers: ManufacturerStats[] }) {
+  if (manufacturers.length === 0) return null;
+  const sorted = [...manufacturers].sort((a, b) => b.count - a.count);
+  const max = sorted[0]?.count ?? 1;
+  return (
+    <div className="glass-card-solid p-6">
+      <h3 className="text-sm font-semibold mb-4" style={{ color: 'var(--text)' }}>Device Manufacturers</h3>
+      <div className="space-y-2">
+        {sorted.map((m) => (
+          <div key={m.name} className="flex items-center gap-3">
+            <span className="text-sm shrink-0">{m.icon || '📡'}</span>
+            <span className="text-xs w-20 shrink-0 font-medium truncate" style={{ color: 'var(--text)' }}>{m.name}</span>
+            <div className="flex-1 h-4 rounded-full overflow-hidden" style={{ background: 'var(--bg-elevated)' }}>
+              <div className="h-full rounded-full" style={{
+                width: `${(m.count / max) * 100}%`,
+                background: 'var(--primary)',
+                transition: 'width 0.6s ease',
+              }} />
+            </div>
+            <span className="text-xs w-8 text-right shrink-0 font-semibold" style={{ color: 'var(--text)' }}>{m.count}</span>
+            <span className="text-[10px] px-1.5 py-0.5 rounded font-medium shrink-0" style={{
+              background: 'rgba(0,136,255,0.1)', color: 'var(--text-muted)',
+            }}>{m.type || 'unknown'}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ── Satisfaction Trend ────────────────────────── */
+
+function SatisfactionTrend({ timeline }: { timeline: EventTimeline }) {
+  const entries = Object.entries(timeline.satisfactionByHour);
+  if (entries.length === 0) return null;
+
+  // Downsample to ~50 points for display
+  const step = Math.max(1, Math.floor(entries.length / 50));
+  const sampled = entries.filter((_, i) => i % step === 0 || i === entries.length - 1);
+  const values = sampled.map(([, v]) => v);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+
+  // SVG sparkline
+  const w = 600;
+  const h = 100;
+  const points = sampled.map(([, v], i) => {
+    const x = (i / (sampled.length - 1)) * w;
+    const y = h - ((v - min) / range) * (h - 10) - 5;
+    return `${x},${y}`;
+  }).join(' ');
+
+  const firstDate = sampled[0]?.[0]?.split(' ')[0] ?? '';
+  const lastDate = sampled[sampled.length - 1]?.[0]?.split(' ')[0] ?? '';
+  const avgSat = (values.reduce((a, b) => a + b, 0) / values.length).toFixed(1);
+
+  return (
+    <div className="glass-card-solid p-6">
+      <div className="flex items-center justify-between mb-4">
+        <h3 className="text-sm font-semibold" style={{ color: 'var(--text)' }}>
+          Satisfaction Trend
+        </h3>
+        <span className="text-xs font-medium px-2 py-1 rounded" style={{
+          background: 'rgba(0,196,143,0.1)', color: 'var(--success)',
+        }}>Avg: {avgSat}%</span>
+      </div>
+      <svg viewBox={`0 0 ${w} ${h}`} className="w-full" style={{ height: 120 }}>
+        <polyline fill="none" stroke="var(--primary)" strokeWidth="2" points={points} />
+        {/* Fill area */}
+        <polygon fill="rgba(0,136,255,0.08)" points={`0,${h} ${points} ${w},${h}`} />
+      </svg>
+      <div className="flex justify-between text-[10px] mt-1" style={{ color: 'var(--text-muted)' }}>
+        <span>{firstDate}</span>
+        <span>{lastDate}</span>
+      </div>
+    </div>
+  );
+}
+
+/* ── Event Summary ─────────────────────────────── */
+
+const EVENT_COLORS: Record<string, string> = {
+  roaming: '#0088ff',
+  device_offline: '#ff4757',
+  device_restart: '#ff8c00',
+  dfs_radar: '#a855f7',
+  wifi_quality: '#ffb800',
+};
+
+const EVENT_LABELS: Record<string, string> = {
+  roaming: 'Roaming',
+  device_offline: 'Device Offline',
+  device_restart: 'Device Restart',
+  dfs_radar: 'DFS Radar',
+  wifi_quality: 'WiFi Quality',
+};
+
+function EventSummary({ timeline }: { timeline: EventTimeline }) {
+  const entries = Object.entries(timeline.totals).filter(([, v]) => v > 0).sort(([, a], [, b]) => b - a);
+  if (entries.length === 0) return null;
+  const max = entries[0]?.[1] ?? 1;
+  return (
+    <div className="glass-card-solid p-6">
+      <h3 className="text-sm font-semibold mb-4" style={{ color: 'var(--text)' }}>
+        Event Summary {timeline.lookbackDays > 0 && <span className="font-normal text-xs" style={{ color: 'var(--text-muted)' }}>({timeline.lookbackDays}d lookback)</span>}
+      </h3>
+      <div className="space-y-2">
+        {entries.map(([name, val]) => {
+          const color = EVENT_COLORS[name] ?? 'var(--primary)';
+          return (
+            <div key={name} className="flex items-center gap-3">
+              <span className="text-xs w-28 shrink-0 font-medium" style={{ color }}>{EVENT_LABELS[name] ?? name}</span>
+              <div className="flex-1 h-4 rounded-full overflow-hidden" style={{ background: 'var(--bg-elevated)' }}>
+                <div className="h-full rounded-full" style={{
+                  width: `${(val / max) * 100}%`, background: color, transition: 'width 0.6s ease',
+                }} />
+              </div>
+              <span className="text-xs w-14 text-right shrink-0 font-semibold" style={{ color: 'var(--text)' }}>
+                {val >= 1000 ? `${(val / 1000).toFixed(1)}k` : val}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ── Per-AP Events Card ────────────────────────── */
+
+function ApEventsCard({ timeline }: { timeline: EventTimeline }) {
+  const apEntries = Object.entries(timeline.apEvents);
+  if (apEntries.length === 0) return null;
+
+  // Sort by total events descending
+  const sorted = apEntries.map(([name, events]) => ({
+    name,
+    events,
+    total: Object.values(events).reduce((a, b) => a + b, 0),
+  })).sort((a, b) => b.total - a.total);
+
+  const max = sorted[0]?.total ?? 1;
+
+  return (
+    <div className="glass-card-solid p-6">
+      <h3 className="text-sm font-semibold mb-4" style={{ color: 'var(--text)' }}>Events by Access Point</h3>
+      <div className="space-y-3">
+        {sorted.map((ap) => (
+          <div key={ap.name}>
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-xs font-medium" style={{ color: 'var(--text)' }}>{ap.name}</span>
+              <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                {ap.total >= 1000 ? `${(ap.total / 1000).toFixed(1)}k` : ap.total} events
+              </span>
+            </div>
+            {/* Stacked bar */}
+            <div className="h-4 rounded-full overflow-hidden flex" style={{ background: 'var(--bg-elevated)', width: `${Math.max((ap.total / max) * 100, 15)}%` }}>
+              {Object.entries(ap.events).filter(([, v]) => v > 0).sort(([, a], [, b]) => b - a).map(([evtName, evtVal]) => (
+                <div key={evtName} style={{
+                  width: `${(evtVal / ap.total) * 100}%`,
+                  background: EVENT_COLORS[evtName] ?? 'var(--primary)',
+                  minWidth: 2,
+                }} title={`${EVENT_LABELS[evtName] ?? evtName}: ${evtVal}`} />
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+      {/* Legend */}
+      <div className="flex flex-wrap gap-4 mt-4 pt-3" style={{ borderTop: '1px solid var(--border)' }}>
+        {Object.entries(EVENT_COLORS).map(([key, color]) => (
+          <div key={key} className="flex items-center gap-1.5 text-xs" style={{ color: 'var(--text-muted)' }}>
+            <span className="w-2.5 h-2.5 rounded-sm" style={{ background: color }} />
+            {EVENT_LABELS[key] ?? key}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -349,6 +1104,9 @@ function OverviewTab({
 
 type SortField =
   | 'name'
+  | 'model'
+  | 'type'
+  | 'bands'
   | 'clients'
   | 'satisfaction';
 
@@ -361,18 +1119,29 @@ function DevicesTab({
     useState<SortField>('name');
   const [asc, setAsc] = useState(true);
 
-  function handleSort(f: SortField) {
-    if (sortBy === f) setAsc(!asc);
-    else {
-      setSortBy(f);
-      setAsc(true);
+  function handleSort(f: string) {
+    const valid: SortField[] = ['name', 'model', 'type', 'bands', 'clients', 'satisfaction'];
+    if (valid.includes(f as SortField)) {
+      const sf = f as SortField;
+      if (sortBy === sf) setAsc(!asc);
+      else {
+        setSortBy(sf);
+        setAsc(true);
+      }
     }
   }
 
   const sorted = [...aps].sort((a, b) => {
     const dir = asc ? 1 : -1;
-    if (sortBy === 'name')
-      return dir * a.name.localeCompare(b.name);
+    if (sortBy === 'name' || sortBy === 'model')
+      return dir * a[sortBy].localeCompare(b[sortBy]);
+    if (sortBy === 'type') {
+      const aType = a.isMesh ? 'mesh' : 'wired';
+      const bType = b.isMesh ? 'mesh' : 'wired';
+      return dir * aType.localeCompare(bType);
+    }
+    if (sortBy === 'bands')
+      return dir * (a.radios.length - b.radios.length);
     return dir * (a[sortBy] - b[sortBy]);
   });
 
@@ -404,9 +1173,7 @@ function DevicesTab({
                   select-none"
                 style={thStyle}
                 onClick={() =>
-                  handleSort(
-                    key as SortField,
-                  )
+                  handleSort(key)
                 }
               >
                 <span className="inline-flex
@@ -444,7 +1211,7 @@ function DevicesTab({
                   color: 'var(--text-muted)',
                 }}
               >
-                {ap.model}
+                {friendlyModel(ap.model)}
               </td>
               <td className="px-4 py-3">
                 <span
@@ -497,7 +1264,7 @@ function DevicesTab({
                         {r.width}MHz
                       </span>
                       <span>
-                        {r.txPowerMode || `${r.txPower}dBm`}
+                        {r.txPowerMode ? `${r.txPowerMode} (${r.txPower}dBm)` : `${r.txPower}dBm`}
                       </span>
                     </div>
                   ))}
@@ -690,7 +1457,6 @@ function ChannelsTab({
       .sort((a, b) => a.channel - b.channel),
   })).filter((g) => g.channels.length > 0);
 
-  const totalRadios = aps.reduce((n, a) => n + a.radios.length, 0);
 
   return (
     <div className="space-y-6">
@@ -712,52 +1478,70 @@ function ChannelsTab({
             {band} Channels
           </h3>
           <div className="space-y-3">
-            {channels.map(({ channel, aps: apNames }) => (
-              <div
-                key={channel}
-                className="flex items-center gap-3"
-              >
-                <span
-                  className="text-xs w-14
-                    font-mono shrink-0
-                    font-semibold"
-                  style={{ color: 'var(--text)' }}
-                >
-                  Ch {channel}
-                </span>
+            {channels.map(({ channel, aps: apNames }) => {
+              const maxAps = Math.max(
+                ...grouped.flatMap((g) =>
+                  g.channels.map((c) => c.aps.length),
+                ),
+              );
+              const chLabel =
+                channel === 0 ? 'Auto' : `Ch ${channel}`;
+              return (
                 <div
-                  className="flex-1 h-5 rounded-full
-                    overflow-hidden relative"
-                  style={{
-                    background: 'var(--bg-elevated)',
-                  }}
+                  key={channel}
+                  className="flex items-center gap-3"
                 >
+                  <span
+                    className="text-xs w-14
+                      font-mono shrink-0
+                      font-semibold"
+                    style={{ color: 'var(--text)' }}
+                  >
+                    {chLabel}
+                  </span>
                   <div
-                    className="h-full rounded-full"
+                    className="flex-1 h-5 rounded-full
+                      overflow-hidden relative"
                     style={{
-                      width: `${Math.min(
-                        (apNames.length / totalRadios) * 100 * 3,
-                        100,
-                      )}%`,
-                      background:
-                        apNames.length > 3
-                          ? 'var(--warning)'
-                          : BAND_COLORS[band] ??
-                            'var(--primary)',
-                      transition: 'width 0.6s ease',
+                      background: 'var(--bg-elevated)',
                     }}
-                  />
+                  >
+                    <div
+                      className="h-full rounded-full"
+                      style={{
+                        width: `${Math.max(
+                          (apNames.length / maxAps) * 100,
+                          8,
+                        )}%`,
+                        background:
+                          BAND_COLORS[band] ??
+                          'var(--primary)',
+                        transition: 'width 0.6s ease',
+                      }}
+                    />
+                  </div>
+                  <span
+                    className="text-xs font-semibold
+                      w-6 text-center shrink-0"
+                    style={{
+                      color:
+                        BAND_COLORS[band] ??
+                        'var(--primary)',
+                    }}
+                  >
+                    {apNames.length}
+                  </span>
+                  <span
+                    className="text-xs shrink-0"
+                    style={{
+                      color: 'var(--text-muted)',
+                    }}
+                  >
+                    {apNames.join(', ')}
+                  </span>
                 </div>
-                <span
-                  className="text-xs shrink-0"
-                  style={{
-                    color: 'var(--text-muted)',
-                  }}
-                >
-                  {apNames.join(', ')}
-                </span>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       ))}
@@ -865,6 +1649,8 @@ function RecsTab({
 
 /* ── Main Page ─────────────────────────────────── */
 
+const CACHE_KEY = 'unifi_last_analysis';
+
 export default function AnalysisPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -887,9 +1673,11 @@ export default function AnalysisPage() {
         const r =
           await api.getAnalysisResults(id);
         setResult(r);
+        // Cache the completed job for this session
+        sessionStorage.setItem(CACHE_KEY, id);
       }
       if (j.status === 'failed') {
-        setError(j.error ?? 'Analysis failed');
+        setError(j.error ?? j.message ?? 'Analysis failed');
       }
     } catch (e) {
       setError(
@@ -909,6 +1697,40 @@ export default function AnalysisPage() {
         }
       }, 2000);
       return () => clearInterval(iv);
+    }
+
+    // Check for cached analysis from this session
+    const cached = sessionStorage.getItem(CACHE_KEY);
+    if (cached) {
+      // Validate cached job still exists before redirect
+      let cancelled = false;
+      (async () => {
+        try {
+          const j = await api.getAnalysisStatus(cached);
+          if (!cancelled) {
+            if (j.status === 'completed') {
+              navigate(`/analysis/${cached}`, { replace: true });
+            } else {
+              // Job no longer valid, clear and start fresh
+              sessionStorage.removeItem(CACHE_KEY);
+              const newJob = await api.runAnalysis();
+              if (!cancelled) navigate(`/analysis/${newJob.jobId}`, { replace: true });
+            }
+          }
+        } catch {
+          // Job doesn't exist anymore, clear cache and start fresh
+          if (!cancelled) {
+            sessionStorage.removeItem(CACHE_KEY);
+            try {
+              const newJob = await api.runAnalysis();
+              if (!cancelled) navigate(`/analysis/${newJob.jobId}`, { replace: true });
+            } catch (e2) {
+              if (!cancelled) setError(e2 instanceof Error ? e2.message : 'Failed to start analysis');
+            }
+          }
+        }
+      })();
+      return () => { cancelled = true; };
     }
 
     // Auto-start analysis when id is "new"
@@ -934,6 +1756,11 @@ export default function AnalysisPage() {
     return () => { cancelled = true; };
   }, [id, poll, result, error, navigate]);
 
+  function handleRerun() {
+    sessionStorage.removeItem(CACHE_KEY);
+    navigate('/analysis/new', { replace: true });
+  }
+
   /* Loading skeleton */
   if (!result && !error) {
     return (
@@ -941,20 +1768,33 @@ export default function AnalysisPage() {
         className="max-w-6xl mx-auto space-y-4"
       >
         <div
-          className="glass-card-solid p-6"
+          className="glass-card-solid p-8
+            text-center"
         >
+          <Loader2
+            size={36}
+            className="mx-auto mb-4
+              animate-spin"
+            style={{ color: 'var(--primary)' }}
+          />
           <p
-            className="text-sm"
+            className="text-lg font-semibold mb-1"
+            style={{ color: 'var(--text)' }}
+          >
+            {job?.message || 'Starting analysis…'}
+          </p>
+          <p
+            className="text-sm mb-4"
             style={{ color: 'var(--text-muted)' }}
           >
             {job
-              ? `Analyzing… ${job.progress}%`
-              : 'Starting analysis…'}
+              ? `${job.progress}% complete`
+              : 'Queuing…'}
           </p>
           {job && (
             <div
-              className="mt-3 h-2 rounded-full
-                overflow-hidden"
+              className="max-w-md mx-auto h-3
+                rounded-full overflow-hidden"
               style={{
                 background: 'var(--bg-elevated)',
               }}
@@ -964,7 +1804,8 @@ export default function AnalysisPage() {
                 style={{
                   width: `${job.progress}%`,
                   background: 'var(--primary)',
-                  transition: 'width 0.5s ease',
+                  transition:
+                    'width 0.5s ease',
                 }}
               />
             </div>
@@ -1004,36 +1845,55 @@ export default function AnalysisPage() {
 
   return (
     <div className="max-w-6xl mx-auto space-y-6">
-      {/* Tab Bar */}
-      <nav
-        className="flex gap-1 p-1 rounded-xl"
-        style={{
-          background: 'var(--bg-elevated)',
-        }}
-      >
-        {TABS.map((t) => (
-          <button
-            key={t.key}
-            onClick={() => setTab(t.key)}
-            className="flex-1 py-2 text-xs
-              font-medium rounded-lg
-              cursor-pointer transition-all"
-            style={{
-              background:
-                tab === t.key
-                  ? 'var(--primary)'
-                  : 'transparent',
-              color:
-                tab === t.key
-                  ? '#fff'
-                  : 'var(--text-muted)',
-              border: 'none',
-            }}
-          >
-            {t.label}
-          </button>
-        ))}
-      </nav>
+      {/* Tab Bar + Re-run */}
+      <div className="flex items-center gap-3">
+        <nav
+          className="flex gap-1 p-1 rounded-xl
+            flex-1"
+          style={{
+            background: 'var(--bg-elevated)',
+          }}
+        >
+          {TABS.map((t) => (
+            <button
+              key={t.key}
+              onClick={() => setTab(t.key)}
+              className="flex-1 py-2 text-xs
+                font-medium rounded-lg
+                cursor-pointer transition-all"
+              style={{
+                background:
+                  tab === t.key
+                    ? 'var(--primary)'
+                    : 'transparent',
+                color:
+                  tab === t.key
+                    ? '#fff'
+                    : 'var(--text-muted)',
+                border: 'none',
+              }}
+            >
+              {t.label}
+            </button>
+          ))}
+        </nav>
+        <button
+          onClick={handleRerun}
+          className="flex items-center gap-1.5
+            px-3 py-2 rounded-lg text-xs
+            font-medium cursor-pointer
+            transition-colors shrink-0"
+          style={{
+            background: 'var(--bg-elevated)',
+            color: 'var(--text-muted)',
+            border: '1px solid var(--border)',
+          }}
+          title="Re-run analysis"
+        >
+          <RefreshCw size={14} />
+          Re-run
+        </button>
+      </div>
 
       {/* Tab Content */}
       {tab === 'overview' && (
@@ -1053,7 +1913,7 @@ export default function AnalysisPage() {
           findings={result.findings}
           onPreview={(ids) => {
             navigate(
-              `/repair?findings=${ids.join(',')}`,
+              `/repair?jobId=${encodeURIComponent(result.jobId)}&findings=${ids.join(',')}`,
             );
           }}
         />

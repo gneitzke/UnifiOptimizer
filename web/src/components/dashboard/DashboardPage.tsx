@@ -1,3 +1,4 @@
+import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Activity,
@@ -8,6 +9,8 @@ import {
   Radio,
   MapPin,
 } from 'lucide-react';
+import * as api from '../../services/api';
+import type { AnalysisResult } from '../../types/api';
 
 /* ── Health Ring SVG ───────────────────────────── */
 
@@ -19,6 +22,7 @@ function HealthRing({
   const r = 70;
   const circ = 2 * Math.PI * r;
   const offset = circ * (1 - score / 100);
+  const color = score >= 80 ? 'var(--success)' : score >= 60 ? 'var(--warning)' : 'var(--error)';
 
   return (
     <div className="relative w-44 h-44 mx-auto">
@@ -37,7 +41,7 @@ function HealthRing({
         <circle
           cx="80" cy="80" r={r}
           fill="none"
-          stroke="var(--primary)"
+          stroke={color}
           strokeWidth="8"
           strokeLinecap="round"
           strokeDasharray={circ}
@@ -55,7 +59,7 @@ function HealthRing({
       >
         <span
           className="text-3xl font-bold"
-          style={{ color: 'var(--text)' }}
+          style={{ color }}
         >
           {score}
         </span>
@@ -181,26 +185,26 @@ function PriorityBadge({
 
 export default function DashboardPage() {
   const navigate = useNavigate();
+  const [data, setData] = useState<AnalysisResult | null>(null);
 
-  // Placeholder data until real API wired
-  const health = 82;
-  const findings = [
-    {
-      id: '1',
-      severity: 'critical',
-      title: 'Co-channel interference on 5 GHz',
-    },
-    {
-      id: '2',
-      severity: 'warning',
-      title: '3 APs with >40 clients',
-    },
-    {
-      id: '3',
-      severity: 'info',
-      title: 'Firmware update available',
-    },
-  ];
+  useEffect(() => {
+    const cached = sessionStorage.getItem('unifi_last_analysis');
+    if (cached) {
+      api.getAnalysisResults(cached).then(setData).catch(() => {});
+    }
+  }, []);
+
+  const health = data?.health.overall ?? 0;
+  const apCount = data?.apCount ?? 0;
+  const clientCount = data?.clientCount ?? 0;
+  const sd = data?.signalDistribution;
+  const wirelessPct = sd
+    ? Math.round(((sd.excellent + sd.good + sd.fair + sd.poor + sd.critical) / Math.max(sd.excellent + sd.good + sd.fair + sd.poor + sd.critical + sd.wired, 1)) * 100)
+    : 0;
+  const grade = data?.health.grade ?? '';
+  const status = data?.health.status ?? '';
+  const findings = data?.findings ?? [];
+  const hasData = data !== null;
 
   return (
     <div className="max-w-6xl mx-auto space-y-8">
@@ -208,13 +212,22 @@ export default function DashboardPage() {
       <section
         className="glass-card p-8 text-center"
       >
-        <HealthRing score={health} />
-        <p
-          className="text-sm mt-3"
-          style={{ color: 'var(--text-muted)' }}
-        >
-          Network is performing well
-        </p>
+        {hasData ? (
+          <>
+            <HealthRing score={health} />
+            <p
+              className="text-sm mt-3"
+              style={{ color: 'var(--text-muted)' }}
+            >
+              {grade ? `Grade ${grade} — ${status}` : 'Run an analysis to see your score'}
+            </p>
+          </>
+        ) : (
+          <div className="py-4">
+            <p className="text-lg font-semibold" style={{ color: 'var(--text)' }}>No Analysis Yet</p>
+            <p className="text-sm mt-1" style={{ color: 'var(--text-muted)' }}>Run an analysis to see your network health</p>
+          </div>
+        )}
       </section>
 
       {/* ── Stat cards ────────────────── */}
@@ -225,22 +238,22 @@ export default function DashboardPage() {
         <StatCard
           icon={Radio}
           label="Access Points"
-          value={12}
+          value={hasData ? apCount : '—'}
         />
         <StatCard
           icon={Users}
           label="Clients"
-          value={87}
+          value={hasData ? clientCount : '—'}
         />
         <StatCard
           icon={Wifi}
           label="Wireless %"
-          value="94%"
+          value={hasData ? `${wirelessPct}%` : '—'}
         />
         <StatCard
           icon={MapPin}
-          label="Coverage"
-          value="Good"
+          label="Findings"
+          value={hasData ? findings.length : '—'}
         />
       </section>
 
@@ -271,52 +284,43 @@ export default function DashboardPage() {
       </section>
 
       {/* ── Recent Findings ───────────── */}
-      <section className="glass-card-solid p-6">
-        <h2
-          className="text-sm font-semibold mb-4"
-          style={{ color: 'var(--text)' }}
-        >
-          Recent Findings
-        </h2>
-        <ul className="space-y-3">
-          {findings.map((f) => (
-            <li
-              key={f.id}
-              className="flex items-center
-                justify-between py-2 px-3
-                rounded-lg"
-              style={{
-                background:
-                  'var(--bg-elevated)',
-              }}
-            >
-              <span
-                className="text-sm"
+      {findings.length > 0 && (
+        <section className="glass-card-solid p-6">
+          <h2
+            className="text-sm font-semibold mb-4"
+            style={{ color: 'var(--text)' }}
+          >
+            Recent Findings
+          </h2>
+          <ul className="space-y-3">
+            {findings.slice(0, 5).map((f) => (
+              <li
+                key={f.id}
+                className="flex items-center
+                  justify-between py-2 px-3
+                  rounded-lg"
                 style={{
-                  color: 'var(--text)',
+                  background:
+                    'var(--bg-elevated)',
                 }}
               >
-                {f.title}
-              </span>
-              <PriorityBadge
-                severity={f.severity}
-              />
-            </li>
-          ))}
-        </ul>
-      </section>
+                <span
+                  className="text-sm"
+                  style={{
+                    color: 'var(--text)',
+                  }}
+                >
+                  {f.title}
+                </span>
+                <PriorityBadge
+                  severity={f.severity}
+                />
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
-      {/* ── Topology placeholder ──────── */}
-      <section className="glass-card-solid p-8
-        text-center"
-      >
-        <p
-          className="text-sm"
-          style={{ color: 'var(--text-muted)' }}
-        >
-          Network topology diagram coming soon
-        </p>
-      </section>
     </div>
   );
 }
