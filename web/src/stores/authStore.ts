@@ -104,3 +104,11 @@ export const useAuthStore = create<AuthState>()(
     },
   }),
 );
+
+// Sync Zustand state when any API call gets a 401
+api.onUnauthorized(() => {
+  useAuthStore.setState({
+    token: null,
+    isAuthenticated: false,
+  });
+});

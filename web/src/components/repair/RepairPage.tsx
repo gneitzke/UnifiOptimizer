@@ -391,6 +391,8 @@ export default function RepairPage() {
         dryRun,
       );
       for (const r of res.results) {
+        // Use changeId (mapped from recommendation_index) to update the status map
+        // This matches the key used in previews.forEach above
         statusMap.set(r.changeId, r.success ? 'done' : 'err');
         setResults((prev) =>
           new Map(prev).set(r.changeId, r),
@@ -412,7 +414,14 @@ export default function RepairPage() {
     entry: ChangeHistoryEntry,
   ) {
     setRevertTarget(null);
-    await api.revertChange(entry.changeId ?? (entry as Record<string, unknown>).change_id as string);
+    // Use realChangeId if available (for recent applies), otherwise changeId (from history)
+    // The history API returns change_id which is mapped to changeId in mapChangeEntry
+    const idToRevert = (entry as any).realChangeId || entry.changeId;
+    if (!idToRevert) {
+       console.error("Missing change ID for revert");
+       return;
+    }
+    await api.revertChange(idToRevert);
     loadHistory();
   }
 
@@ -785,11 +794,11 @@ export default function RepairPage() {
                       </p>
                     )}
                   </div>
-                  {r?.revertible && (
+                  {r?.revertible && r.realChangeId && (
                     <button
                       onClick={() => {
                         setRevertTarget({
-                          changeId: r?.realChangeId || p.changeId,
+                          changeId: r.realChangeId,
                           description:
                             p.description,
                           deviceName:
@@ -803,7 +812,8 @@ export default function RepairPage() {
                             r.appliedAt,
                           appliedBy: '',
                           reverted: false,
-                        });
+                          device_mac: '', // Preview doesn't return mac, but it's not used for revert call here
+                        } as ChangeHistoryEntry);
                       }}
                       className="flex items-center
                         gap-1 px-3 py-1.5

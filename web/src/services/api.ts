@@ -20,6 +20,11 @@ const CREDS_KEY = 'unifi_creds';
 
 /* ── helpers ───────────────────────────────────── */
 
+let _onUnauthorized: (() => void) | null = null;
+export function onUnauthorized(cb: () => void): void {
+  _onUnauthorized = cb;
+}
+
 export function getToken(): string | null {
   return localStorage.getItem(TOKEN_KEY);
 }
@@ -76,6 +81,7 @@ async function request<T>(
 
   if (res.status === 401) {
     setToken(null);
+    _onUnauthorized?.();
     throw new Error('Unauthorized');
   }
   if (!res.ok) {
@@ -277,7 +283,7 @@ export async function previewRepair(
     return {
       changeId: String(p.index ?? ''),
       description: (impact.reason as string) || actionLabels[action] || action,
-      deviceMac: '',
+      deviceMac: (p.device_mac ?? '') as string,
       deviceName: (p.device_name ?? '') as string,
       setting: actionLabels[action] || action,
       currentValue: (p.current_value ?? '') as string,
@@ -361,7 +367,7 @@ function mapChangeEntry(
     ? JSON.stringify(beforeConfig).slice(0, 100)
     : '';
   const newVal = afterConfig
-    ? (afterConfig.action as string ?? JSON.stringify(afterConfig).slice(0, 100))
+    ? ((afterConfig.action as string) ?? JSON.stringify(afterConfig).slice(0, 100))
     : '';
   return {
     changeId: (h.change_id ?? h.changeId ?? '') as string,
