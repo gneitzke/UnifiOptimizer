@@ -19,6 +19,7 @@ import type {
   ComponentScores,
   ClientCapabilities,
   ManufacturerStats,
+  ClientJourney,
 } from '../types/api';
 
 const BASE = import.meta.env.VITE_API_URL ?? '';
@@ -362,6 +363,31 @@ function mapAnalysisResult(
     icon: (info.icon ?? '') as string,
   }));
 
+  // Extract client journeys (roaming history, behavior)
+  const journeysRaw = (fullAnalysis.client_journeys ?? {}) as Record<string, unknown>;
+  const journeyClients = (journeysRaw.clients ?? {}) as Record<string, Record<string, unknown>>;
+  const clientJourneys: ClientJourney[] = Object.values(journeyClients).map((c) => {
+    const pathRaw = (c.ap_path ?? []) as Record<string, unknown>[];
+    return {
+      hostname: (c.hostname ?? '') as string,
+      mac: (c.mac ?? '') as string,
+      currentRssi: (c.current_rssi ?? 0) as number,
+      currentAp: (c.current_ap ?? '') as string,
+      behavior: (c.behavior ?? 'stable') as string,
+      behaviorDetail: (c.behavior_detail ?? '') as string,
+      disconnectCount: (c.disconnect_count ?? 0) as number,
+      roamCount: (c.roam_count ?? 0) as number,
+      visitedAps: (c.visited_aps ?? []) as string[],
+      apPath: pathRaw.map((p) => ({
+        ts: (p.ts ?? 0) as number,
+        fromAp: (p.from_ap ?? '') as string,
+        toAp: (p.to_ap ?? '') as string,
+        channelFrom: (p.channel_from ?? '') as string,
+        channelTo: (p.channel_to ?? '') as string,
+      })),
+    };
+  });
+
   return {
     jobId: (raw.job_id ?? '') as string,
     timestamp: new Date().toISOString(),
@@ -379,6 +405,7 @@ function mapAnalysisResult(
     componentScores,
     clientCapabilities,
     manufacturers,
+    clientJourneys,
   };
 }
 

@@ -128,6 +128,7 @@ export interface AnalysisResult {
   componentScores: ComponentScores;
   clientCapabilities: ClientCapabilities;
   manufacturers: ManufacturerStats[];
+  clientJourneys: ClientJourney[];
 }
 
 export interface TopologyNode {
@@ -195,6 +196,19 @@ export interface ManufacturerStats {
   count: number;
   type: string;
   icon: string;
+}
+
+export interface ClientJourney {
+  hostname: string;
+  mac: string;
+  currentRssi: number;
+  currentAp: string;
+  behavior: string;
+  behaviorDetail: string;
+  disconnectCount: number;
+  roamCount: number;
+  visitedAps: string[];
+  apPath: { ts: number; fromAp: string; toAp: string; channelFrom: string; channelTo: string }[];
 }
 
 export interface ChangeHistoryEntry {

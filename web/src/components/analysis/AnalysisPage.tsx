@@ -28,6 +28,7 @@ import type {
   ComponentScores,
   ClientCapabilities,
   ManufacturerStats,
+  ClientJourney,
 } from '../../types/api';
 import * as api from '../../services/api';
 import StatCard from '../dashboard/StatCard';
@@ -227,244 +228,141 @@ const NODE_ICONS: Record<TopologyNode['type'], string> = {
   mesh: '◎',
 };
 
-function NetworkDAG({
-  topology,
-}: {
-  topology: TopologyNode[];
-}) {
+function NetworkDAG({ topology }: { topology: TopologyNode[] }) {
   if (topology.length === 0) return null;
 
-  const switches = topology.filter(
-    (n) => n.type === 'switch',
-  );
-  const wiredAps = topology.filter(
-    (n) => n.type === 'ap',
-  );
-  const meshAps = topology.filter(
-    (n) => n.type === 'mesh',
-  );
+  // Build tree structure
+  type TreeNode = { node: TopologyNode; children: TreeNode[] };
+  const byName = new Map<string, TreeNode>();
+  topology.forEach((n) => byName.set(n.name, { node: n, children: [] }));
 
-  const meshByParent = new Map<string, TopologyNode[]>();
-  meshAps.forEach((m) => {
-    const list = meshByParent.get(m.parentName) ?? [];
-    list.push(m);
-    meshByParent.set(m.parentName, list);
+  const roots: TreeNode[] = [];
+  topology.forEach((n) => {
+    const tn = byName.get(n.name)!;
+    const parent = byName.get(n.parentName);
+    if (parent) parent.children.push(tn);
+    else roots.push(tn);
   });
 
-  // Build ordered tree for layout
-  type TreeNode = {
-    node: TopologyNode;
-    children: TreeNode[];
-  };
+  // Sort children by client count desc
+  function sortTree(t: TreeNode) {
+    t.children.sort((a, b) => b.node.clients - a.node.clients);
+    t.children.forEach(sortTree);
+  }
+  roots.forEach(sortTree);
 
-  const roots: TreeNode[] = switches.map((sw) => {
-    const children: TreeNode[] = wiredAps
-      .filter((a) => a.parentName === sw.name)
-      .sort((a, b) => b.clients - a.clients)
-      .map((ap) => ({
-        node: ap,
-        children: (meshByParent.get(ap.name) ?? [])
-          .sort((a, b) => b.clients - a.clients)
-          .map((m) => ({ node: m, children: [] })),
-      }));
-    // Also add mesh APs that connect directly to switch
-    meshAps
-      .filter(
-        (m) =>
-          m.parentName === sw.name ||
-          (!m.parentName &&
-            !wiredAps.some(
-              (a) => a.name === m.parentName,
-            )),
-      )
-      .forEach((m) =>
-        children.push({
-          node: m,
-          children: [],
-        }),
-      );
-    return { node: sw, children };
-  });
+  // Layout: assign x,y positions using a breadth-first horizontal spread
+  type Positioned = { node: TopologyNode; x: number; y: number; children: Positioned[] };
+  const nodeW = 120;
+  const nodeH = 56;
+  const gapX = 24;
+  const gapY = 80;
 
-  // Orphan wired APs
-  const orphanAps = wiredAps.filter(
-    (a) =>
-      !switches.some(
-        (s) => s.name === a.parentName,
-      ),
-  );
-  orphanAps.forEach((ap) =>
-    roots.push({
-      node: ap,
-      children: (meshByParent.get(ap.name) ?? []).map(
-        (m) => ({ node: m, children: [] }),
-      ),
-    }),
-  );
-
-  function NodeCard({
-    node,
-    depth,
-  }: {
-    node: TopologyNode;
-    depth: number;
-  }) {
-    const color = NODE_COLORS[node.type];
-    return (
-      <div
-        className="flex items-center gap-2.5 px-3
-          py-2 rounded-lg"
-        style={{
-          background: `${color}0c`,
-          border: `1px solid ${color}30`,
-          marginLeft: depth * 32,
-        }}
-      >
-        <div
-          className="w-8 h-8 rounded-lg
-            flex items-center justify-center
-            text-sm shrink-0"
-          style={{
-            background: `${color}20`,
-            color,
-          }}
-        >
-          {NODE_ICONS[node.type]}
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
-            <span
-              className="text-sm font-semibold
-                truncate"
-              style={{ color: 'var(--text)' }}
-            >
-              {node.name}
-            </span>
-            <span
-              className="text-[10px] px-1.5
-                py-0.5 rounded font-medium
-                shrink-0"
-              style={{
-                background: `${color}18`,
-                color,
-              }}
-            >
-              {node.type === 'switch'
-                ? 'SWITCH'
-                : node.type === 'mesh'
-                  ? 'MESH'
-                  : 'WIRED'}
-            </span>
-          </div>
-          <div
-            className="text-[11px] flex
-              items-center gap-3 mt-0.5"
-            style={{
-              color: 'var(--text-muted)',
-            }}
-          >
-            <span>
-              {friendlyModel(node.model)}
-            </span>
-            {node.clients > 0 && (
-              <span>
-                {node.clients}{' '}
-                {node.clients === 1
-                  ? 'client'
-                  : 'clients'}
-              </span>
-            )}
-          </div>
-        </div>
-      </div>
-    );
+  function layoutTree(tree: TreeNode, depth: number, xOffset: number): { positioned: Positioned; width: number } {
+    if (tree.children.length === 0) {
+      return { positioned: { node: tree.node, x: xOffset, y: depth * (nodeH + gapY), children: [] }, width: nodeW };
+    }
+    let childX = xOffset;
+    const childPositions: Positioned[] = [];
+    let totalWidth = 0;
+    tree.children.forEach((child, i) => {
+      const { positioned, width } = layoutTree(child, depth + 1, childX);
+      childPositions.push(positioned);
+      childX += width + (i < tree.children.length - 1 ? gapX : 0);
+      totalWidth += width + (i < tree.children.length - 1 ? gapX : 0);
+    });
+    const parentX = childPositions.length > 0
+      ? (childPositions[0].x + childPositions[childPositions.length - 1].x) / 2
+      : xOffset;
+    return {
+      positioned: { node: tree.node, x: parentX, y: depth * (nodeH + gapY), children: childPositions },
+      width: Math.max(totalWidth, nodeW),
+    };
   }
 
-  function renderTree(
-    tree: TreeNode,
-    depth: number,
-  ) {
-    return (
-      <div key={tree.node.mac || tree.node.name}>
-        <NodeCard
-          node={tree.node}
-          depth={depth}
-        />
-        {tree.children.length > 0 && (
-          <div className="relative mt-1.5 space-y-1.5">
-            {/* Vertical connector line */}
-            <div
-              className="absolute top-0 bottom-0"
-              style={{
-                left: depth * 32 + 19,
-                width: 1,
-                background: 'var(--border)',
-              }}
-            />
-            {tree.children.map((child) => (
-              <div
-                key={child.node.mac || child.node.name}
-                className="relative"
-              >
-                {/* Horizontal connector */}
-                <div
-                  className="absolute"
-                  style={{
-                    left: depth * 32 + 19,
-                    top: 20,
-                    width: 12,
-                    height: 1,
-                    background: 'var(--border)',
-                  }}
-                />
-                {renderTree(child, depth + 1)}
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-    );
+  let globalX = 0;
+  const positionedRoots: Positioned[] = [];
+  roots.forEach((root, i) => {
+    const { positioned, width } = layoutTree(root, 0, globalX);
+    positionedRoots.push(positioned);
+    globalX += width + (i < roots.length - 1 ? gapX * 2 : 0);
+  });
+
+  // Calculate SVG bounds
+  function getBounds(nodes: Positioned[]): { maxX: number; maxY: number } {
+    let maxX = 0;
+    let maxY = 0;
+    nodes.forEach((n) => {
+      maxX = Math.max(maxX, n.x + nodeW);
+      maxY = Math.max(maxY, n.y + nodeH);
+      const childBounds = getBounds(n.children);
+      maxX = Math.max(maxX, childBounds.maxX);
+      maxY = Math.max(maxY, childBounds.maxY);
+    });
+    return { maxX, maxY };
+  }
+  const { maxX, maxY } = getBounds(positionedRoots);
+  const svgW = maxX + 20;
+  const svgH = maxY + 20;
+
+  function renderEdges(nodes: Positioned[]): React.ReactNode[] {
+    const edges: React.ReactNode[] = [];
+    nodes.forEach((n) => {
+      const px = n.x + nodeW / 2;
+      const py = n.y + nodeH;
+      n.children.forEach((child) => {
+        const cx = child.x + nodeW / 2;
+        const cy = child.y;
+        const midY = (py + cy) / 2;
+        edges.push(
+          <path key={`${n.node.name}-${child.node.name}`}
+            d={`M${px},${py} C${px},${midY} ${cx},${midY} ${cx},${cy}`}
+            fill="none" stroke="var(--border-strong)" strokeWidth="2" />
+        );
+      });
+      edges.push(...renderEdges(n.children));
+    });
+    return edges;
+  }
+
+  function renderNodes(nodes: Positioned[]): React.ReactNode[] {
+    const result: React.ReactNode[] = [];
+    nodes.forEach((n) => {
+      const color = NODE_COLORS[n.node.type];
+      result.push(
+        <g key={n.node.name} transform={`translate(${n.x},${n.y})`}>
+          <rect width={nodeW} height={nodeH} rx="10" fill={`${color}15`} stroke={color} strokeWidth="1.5" />
+          <text x={nodeW / 2} y={18} textAnchor="middle" fill="var(--text)" fontSize="11" fontWeight="600">
+            {n.node.name.length > 14 ? n.node.name.slice(0, 13) + '…' : n.node.name}
+          </text>
+          <text x={nodeW / 2} y={32} textAnchor="middle" fill="var(--text-muted)" fontSize="9">
+            {friendlyModel(n.node.model)}
+          </text>
+          <text x={nodeW / 2} y={46} textAnchor="middle" fill={color} fontSize="9" fontWeight="600">
+            {NODE_ICONS[n.node.type]} {n.node.type === 'switch' ? 'SWITCH' : n.node.type === 'mesh' ? 'MESH' : 'WIRED'}
+            {n.node.clients > 0 ? ` · ${n.node.clients}` : ''}
+          </text>
+        </g>
+      );
+      result.push(...renderNodes(n.children));
+    });
+    return result;
   }
 
   return (
     <div className="glass-card-solid p-6">
-      <h3
-        className="text-sm font-semibold mb-4"
-        style={{ color: 'var(--text)' }}
-      >
-        Network Topology
-      </h3>
-      <div className="space-y-2">
-        {roots.map((root) =>
-          renderTree(root, 0),
-        )}
+      <h3 className="text-sm font-semibold mb-4" style={{ color: 'var(--text)' }}>Network Topology</h3>
+      <div className="overflow-x-auto">
+        <svg viewBox={`0 0 ${svgW} ${svgH}`} style={{ minWidth: Math.min(svgW, 600), width: '100%', height: 'auto' }}>
+          {renderEdges(positionedRoots)}
+          {renderNodes(positionedRoots)}
+        </svg>
       </div>
       {/* Legend */}
-      <div
-        className="flex gap-5 mt-5 pt-3"
-        style={{
-          borderTop: '1px solid var(--border)',
-        }}
-      >
-        {(
-          [
-            ['switch', 'Switch'],
-            ['ap', 'Wired AP'],
-            ['mesh', 'Mesh AP'],
-          ] as const
-        ).map(([t, label]) => (
-          <div
-            key={t}
-            className="flex items-center gap-1.5
-              text-xs"
-            style={{ color: 'var(--text-muted)' }}
-          >
-            <span
-              className="w-2.5 h-2.5 rounded-sm"
-              style={{
-                background: NODE_COLORS[t],
-              }}
-            />
+      <div className="flex gap-5 mt-4 pt-3" style={{ borderTop: '1px solid var(--border)' }}>
+        {([['switch', 'Switch'], ['ap', 'Wired AP'], ['mesh', 'Mesh AP']] as const).map(([t, label]) => (
+          <div key={t} className="flex items-center gap-1.5 text-xs" style={{ color: 'var(--text-muted)' }}>
+            <span className="w-2.5 h-2.5 rounded-sm" style={{ background: NODE_COLORS[t] }} />
             {label}
           </div>
         ))}
@@ -1351,128 +1249,194 @@ function DevicesTab({
 
 /* ── Clients Tab ───────────────────────────────── */
 
-function IssueBadge({
-  issue,
-}: {
-  issue: string;
-}) {
-  const lower = issue.toLowerCase();
-  const color = lower.includes('dead')
-    ? 'var(--error)'
-    : lower.includes('weak')
-      ? 'var(--warning)'
-      : 'var(--primary)';
-  return (
-    <span
-      className="text-[10px] font-semibold
-        px-2 py-0.5 rounded-full"
-      style={{
-        background: `color-mix(
-          in srgb, ${color} 20%, transparent
-        )`,
-        color,
-      }}
-    >
-      {issue}
-    </span>
-  );
-}
+const BEHAVIOR_COLORS: Record<string, string> = {
+  stable: 'var(--success)',
+  healthy_roamer: '#0088ff',
+  pattern: '#ffb800',
+  flapping: 'var(--error)',
+};
+
+const BEHAVIOR_LABELS: Record<string, string> = {
+  stable: 'Stable',
+  healthy_roamer: 'Roamer',
+  pattern: 'Pattern',
+  flapping: 'Flapping',
+};
 
 function ClientsTab({
   clients,
+  journeys,
 }: {
   clients: ClientAnalysis[];
+  journeys: ClientJourney[];
 }) {
-  const problem = clients.filter(
-    (c) => c.issues.length > 0,
-  );
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [sortBy, setSortBy] = useState<'roams' | 'name' | 'rssi'>('roams');
 
-  if (problem.length === 0) {
-    return (
-      <div
-        className="glass-card-solid p-8
-          text-center"
-      >
-        <CheckCircle2
-          size={32}
-          className="mx-auto mb-2"
-          style={{ color: 'var(--success)' }}
-        />
-        <p style={{ color: 'var(--text-muted)' }}>
-          No client issues detected
-        </p>
-      </div>
-    );
-  }
+  // Merge journey data — this is the primary view now
+  const sorted = [...journeys]
+    .filter((j) => j.roamCount > 0 || j.disconnectCount > 0)
+    .sort((a, b) => {
+      if (sortBy === 'roams') return b.roamCount - a.roamCount;
+      if (sortBy === 'rssi') return a.currentRssi - b.currentRssi;
+      return a.hostname.localeCompare(b.hostname);
+    });
+
+  // Also get weak signal clients from old data
+  const weakClients = clients.filter((c) => c.issues.length > 0);
+
+  const thStyle = { color: 'var(--text-muted)', borderBottom: '1px solid var(--border)' };
 
   return (
-    <div
-      className="glass-card-solid overflow-x-auto"
-    >
-      <table className="w-full text-sm">
-        <thead>
-          <tr>
-            {['Client', 'Signal', 'Issues'].map(
-              (h) => (
-                <th
-                  key={h}
-                  className="text-left px-4
-                    py-3 text-xs font-medium"
+    <div className="space-y-6">
+      {/* Roaming & Journey Table */}
+      {sorted.length > 0 && (
+        <div className="glass-card-solid overflow-x-auto">
+          <div className="flex items-center justify-between p-4 pb-0">
+            <h3 className="text-sm font-semibold" style={{ color: 'var(--text)' }}>
+              Client Activity ({sorted.length} active)
+            </h3>
+            <div className="flex gap-1">
+              {(['roams', 'name', 'rssi'] as const).map((s) => (
+                <button key={s} onClick={() => setSortBy(s)}
+                  className="text-[10px] px-2 py-1 rounded font-medium cursor-pointer"
                   style={{
-                    color: 'var(--text-muted)',
-                    borderBottom:
-                      '1px solid var(--border)',
-                  }}
-                >
-                  {h}
-                </th>
-              ),
-            )}
-          </tr>
-        </thead>
-        <tbody>
-          {problem.map((c) => (
-            <tr
-              key={c.mac}
-              style={{
-                borderBottom:
-                  '1px solid var(--border)',
-              }}
-            >
-              <td
-                className="px-4 py-3 font-medium"
-                style={{ color: 'var(--text)' }}
-              >
-                {c.hostname || c.mac}
-              </td>
-              <td
-                className="px-4 py-3"
-                style={{
-                  color:
-                    c.signal >= -65
-                      ? 'var(--success)'
-                      : c.signal >= -75
-                        ? 'var(--warning)'
-                        : 'var(--error)',
-                }}
-              >
-                {c.signal} dBm
-              </td>
-              <td
-                className="px-4 py-3 flex
-                  flex-wrap gap-1"
-              >
-                {c.issues.map((issue) => (
-                  <IssueBadge
-                    key={issue}
-                    issue={issue}
-                  />
+                    background: sortBy === s ? 'var(--primary)' : 'var(--bg-elevated)',
+                    color: sortBy === s ? '#fff' : 'var(--text-muted)',
+                    border: 'none',
+                  }}>{s === 'rssi' ? 'Signal' : s.charAt(0).toUpperCase() + s.slice(1)}</button>
+              ))}
+            </div>
+          </div>
+          <table className="w-full text-sm">
+            <thead>
+              <tr>
+                {['Client', 'AP', 'Roams', 'Signal', 'Behavior', 'APs Visited'].map((h) => (
+                  <th key={h} className="text-left px-4 py-3 text-xs font-medium" style={thStyle}>{h}</th>
                 ))}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.map((j) => {
+                const isExpanded = expanded === j.mac;
+                const behaviorColor = BEHAVIOR_COLORS[j.behavior] ?? 'var(--text-muted)';
+                return (
+                  <>
+                    <tr key={j.mac}
+                      className="cursor-pointer hover:opacity-80 transition-opacity"
+                      style={{ borderBottom: '1px solid var(--border)' }}
+                      onClick={() => setExpanded(isExpanded ? null : j.mac)}>
+                      <td className="px-4 py-3 font-medium" style={{ color: 'var(--text)' }}>
+                        {j.hostname || j.mac.slice(-8)}
+                      </td>
+                      <td className="px-4 py-3" style={{ color: 'var(--text-muted)' }}>{j.currentAp}</td>
+                      <td className="px-4 py-3 font-semibold" style={{
+                        color: j.roamCount > 100 ? 'var(--warning)' : j.roamCount > 30 ? '#0088ff' : 'var(--text-muted)',
+                      }}>{j.roamCount}</td>
+                      <td className="px-4 py-3" style={{
+                        color: j.currentRssi >= -50 ? 'var(--success)' : j.currentRssi >= -70 ? 'var(--warning)' : 'var(--error)',
+                      }}>{j.currentRssi} dBm</td>
+                      <td className="px-4 py-3">
+                        <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full uppercase"
+                          style={{ background: `color-mix(in srgb, ${behaviorColor} 20%, transparent)`, color: behaviorColor }}>
+                          {BEHAVIOR_LABELS[j.behavior] ?? j.behavior}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3" style={{ color: 'var(--text-muted)' }}>{j.visitedAps.length}</td>
+                    </tr>
+                    {/* Expanded: AP path timeline */}
+                    {isExpanded && j.apPath.length > 0 && (
+                      <tr key={`${j.mac}-detail`}>
+                        <td colSpan={6} className="px-4 py-3" style={{ background: 'var(--bg-elevated)' }}>
+                          <div className="text-xs mb-2" style={{ color: 'var(--text-muted)' }}>
+                            {j.behaviorDetail}
+                          </div>
+                          <div className="text-xs font-medium mb-2" style={{ color: 'var(--text)' }}>
+                            Visited: {j.visitedAps.join(' → ')}
+                          </div>
+                          {/* AP path density strip */}
+                          <div className="text-[10px] mb-1" style={{ color: 'var(--text-muted)' }}>Recent roam path:</div>
+                          <div className="flex gap-0.5 flex-wrap">
+                            {j.apPath.slice(-30).map((p, i) => {
+                              // Color by AP name using a hash
+                              const apNames = j.visitedAps;
+                              const idx = apNames.indexOf(p.toAp);
+                              const colors = ['#0088ff', '#00c48f', '#ff8c00', '#a855f7', '#ff4757', '#ffb800', '#06b6d4', '#ec4899', '#84cc16'];
+                              const color = colors[idx >= 0 ? idx % colors.length : 0];
+                              return (
+                                <div key={i} className="flex flex-col items-center" title={`${p.fromAp} → ${p.toAp} ch${p.channelFrom}→${p.channelTo}`}>
+                                  <div className="w-5 h-5 rounded" style={{ background: `${color}30`, border: `1px solid ${color}` }}>
+                                    <div className="w-full h-full flex items-center justify-center text-[8px] font-bold" style={{ color }}>
+                                      {p.toAp.slice(0, 2)}
+                                    </div>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                          {/* AP color legend */}
+                          <div className="flex flex-wrap gap-3 mt-2">
+                            {j.visitedAps.map((ap, i) => {
+                              const colors = ['#0088ff', '#00c48f', '#ff8c00', '#a855f7', '#ff4757', '#ffb800', '#06b6d4', '#ec4899', '#84cc16'];
+                              return (
+                                <div key={ap} className="flex items-center gap-1 text-[10px]" style={{ color: 'var(--text-muted)' }}>
+                                  <span className="w-2.5 h-2.5 rounded-sm" style={{ background: colors[i % colors.length] }} />
+                                  {ap}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Weak signal clients (legacy) */}
+      {weakClients.length > 0 && (
+        <div className="glass-card-solid overflow-x-auto">
+          <h3 className="text-sm font-semibold p-4 pb-0" style={{ color: 'var(--text)' }}>
+            Signal Issues ({weakClients.length})
+          </h3>
+          <table className="w-full text-sm">
+            <thead>
+              <tr>
+                {['Client', 'Signal', 'Issues'].map((h) => (
+                  <th key={h} className="text-left px-4 py-3 text-xs font-medium" style={thStyle}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {weakClients.map((c) => (
+                <tr key={c.mac} style={{ borderBottom: '1px solid var(--border)' }}>
+                  <td className="px-4 py-3 font-medium" style={{ color: 'var(--text)' }}>{c.hostname || c.mac}</td>
+                  <td className="px-4 py-3" style={{
+                    color: c.signal >= -65 ? 'var(--success)' : c.signal >= -75 ? 'var(--warning)' : 'var(--error)',
+                  }}>{c.signal} dBm</td>
+                  <td className="px-4 py-3 flex flex-wrap gap-1">
+                    {c.issues.map((issue) => (
+                      <span key={issue} className="text-[10px] font-semibold px-2 py-0.5 rounded-full"
+                        style={{ background: 'rgba(255,71,87,0.15)', color: 'var(--error)' }}>{issue}</span>
+                    ))}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {sorted.length === 0 && weakClients.length === 0 && (
+        <div className="glass-card-solid p-8 text-center">
+          <CheckCircle2 size={32} className="mx-auto mb-2" style={{ color: 'var(--success)' }} />
+          <p style={{ color: 'var(--text-muted)' }}>No client issues detected</p>
+        </div>
+      )}
     </div>
   );
 }
@@ -1966,7 +1930,7 @@ export default function AnalysisPage() {
         <DevicesTab aps={result.aps} />
       )}
       {tab === 'clients' && (
-        <ClientsTab clients={result.clients} />
+        <ClientsTab clients={result.clients} journeys={result.clientJourneys} />
       )}
       {tab === 'channels' && (
         <ChannelsTab aps={result.aps} channelUsage={result.channelUsage} />
