@@ -185,32 +185,37 @@ function mapAnalysisResult(
 ): AnalysisResult {
   const fullAnalysis = (raw.full_analysis ?? {}) as Record<string, unknown>;
   const healthRaw = (raw.health_score ?? fullAnalysis.health_score ?? {}) as Record<string, unknown>;
+  const healthDetails = (healthRaw.details ?? {}) as Record<string, unknown>;
   const apRaw = (raw.ap_analysis ?? fullAnalysis.ap_analysis ?? {}) as Record<string, unknown>;
   const clientRaw = (raw.client_analysis ?? fullAnalysis.client_analysis ?? {}) as Record<string, unknown>;
   const recsRaw = (raw.recommendations ?? []) as Record<string, unknown>[];
 
   const health: HealthScore = {
-    overall: (healthRaw.overall_score ?? healthRaw.overall ?? 0) as number,
-    wireless: (healthRaw.wireless_score ?? healthRaw.wireless ?? 0) as number,
-    wired: (healthRaw.wired_score ?? healthRaw.wired ?? 0) as number,
-    latency: (healthRaw.latency_score ?? healthRaw.latency ?? 0) as number,
-    coverage: (healthRaw.coverage_score ?? healthRaw.coverage ?? 0) as number,
+    overall: (healthRaw.score ?? healthRaw.overall_score ?? healthRaw.overall ?? 0) as number,
+    wireless: (healthDetails.rssi_score ?? healthRaw.wireless_score ?? healthRaw.wireless ?? 0) as number,
+    wired: (healthDetails.distribution_score ?? healthRaw.wired_score ?? healthRaw.wired ?? 0) as number,
+    latency: (healthDetails.airtime_score ?? healthRaw.latency_score ?? healthRaw.latency ?? 0) as number,
+    coverage: (healthDetails.mesh_score ?? healthRaw.coverage_score ?? healthRaw.coverage ?? 0) as number,
   };
 
-  const apList = (apRaw.aps ?? apRaw.devices ?? []) as Record<string, unknown>[];
-  const aps: ApAnalysis[] = apList.map((a) => ({
-    mac: (a.mac ?? '') as string,
-    name: (a.name ?? a.hostname ?? 'Unknown') as string,
-    model: (a.model ?? '') as string,
-    channel: (a.channel ?? 0) as number,
-    band: (a.band ?? a.radio ?? '') as string,
-    txPower: (a.tx_power ?? a.txPower ?? 0) as number,
-    clients: (a.num_sta ?? a.clients ?? 0) as number,
-    satisfaction: (a.satisfaction ?? a.score ?? 0) as number,
-    interference: (a.interference ?? 0) as number,
-    issues: (a.issues ?? []) as string[],
-    suggestions: (a.suggestions ?? []) as string[],
-  }));
+  const apList = (apRaw.ap_details ?? apRaw.aps ?? apRaw.devices ?? []) as Record<string, unknown>[];
+  const aps: ApAnalysis[] = apList.map((a) => {
+    const radios = (a.radios ?? {}) as Record<string, Record<string, unknown>>;
+    const firstRadio = Object.values(radios)[0] ?? {};
+    return {
+      mac: (a.mac ?? '') as string,
+      name: (a.name ?? a.hostname ?? 'Unknown') as string,
+      model: (a.model ?? '') as string,
+      channel: (firstRadio.channel ?? a.channel ?? 0) as number,
+      band: (Object.keys(radios)[0] ?? a.band ?? a.radio ?? '') as string,
+      txPower: (firstRadio.tx_power ?? a.tx_power ?? a.txPower ?? 0) as number,
+      clients: (a.client_count ?? a.num_sta ?? a.clients ?? 0) as number,
+      satisfaction: (a.satisfaction ?? a.score ?? 0) as number,
+      interference: (a.interference ?? 0) as number,
+      issues: (a.issues ?? []) as string[],
+      suggestions: (a.suggestions ?? []) as string[],
+    };
+  });
 
   const clientList = (clientRaw.clients ?? clientRaw.problem_clients ?? []) as Record<string, unknown>[];
   const clients: ClientAnalysis[] = clientList.map((c) => ({
@@ -240,9 +245,9 @@ function mapAnalysisResult(
     health,
     aps,
     clients,
-    apCount: aps.length,
-    clientCount: clients.length,
-    summary: `${aps.length} APs, ${clients.length} problem clients, ${findings.length} recommendations`,
+    apCount: aps.length || (apRaw.total_aps as number ?? 0),
+    clientCount: clients.length || (clientRaw.total_clients as number ?? 0),
+    summary: `${aps.length} APs, ${clients.length} clients, ${findings.length} recommendations`,
     findings,
   };
 }
