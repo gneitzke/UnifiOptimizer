@@ -1638,6 +1638,13 @@ function ChannelsTab({
 
 /* ── Recommendations Tab ───────────────────────── */
 
+const ACTION_META: Record<string, { icon: string; label: string; color: string }> = {
+  power_change: { icon: '⚡', label: 'TX Power', color: '#ff8c00' },
+  channel_change: { icon: '📡', label: 'Channel', color: '#0088ff' },
+  band_steering: { icon: '🔀', label: 'Band Steering', color: '#a855f7' },
+  min_rssi: { icon: '📶', label: 'Min RSSI', color: '#00c48f' },
+};
+
 function RecsTab({
   findings,
   onPreview,
@@ -1645,9 +1652,7 @@ function RecsTab({
   findings: Finding[];
   onPreview: (ids: string[]) => void;
 }) {
-  const [selected, setSelected] = useState<
-    Set<string>
-  >(new Set());
+  const [selected, setSelected] = useState<Set<string>>(new Set());
 
   function toggle(id: string) {
     setSelected((prev) => {
@@ -1658,77 +1663,119 @@ function RecsTab({
     });
   }
 
-  return (
-    <div className="space-y-4">
-      {findings.map((f) => (
-        <label
-          key={f.id}
-          className="glass-card-solid p-5 flex
-            items-start gap-4 cursor-pointer
-            hover:opacity-90 transition-opacity"
-        >
-          <input
-            type="checkbox"
-            checked={selected.has(f.id)}
-            onChange={() => toggle(f.id)}
-            className="mt-1 shrink-0
-              accent-[var(--primary)]"
-          />
-          <div className="flex-1 min-w-0">
-            <div
-              className="flex items-center
-                gap-2 mb-1"
-            >
-              <PriorityBadge
-                severity={f.severity}
-              />
-              <span
-                className="text-xs"
-                style={{
-                  color: 'var(--text-muted)',
-                }}
-              >
-                {f.category}
-              </span>
-            </div>
-            <h4
-              className="text-sm font-medium"
-              style={{ color: 'var(--text)' }}
-            >
-              {f.title}
-            </h4>
-            <p
-              className="text-xs mt-1"
-              style={{
-                color: 'var(--text-muted)',
-              }}
-            >
-              {f.description}
-            </p>
-          </div>
-        </label>
-      ))}
+  function selectAll() {
+    if (selected.size === findings.length) setSelected(new Set());
+    else setSelected(new Set(findings.map((f) => f.id)));
+  }
 
-      {selected.size > 0 && (
-        <button
-          onClick={() =>
-            onPreview([...selected])
-          }
-          className="w-full py-3 rounded-xl
-            font-medium text-sm cursor-pointer
-            transition-colors"
-          style={{
-            background: 'var(--primary)',
-            color: '#fff',
-            border: 'none',
-          }}
-        >
-          <Eye
-            size={16}
-            className="inline mr-2 -mt-0.5"
-          />
-          Preview {selected.size} Selected
+  // Group by category (action type)
+  const grouped = new Map<string, Finding[]>();
+  findings.forEach((f) => {
+    const list = grouped.get(f.category) || [];
+    list.push(f);
+    grouped.set(f.category, list);
+  });
+
+  // Sort groups by the ACTION_META order, then alphabetically
+  const groupOrder = Object.keys(ACTION_META);
+  const sortedGroups = [...grouped.entries()].sort(([a], [b]) => {
+    const ai = groupOrder.indexOf(a);
+    const bi = groupOrder.indexOf(b);
+    return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+  });
+
+  return (
+    <div className="space-y-6">
+      {/* Summary bar */}
+      <div className="glass-card-solid p-4 flex items-center justify-between">
+        <div className="flex items-center gap-4">
+          <span className="text-sm font-semibold" style={{ color: 'var(--text)' }}>
+            {findings.length} Recommendations
+          </span>
+          <div className="flex gap-2">
+            {sortedGroups.map(([cat, items]) => {
+              const meta = ACTION_META[cat];
+              return (
+                <span key={cat} className="text-[10px] font-medium px-2 py-0.5 rounded-full"
+                  style={{ background: `${meta?.color ?? 'var(--primary)'}15`, color: meta?.color ?? 'var(--text-muted)' }}>
+                  {meta?.icon} {items.length}
+                </span>
+              );
+            })}
+          </div>
+        </div>
+        <button onClick={selectAll}
+          className="text-xs font-medium px-3 py-1.5 rounded-lg cursor-pointer transition-colors"
+          style={{ background: 'var(--bg-elevated)', color: 'var(--text-muted)', border: '1px solid var(--border)' }}>
+          {selected.size === findings.length ? 'Deselect All' : 'Select All'}
         </button>
+      </div>
+
+      {/* Grouped recommendations */}
+      {sortedGroups.map(([cat, items]) => {
+        const meta = ACTION_META[cat] ?? { icon: '🔧', label: cat.replace(/_/g, ' '), color: 'var(--primary)' };
+        const groupSelected = items.filter((f) => selected.has(f.id)).length;
+        return (
+          <div key={cat} className="glass-card-solid overflow-hidden">
+            {/* Group header */}
+            <div className="px-5 py-3 flex items-center gap-3" style={{ borderBottom: '1px solid var(--border)' }}>
+              <span className="text-base">{meta.icon}</span>
+              <span className="text-sm font-semibold" style={{ color: 'var(--text)' }}>{meta.label}</span>
+              <span className="text-[10px] font-medium px-2 py-0.5 rounded-full"
+                style={{ background: `${meta.color}15`, color: meta.color }}>
+                {items.length} {items.length === 1 ? 'change' : 'changes'}
+              </span>
+              {groupSelected > 0 && (
+                <span className="text-[10px] font-medium px-2 py-0.5 rounded-full"
+                  style={{ background: 'rgba(0,136,255,0.1)', color: 'var(--primary)' }}>
+                  {groupSelected} selected
+                </span>
+              )}
+            </div>
+            {/* Items */}
+            <div>
+              {items.map((f, i) => {
+                const isSelected = selected.has(f.id);
+                // Extract device name and action details from title
+                const deviceMatch = f.title.match(/^(.+?):\s*(.+)$/);
+                const deviceName = deviceMatch ? deviceMatch[1] : '';
+                const actionText = deviceMatch ? deviceMatch[2] : f.title;
+                return (
+                  <label key={f.id}
+                    className="flex items-center gap-4 px-5 py-3 cursor-pointer transition-colors"
+                    style={{
+                      background: isSelected ? `${meta.color}08` : 'transparent',
+                      borderBottom: i < items.length - 1 ? '1px solid var(--border)' : 'none',
+                    }}>
+                    <input type="checkbox" checked={isSelected} onChange={() => toggle(f.id)}
+                      className="shrink-0 accent-[var(--primary)]" />
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        {deviceName && (
+                          <span className="text-xs font-semibold" style={{ color: meta.color }}>{deviceName}</span>
+                        )}
+                        <PriorityBadge severity={f.severity} />
+                      </div>
+                      <p className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>{f.description || actionText}</p>
+                    </div>
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
+
+      {/* Action button */}
+      {selected.size > 0 && (
+        <div className="sticky bottom-4">
+          <button onClick={() => onPreview([...selected])}
+            className="w-full py-3 rounded-xl font-medium text-sm cursor-pointer transition-all shadow-lg"
+            style={{ background: 'var(--primary)', color: '#fff', border: 'none' }}>
+            <Eye size={16} className="inline mr-2 -mt-0.5" />
+            Preview {selected.size} of {findings.length} Changes
+          </button>
+        </div>
       )}
     </div>
   );
