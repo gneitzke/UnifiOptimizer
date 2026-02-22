@@ -957,6 +957,7 @@ function SatisfactionTrend({ timeline }: { timeline: EventTimeline }) {
   // Downsample to ~50 points for display
   const step = Math.max(1, Math.floor(entries.length / 50));
   const sampled = entries.filter((_, i) => i % step === 0 || i === entries.length - 1);
+  if (sampled.length < 2) return null;
   const values = sampled.map(([, v]) => v);
   const min = Math.min(...values);
   const max = Math.max(...values);
@@ -1053,12 +1054,20 @@ function ApEventsCard({ timeline }: { timeline: EventTimeline }) {
   const apEntries = Object.entries(timeline.apEvents);
   if (apEntries.length === 0) return null;
 
+  // Filter out non-event keys (e.g. restart_uptime, session_restarts)
+  const eventKeys = new Set(Object.keys(EVENT_COLORS));
+
   // Sort by total events descending
-  const sorted = apEntries.map(([name, events]) => ({
-    name,
-    events,
-    total: Object.values(events).reduce((a, b) => a + b, 0),
-  })).sort((a, b) => b.total - a.total);
+  const sorted = apEntries.map(([name, events]) => {
+    const filtered = Object.fromEntries(
+      Object.entries(events).filter(([k]) => eventKeys.has(k)),
+    );
+    return {
+      name,
+      events: filtered,
+      total: Object.values(filtered).reduce((a, b) => a + b, 0),
+    };
+  }).filter((a) => a.total > 0).sort((a, b) => b.total - a.total);
 
   const max = sorted[0]?.total ?? 1;
 

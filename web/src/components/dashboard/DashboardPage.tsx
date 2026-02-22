@@ -190,7 +190,9 @@ export default function DashboardPage() {
   useEffect(() => {
     const cached = sessionStorage.getItem('unifi_last_analysis');
     if (cached) {
-      api.getAnalysisResults(cached).then(setData).catch(() => {});
+      api.getAnalysisResults(cached).then(setData).catch(() => {
+        sessionStorage.removeItem('unifi_last_analysis');
+      });
     }
   }, []);
 
