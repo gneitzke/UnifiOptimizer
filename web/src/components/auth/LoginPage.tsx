@@ -654,6 +654,12 @@ export default function LoginPage() {
           )}
         </AnimatePresence>
       </motion.div>
+      <div
+        className="fixed bottom-2 right-3 text-[10px] select-none opacity-30"
+        style={{ color: 'var(--text-muted)' }}
+      >
+        v{__APP_VERSION__}
+      </div>
     </div>
   );
 }
