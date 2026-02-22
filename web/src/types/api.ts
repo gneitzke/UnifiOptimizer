@@ -56,6 +56,7 @@ export interface RadioInfo {
   width: number;
   txPower: number;
   txPowerMode: string;
+  isAuto?: boolean;
 }
 
 export interface ApAnalysis {

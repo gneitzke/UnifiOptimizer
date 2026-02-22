@@ -927,19 +927,51 @@ function EventSummary({ timeline }: { timeline: EventTimeline }) {
   const hours = timeline.hours;
   const hasDensity = catEntries.length > 0 && hours.length > 1;
 
-  // Derive date labels for the x-axis
   const firstDate = hours[0]?.split(' ')[0] ?? '';
   const lastDate = hours[hours.length - 1]?.split(' ')[0] ?? '';
 
+  // Hover state for tooltip
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+  const [tooltipPos, setTooltipPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const containerRef = React.useRef<HTMLDivElement>(null);
+
+  const handleMouseMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const pct = x / rect.width;
+    const idx = Math.min(Math.max(Math.floor(pct * hours.length), 0), hours.length - 1);
+    setHoverIdx(idx);
+    // Position tooltip relative to container
+    const containerRect = containerRef.current?.getBoundingClientRect();
+    if (containerRect) {
+      setTooltipPos({ x: e.clientX - containerRect.left, y: e.clientY - containerRect.top });
+    }
+  }, [hours.length]);
+
+  const handleMouseLeave = useCallback(() => setHoverIdx(null), []);
+
+  // Build tooltip data for hovered hour
+  const tooltipData = hoverIdx !== null ? {
+    hour: hours[hoverIdx] ?? '',
+    events: catEntries.map(([name, counts]) => ({
+      name,
+      label: EVENT_LABELS[name] ?? name,
+      color: EVENT_COLORS[name] ?? 'var(--primary)',
+      count: counts[hoverIdx] ?? 0,
+    })).filter((e) => e.count > 0),
+    total: catEntries.reduce((sum, [, counts]) => sum + (counts[hoverIdx] ?? 0), 0),
+  } : null;
+
   return (
-    <div className="glass-card-solid p-6">
+    <div className="glass-card-solid p-6" ref={containerRef} style={{ position: 'relative' }}>
       <h3 className="text-sm font-semibold mb-4" style={{ color: 'var(--text)' }}>
         Event Timeline {timeline.lookbackDays > 0 && <span className="font-normal text-xs" style={{ color: 'var(--text-muted)' }}>({timeline.lookbackDays}d lookback)</span>}
       </h3>
 
       {/* Density timeline — colored ticks at each hour */}
       {hasDensity && (
-        <div className="mb-5">
+        <div className="mb-5" onMouseMove={handleMouseMove} onMouseLeave={handleMouseLeave}
+          style={{ cursor: 'crosshair' }}>
           {catEntries.map(([name, counts]) => {
             const catMax = Math.max(...counts);
             if (catMax === 0) return null;
@@ -953,7 +985,6 @@ function EventSummary({ timeline }: { timeline: EventTimeline }) {
                     {total >= 1000 ? `${(total / 1000).toFixed(1)}k` : total} total
                   </span>
                 </div>
-                {/* Tick strip — each hour is a vertical tick with opacity proportional to count */}
                 <svg viewBox={`0 0 ${counts.length} 20`} preserveAspectRatio="none"
                   className="w-full rounded" style={{ height: 20, background: 'var(--bg-elevated)' }}>
                   {counts.map((v, i) => {
@@ -965,6 +996,11 @@ function EventSummary({ timeline }: { timeline: EventTimeline }) {
                         fill={color} opacity={opacity} />
                     );
                   })}
+                  {/* Hover indicator line */}
+                  {hoverIdx !== null && (
+                    <rect x={hoverIdx} y={0} width={1} height={20}
+                      fill="var(--text)" opacity={0.4} />
+                  )}
                 </svg>
               </div>
             );
@@ -973,6 +1009,49 @@ function EventSummary({ timeline }: { timeline: EventTimeline }) {
           <div className="flex justify-between text-[10px] mt-1" style={{ color: 'var(--text-muted)' }}>
             <span>{firstDate}</span>
             <span>{lastDate}</span>
+          </div>
+        </div>
+      )}
+
+      {/* Hover tooltip */}
+      {tooltipData && tooltipData.hour && (
+        <div style={{
+          position: 'absolute',
+          left: Math.min(tooltipPos.x + 12, (containerRef.current?.offsetWidth ?? 400) - 180),
+          top: tooltipPos.y - 10,
+          pointerEvents: 'none',
+          zIndex: 50,
+        }}>
+          <div className="rounded-lg px-3 py-2 shadow-lg" style={{
+            background: 'var(--bg-card)',
+            border: '1px solid var(--border)',
+            backdropFilter: 'blur(12px)',
+            minWidth: 150,
+          }}>
+            <div className="text-[10px] font-semibold mb-1.5" style={{ color: 'var(--text-muted)' }}>
+              {tooltipData.hour}
+            </div>
+            {tooltipData.events.length > 0 ? (
+              <div className="space-y-1">
+                {tooltipData.events.map((e) => (
+                  <div key={e.name} className="flex items-center justify-between gap-4">
+                    <div className="flex items-center gap-1.5">
+                      <span className="w-2 h-2 rounded-sm shrink-0" style={{ background: e.color }} />
+                      <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>{e.label}</span>
+                    </div>
+                    <span className="text-[11px] font-semibold tabular-nums" style={{ color: 'var(--text)' }}>{e.count}</span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-[11px]" style={{ color: 'var(--text-muted)' }}>No events</div>
+            )}
+            {tooltipData.total > 0 && tooltipData.events.length > 1 && (
+              <div className="flex justify-between mt-1.5 pt-1.5" style={{ borderTop: '1px solid var(--border)' }}>
+                <span className="text-[10px]" style={{ color: 'var(--text-muted)' }}>Total</span>
+                <span className="text-[10px] font-bold" style={{ color: 'var(--text)' }}>{tooltipData.total}</span>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -1219,7 +1298,7 @@ function DevicesTab({
                         {r.band}
                       </span>
                       <span>
-                        ch{r.channel}
+                        ch{r.channel}{r.isAuto ? ' (Auto)' : ''}
                       </span>
                       <span>
                         {r.width}MHz
@@ -1271,48 +1350,65 @@ function ClientsTab({
   journeys: ClientJourney[];
 }) {
   const [expanded, setExpanded] = useState<string | null>(null);
-  const [sortBy, setSortBy] = useState<'roams' | 'name' | 'rssi'>('roams');
+  type ClientSort = 'name' | 'ap' | 'roams' | 'rssi' | 'behavior' | 'aps';
+  const [sortBy, setSortBy] = useState<ClientSort>('roams');
+  const [sortAsc, setSortAsc] = useState(false);
 
-  // Merge journey data — this is the primary view now
+  function handleSort(col: ClientSort) {
+    if (sortBy === col) setSortAsc(!sortAsc);
+    else { setSortBy(col); setSortAsc(col === 'name' || col === 'ap'); }
+  }
+
+  const BEHAVIOR_ORDER: Record<string, number> = { flapping: 0, pattern: 1, healthy_roamer: 2, stable: 3 };
+
   const sorted = [...journeys]
     .filter((j) => j.roamCount > 0 || j.disconnectCount > 0)
     .sort((a, b) => {
-      if (sortBy === 'roams') return b.roamCount - a.roamCount;
-      if (sortBy === 'rssi') return a.currentRssi - b.currentRssi;
-      return a.hostname.localeCompare(b.hostname);
+      const dir = sortAsc ? 1 : -1;
+      switch (sortBy) {
+        case 'name': return dir * (a.hostname || a.mac).localeCompare(b.hostname || b.mac);
+        case 'ap': return dir * a.currentAp.localeCompare(b.currentAp);
+        case 'roams': return dir * (a.roamCount - b.roamCount);
+        case 'rssi': return dir * (a.currentRssi - b.currentRssi);
+        case 'behavior': return dir * ((BEHAVIOR_ORDER[a.behavior] ?? 9) - (BEHAVIOR_ORDER[b.behavior] ?? 9));
+        case 'aps': return dir * (a.visitedAps.length - b.visitedAps.length);
+        default: return 0;
+      }
     });
 
-  // Also get weak signal clients from old data
   const weakClients = clients.filter((c) => c.issues.length > 0);
 
-  const thStyle = { color: 'var(--text-muted)', borderBottom: '1px solid var(--border)' };
+  const columns: { key: ClientSort; label: string }[] = [
+    { key: 'name', label: 'Client' },
+    { key: 'ap', label: 'AP' },
+    { key: 'roams', label: 'Roams' },
+    { key: 'rssi', label: 'Signal' },
+    { key: 'behavior', label: 'Behavior' },
+    { key: 'aps', label: 'APs Visited' },
+  ];
 
   return (
     <div className="space-y-6">
-      {/* Roaming & Journey Table */}
       {sorted.length > 0 && (
         <div className="glass-card-solid overflow-x-auto">
-          <div className="flex items-center justify-between p-4 pb-0">
+          <div className="p-4 pb-0">
             <h3 className="text-sm font-semibold" style={{ color: 'var(--text)' }}>
               Client Activity ({sorted.length} active)
             </h3>
-            <div className="flex gap-1">
-              {(['roams', 'name', 'rssi'] as const).map((s) => (
-                <button key={s} onClick={() => setSortBy(s)}
-                  className="text-[10px] px-2 py-1 rounded font-medium cursor-pointer"
-                  style={{
-                    background: sortBy === s ? 'var(--primary)' : 'var(--bg-elevated)',
-                    color: sortBy === s ? '#fff' : 'var(--text-muted)',
-                    border: 'none',
-                  }}>{s === 'rssi' ? 'Signal' : s.charAt(0).toUpperCase() + s.slice(1)}</button>
-              ))}
-            </div>
           </div>
           <table className="w-full text-sm">
             <thead>
               <tr>
-                {['Client', 'AP', 'Roams', 'Signal', 'Behavior', 'APs Visited'].map((h) => (
-                  <th key={h} className="text-left px-4 py-3 text-xs font-medium" style={thStyle}>{h}</th>
+                {columns.map((col) => (
+                  <th key={col.key}
+                    className="text-left px-4 py-3 text-xs font-medium cursor-pointer select-none"
+                    style={{ color: 'var(--text-muted)', borderBottom: '1px solid var(--border)' }}
+                    onClick={() => handleSort(col.key)}>
+                    <span className="inline-flex items-center gap-1">
+                      {col.label}
+                      {sortBy === col.key && <ArrowUpDown size={12} />}
+                    </span>
+                  </th>
                 ))}
               </tr>
             </thead>
@@ -1344,7 +1440,6 @@ function ClientsTab({
                       </td>
                       <td className="px-4 py-3" style={{ color: 'var(--text-muted)' }}>{j.visitedAps.length}</td>
                     </tr>
-                    {/* Expanded: AP path timeline */}
                     {isExpanded && j.apPath.length > 0 && (
                       <tr key={`${j.mac}-detail`}>
                         <td colSpan={6} className="px-4 py-3" style={{ background: 'var(--bg-elevated)' }}>
@@ -1354,11 +1449,9 @@ function ClientsTab({
                           <div className="text-xs font-medium mb-2" style={{ color: 'var(--text)' }}>
                             Visited: {j.visitedAps.join(' → ')}
                           </div>
-                          {/* AP path density strip */}
                           <div className="text-[10px] mb-1" style={{ color: 'var(--text-muted)' }}>Recent roam path:</div>
                           <div className="flex gap-0.5 flex-wrap">
                             {j.apPath.slice(-30).map((p, i) => {
-                              // Color by AP name using a hash
                               const apNames = j.visitedAps;
                               const idx = apNames.indexOf(p.toAp);
                               const colors = ['#0088ff', '#00c48f', '#ff8c00', '#a855f7', '#ff4757', '#ffb800', '#06b6d4', '#ec4899', '#84cc16'];
@@ -1374,7 +1467,6 @@ function ClientsTab({
                               );
                             })}
                           </div>
-                          {/* AP color legend */}
                           <div className="flex flex-wrap gap-3 mt-2">
                             {j.visitedAps.map((ap, i) => {
                               const colors = ['#0088ff', '#00c48f', '#ff8c00', '#a855f7', '#ff4757', '#ffb800', '#06b6d4', '#ec4899', '#84cc16'];
@@ -1407,7 +1499,7 @@ function ClientsTab({
             <thead>
               <tr>
                 {['Client', 'Signal', 'Issues'].map((h) => (
-                  <th key={h} className="text-left px-4 py-3 text-xs font-medium" style={thStyle}>{h}</th>
+                  <th key={h} className="text-left px-4 py-3 text-xs font-medium" style={{ color: 'var(--text-muted)', borderBottom: '1px solid var(--border)' }}>{h}</th>
                 ))}
               </tr>
             </thead>
@@ -1450,32 +1542,31 @@ function ChannelsTab({
   aps: ApAnalysis[];
   channelUsage: Record<string, string[]>;
 }) {
-  // Use backend's pre-computed channel_usage if available,
-  // otherwise build from per-radio data
-  type ChEntry = { band: string; channel: number; aps: string[] };
-  const entries: ChEntry[] = [];
+  // Build from per-radio data with auto status
+  type ChEntry = { band: string; channel: number; aps: { name: string; isAuto: boolean }[] };
+  const map = new Map<string, ChEntry>();
+  aps.forEach((ap) =>
+    ap.radios.forEach((r) => {
+      if (r.channel <= 0) return;
+      const key = `${r.band}_ch${r.channel}`;
+      const e = map.get(key);
+      const apInfo = { name: ap.name, isAuto: !!r.isAuto };
+      if (e) e.aps.push(apInfo);
+      else map.set(key, { band: r.band, channel: r.channel, aps: [apInfo] });
+    }),
+  );
+  const entries = [...map.values()];
 
-  if (Object.keys(channelUsage).length > 0) {
+  // Fallback to channelUsage if no radio data
+  if (entries.length === 0 && Object.keys(channelUsage).length > 0) {
     for (const [key, apNames] of Object.entries(channelUsage)) {
       const parts = key.split('_ch');
       const band = parts[0] ?? '';
       const ch = parseInt(parts[1] ?? '0', 10);
-      entries.push({ band, channel: ch, aps: apNames });
+      if (ch > 0) entries.push({ band, channel: ch, aps: apNames.map((n) => ({ name: n, isAuto: false })) });
     }
-  } else {
-    const map = new Map<string, ChEntry>();
-    aps.forEach((ap) =>
-      ap.radios.forEach((r) => {
-        const key = `${r.band}_ch${r.channel}`;
-        const e = map.get(key);
-        if (e) e.aps.push(ap.name);
-        else map.set(key, { band: r.band, channel: r.channel, aps: [ap.name] });
-      }),
-    );
-    entries.push(...map.values());
   }
 
-  // Group by band
   const bands = ['2.4GHz', '5GHz', '6GHz'];
   const grouped = bands.map((band) => ({
     band,
@@ -1484,87 +1575,50 @@ function ChannelsTab({
       .sort((a, b) => a.channel - b.channel),
   })).filter((g) => g.channels.length > 0);
 
-
   return (
     <div className="space-y-6">
       {grouped.map(({ band, channels }) => (
         <div key={band} className="glass-card-solid p-6">
           <h3
-            className="text-sm font-semibold mb-4
-              flex items-center gap-2"
+            className="text-sm font-semibold mb-4 flex items-center gap-2"
             style={{ color: 'var(--text)' }}
           >
-            <span
-              className="inline-block w-3 h-3
-                rounded-full"
-              style={{
-                background:
-                  BAND_COLORS[band] ?? 'var(--primary)',
-              }}
-            />
+            <span className="inline-block w-3 h-3 rounded-full"
+              style={{ background: BAND_COLORS[band] ?? 'var(--primary)' }} />
             {band} Channels
           </h3>
           <div className="space-y-3">
-            {channels.map(({ channel, aps: apNames }) => {
+            {channels.map(({ channel, aps: chAps }) => {
               const maxAps = Math.max(
-                ...grouped.flatMap((g) =>
-                  g.channels.map((c) => c.aps.length),
-                ),
+                ...grouped.flatMap((g) => g.channels.map((c) => c.aps.length)),
               );
-              const chLabel =
-                channel === 0 ? 'Auto' : `Ch ${channel}`;
+              const allAuto = chAps.every((a) => a.isAuto);
+              const someAuto = chAps.some((a) => a.isAuto);
+              const chLabel = `Ch ${channel}`;
               return (
-                <div
-                  key={channel}
-                  className="flex items-center gap-3"
-                >
-                  <span
-                    className="text-xs w-14
-                      font-mono shrink-0
-                      font-semibold"
-                    style={{ color: 'var(--text)' }}
-                  >
+                <div key={channel} className="flex items-center gap-3">
+                  <span className="text-xs w-20 font-mono shrink-0 font-semibold"
+                    style={{ color: 'var(--text)' }}>
                     {chLabel}
+                    {allAuto && <span className="text-[9px] font-normal ml-1" style={{ color: 'var(--text-muted)' }}>(Auto)</span>}
                   </span>
                   <div
-                    className="flex-1 h-5 rounded-full
-                      overflow-hidden relative"
-                    style={{
-                      background: 'var(--bg-elevated)',
-                    }}
+                    className="flex-1 h-5 rounded-full overflow-hidden relative"
+                    style={{ background: 'var(--bg-elevated)' }}
                   >
-                    <div
-                      className="h-full rounded-full"
-                      style={{
-                        width: `${Math.max(
-                          (apNames.length / maxAps) * 100,
-                          8,
-                        )}%`,
-                        background:
-                          BAND_COLORS[band] ??
-                          'var(--primary)',
-                        transition: 'width 0.6s ease',
-                      }}
-                    />
+                    <div className="h-full rounded-full" style={{
+                      width: `${Math.max((chAps.length / maxAps) * 100, 8)}%`,
+                      background: BAND_COLORS[band] ?? 'var(--primary)',
+                      transition: 'width 0.6s ease',
+                    }} />
                   </div>
-                  <span
-                    className="text-xs font-semibold
-                      w-6 text-center shrink-0"
-                    style={{
-                      color:
-                        BAND_COLORS[band] ??
-                        'var(--primary)',
-                    }}
-                  >
-                    {apNames.length}
+                  <span className="text-xs font-semibold w-6 text-center shrink-0"
+                    style={{ color: BAND_COLORS[band] ?? 'var(--primary)' }}>
+                    {chAps.length}
                   </span>
-                  <span
-                    className="text-xs shrink-0"
-                    style={{
-                      color: 'var(--text-muted)',
-                    }}
-                  >
-                    {apNames.join(', ')}
+                  <span className="text-xs shrink-0" style={{ color: 'var(--text-muted)' }}>
+                    {chAps.map((a) => a.isAuto ? `${a.name}*` : a.name).join(', ')}
+                    {someAuto && !allAuto && <span className="text-[9px] ml-1" style={{ color: 'var(--text-muted)' }}>(*=auto)</span>}
                   </span>
                 </div>
               );

@@ -216,19 +216,44 @@ function mapAnalysisResult(
   };
 
   // Map APs with full per-radio detail
+  // Build lookup of actual operating channels from raw device radio_table_stats
+  const actualChannels = new Map<string, Map<string, number>>();
+  const rawDevices = (fullAnalysis.devices ?? []) as Record<string, unknown>[];
+  rawDevices.forEach((dev) => {
+    const mac = (dev.mac ?? '') as string;
+    const radioTable = (dev.radio_table ?? []) as Record<string, unknown>[];
+    const radioStats = (dev.radio_table_stats ?? []) as Record<string, unknown>[];
+    const chanMap = new Map<string, number>();
+    // radio_table[i] config corresponds to radio_table_stats[i] actual
+    radioTable.forEach((rt, i) => {
+      const radio = (rt.radio ?? '') as string;
+      const band = radio === 'ng' ? '2.4GHz' : radio === 'na' ? '5GHz' : radio === '6e' ? '6GHz' : radio;
+      const actualCh = radioStats[i] ? (radioStats[i].channel ?? 0) as number : 0;
+      if (actualCh > 0) chanMap.set(band, actualCh);
+    });
+    if (chanMap.size > 0) actualChannels.set(mac, chanMap);
+  });
+
   const apList = (apRaw.ap_details ?? apRaw.aps ?? []) as Record<string, unknown>[];
   const aps: ApAnalysis[] = apList.map((a) => {
+    const mac = (a.mac ?? '') as string;
+    const devChannels = actualChannels.get(mac);
     const radiosRaw = (a.radios ?? {}) as Record<string, Record<string, unknown>>;
-    const radioList: RadioInfo[] = Object.entries(radiosRaw).map(([band, r]) => ({
-      band,
-      channel: (r.channel ?? 0) as number,
-      width: (r.width ?? 0) as number,
-      txPower: (r.tx_power ?? 0) as number,
-      txPowerMode: (r.tx_power_mode ?? '') as string,
-    }));
+    const radioList: RadioInfo[] = Object.entries(radiosRaw).map(([band, r]) => {
+      const configCh = (r.channel ?? 0) as number;
+      const actualCh = devChannels?.get(band) ?? 0;
+      return {
+        band,
+        channel: configCh === 0 && actualCh > 0 ? actualCh : configCh,
+        width: (r.width ?? 0) as number,
+        txPower: (r.tx_power ?? 0) as number,
+        txPowerMode: (r.tx_power_mode ?? '') as string,
+        isAuto: configCh === 0,
+      };
+    });
     const firstRadio = radioList[0];
     return {
-      mac: (a.mac ?? '') as string,
+      mac,
       name: (a.name ?? 'Unknown') as string,
       model: (a.model ?? '') as string,
       isMesh: !!a.is_mesh,
@@ -255,8 +280,17 @@ function mapAnalysisResult(
     wired: sigRaw.wired ?? 0,
   };
 
-  // Use backend's pre-computed channel usage
-  const channelUsage = (apRaw.channel_usage ?? {}) as Record<string, string[]>;
+  // Build channel usage from mapped APs (with actual operating channels)
+  const channelUsage: Record<string, string[]> = {};
+  aps.forEach((ap) => {
+    ap.radios.forEach((r) => {
+      if (r.channel > 0) {
+        const key = `${r.band}_ch${r.channel}`;
+        if (!channelUsage[key]) channelUsage[key] = [];
+        channelUsage[key].push(ap.name);
+      }
+    });
+  });
 
   // Map only problem clients (weak + poor health)
   const weakClients = (clientRaw.weak_signal ?? []) as Record<string, unknown>[];
@@ -301,8 +335,8 @@ function mapAnalysisResult(
   });
 
   // Extract topology from full device data
-  const rawDevices = (fullAnalysis.devices ?? []) as Record<string, unknown>[];
-  const topology: TopologyNode[] = rawDevices
+  const topoDevices = rawDevices;
+  const topology: TopologyNode[] = topoDevices
     .filter((dev) => {
       const dtype = (dev.type ?? '') as string;
       return dtype === 'uap' || dtype === 'usw';
