@@ -216,6 +216,14 @@ export default function AppShell() {
         <main className="flex-1 overflow-y-auto p-6">
           <Outlet />
         </main>
+
+        {/* Version tag */}
+        <div
+          className="text-[10px] px-3 py-1 text-right select-none opacity-30"
+          style={{ color: 'var(--text-muted)' }}
+        >
+          v{__APP_VERSION__}
+        </div>
       </div>
     </div>
   );
