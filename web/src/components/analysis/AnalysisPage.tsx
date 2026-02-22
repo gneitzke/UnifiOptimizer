@@ -1684,15 +1684,27 @@ function RecsTab({
     return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
   });
 
+  // Toggle entire group
+  function toggleGroup(cat: string) {
+    const items = grouped.get(cat) ?? [];
+    setSelected((prev) => {
+      const next = new Set(prev);
+      const allIn = items.every((f) => next.has(f.id));
+      items.forEach((f) => (allIn ? next.delete(f.id) : next.add(f.id)));
+      return next;
+    });
+  }
+
   return (
-    <div className="space-y-6">
-      {/* Summary bar */}
-      <div className="glass-card-solid p-4 flex items-center justify-between">
-        <div className="flex items-center gap-4">
+    <div className="space-y-4">
+      {/* Sticky header bar — summary + action */}
+      <div className="sticky top-0 z-20 glass-card-solid p-3 flex items-center justify-between gap-3"
+        style={{ borderBottom: '2px solid var(--border)', backdropFilter: 'blur(12px)' }}>
+        <div className="flex items-center gap-3 flex-wrap">
           <span className="text-sm font-semibold" style={{ color: 'var(--text)' }}>
             {findings.length} Recommendations
           </span>
-          <div className="flex gap-2">
+          <div className="flex gap-1.5">
             {sortedGroups.map(([cat, items]) => {
               const meta = ACTION_META[cat];
               return (
@@ -1704,21 +1716,38 @@ function RecsTab({
             })}
           </div>
         </div>
-        <button onClick={selectAll}
-          className="text-xs font-medium px-3 py-1.5 rounded-lg cursor-pointer transition-colors"
-          style={{ background: 'var(--bg-elevated)', color: 'var(--text-muted)', border: '1px solid var(--border)' }}>
-          {selected.size === findings.length ? 'Deselect All' : 'Select All'}
-        </button>
+        <div className="flex items-center gap-2 shrink-0">
+          <button onClick={selectAll}
+            className="text-xs font-medium px-3 py-1.5 rounded-lg cursor-pointer transition-colors"
+            style={{ background: 'var(--bg-elevated)', color: 'var(--text-muted)', border: '1px solid var(--border)' }}>
+            {selected.size === findings.length ? 'Deselect All' : 'Select All'}
+          </button>
+          {selected.size > 0 && (
+            <button onClick={() => onPreview([...selected])}
+              className="text-xs font-semibold px-4 py-1.5 rounded-lg cursor-pointer transition-all shadow-md flex items-center gap-1.5"
+              style={{ background: 'var(--primary)', color: '#fff', border: 'none' }}>
+              <Eye size={13} />
+              Preview {selected.size} Change{selected.size !== 1 ? 's' : ''}
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Grouped recommendations */}
       {sortedGroups.map(([cat, items]) => {
         const meta = ACTION_META[cat] ?? { icon: '🔧', label: cat.replace(/_/g, ' '), color: 'var(--primary)' };
         const groupSelected = items.filter((f) => selected.has(f.id)).length;
+        const allGroupSelected = groupSelected === items.length;
         return (
           <div key={cat} className="glass-card-solid overflow-hidden">
-            {/* Group header */}
-            <div className="px-5 py-3 flex items-center gap-3" style={{ borderBottom: '1px solid var(--border)' }}>
+            {/* Group header — clickable to toggle group */}
+            <div className="px-5 py-3 flex items-center gap-3 cursor-pointer select-none"
+              onClick={() => toggleGroup(cat)}
+              style={{ borderBottom: '1px solid var(--border)' }}>
+              <input type="checkbox" checked={allGroupSelected}
+                readOnly className="shrink-0 accent-[var(--primary)] pointer-events-none"
+                {...(groupSelected > 0 && !allGroupSelected ? { ref: (el: HTMLInputElement | null) => { if (el) el.indeterminate = true; } } : {})}
+              />
               <span className="text-base">{meta.icon}</span>
               <span className="text-sm font-semibold" style={{ color: 'var(--text)' }}>{meta.label}</span>
               <span className="text-[10px] font-medium px-2 py-0.5 rounded-full"
@@ -1726,7 +1755,7 @@ function RecsTab({
                 {items.length} {items.length === 1 ? 'change' : 'changes'}
               </span>
               {groupSelected > 0 && (
-                <span className="text-[10px] font-medium px-2 py-0.5 rounded-full"
+                <span className="ml-auto text-[10px] font-medium px-2 py-0.5 rounded-full"
                   style={{ background: 'rgba(0,136,255,0.1)', color: 'var(--primary)' }}>
                   {groupSelected} selected
                 </span>
@@ -1736,7 +1765,6 @@ function RecsTab({
             <div>
               {items.map((f, i) => {
                 const isSelected = selected.has(f.id);
-                // Extract device name and action details from title
                 const deviceMatch = f.title.match(/^(.+?):\s*(.+)$/);
                 const deviceName = deviceMatch ? deviceMatch[1] : '';
                 const actionText = deviceMatch ? deviceMatch[2] : f.title;
@@ -1765,18 +1793,6 @@ function RecsTab({
           </div>
         );
       })}
-
-      {/* Action button */}
-      {selected.size > 0 && (
-        <div className="sticky bottom-4">
-          <button onClick={() => onPreview([...selected])}
-            className="w-full py-3 rounded-xl font-medium text-sm cursor-pointer transition-all shadow-lg"
-            style={{ background: 'var(--primary)', color: '#fff', border: 'none' }}>
-            <Eye size={16} className="inline mr-2 -mt-0.5" />
-            Preview {selected.size} of {findings.length} Changes
-          </button>
-        </div>
-      )}
     </div>
   );
 }

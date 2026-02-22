@@ -88,7 +88,7 @@ export default function AppShell() {
             h-14 font-bold tracking-wide"
           style={{ color: 'var(--primary)' }}
         >
-          {expanded ? 'UniFi Opt' : 'U'}
+          {expanded ? 'UniFi Optimizer' : '⚡'}
         </div>
 
         {/* Nav links */}
