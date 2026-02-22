@@ -765,33 +765,33 @@ const WIFI_COLORS: Record<string, string> = {
   'legacy': '#ff4757',
 };
 
+function DistBar({ items, colors }: { items: Record<string, number>; colors?: Record<string, string> }) {
+  const total = Object.values(items).reduce((a, b) => a + b, 0);
+  if (total === 0) return null;
+  return (
+    <div className="space-y-2">
+      {Object.entries(items).filter(([, v]) => v > 0).sort(([, a], [, b]) => b - a).map(([name, val]) => {
+        const pct = (val / total) * 100;
+        const color = colors?.[name] ?? 'var(--primary)';
+        return (
+          <div key={name} className="flex items-center gap-3">
+            <span className="text-xs w-16 shrink-0 font-medium" style={{ color }}>{name}</span>
+            <div className="flex-1 h-4 rounded-full overflow-hidden" style={{ background: 'var(--bg-elevated)' }}>
+              <div className="h-full rounded-full" style={{ width: `${pct}%`, background: color, transition: 'width 0.6s ease' }} />
+            </div>
+            <span className="text-xs w-8 text-right shrink-0 font-semibold" style={{ color: 'var(--text)' }}>{val}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function ClientCapabilitiesCard({ caps }: { caps: ClientCapabilities }) {
   const hasStandards = Object.values(caps.wifiStandards).some((v) => v > 0);
   const hasWidths = Object.values(caps.channelWidths).some((v) => v > 0);
   const hasStreams = Object.values(caps.spatialStreams).some((v) => v > 0);
   if (!hasStandards && !hasWidths && !hasStreams) return null;
-
-  function DistBar({ items, colors }: { items: Record<string, number>; colors?: Record<string, string> }) {
-    const total = Object.values(items).reduce((a, b) => a + b, 0);
-    if (total === 0) return null;
-    return (
-      <div className="space-y-2">
-        {Object.entries(items).filter(([, v]) => v > 0).sort(([, a], [, b]) => b - a).map(([name, val]) => {
-          const pct = (val / total) * 100;
-          const color = colors?.[name] ?? 'var(--primary)';
-          return (
-            <div key={name} className="flex items-center gap-3">
-              <span className="text-xs w-16 shrink-0 font-medium" style={{ color }}>{name}</span>
-              <div className="flex-1 h-4 rounded-full overflow-hidden" style={{ background: 'var(--bg-elevated)' }}>
-                <div className="h-full rounded-full" style={{ width: `${pct}%`, background: color, transition: 'width 0.6s ease' }} />
-              </div>
-              <span className="text-xs w-8 text-right shrink-0 font-semibold" style={{ color: 'var(--text)' }}>{val}</span>
-            </div>
-          );
-        })}
-      </div>
-    );
-  }
 
   return (
     <div className="glass-card-solid p-6">
@@ -923,8 +923,6 @@ const EVENT_LABELS: Record<string, string> = {
 
 function EventSummary({ timeline }: { timeline: EventTimeline }) {
   const entries = Object.entries(timeline.totals).filter(([, v]) => v > 0).sort(([, a], [, b]) => b - a);
-  if (entries.length === 0) return null;
-  const max = entries[0]?.[1] ?? 1;
 
   // Build density timeline data — one row per event category
   const catEntries = Object.entries(timeline.categories)
@@ -936,9 +934,9 @@ function EventSummary({ timeline }: { timeline: EventTimeline }) {
   const firstDate = hours[0]?.split(' ')[0] ?? '';
   const lastDate = hours[hours.length - 1]?.split(' ')[0] ?? '';
 
-  // Hover state for tooltip
+  // Hover state for tooltip — hooks must be called unconditionally
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
-  const [tooltipPos, setTooltipPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [tooltipPos, setTooltipPos] = useState<{ x: number; y: number; containerWidth: number }>({ x: 0, y: 0, containerWidth: 400 });
   const containerRef = React.useRef<HTMLDivElement>(null);
 
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
@@ -947,14 +945,16 @@ function EventSummary({ timeline }: { timeline: EventTimeline }) {
     const pct = x / rect.width;
     const idx = Math.min(Math.max(Math.floor(pct * hours.length), 0), hours.length - 1);
     setHoverIdx(idx);
-    // Position tooltip relative to container
     const containerRect = containerRef.current?.getBoundingClientRect();
     if (containerRect) {
-      setTooltipPos({ x: e.clientX - containerRect.left, y: e.clientY - containerRect.top });
+      setTooltipPos({ x: e.clientX - containerRect.left, y: e.clientY - containerRect.top, containerWidth: containerRect.width });
     }
   }, [hours.length]);
 
   const handleMouseLeave = useCallback(() => setHoverIdx(null), []);
+
+  if (entries.length === 0) return null;
+  const max = entries[0]?.[1] ?? 1;
 
   // Build tooltip data for hovered hour
   const tooltipData = hoverIdx !== null ? {
@@ -1023,7 +1023,7 @@ function EventSummary({ timeline }: { timeline: EventTimeline }) {
       {tooltipData && tooltipData.hour && (
         <div style={{
           position: 'absolute',
-          left: Math.min(tooltipPos.x + 12, (containerRef.current?.offsetWidth ?? 400) - 180),
+          left: Math.min(tooltipPos.x + 12, (tooltipPos.containerWidth || 400) - 180),
           top: tooltipPos.y - 10,
           pointerEvents: 'none',
           zIndex: 50,
@@ -1840,13 +1840,13 @@ export default function AnalysisPage() {
 
   useEffect(() => {
     if (id !== 'new') {
-      void poll();
+      const t = setTimeout(() => void poll(), 0);
       const iv = setInterval(() => {
         if (!result && !error) {
           void poll();
         }
       }, 2000);
-      return () => clearInterval(iv);
+      return () => { clearTimeout(t); clearInterval(iv); };
     }
 
     // Check for cached analysis from this session

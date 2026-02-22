@@ -152,7 +152,7 @@ function groupFindings(findings: Finding[]) {
 
 /* ── Helper: group previews by category ────────── */
 
-function groupPreviews(previews: ChangePreview[], findings: Finding[], _selectedIds: Set<string>) {
+function groupPreviews(previews: ChangePreview[], findings: Finding[]) {
   const findingMap = new Map<string, Finding>();
   findings.forEach((f) => findingMap.set(f.id, f));
 
@@ -194,7 +194,7 @@ export default function RepairPage() {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const jobId = params.get('jobId');
-    if (!jobId) { setLoading(false); return; }
+    if (!jobId) { queueMicrotask(() => setLoading(false)); return; }
     api.getAnalysisResults(jobId)
       .then((r: AnalysisResult) => {
         setFindings(r.findings);
@@ -211,7 +211,7 @@ export default function RepairPage() {
   useEffect(() => { loadHistory(); }, [loadHistory]);
 
   function toggleFinding(id: string) {
-    setSelectedIds((prev) => { const next = new Set(prev); next.has(id) ? next.delete(id) : next.add(id); return next; });
+    setSelectedIds((prev) => { const next = new Set(prev); if (next.has(id)) { next.delete(id); } else { next.add(id); } return next; });
   }
 
   function toggleGroup(cat: string) {
@@ -263,7 +263,7 @@ export default function RepairPage() {
 
   async function handleRevert(entry: ChangeHistoryEntry) {
     setRevertTarget(null);
-    const idToRevert = (entry as any).realChangeId || entry.changeId;
+    const idToRevert = entry.realChangeId || entry.changeId;
     if (!idToRevert) return;
     try { await api.revertChange(idToRevert); loadHistory(); }
     catch (err) { console.error('Revert failed:', err); }
@@ -453,7 +453,7 @@ export default function RepairPage() {
             </div>
 
             {/* Grouped preview cards */}
-            {groupPreviews(previews, findings, selectedIds).map(([cat, items]) => {
+            {groupPreviews(previews, findings).map(([cat, items]) => {
               const meta = getMeta(cat);
               return (
                 <div key={cat} className="glass-card-solid overflow-hidden">

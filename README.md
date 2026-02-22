@@ -2,6 +2,8 @@
 
 **Professional-grade network analysis and optimization for UniFi controllers**
 
+**Version:** 3.0.0-rc3 &nbsp;|&nbsp; **Stack:** Python 3.9+ · FastAPI · React 18 · TypeScript · Tailwind CSS
+
 A comprehensive toolkit for analyzing and optimizing Ubiquiti UniFi networks. Provides expert-level insights, recommendations, and automated optimization for wireless networks with CloudKey Gen2/UDM support.
 
 **GitHub:** https://github.com/gneitzke/UnifiOptimizer
@@ -65,7 +67,8 @@ A comprehensive toolkit for analyzing and optimizing Ubiquiti UniFi networks. Pr
 ## 📦 Prerequisites
 
 ### Required Software
-- **Python 3.7+** (Python 3.8+ recommended)
+- **Python 3.9+** (Python 3.10+ recommended)
+- **Node.js 18+** (Node 20 recommended) — for the web frontend
 - **UniFi Controller** (CloudKey Gen2/Gen2+, UDM/UDM-Pro, or self-hosted)
 - **Network Controller version 6.0+**
 - **Administrator account** on your UniFi Controller
@@ -223,10 +226,20 @@ npm run dev    # starts on http://localhost:5173
 The frontend proxies `/api` requests to the backend at `localhost:8000`.
 
 ### Web Features
+
+The web dashboard provides a rich, interactive experience with the following views:
+
 - **Controller Discovery**: Auto-scan your network for UniFi controllers
-- **Live Analysis**: Run full network analysis from the browser
-- **Interactive Recommendations**: Preview and apply changes with one click
-- **Change History**: Track all applied changes with revert capability
+- **Dashboard**: Real-time network overview with health scores and key metrics
+- **Analysis Tabs**:
+  - **Overview**: Network health score, AP count, client summary, network topology DAG
+  - **Devices**: Per-AP channel, power levels, uplink status (mesh/wired badges), DFS avoidance
+  - **Clients**: Health dashboard, RSSI signal histogram, manufacturer breakdown, per-client journeys
+  - **Channels**: Overlap detection, power optimization visualizations
+  - **Recommendations**: Prioritized findings grouped by category with severity levels, bulk select & preview
+  - **Event Timeline**: Stacked density chart of roaming, disconnects, DFS radar, restarts with hover tooltips
+- **Repair Page**: Grouped change cards, pill-step workflow, sticky action bar, dry-run & apply with revert
+- **Change History**: Full audit trail with comparison view and one-click revert
 - **Real-time Updates**: WebSocket support for live analysis progress
 
 ---
@@ -445,7 +458,7 @@ python -m pytest tests/test_health_scoring.py -v
 
 ### Test Status
 
-The test suite has **138 passing tests** across:
+The test suite covers:
 - Client health scoring (RSSI, stability, roaming, throughput)
 - Network analysis and recommendations
 - Configuration loading and thresholds

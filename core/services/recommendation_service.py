@@ -9,8 +9,6 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from utils.network_helpers import is_mesh_parent
-
 
 def convert_recommendations(expert_recs, all_devices=None):
     """Convert expert analyzer recommendations to change-applier format.

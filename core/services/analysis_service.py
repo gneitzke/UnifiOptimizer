@@ -37,8 +37,6 @@ def run_analysis(client, site="default", lookback_days=3, min_rssi_strategy="opt
     Raises:
         Exception: On fatal analysis errors (caller should handle).
     """
-    from api.cloudkey_gen2_client import get_devices
-
     # Step 1: Expert base analysis (devices, clients, events, stats)
     analysis = run_expert_analysis(client, site, lookback_days)
 

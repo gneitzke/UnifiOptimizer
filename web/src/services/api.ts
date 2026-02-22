@@ -355,7 +355,7 @@ function mapAnalysisResult(
         parentName: (uplink.uplink_device_name ?? '') as string,
         clients: (dev.num_sta ?? 0) as number,
         model: (dev.model ?? '') as string,
-        isOffline: (dev.state ?? 1) as number === 0,
+        isOffline: ((dev.state ?? 1) as number) === 0,
       };
     });
 

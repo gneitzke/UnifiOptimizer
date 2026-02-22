@@ -710,7 +710,6 @@ def _svg_device_timeline(analysis_data, width=860):
     """Network event timeline using accurate hourly event data.
     Rows: Roaming, Restarts, DFS Radar. X-axis: hours, ending at today."""
     from datetime import datetime as _dt
-    import time
 
     et = analysis_data.get("event_timeline", {})
     hours = et.get("hours", [])

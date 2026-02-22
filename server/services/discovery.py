@@ -2,8 +2,7 @@
 
 import asyncio
 import socket
-import time
-from typing import List
+from typing import Dict, List, Optional
 
 from server.models.schemas import DiscoveredDevice
 
@@ -69,7 +68,7 @@ async def scan_network(
             await progress_callback(pct, f"Scanned {checked}/{total} endpoints")
 
     # Deduplicate: keep one entry per IP, prefer port 443
-    ip_map: dict[str, DiscoveredDevice] = {}
+    ip_map: Dict[str, DiscoveredDevice] = {}
     for d in raw_devices:
         clean = d.host.replace("https://", "").replace("http://", "")
         if clean not in ip_map or d.port == 443:
@@ -99,7 +98,7 @@ async def _probe_host(ip: str, port: int, timeout: float):
         return None
 
 
-async def _reverse_lookup(ip: str) -> str | None:
+async def _reverse_lookup(ip: str) -> Optional[str]:
     """Attempt reverse DNS lookup; return hostname or None."""
     loop = asyncio.get_running_loop()
     try:

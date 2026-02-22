@@ -7,9 +7,8 @@ re-authentication when sessions expire.
 import os
 import sys
 import threading
-import time
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 from jose import jwt
 

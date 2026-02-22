@@ -216,6 +216,7 @@ export interface ClientJourney {
 export interface ChangeHistoryEntry {
   changeId: string;
   change_id?: string;
+  realChangeId?: string;
   description: string;
   deviceName: string;
   device_name?: string;

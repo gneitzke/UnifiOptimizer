@@ -6,7 +6,7 @@ import threading
 import uuid
 from typing import Dict
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 

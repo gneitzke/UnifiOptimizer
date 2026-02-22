@@ -8,7 +8,6 @@ from fastapi import APIRouter, Header, HTTPException
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from server.models.schemas import (
-    ChangeHistoryEntry,
     ChangePreview,
     ChangeResult,
     RepairApplyRequest,
