@@ -329,18 +329,24 @@ function NetworkDAG({ topology }: { topology: TopologyNode[] }) {
     const result: React.ReactNode[] = [];
     nodes.forEach((n) => {
       const color = NODE_COLORS[n.node.type];
+      const offline = n.node.isOffline;
+      const strokeColor = offline ? 'var(--error)' : color;
+      const strokeStyle = offline ? '3,3' : 'none';
       result.push(
-        <g key={n.node.name} transform={`translate(${n.x},${n.y})`}>
-          <rect width={nodeW} height={nodeH} rx="10" fill={`${color}15`} stroke={color} strokeWidth="1.5" />
+        <g key={n.node.name} transform={`translate(${n.x},${n.y})`} opacity={offline ? 0.75 : 1}>
+          <rect width={nodeW} height={nodeH} rx="10" fill={`${color}15`}
+            stroke={strokeColor} strokeWidth="1.5" strokeDasharray={strokeStyle} />
           <text x={nodeW / 2} y={18} textAnchor="middle" fill="var(--text)" fontSize="11" fontWeight="600">
             {n.node.name.length > 14 ? n.node.name.slice(0, 13) + '…' : n.node.name}
           </text>
           <text x={nodeW / 2} y={32} textAnchor="middle" fill="var(--text-muted)" fontSize="9">
             {friendlyModel(n.node.model)}
           </text>
-          <text x={nodeW / 2} y={46} textAnchor="middle" fill={color} fontSize="9" fontWeight="600">
-            {NODE_ICONS[n.node.type]} {n.node.type === 'switch' ? 'SWITCH' : n.node.type === 'mesh' ? 'MESH' : 'WIRED'}
-            {n.node.clients > 0 ? ` · ${n.node.clients}` : ''}
+          <text x={nodeW / 2} y={46} textAnchor="middle" fill={offline ? 'var(--error)' : color} fontSize="9" fontWeight="600">
+            {offline
+              ? '⚠ OFFLINE'
+              : `${NODE_ICONS[n.node.type]} ${n.node.type === 'switch' ? 'SWITCH' : n.node.type === 'mesh' ? 'MESH' : 'WIRED'}${n.node.clients > 0 ? ` · ${n.node.clients}` : ''}`
+            }
           </text>
         </g>
       );

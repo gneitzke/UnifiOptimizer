@@ -139,6 +139,7 @@ export interface TopologyNode {
   parentName: string;
   clients: number;
   model: string;
+  isOffline?: boolean;
 }
 
 export interface Finding {
