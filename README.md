@@ -2,7 +2,7 @@
 
 **Professional-grade network analysis and optimization for UniFi controllers**
 
-**Version:** 3.0.0-rc3 &nbsp;|&nbsp; **Stack:** Python 3.9+ · FastAPI · React 18 · TypeScript · Tailwind CSS
+**Version:** 3.0.0 &nbsp;|&nbsp; **Stack:** Python 3.9+ · FastAPI · React 18 · TypeScript · Tailwind CSS
 
 A comprehensive toolkit for analyzing and optimizing Ubiquiti UniFi networks. Provides expert-level insights, recommendations, and automated optimization for wireless networks with CloudKey Gen2/UDM support.
 

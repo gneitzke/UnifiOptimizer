@@ -48,11 +48,11 @@ Sample item (first of 15):
 {
   "adopted": true,
   "config_network": {
-    "ip": "192.168.1.5",
+    "ip": "192.168.1.100",
     "type": "dhcp"
   },
   "device_id": "abc123...",
-  "ip": "192.168.1.5",
+  "ip": "192.168.1.100",
   "mac": "aa:bb:cc:dd:ee:ff",
   "model": "U6-Pro",
   "name": "Living Room AP",
