@@ -2,7 +2,7 @@
 
 **Professional-grade network analysis and optimization for UniFi controllers**
 
-**Version:** 3.0.0 &nbsp;|&nbsp; **Stack:** Python 3.9+ · FastAPI · React 18 · TypeScript · Tailwind CSS
+**Version:** 3.15.0 &nbsp;|&nbsp; **Stack:** Python 3.9+ · FastAPI · React 18 · TypeScript · Tailwind CSS
 
 A comprehensive toolkit for analyzing and optimizing Ubiquiti UniFi networks. Provides expert-level insights, recommendations, and automated optimization for wireless networks with CloudKey Gen2/UDM support.
 
@@ -12,9 +12,7 @@ A comprehensive toolkit for analyzing and optimizing Ubiquiti UniFi networks. Pr
 
 ## 📋 Table of Contents
 
-- [Features](#features)
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
+- [Quick Install](#quick-install-macos--linux)
 - [CloudKey User Setup](#cloudkey-user-setup)
 - [Quick Start](#quick-start)
 - [Web Dashboard](#web-dashboard)
@@ -64,7 +62,32 @@ A comprehensive toolkit for analyzing and optimizing Ubiquiti UniFi networks. Pr
 
 ---
 
-## 📦 Prerequisites
+## 🚀 Quick Install (macOS & Linux)
+
+One command — installs Python, Node.js, all dependencies, and builds the frontend:
+
+```bash
+git clone https://github.com/gneitzke/UnifiOptimizer.git
+cd UnifiOptimizer
+bash install.sh
+```
+
+Then start the app:
+
+```bash
+./start.sh
+# Open http://localhost:5173
+```
+
+The installer automatically:
+- Detects macOS or Linux (Ubuntu/Debian/CentOS/RHEL)
+- Installs Python 3.9+ and Node.js 18+ if missing (via Homebrew / apt / dnf)
+- Installs all Python and npm dependencies
+- Builds the React frontend for production
+- Generates a `JWT_SECRET` for session signing
+
+<details>
+<summary><strong>📦 Manual Installation / Prerequisites</strong></summary>
 
 ### Required Software
 - **Python 3.9+** (Python 3.10+ recommended)
@@ -73,53 +96,27 @@ A comprehensive toolkit for analyzing and optimizing Ubiquiti UniFi networks. Pr
 - **Network Controller version 6.0+**
 - **Administrator account** on your UniFi Controller
 
-### Python Installation
+### Step-by-Step
 
-**macOS:**
 ```bash
-# Install Homebrew (if not already installed)
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+# 1. Clone
+git clone https://github.com/gneitzke/UnifiOptimizer.git
+cd UnifiOptimizer
 
-# Install Python 3
-brew install python3
+# 2. Python dependencies
+pip3 install -r requirements.txt
+
+# 3. Frontend
+cd web && npm install && npm run build && cd ..
+
+# 4. (Optional) Dev tools — Black, Flake8, isort
+pip3 install -r requirements-dev.txt
+
+# 5. Verify
+python3 optimizer.py --help
 ```
 
-**Linux (Ubuntu/Debian):**
-```bash
-sudo apt update
-sudo apt install python3 python3-pip
-```
-
-**Linux (CentOS/RHEL):**
-```bash
-sudo yum install python3 python3-pip
-```
-
----
-
-## 🚀 Installation
-
-1. **Clone or download this repository:**
-   ```bash
-   git clone https://github.com/gneitzke/UnifiOptimizer.git
-   cd UnifiOptimizer
-   ```
-
-2. **Install required Python packages:**
-   ```bash
-   pip3 install -r requirements.txt
-   ```
-
-3. **(Optional) Install development tools for code quality:**
-   ```bash
-   pip3 install -r requirements-dev.txt
-   ```
-   Includes: Black (formatter), Flake8 (linter), isort (import organizer)
-
-4. **Verify installation:**
-   ```bash
-   python3 optimizer.py --help
-   ```
+</details>
 
 ---
 
@@ -366,14 +363,8 @@ open reports/network_analysis_YYYYMMDD_HHMMSS.html
 ### Local Development
 
 ```bash
-# CLI only
-pip3 install -r requirements.txt
-python3 optimizer.py analyze --host https://YOUR_CONTROLLER_IP --username admin
-
-# Full web stack
-pip3 install -r requirements.txt
-uvicorn server.main:app --reload --port 8000 &
-cd web && npm install && npm run dev
+bash install.sh       # installs everything
+./start.sh            # backend + frontend dev servers
 ```
 
 ### Production (Systemd)

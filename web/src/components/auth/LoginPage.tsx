@@ -63,7 +63,7 @@ export default function LoginPage() {
         password,
         remember,
       });
-      navigate('/dashboard');
+      navigate('/analysis/new');
     } catch (err) {
       const msg =
         err instanceof Error ? err.message : String(err);
