@@ -1,6 +1,8 @@
 import { test, expect } from '@playwright/test';
 
 const BASE = 'http://localhost:5173';
+const E2E_HOST = process.env.E2E_HOST || 'https://192.168.1.1';
+const E2E_PASS = process.env.E2E_PASS || 'password';
 
 // Auth state is pre-loaded via auth.setup.ts (storageState)
 
@@ -182,14 +184,14 @@ test.describe('Logout flow', () => {
     await page.evaluate(() => localStorage.clear());
     await page.goto(BASE);
     await page.getByText('Enter Manually').click();
-    await page.getByPlaceholder('https://192.168.1.1:8443').fill('https://192.168.1.1');
+    await page.getByPlaceholder('https://192.168.1.1:8443').fill(E2E_HOST);
     await page.getByRole('button', { name: 'Continue' }).click();
     await expect(page.getByText('Connecting to')).toBeVisible();
     const usernameInput = page.locator(
       'input:not([type="password"]):not([type="checkbox"])',
     );
-    await usernameInput.fill('audit');
-    await page.locator('input[type="password"]').fill('CHANGE_ME');
+    await usernameInput.fill('admin');
+    await page.locator('input[type="password"]').fill(E2E_PASS);
     await page.getByRole('button', { name: /Sign In/i }).click();
     await page.waitForURL('**/dashboard', { timeout: 15000 });
 
@@ -209,14 +211,14 @@ test.describe('Logout flow', () => {
     await page.evaluate(() => localStorage.clear());
     await page.goto(BASE);
     await page.getByText('Enter Manually').click();
-    await page.getByPlaceholder('https://192.168.1.1:8443').fill('https://192.168.1.1');
+    await page.getByPlaceholder('https://192.168.1.1:8443').fill(E2E_HOST);
     await page.getByRole('button', { name: 'Continue' }).click();
     await expect(page.getByText('Connecting to')).toBeVisible();
-    const usernameInput = page.locator(
+    const usernameInput2 = page.locator(
       'input:not([type="password"]):not([type="checkbox"])',
     );
-    await usernameInput.fill('audit');
-    await page.locator('input[type="password"]').fill('CHANGE_ME');
+    await usernameInput2.fill('admin');
+    await page.locator('input[type="password"]').fill(E2E_PASS);
     await page.getByRole('button', { name: /Sign In/i }).click();
     await page.waitForURL('**/dashboard', { timeout: 15000 });
 

@@ -1,0 +1,13 @@
+[
+  {
+    "id": "durable_1771690857089_r177s5",
+    "name": "Node",
+    "color": "indigo",
+    "branch": "Node/standby",
+    "worktreePath": "/Users/garyneitzke/projects/UnifiOptimizer/.clubhouse/agents/Node",
+    "createdAt": "2026-02-21T16:20:57.182Z",
+    "model": "claude-opus-4.6",
+    "orchestrator": "copilot-cli",
+    "freeAgentMode": true
+  }
+]

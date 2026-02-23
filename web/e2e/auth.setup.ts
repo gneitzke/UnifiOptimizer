@@ -1,9 +1,9 @@
 import { test as setup, expect } from '@playwright/test';
 
 const BASE = 'http://localhost:5173';
-const HOST = 'https://192.168.1.1';
-const USER = 'audit';
-const PASS = 'CHANGE_ME';
+const HOST = process.env.E2E_HOST || 'https://192.168.1.1';
+const USER = process.env.E2E_USER || 'admin';
+const PASS = process.env.E2E_PASS || 'password';
 
 setup('authenticate', async ({ page }) => {
   await page.goto(BASE);

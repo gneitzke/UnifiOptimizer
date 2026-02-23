@@ -907,7 +907,7 @@ def main():
 
     # Example: Create client and applier
     client = CloudKeyGen2Client(
-        host="https://192.168.1.1", username="audit", password="password", site="default"
+        host="https://192.168.1.1", username="admin", password="password", site="default"
     )
 
     # Login

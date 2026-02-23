@@ -1,9 +1,9 @@
 import { test, expect, Page } from '@playwright/test';
 
 const BASE = 'http://localhost:5173';
-const VALID_HOST = 'https://192.168.1.1';
-const VALID_USER = 'audit';
-const VALID_PASS = 'CHANGE_ME';
+const VALID_HOST = process.env.E2E_HOST || 'https://192.168.1.1';
+const VALID_USER = process.env.E2E_USER || 'admin';
+const VALID_PASS = process.env.E2E_PASS || 'password';
 const BAD_HOST = 'https://10.255.255.1';
 const BAD_USER = 'nobody';
 const BAD_PASS = 'wrong';
@@ -360,10 +360,10 @@ test.describe('Scan → login end-to-end', () => {
       page.getByText('choose a connection'),
     ).toBeVisible({ timeout: 90000 });
 
-    // Find and click the 192.168.1.1 IP option (port 443)
+    // Find and click the controller IP option (port 443)
     const targetBtn = page
       .locator('button')
-      .filter({ hasText: '192.168.1.1' })
+      .filter({ hasText: VALID_HOST.replace('https://', '') })
       .filter({ hasText: 'IP address' })
       .first();
     await expect(targetBtn).toBeVisible();
@@ -390,7 +390,7 @@ test.describe('Scan → login end-to-end', () => {
 
     const targetBtn = page
       .locator('button')
-      .filter({ hasText: '192.168.1.1' })
+      .filter({ hasText: VALID_HOST.replace('https://', '') })
       .filter({ hasText: 'IP address' })
       .first();
     await targetBtn.click();

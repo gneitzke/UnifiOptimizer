@@ -111,3 +111,10 @@ docs/fixes/RADIO_TABLE_API_FIX_AND_MENU.md
 analysis_cache_*.json
 Go.sh
 .jwt_secret
+
+# E2E auth state
+web/e2e/.auth/
+
+# Test artifacts
+.coverage
+test-results/*.png
