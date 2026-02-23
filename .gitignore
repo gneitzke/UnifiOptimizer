@@ -7,7 +7,7 @@ data/config.json
 # Generated reports
 reports/*.html
 reports/*.png
-*.html
+*_report_*.html
 *_share.html
 
 # State and output files
