@@ -1,0 +1,50 @@
+{
+  "data": [
+    {
+      "num_adopted": 9,
+      "num_ap": 9,
+      "num_disabled": 0,
+      "num_disconnected": 0,
+      "num_guest": 0,
+      "num_iot": 0,
+      "num_pending": 0,
+      "num_user": 112,
+      "rx_bytes-r": 2673597,
+      "status": "ok",
+      "subsystem": "wlan",
+      "tx_bytes-r": 1416389
+    },
+    {
+      "num_adopted": 0,
+      "num_disconnected": 0,
+      "num_gw": 0,
+      "num_pending": 0,
+      "status": "unknown",
+      "subsystem": "wan"
+    },
+    {
+      "status": "unknown",
+      "subsystem": "www"
+    },
+    {
+      "num_adopted": 3,
+      "num_disconnected": 0,
+      "num_guest": 0,
+      "num_iot": 0,
+      "num_pending": 0,
+      "num_sw": 3,
+      "num_user": 16,
+      "rx_bytes-r": 6251949,
+      "status": "ok",
+      "subsystem": "lan",
+      "tx_bytes-r": 4676605
+    },
+    {
+      "status": "unknown",
+      "subsystem": "vpn"
+    }
+  ],
+  "meta": {
+    "rc": "ok"
+  }
+}

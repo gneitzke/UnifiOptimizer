@@ -1,0 +1,19 @@
+{
+  "audit_mode": "deep",
+  "auth_method": "user",
+  "auto_open_reports": true,
+  "channel_width_2g": 20,
+  "channel_width_5g": 80,
+  "default_output_dir": "reports",
+  "host": "",
+  "min_rssi": -75,
+  "site": "default",
+  "state_file": "data/state.json",
+  "theme": "default",
+  "valid_channels_2g": [
+    1,
+    6,
+    11
+  ],
+  "verbose_logging": false
+}

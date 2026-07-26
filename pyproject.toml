@@ -1,0 +1,140 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# Distribution name on PyPI is "unifioptimizer" (the product name); the import
+# package and the console script both stay "netadmin". Dist-name != import-name
+# is fully supported: pip installs "unifioptimizer", `import netadmin` works, and
+# the `netadmin` command is registered via [project.scripts] below.
+name = "unifioptimizer"
+version = "0.4.0"
+description = "The incident engine for UniFi: keeps the history your controller throws away and turns it into tracked, root-caused issues with revertible fixes."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "Gary Neitzke", email = "gneitzke123@gmail.com" }]
+keywords = [
+    "unifi",
+    "ubiquiti",
+    "network-monitoring",
+    "wifi",
+    "self-hosted",
+    "sqlite",
+    "home-assistant",
+    "observability",
+    "homelab",
+    "incident-management",
+    "root-cause-analysis",
+    "unifi-network",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Framework :: FastAPI",
+    "Intended Audience :: System Administrators",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Networking :: Monitoring",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2",
+    "pydantic-settings>=2",
+    "APScheduler>=3.10",
+    "websockets>=12",
+    "pyyaml>=6",
+    "rich>=13",
+    "fastapi>=0.104",
+    "uvicorn[standard]>=0.24",
+    "dnspython>=2",
+    "aiomqtt>=2",
+]
+
+[project.urls]
+Homepage = "https://github.com/gneitzke/UnifiOptimizer"
+Repository = "https://github.com/gneitzke/UnifiOptimizer"
+Issues = "https://github.com/gneitzke/UnifiOptimizer/issues"
+Documentation = "https://github.com/gneitzke/UnifiOptimizer/blob/main/docs/ARCHITECTURE.md"
+
+[project.optional-dependencies]
+# What the netadmin test suite actually imports/uses (matches reality; installed).
+test = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+]
+# The read-only MCP server (docs/MCP_SERVER.md). Deliberately an extra, not a core
+# dependency: the daemon does not need it, and the core install stays at 11 runtime
+# deps. `netadmin-mcp` imports the SDK lazily and prints this install line if absent.
+mcp = ["mcp>=1.2"]
+
+[project.scripts]
+netadmin = "netadmin.cli:main"
+netadmin-mcp = "netadmin.mcp.server:main"
+
+# --- Packaging: ship only the netadmin package, with the prebuilt web UI as
+#     package data so `pip install` gives a working dashboard with ZERO Node.
+#     The bundled UI lives at netadmin/_webui/ and is produced by
+#     `python tools/build_web.py` before the wheel is built (see
+#     .github/workflows/release.yml). The old top-level dirs (core/, api/,
+#     utils/, ...) are intentionally excluded from the distribution.
+[tool.setuptools.packages.find]
+include = ["netadmin*"]
+namespaces = false
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+# The prebuilt web UI (no Node needed at runtime) AND the numbered SQL migrations
+# the store applies at startup via netadmin/store/db.py:MIGRATIONS_DIR — both are
+# non-.py runtime data that must ship inside the wheel or `netadmin` cannot boot.
+netadmin = ["_webui/**/*", "store/migrations/*.sql"]
+
+[tool.black]
+line-length = 100
+target-version = ['py311', 'py312']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.git
+  | __pycache__
+  | \.venv
+  | venv
+  | env
+  | build
+  | dist
+  | Archive
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 100
+skip_gitignore = true
+extend_skip = ["Archive"]
+known_first_party = ["api", "core", "utils"]
+sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["core", "api", "utils"]
+omit = ["*/tests/*", "*/__pycache__/*"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 0

@@ -1,0 +1,192 @@
+# Sensitive data - credentials and personal info
+*.keychain
+*.credentials
+data/config.json
+.channel_recommendations.json
+
+# Generated reports
+reports/*.html
+reports/*.png
+*_report_*.html
+*_share.html
+
+# State and output files
+state.json
+audit-*.json
+plan-*.json
+report-*.html
+model-*.html
+apply-*.html
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+
+# Virtual environment
+venv/
+env/
+.env/
+.venv/
+ENV/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# MacOS files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Logs
+*.log
+# Rotated log files (netadmin.log.1, .log.2, ...) — `*.log` does not match these,
+# and the daemon's own log dir holds operational network data that must never be
+# committed to a public repo.
+*.log.[0-9]*
+data/logs/
+Logging/
+# Self-upgrade working directory. The journal records the daemon's environment so
+# the runner can respawn it, which means it holds whatever secrets were exported
+# (the API token, controller credentials). It also holds pre-upgrade database
+# backups. Neither may ever be committed.
+data/upgrade/
+Logging/
+
+# Test files
+test_output/
+.pytest_cache/
+
+# Archive directory - historical files and old versions
+Archive/
+docs/ANALYZE_MODE_ENHANCEMENT.md
+docs/API_COMPATIBILITY.md
+docs/API_DOCUMENTATION.md
+docs/ASCII_ART_SHOWCASE.md
+docs/BUG_FIXES_COMPLETE.md
+docs/CLIENT_HEALTH_GUIDE.md
+docs/CLIENT_HEALTH_INTEGRATION.md
+docs/CLOUDKEY_AUTH_ENHANCEMENT.md
+docs/CLOUDKEY_COMPATIBILITY.md
+docs/CLOUDKEY_DIAGNOSTICS.md
+docs/CLOUDKEY_GEN2_INTEGRATION_COMPLETE.md
+docs/CLOUDKEY_GEN2_OPTIMIZATION.md
+docs/CLOUDKEY_OPTIMIZATION_SUMMARY.md
+docs/CLOUDKEY_TEST_GUIDE.md
+docs/CLOUDKEY_TEST_README.md
+docs/COMPLETE_IMPLEMENTATION.md
+docs/CONNECTION_ANALYSIS_ENHANCEMENT.md
+docs/CONNECTION_ANALYSIS_SUMMARY.md
+docs/DEMO_OPTIMIZER_WITH_DIAGNOSTICS.md
+docs/ENHANCEMENT_COMPLETE.md
+docs/EXPERT_ANALYSIS_COMPLETE.md
+docs/EXPERT_NETWORK_ANALYSIS.md
+docs/FINAL_ENHANCEMENT_SUMMARY.md
+docs/FRIENDLY_NAME_VERIFICATION.md
+docs/HISTORICAL_ANALYSIS_ENHANCEMENT.md
+docs/IMPLEMENTATION_COMPLETE.md
+docs/OPTIMIZER_IMPLEMENTATION.md
+docs/OPTIMIZER_USER_GUIDE.md
+docs/PROJECT_REORGANIZATION.md
+docs/QUICK_REFERENCE.md
+docs/QUICK_START_EXPERT.md
+docs/QUICK_START_OPTIMIZER.md
+docs/README.md
+docs/README_UPDATE_VERIFICATION.md
+docs/RENAME_TO_OPTIMIZER.md
+docs/ROAMING_ANALYSIS_VERIFICATION.md
+docs/RUN_ALL_TESTS_STATUS.md
+docs/RUN_ALL_TESTS_WORKING.md
+docs/RunUnitTests_README.md
+docs/TEST_SAFETY_AND_IMPACT.md
+docs/TOOLS_COMPARISON.md
+docs/features/ADVANCED_ANALYSIS.md
+docs/features/AUTO_CREDENTIAL_LOADING.md
+docs/features/EXECUTIVE_SUMMARY_DISPLAY_ORDER.md
+docs/features/EXPERT_SUMMARY_IN_APPLY_MODE.md
+docs/features/HTML_REPORT_GENERATION.md
+docs/features/KEYCHAIN_CREDENTIALS.md
+docs/features/LOGIN_RETRY.md
+docs/features/RSSI_HISTOGRAM_AND_SUMMARY.md
+docs/features/SIMPLIFIED_MENU.md
+docs/fixes/CHANNEL_TYPE_COMPREHENSIVE_FIX.md
+docs/fixes/CHANNEL_TYPE_FIX.md
+docs/fixes/DEVICE_ID_FIX.md
+docs/fixes/RADIO_TABLE_API_FIX_AND_MENU.md
+analysis_cache_*.json
+Go.sh
+.jwt_secret
+
+# E2E auth state
+web/e2e/.auth/
+
+# Test artifacts
+.coverage
+test-results/*.png
+.playwright-mcp/
+
+# Clubhouse agent manager (MCP bridge config carries a live hook nonce +
+# agent id — secret-bearing, must never enter the public repo)
+.mcp.json
+.clubhouse/agents/
+.clubhouse/.local/
+.clubhouse/agents.json
+.clubhouse/agents.json.bak
+.clubhouse/settings.local.json
+
+# Claude Code local settings (per-machine permissions/allowlist + local hooks).
+# Never a shared artifact; keep it out of the public repo. Shared project config
+# (e.g. .claude/commands) can be un-ignored explicitly if it is ever committed.
+.claude/settings.local.json
+
+# Local secrets (controller credentials) — never commit
+data/secrets.env
+data/deploy_hosts.env
+data/*.db
+data/*.db-wal
+data/*.db-shm
+scratch_validation/
+
+# LLM investigation dossiers (embed live network topology) — never commit
+investigations/
+
+# Environment files — any .env anywhere is treated as secret-bearing.
+# Commit a sanitized *.env.example instead (explicitly re-allowed below).
+*.env
+!*.env.example
+
+# LLM investigator dossiers (netadmin/llm, ARCHITECTURE §10) — contain issue
+# evidence, topology context, and device/room names. Local-only.
+investigations/
+
+# Generated reports (HTML/PNG/MD tech-visit + morning reports). The whole tree
+# is machine output; nothing here is source. Keep docs/ reports out of here.
+reports/
+
+# Bundled web UI (built into the package at release; never committed)
+netadmin/_webui/
+
+# Python build artifacts (python -m build)
+/build/
+/dist/
+*.egg-info/
+
+# stray local UI captures
+.preview-shots/
+
+# home-network / internal docs — kept local, never public
+docs/MORNING_REPORT_*.md
+docs/PUBLIC_REPO_CHECKLIST.md
+deploy/macmini.md
+deploy/update-macmini.sh
+deploy/artifacts/
+.clubhouse/plugin-data-local/
+
+# local PII denylist (owner real names — never public)
+.pii_denylist

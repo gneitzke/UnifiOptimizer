@@ -1,0 +1,9 @@
+# Home Assistant add-on repository manifest.
+#
+# Its presence is what lets someone paste this repository's GitHub URL into
+# Settings -> Add-ons -> Add-on store -> Repositories and have the Supervisor
+# find the add-on in ./addon. It is inert for every other use of this repo: not
+# read by the package, not shipped in the wheel, not touched by CI.
+name: UnifiOptimizer
+url: https://github.com/gneitzke/UnifiOptimizer
+maintainer: Gary Neitzke <gneitzke123@gmail.com>

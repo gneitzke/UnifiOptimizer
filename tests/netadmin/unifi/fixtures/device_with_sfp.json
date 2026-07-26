@@ -1,0 +1,62 @@
+{
+  "meta": {"rc": "ok"},
+  "data": [
+    {
+      "mac": "02:00:11:22:33:0a",
+      "model": "USAGGPRO",
+      "type": "usw",
+      "name": "<name>",
+      "version": "6.6.65",
+      "adopted": true,
+      "state": 1,
+      "total_max_power": 0,
+      "total_used_power": 0,
+      "port_table": [
+        {
+          "port_idx": 1,
+          "media": "SFP+",
+          "up": true,
+          "enable": true,
+          "is_uplink": true,
+          "speed": 10000,
+          "full_duplex": true,
+          "autoneg": false,
+          "rx_errors": 0,
+          "tx_errors": 0,
+          "sfp_found": true,
+          "sfp_vendor": "<vendor>",
+          "sfp_part": "<part>",
+          "sfp_serial": "<serial>",
+          "sfp_temperature": 41.2,
+          "sfp_voltage": 3.28,
+          "sfp_current": 6.1,
+          "sfp_rxpower": -4.7,
+          "sfp_txpower": -2.3,
+          "sfp_rxfault": false,
+          "sfp_txfault": false,
+          "satisfaction": 100
+        },
+        {
+          "port_idx": 2,
+          "media": "GE",
+          "up": true,
+          "enable": true,
+          "speed": 100,
+          "full_duplex": false,
+          "autoneg": true,
+          "rx_errors": 1423,
+          "tx_errors": 12,
+          "port_poe": true,
+          "poe_enable": true,
+          "poe_mode": "auto",
+          "poe_power": 7.4,
+          "poe_voltage": 53.1,
+          "poe_current": 139.0,
+          "poe_class": "Class 4",
+          "poe_good": true,
+          "satisfaction": 62
+        }
+      ]
+    }
+  ]
+}

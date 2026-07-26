@@ -1,0 +1,48 @@
+{
+  "meta": {"rc": "ok"},
+  "data": [
+    {
+      "_id": "6600000000000000000000a1",
+      "key": "EVT_WU_Roam",
+      "time": 1721600000000,
+      "datetime": "2024-07-21T22:13:20Z",
+      "subsystem": "wlan",
+      "user": "02:00:aa:bb:cc:01",
+      "ap": "02:00:11:22:33:01",
+      "ap_from": "02:00:11:22:33:02",
+      "ap_to": "02:00:11:22:33:01",
+      "ssid": "<ssid>",
+      "channel": 36,
+      "msg": "Client roamed"
+    },
+    {
+      "_id": "6600000000000000000000a2",
+      "key": "EVT_SW_PoeOverload",
+      "time": 1721600060000,
+      "datetime": "2024-07-21T22:14:20Z",
+      "subsystem": "lan",
+      "sw": "02:00:11:22:33:08",
+      "port": 5,
+      "msg": "PoE overload on port 5"
+    },
+    {
+      "_id": "6600000000000000000000a3",
+      "key": "EVT_AP_RadarDetected",
+      "time": 1721600120000,
+      "datetime": "2024-07-21T22:15:20Z",
+      "subsystem": "wlan",
+      "ap": "02:00:11:22:33:01",
+      "channel": 100,
+      "msg": "Radar detected on channel 100"
+    },
+    {
+      "_id": "6600000000000000000000a4",
+      "key": "EVT_GW_WANTransition",
+      "time": 1721600180000,
+      "datetime": "2024-07-21T22:16:20Z",
+      "subsystem": "wan",
+      "gw": "02:00:11:22:33:09",
+      "msg": "WAN link transitioned"
+    }
+  ]
+}

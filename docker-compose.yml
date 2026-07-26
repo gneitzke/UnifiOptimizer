@@ -1,0 +1,78 @@
+# UnifiOptimizer daemon, one command: `docker compose up -d`.
+#
+# Builds Dockerfile.netadmin from this checkout and runs the single daemon
+# process (collector, detectors, issue engine, SLE, FastAPI + WebSocket).
+# Controller access is read-only. See docs/CONTAINER.md for the full walkthrough
+# and for the bind-mount variant.
+#
+# THREE THINGS THIS FILE GETS RIGHT ON PURPOSE, do not "simplify" them away:
+#
+# 1. The published port is `127.0.0.1:8765:8765`, not `8765:8765`. Reads on the
+#    API are unauthenticated by design (docs/ARCHITECTURE.md 18.1), so the bare
+#    form, which binds 0.0.0.0 on the host, would hand your whole network
+#    inventory to anyone on the LAN. Put a reverse proxy with auth in front if
+#    you want remote access.
+#
+# 2. Storage is a named volume, not a `./data` bind mount. The image runs as a
+#    non-root user (uid 501 by default, see Dockerfile.netadmin) and Docker
+#    seeds a fresh named volume from the image with that ownership already
+#    correct, on any host, with no uid bookkeeping from you. A bind mount only
+#    works when the host directory happens to be writable by the container's
+#    uid; docs/CONTAINER.md shows how to do that deliberately if you want the
+#    files on the host.
+#
+# 3. NETADMIN_DATA_DIR is set explicitly even though /app/data is also where the
+#    default cwd-relative lookup lands. It pins secrets.env, config.yaml, the
+#    SQLite database, and the logs to the volume regardless of the working
+#    directory, so an upgrade cannot silently start writing somewhere else.
+
+services:
+  netadmin:
+    build:
+      context: .
+      dockerfile: Dockerfile.netadmin
+    image: unifioptimizer:local
+    container_name: unifioptimizer
+    restart: unless-stopped
+
+    # Loopback only. See note 1 above.
+    ports:
+      - "127.0.0.1:8765:8765"
+
+    environment:
+      NETADMIN_DATA_DIR: /app/data
+      # Tells self-update (docs/ARCHITECTURE.md section 23) which host command
+      # to show: `git pull && docker compose up -d --build`. The image already
+      # sets NETADMIN_INSTALL_METHOD=container; this just picks the variant.
+      NETADMIN_UPDATE_VARIANT: compose
+      # Uncomment to gate fix apply/revert over HTTP. Reads stay open; without a
+      # token every mutating endpoint is refused, which is the safe default.
+      # NETADMIN_API_TOKEN: ${NETADMIN_API_TOKEN:-}
+
+    volumes:
+      - netadmin-data:/app/data
+
+    # No curl in the python:3.12-slim base, so probe with the interpreter that
+    # is already there.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sys, urllib.request
+          with urllib.request.urlopen("http://127.0.0.1:8765/api/health", timeout=5) as r:
+              sys.exit(0 if r.status == 200 else 1)
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  netadmin-data:

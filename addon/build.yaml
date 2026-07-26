@@ -1,0 +1,24 @@
+# Per-architecture base images for the add-on build.
+#
+# The Home Assistant builder substitutes the entry matching the target arch into
+# the ARG BUILD_FROM in ./Dockerfile. These are the official Home Assistant
+# Python bases: they ship s6-overlay as PID 1 (hence `init: false` in
+# config.yaml) and bashio, which run.sh uses to read /data/options.json.
+#
+# Alpine, so every wheel must be musllinux. All eleven runtime dependencies
+# publish musllinux wheels for both x86_64 and aarch64, including the compiled
+# ones (pydantic-core, uvloop, httptools, watchfiles), so nothing is built from
+# source and no toolchain is needed in the image. Verify with a real build
+# before bumping these tags; a base bump that loses a wheel turns into a slow
+# source compile or a hard failure.
+#
+# armv7/armhf are not listed: the arch list in config.yaml is amd64 and aarch64
+# only, matching where the wheels exist.
+build_from:
+  amd64: ghcr.io/home-assistant/amd64-base-python:3.12-alpine3.19
+  aarch64: ghcr.io/home-assistant/aarch64-base-python:3.12-alpine3.19
+
+labels:
+  org.opencontainers.image.title: UnifiOptimizer
+  org.opencontainers.image.source: https://github.com/gneitzke/UnifiOptimizer
+  org.opencontainers.image.licenses: MIT

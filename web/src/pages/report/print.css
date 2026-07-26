@@ -1,0 +1,185 @@
+/*
+ * Print styling for the network assessment report (docs/REPORT_SPEC.md §Delivery;
+ * docs/ARCHITECTURE.md §19). The report is delivered as a browser Save-as-PDF, so
+ * this sheet turns the on-screen surface into a clean, multi-page letter document:
+ * page size + generous margins, a section per page, a running site/confidential
+ * header and page numbers, and a forced light "paper" look so a dark-mode reader
+ * still prints a legible document. No server PDF engine, no print library.
+ *
+ * The global `.no-print` rule (src/index.css) already drops the app chrome and the
+ * print button; this sheet is scoped to `.report-root` so it only reshapes the
+ * report itself.
+ */
+
+/* ---- On screen: the report reads as a centred document, not a dashboard --- */
+.report-root {
+  max-width: 9in;
+  margin: 0 auto;
+  padding: 24px 16px 64px;
+}
+
+/* The per-page running header + margin-box page numbers are print-only. */
+.report-runhead {
+  display: none;
+}
+
+@media screen {
+  /* Render each section as an 8.5in "sheet" whose 0.75in padding mirrors the print
+     page margin, so the CONTENT column is exactly the print content width (7in).
+     The hand-rolled SVG charts measure that width once on screen; because print
+     lays out at the same content width, they reflow to the page without clipping,
+     with no need to touch the shared chart primitives. */
+  .report-page {
+    width: 8.5in;
+    max-width: 100%;
+    margin: 0 auto 24px;
+    padding: 0.75in;
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-card);
+    box-shadow: var(--shadow-card);
+  }
+}
+
+/* ---- Print ------------------------------------------------------------- */
+@page {
+  size: Letter;
+  margin: 0.85in 0.75in 0.9in;
+
+  /* Page numbers via a paged-media margin box — the only pure-CSS way to number
+     pages. Honoured by engines that support margin boxes (headless Chromium,
+     Firefox, Safari). Interactive Chrome ignores it and numbers pages from the
+     print dialog's "Headers and footers" toggle instead. The site + confidential
+     running header is the in-flow `.report-runhead` band below, which every engine
+     renders, so there is one header everywhere and no duplication. */
+  @bottom-right {
+    content: 'Page ' counter(page) ' of ' counter(pages);
+    font: 9px 'Inter Variable', sans-serif;
+    color: #6e6e73;
+  }
+}
+
+@media print {
+  /* Force an exact-colour light "paper" theme, independent of the reader's screen
+     theme, so severity chips, chart fills and band dots print as designed. */
+  .report-root {
+    max-width: none;
+    margin: 0;
+    padding: 0;
+
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+
+    --canvas: #ffffff;
+    --surface: #ffffff;
+    --elevated: #ffffff;
+    --hairline: #d9d9de;
+    --strong: #c6c6c8;
+
+    --fg: #1d1d1f;
+    --fg-muted: #45454a;
+    --fg-subtle: #6e6e73;
+
+    --accent: #0057b0;
+    --accent-muted: #5a9be0;
+
+    --sev-p1: #c40012;
+    --sev-p2: #b53000;
+    --sev-p3: #9c4600;
+    --sev-healthy: #1a6b2e;
+    --sev-neutral: #6e6e73;
+
+    /* health bands — distinct from severity, print-legible on white paper. */
+    --health-good: #1a6b2e;
+    --health-fair: #8a5e00;
+    --health-poor: #b84a00;
+
+    --sev-p1-fill: rgba(196, 0, 18, 0.1);
+    --sev-p2-fill: rgba(181, 48, 0, 0.1);
+    --sev-p3-fill: rgba(156, 70, 0, 0.1);
+    --sev-healthy-fill: rgba(26, 107, 46, 0.1);
+    --sev-neutral-fill: rgba(110, 110, 115, 0.1);
+
+    --grid: #e5e5ea;
+    --shadow-card: none;
+    --shadow-elevated: none;
+
+    color: var(--fg);
+    background: #ffffff;
+  }
+
+  .report-page {
+    width: auto;
+    max-width: none;
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    padding: 0;
+    margin: 0;
+  }
+
+  /* Belt-and-suspenders: never let a measured-width SVG spill past its column if
+     screen and print widths differ by a sub-pixel. height:auto keeps it scaling
+     proportionally within its viewBox rather than letterboxing. */
+  .report-root svg {
+    max-width: 100%;
+    height: auto;
+  }
+
+  /* Chromium can't paint the @page margin boxes above, so a slim print-only band
+     at the top of each section gives Chrome readers the same site/confidential
+     running marker. It sits in normal flow (no overlap) at every section break,
+     i.e. the top of most pages. */
+  .report-runhead {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-size: 8.5px;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    color: #8a8a8f;
+    border-bottom: 0.5px solid #e0e0e4;
+    padding-bottom: 4px;
+    margin-bottom: 14px;
+  }
+
+  /* One section per page. The cover carries no leading break. */
+  .report-section {
+    break-before: page;
+    page-break-before: always;
+  }
+  .report-section:first-of-type,
+  .report-section--cover {
+    break-before: auto;
+    page-break-before: auto;
+  }
+
+  /* Keep only GENUINELY atomic units whole across a page edge — a single finding,
+     a chart figure, a table row, and the small tiles/cards still tagged
+     `.report-keep`. Large sub-blocks are deliberately NOT kept whole: forcing a
+     whole section-block to avoid a break made it jump to a fresh page and leave the
+     previous one mostly empty. Letting the block flow (its inner figure/rows still
+     atomic) lets content backfill the page. */
+  .report-keep,
+  .report-finding,
+  figure,
+  tr {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  thead {
+    display: table-header-group; /* repeat table headers across page breaks */
+  }
+
+  h2,
+  h3 {
+    break-after: avoid;
+    page-break-after: avoid;
+  }
+
+  /* Anything that is purely an on-screen affordance. */
+  .report-screen-only {
+    display: none !important;
+  }
+}

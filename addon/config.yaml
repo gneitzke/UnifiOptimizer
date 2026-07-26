@@ -1,0 +1,73 @@
+# Home Assistant add-on manifest for UnifiOptimizer.
+#
+# Installed by adding this GitHub repository as an add-on repository in Home
+# Assistant (Settings -> Add-ons -> Add-on store -> three dots -> Repositories).
+# The repository-level manifest is repository.yaml at the repo root; this file
+# describes the one add-on it contains. Full setup: docs/CONTAINER.md.
+#
+# `version` is kept in lockstep with pyproject.toml [project].version and with
+# the pinned install in Dockerfile, because the add-on installs the published
+# wheel of exactly that version. A test enforces all three agree.
+name: UnifiOptimizer
+version: "0.4.0"
+slug: unifioptimizer
+description: Keeps the UniFi history your controller throws away and turns it into tracked, root-caused issues.
+url: https://github.com/gneitzke/UnifiOptimizer
+image: null # built locally from ./Dockerfile; no registry image is published yet
+codenotary: null
+
+arch:
+  - amd64
+  - aarch64
+
+# The Home Assistant base images ship s6-overlay as PID 1, so the Supervisor must
+# not inject its own init on top of it.
+init: false
+startup: application
+boot: auto
+
+# NOT INGRESS, and that is deliberate rather than an oversight.
+#
+# Ingress serves an add-on under https://<home-assistant>/api/hassio_ingress/
+# <token>/ and strips that prefix before proxying. The UnifiOptimizer dashboard
+# is a Vite SPA built with the default base of "/", and its API client requests
+# absolute "/api/..." and "/ws" paths (web/src/api/client.ts,
+# web/src/api/useWebSocket.ts). Under ingress the browser would resolve those
+# against the Home Assistant root instead of the add-on, so assets, API calls,
+# and the WebSocket would all 404. Turning ingress on before the SPA learns a
+# runtime base path would ship a blank page, so the port is the honest surface
+# for now. Tracked as a follow-up in docs/CONTAINER.md.
+ingress: false
+panel_icon: mdi:wifi-cog
+
+# Declared but UNPUBLISHED by default (null). Reads on the API are
+# unauthenticated (docs/ARCHITECTURE.md 18.1) and Home Assistant publishes a
+# mapped add-on port on every interface, with no loopback-only option, so
+# defaulting to a live port would put the whole inventory on the LAN. Set a host
+# port in the add-on Configuration tab when you have decided that is what you
+# want.
+ports:
+  8765/tcp: null
+ports_description:
+  8765/tcp: Dashboard and read-only API. Unauthenticated for reads, so only map this on a network you trust.
+
+# /data is the add-on's own persistent directory, provided by the Supervisor and
+# preserved across add-on updates. run.sh points NETADMIN_DATA_DIR at it, so
+# secrets.env, config.yaml, the SQLite store, and the logs all live there. No
+# extra `map:` entries: the daemon needs nothing from the Home Assistant config,
+# media, or share directories.
+map: []
+
+# Credentials are entered in the first-run web setup and written to
+# /data/secrets.env by the daemon itself. The options below are the few knobs
+# worth having in the add-on UI; leaving them empty is a supported state.
+options:
+  log_level: info
+  api_token: ""
+  controller_host: ""
+  controller_api_key: ""
+schema:
+  log_level: list(debug|info|warning|error)
+  api_token: password?
+  controller_host: str?
+  controller_api_key: password?

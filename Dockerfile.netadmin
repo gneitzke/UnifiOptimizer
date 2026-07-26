@@ -1,0 +1,93 @@
+# netadmin daemon — permanent-home image (docs/ARCHITECTURE.md sections 3, 5, 12).
+#
+# One Python process runs everything: collector, detectors, issue engine, SLE,
+# FastAPI + WebSocket. Controller access is READ-ONLY (GETs + documented read
+# POSTs); this image contains no mutation path and no fix/apply wiring.
+#
+# Built ON the Mac mini with the Apple `container` CLI (v1.0.0) from a git-archive
+# tar (tracked files only) plus a locally prebuilt web/dist. NO secrets are ever
+# baked in: controller credentials live only in the bind-mounted data/secrets.env.
+#
+# MULTI-ARCH: this Dockerfile is arch-neutral and builds unchanged for both
+# linux/arm64 and linux/amd64 (ARCHITECTURE.md decision 6). Nothing here is
+# arch-specific — python:3.12-slim is a manifest-list base that buildx resolves
+# per target platform, every pip dependency ships prebuilt wheels for both arches
+# (no source-only native builds), and no RUN step shells out to an arch-specific
+# binary. Two documented build paths use it:
+#   * arm64 / Apple Silicon -> Apple `container build`.
+#   * amd64 / x86 NAS+server -> `docker buildx` (deploy/build-multiarch.sh).
+# The build context must exclude secrets and the live DB. On the mini that is the
+# git-archive tar; for `docker build .` it is the repo's .dockerignore.
+#
+# Data model at runtime (why the volume is /app/data, not /data):
+#   netadmin/config.py hardcodes PROJECT_ROOT/data for the two files it auto-loads
+#   and CANNOT env-override — data/config.yaml (CONFIG_YAML) and data/secrets.env
+#   (env_file). With the source at /app, PROJECT_ROOT == /app, so those resolve to
+#   /app/data. Mounting the host data dir there lets config + secrets + DB all come
+#   from one volume with zero code changes. DB_PATH *is* env-overridable and is
+#   pinned below for clarity; LOG_DIR is NOT wired by the CLI (cli.main calls
+#   configure_logging without log_dir) so file logs land in /app/Logging — persist
+#   them with a second bind mount at run time.
+FROM python:3.12-slim
+
+# Non-root runtime user. Defaults (501:20) match a typical macOS first-user account
+# so the bind-mounted, host-owned data/ — including the chmod-600 secrets.env — is
+# readable and writable by the process without loosening any file modes. Override
+# --build-arg APP_UID/APP_GID to retarget another host.
+ARG APP_UID=501
+ARG APP_GID=20
+
+# NETADMIN_INSTALL_METHOD=container is baked in, not detected, so self-update
+# (docs/ARCHITECTURE.md section 23) always tells a container user the correct
+# truth ("run the host update command") and never offers a pip self-upgrade
+# that would upgrade nothing (the wheel/venv here is not what a container
+# restart re-reads). NETADMIN_UPDATE_VARIANT (compose vs macmini) is NOT baked
+# in here -- this one Dockerfile builds both deploy paths; the variant rides
+# along as a run-time env var set by docker-compose.yml and
+# deploy/update-macmini.sh respectively.
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DB_PATH=/app/data/netadmin.db \
+    NETADMIN_INSTALL_METHOD=container
+
+WORKDIR /app
+
+# Dependency closure == pyproject [project].dependencies (daemon runtime only).
+# The heavier legacy-CLI deps in requirements.txt (matplotlib, requests, jose,
+# urllib3<2) are intentionally excluded — the daemon imports none of them.
+RUN pip install --no-cache-dir \
+      "httpx>=0.27" \
+      "pydantic>=2" \
+      "pydantic-settings>=2" \
+      "APScheduler>=3.10" \
+      "websockets>=12" \
+      "pyyaml>=6" \
+      "rich>=13" \
+      "fastapi>=0.104" \
+      "uvicorn[standard]>=0.24" \
+      "dnspython>=2" \
+      "aiomqtt>=2"
+
+# Application source (build context = git-archive tar + prebuilt web/dist; the tar
+# excludes every gitignored secret: data/secrets.env, data/*.db*, *.env).
+COPY . /app
+
+# Non-root user, own the tree, pre-create the mountpoints. The run-time bind mounts
+# replace /app/data and /app/Logging; these mkdirs are the unmounted fallback.
+RUN ( getent group "${APP_GID}" >/dev/null || groupadd -g "${APP_GID}" netadmin ) \
+ && useradd -u "${APP_UID}" -g "${APP_GID}" -M -s /usr/sbin/nologin -d /app netadmin \
+ && mkdir -p /app/data/logs /app/Logging \
+ && chown -R "${APP_UID}:${APP_GID}" /app
+
+USER netadmin
+
+# The daemon owns port 8765 (section 12). Bind 0.0.0.0 INSIDE the container's own
+# netns so the host port-publish can reach it; LAN exposure is controlled at run
+# time by the publish spec, which defaults to loopback-only (127.0.0.1:8765:8765)
+# because the API is unauthenticated — keep it bound to loopback, never LAN-exposed.
+# Controller access stays GET-only regardless.
+EXPOSE 8765
+VOLUME ["/app/data"]
+
+CMD ["python", "-m", "netadmin.cli", "daemon", "--host", "0.0.0.0"]

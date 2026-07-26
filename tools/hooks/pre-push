@@ -1,0 +1,10 @@
+#!/bin/sh
+# Refuse any push whose tracked files carry a credential or a real network
+# identifier. This is a public repository; the check is not optional and not a
+# habit. Bypass only with --no-verify, which should mean "I have read the finding".
+echo "pre-push: scanning tracked files for secrets and PII..."
+if ! python3 tools/scan_secrets.py; then
+    echo ""
+    echo "PUSH REFUSED: fix the finding above, or re-run with --no-verify if it is a false positive."
+    exit 1
+fi

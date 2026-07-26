@@ -1,0 +1,324 @@
+@import "tailwindcss";
+
+/* ============================================================================
+   netadmin design foundation — tokens per docs/DESIGN_FOUNDATION.md
+   Both themes are first-class. Dark is re-picked, never an inversion.
+   Resolution: prefers-color-scheme drives the default; an explicit
+   [data-theme] attribute (set by the theme toggle) always wins by specificity.
+   ========================================================================= */
+
+/* ---- Light (default) ---------------------------------------------------- */
+:root,
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --canvas: #f5f5f7;
+  --surface: #ffffff;
+  --elevated: #ffffff;
+  --hairline: #e5e5ea;
+  --strong: #c6c6c8;
+
+  --fg: #1d1d1f;
+  --fg-muted: #55555a;
+  --fg-subtle: #6e6e73;
+
+  --accent: #0066cc;
+  --accent-fg: #ffffff;
+  --accent-muted: #5a9be0; /* second shade of the one hue, for a 2nd chart series */
+
+  /* severity — AA-verified text/icon colors */
+  --sev-p1: #d70015;
+  --sev-p2: #c93400;
+  --sev-p3: #b25000;
+  --sev-healthy: #1e7a34;
+  --sev-neutral: #6e6e73;
+
+  /* severity pill fills — 10% tint in light */
+  --sev-p1-fill: rgba(215, 0, 21, 0.1);
+  --sev-p2-fill: rgba(201, 52, 0, 0.1);
+  --sev-p3-fill: rgba(178, 80, 0, 0.1);
+  --sev-healthy-fill: rgba(30, 122, 52, 0.1);
+  --sev-neutral-fill: rgba(110, 110, 115, 0.1);
+
+  /* chart gridlines */
+  --grid: #e5e5ea;
+
+  /* health/score bands — a DISTINCT palette from the severity ramp so a degraded
+     bar never reads as a High-severity red. green healthy / amber fair / orange
+     degraded, one meaning per band, re-picked (not hue-swapped) per theme. */
+  --health-good: #1e7a34;
+  --health-fair: #9a6a00;
+  --health-poor: #c85200;
+
+  /* elevation: light surfaces lean on shadow, minimal on canvas cards */
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-elevated: 0 6px 20px rgba(0, 0, 0, 0.14), 0 1px 3px rgba(0, 0, 0, 0.08);
+
+  --overlay: rgba(0, 0, 0, 0.28);
+  --focus: var(--accent);
+
+  --radius-control: 8px;
+  --radius-card: 10px;
+}
+
+/* ---- Dark (system default in dark, or forced) --------------------------- */
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+
+    --canvas: #161618;
+    --surface: #1f1f21;
+    --elevated: #28282b;
+    --hairline: rgba(255, 255, 255, 0.1);
+    --strong: rgba(255, 255, 255, 0.18);
+
+    --fg: #f5f5f7;
+    --fg-muted: #a1a1a6;
+    --fg-subtle: #8e8e93;
+
+    --accent: #64a8ff;
+    --accent-fg: #0b1524;
+    --accent-muted: #3d6ea5;
+
+    --sev-p1: #ff6961;
+    --sev-p2: #ffb340;
+    --sev-p3: #ffd426;
+    --sev-healthy: #30db5b;
+    --sev-neutral: #8e8e93;
+
+    --sev-p1-fill: rgba(255, 105, 97, 0.16);
+    --sev-p2-fill: rgba(255, 179, 64, 0.16);
+    --sev-p3-fill: rgba(255, 212, 38, 0.16);
+    --sev-healthy-fill: rgba(48, 219, 91, 0.16);
+    --sev-neutral-fill: rgba(142, 142, 147, 0.16);
+
+    --grid: rgba(255, 255, 255, 0.08);
+
+    /* health/score bands (dark): same meaning as light, brighter for contrast. */
+    --health-good: #30db5b;
+    --health-fair: #ffd426;
+    --health-poor: #ff9f0a;
+
+    /* dark elevation = lighter surface + hairline border + ≥2× shadow opacity */
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-elevated: 0 10px 30px rgba(0, 0, 0, 0.6), 0 2px 8px rgba(0, 0, 0, 0.5);
+
+    --overlay: rgba(0, 0, 0, 0.6);
+  }
+}
+
+/* ---- Dark (forced by the toggle, wins by specificity in any system) ----- */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --canvas: #161618;
+  --surface: #1f1f21;
+  --elevated: #28282b;
+  --hairline: rgba(255, 255, 255, 0.1);
+  --strong: rgba(255, 255, 255, 0.18);
+
+  --fg: #f5f5f7;
+  --fg-muted: #a1a1a6;
+  --fg-subtle: #8e8e93;
+
+  --accent: #64a8ff;
+  --accent-fg: #0b1524;
+  --accent-muted: #3d6ea5;
+
+  --sev-p1: #ff6961;
+  --sev-p2: #ffb340;
+  --sev-p3: #ffd426;
+  --sev-healthy: #30db5b;
+  --sev-neutral: #8e8e93;
+
+  --sev-p1-fill: rgba(255, 105, 97, 0.16);
+  --sev-p2-fill: rgba(255, 179, 64, 0.16);
+  --sev-p3-fill: rgba(255, 212, 38, 0.16);
+  --sev-healthy-fill: rgba(48, 219, 91, 0.16);
+  --sev-neutral-fill: rgba(142, 142, 147, 0.16);
+
+  --grid: rgba(255, 255, 255, 0.08);
+
+  --health-good: #30db5b;
+  --health-fair: #ffd426;
+  --health-poor: #ff9f0a;
+
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-elevated: 0 10px 30px rgba(0, 0, 0, 0.6), 0 2px 8px rgba(0, 0, 0, 0.5);
+
+  --overlay: rgba(0, 0, 0, 0.6);
+}
+
+/* ---- Tailwind token bridge --------------------------------------------- */
+/* `inline` keeps the var() reference in generated utilities, so switching
+   [data-theme] re-resolves every utility at runtime. */
+@theme inline {
+  --color-canvas: var(--canvas);
+  --color-surface: var(--surface);
+  --color-elevated: var(--elevated);
+  --color-hairline: var(--hairline);
+  --color-strong: var(--strong);
+
+  --color-fg: var(--fg);
+  --color-fg-muted: var(--fg-muted);
+  --color-fg-subtle: var(--fg-subtle);
+
+  --color-accent: var(--accent);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-muted: var(--accent-muted);
+
+  --color-p1: var(--sev-p1);
+  --color-p2: var(--sev-p2);
+  --color-p3: var(--sev-p3);
+  --color-healthy: var(--sev-healthy);
+  --color-neutral: var(--sev-neutral);
+  --color-grid: var(--grid);
+
+  --radius-control: var(--radius-control);
+  --radius-card: var(--radius-card);
+
+  --font-sans: "Inter Variable", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+}
+
+/* ---- Base --------------------------------------------------------------- */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  font-family: var(--font-sans);
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--canvas);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 400;
+  font-optical-sizing: auto;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+/* Numerics: tabular + lining everywhere they are asked for (never proportional
+   figures in data columns — never-do rule 7). */
+.tnum {
+  font-variant-numeric: tabular-nums lining-nums;
+}
+
+.font-mono,
+code,
+kbd,
+samp {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums lining-nums;
+}
+
+/* Consistent accent focus ring across every interactive element. */
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--accent) 26%, transparent);
+}
+
+/* ---- Type roles (docs §Typography) -------------------------------------- */
+@layer components {
+  .t-page-title {
+    font-size: 24px;
+    line-height: 30px;
+    font-weight: 600;
+    letter-spacing: -0.015em;
+  }
+  .t-section {
+    font-size: 17px;
+    line-height: 24px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  .t-label {
+    font-size: 13px;
+    line-height: 18px;
+    font-weight: 500;
+  }
+  .t-body {
+    font-size: 14px;
+    line-height: 20px;
+    font-weight: 400;
+  }
+  .t-secondary {
+    font-size: 13px;
+    line-height: 18px;
+    font-weight: 400;
+  }
+  .t-caption {
+    font-size: 12px;
+    line-height: 16px;
+    font-weight: 400;
+    letter-spacing: 0.005em;
+  }
+  .t-metric {
+    font-size: 28px;
+    line-height: 34px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums lining-nums;
+  }
+  /* 11px floor — dense chart annotations only (docs §Typography). */
+  .t-micro {
+    font-size: 11px;
+    line-height: 14px;
+    font-weight: 400;
+    font-variant-numeric: tabular-nums lining-nums;
+  }
+}
+
+/* ---- Scrollbar (quiet) -------------------------------------------------- */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--strong);
+  border-radius: 4px;
+}
+
+/* ---- Print — Save-as-PDF delivery for the report (ARCHITECTURE §19) ------
+   The report is delivered by the browser's print-to-PDF, so no server PDF engine
+   is needed. Anything marked `.no-print` (the app sidebar and top bar, the report
+   page's print button and its hint) drops out, leaving the report as a standalone
+   document rather than a screenshot of the dashboard shell. */
+@media print {
+  .no-print {
+    display: none !important;
+  }
+}
+
+/* Respect reduced-motion for the few transitions the shell uses. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

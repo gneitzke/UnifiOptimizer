@@ -1,0 +1,187 @@
+# UniFi Network Optimizer Configuration
+# All thresholds and options are customizable here.
+# Values shown are the defaults — uncomment and change as needed.
+
+thresholds:
+  # Client signal quality classification (dBm)
+  rssi:
+    excellent: -50
+    good: -60
+    fair: -70
+    poor: -80
+
+  # Minimum RSSI roaming thresholds by strategy
+  min_rssi:
+    optimal:
+      2.4ghz: -75
+      5ghz: -72
+      6ghz: -70
+    max_connectivity:
+      2.4ghz: -80
+      5ghz: -77
+      6ghz: -75
+    # iOS-friendly: auto-used when >20% of clients are iOS devices
+    ios_friendly:
+      2.4ghz: -78
+      5ghz: -75
+      6ghz: -72
+
+  # Mesh AP thresholds
+  mesh:
+    uplink_critical_dbm: -80
+    uplink_acceptable_dbm: -75
+    disconnect_threshold: 5
+
+  # Channel width recommendation thresholds
+  channel_width:
+    # Recommend 40MHz instead of 80MHz when more than this many APs exist
+    prefer_40mhz_when_aps_gt: 4
+    # Only recommend narrowing if client count on the AP is below this
+    narrow_when_clients_lt: 5
+
+  # Power optimization
+  power:
+    # Never reduce power on mesh APs or mesh parent APs
+    skip_reduction_for_mesh: true
+    skip_reduction_for_mesh_parents: true
+
+options:
+  # Days of historical data to analyze
+  lookback_days: 3
+
+  # Min RSSI strategy: "optimal" or "max_connectivity"
+  min_rssi_strategy: optimal
+
+  # Report generation
+  generate_html_report: true
+  generate_share_report: true
+
+# ---------------------------------------------------------------------------
+# netadmin rebuild (docs/ARCHITECTURE.md). Structural defaults live here;
+# controller credentials live in data/secrets.env, never in this file.
+# Everything below is optional — omitted keys fall back to the code defaults
+# in netadmin/config.py.
+# ---------------------------------------------------------------------------
+netadmin:
+  # SQLite metrics store (one file, WAL). Relative to the project root.
+  db_path: data/netadmin.db
+  log_level: INFO
+  site_id: default
+
+  # FastAPI daemon bind + `netadmin status` target (section 12).
+  server_host: 127.0.0.1
+  server_port: 8765
+  # Pinned CORS origins; wildcard is never allowed. Empty -> localhost dev
+  # defaults (5173 Vite + the API port).
+  cors_origins: []
+
+  # Collector cadences, in seconds (netadmin/config.py: PollIntervals).
+  poll:
+    device_s: 60
+    sta_s: 60
+    health_s: 60
+    event_catchup_s: 300
+    probe_s: 60
+    alarm_s: 900
+    report_5min_s: 21600      # 6 h
+    report_daily_s: 86400
+    rogueap_s: 86400
+
+  # Per-tier retention (netadmin/config.py: Retention).
+  retention:
+    raw_days: 30
+    hourly_months: 18
+    daily_forever: true
+    prune_hour: 3            # UTC hour the nightly prune job fires
+
+  # Startup backfill caps; verified per-install at runtime (Backfill).
+  backfill:
+    fivemin_hours: 24
+    hourly_days: 7
+    daily_days: 31
+
+  # Active probes (netadmin/config.py: ProbeConfig). DNS/RTT timing the
+  # controller does not report. Targets default to auto-discovery from the
+  # gateway entity; set explicitly to override. Cadence is poll.probe_s.
+  probe:
+    enabled: true
+    gateway_ip: 192.168.1.1   # third-party gateway (no UniFi gateway on this site); from `route -n get default`
+    gateway_resolver: 192.168.1.1
+    anchor: 1.1.1.1           # public "me vs ISP" DNS anchor
+
+  # WAN plan rate for saturation / bufferbloat detectors (null = auto).
+  wan_plan_down_mbps: null
+  wan_plan_up_mbps: null
+
+  # Detection-engine scheduler cadences (netadmin/config.py: DetectConfig,
+  # docs/ARCHITECTURE.md section 6). The three detector tiers plus the
+  # incremental baseline update; wired onto the daemon scheduler by the factory.
+  detect:
+    fast_s: 60          # FAST tier (each collector fast cadence)
+    window_s: 900       # WINDOW tier (15-minute rolling window)
+    daily_hour: 3       # DAILY tier config audits (UTC hour)
+    baseline_s: 300     # EWMA + rolling-quantile incremental update (5 min)
+
+  # Correlation / incident engine (netadmin/config.py: CorrelateConfig,
+  # docs/ARCHITECTURE.md section 17). Groups the confirmed open-issue set into
+  # incidents (one root cause + its symptoms) each pass, on a concrete
+  # topological/causal-rule basis. Runs as one more firewalled interval job on the
+  # daemon scheduler, offset after the detect passes.
+  correlate:
+    enabled: true          # false -> no correlate job; incidents are not maintained
+    interval_s: 60         # recompute cadence (idempotent; offset after detect)
+    temporal_slack_s: 900  # a symptom may predate its root by at most this (the guard)
+
+  # Home Assistant MQTT-discovery integration (netadmin/config.py: HaConfig,
+  # docs/ARCHITECTURE.md section 11). Structural, non-secret config only —
+  # broker credentials live in data/secrets.env as HA_MQTT_HOST / HA_MQTT_PORT /
+  # HA_MQTT_USERNAME / HA_MQTT_PASSWORD, never here. Off by default: nothing is
+  # published to MQTT until enabled is true.
+  ha:
+    enabled: true
+    discovery_prefix: homeassistant  # HA's MQTT-discovery listen prefix
+    base_topic: netadmin             # our state/event/availability topic root — MUST stay 'netadmin' (dashboard entity IDs)
+    node_id: netadmin                # discovery node id + object_id prefix — MUST stay 'netadmin' (dashboard entity IDs)
+    device_name: UnifiOptimizer      # HA device friendly display name only (visible rebrand; does not affect entity IDs/topics)
+    state_refresh_s: 60              # periodic score/count republish cadence
+
+  # SLE minutes-job cadence + default /api/sle scoring window
+  # (netadmin/config.py: SleRuntimeConfig, section 8). Classifier thresholds and
+  # blend weights live under `thresholds.sle` below, NOT here.
+  sle:
+    minutes_s: 300         # 5-minute-bucket accounting job cadence
+    score_window_s: 86400  # /api/sle look-back window (24 h)
+
+  # Per-detector / per-classifier threshold overrides, keyed by detector_key
+  # (docs/ARCHITECTURE.md section 6). Detectors ship their own defaults and read
+  # overrides through DetectorContext.threshold(); an omitted key keeps the code
+  # default. The SLE classifiers read `sle` here and the scorer reads
+  # `sle.weights`. Example overrides (commented — defaults apply when absent):
+  #
+  #   wired.bad_cable:
+  #     errors_per_min: 10          # rx/tx error-rate floor per minute
+  #   wifi.airtime_saturation:
+  #     degraded_pct: 50            # cu_total degraded floor (P2)
+  #     critical_pct: 80            # cu_total critical floor (P1)
+  #   wifi.rogue_ap:                # strong, persistent neighbor BSS (section 17)
+  #     rssi_floor_dbm: -75         # ignore neighbors weaker than this at the AP
+  #     adjacent_channel_distance: 4  # 2.4 GHz adjacent-channel overlap span
+  #     min_persistence_s: 3600     # must persist across scans (kills one-scan sightings)
+  #     known_bssids: []            # our own hardware / allowlisted neighbor BSSIDs
+  #   offenders:                    # "who causes most of my grief" leaderboard (section 17)
+  #     weights:                    # composite-burden blend (defaults shown)
+  #       sle_minute: 1.0           # per failed attributed client-minute (base unit)
+  #       issue_p1: 30.0            # per open P1 issue
+  #       issue_p2: 10.0            # per open P2 issue
+  #       issue_p3: 3.0             # per open P3 issue
+  #       event: 0.5               # per disconnect / roam event
+  #   sle:
+  #     coverage_weak_dbm: -72      # coverage RSSI floor
+  #     weights:                    # headline blend (renormalised over live SLEs)
+  #       coverage: 0.25
+  #       capacity: 0.20
+  #       connect: 0.20
+  #       roaming: 0.15
+  #       wan: 0.15
+  #       infra: 0.05
+  thresholds: {}

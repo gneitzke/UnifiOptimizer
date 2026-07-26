@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>UnifiOptimizer</title>
+    <!--
+      Apply the stored theme override BEFORE first paint so an override user
+      (chose light while the OS is dark, or vice-versa) never sees the OS theme
+      flash then snap. Synchronous + blocking on purpose; useTheme remains the
+      runtime source of truth and re-applies the same attribute on load. No
+      stored override → no attribute → prefers-color-scheme wins, as intended.
+    -->
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem('netadmin_theme');
+          if (t === 'light' || t === 'dark') {
+            document.documentElement.setAttribute('data-theme', t);
+          }
+        } catch (e) {
+          /* storage unavailable — fall back to the OS theme */
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

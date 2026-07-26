@@ -1,0 +1,18 @@
+# Source-distribution contents. The wheel's package data is declared in
+# pyproject.toml ([tool.setuptools.package-data]); this file makes `python -m
+# build` (which builds the wheel FROM the sdist) also carry the prebuilt web UI,
+# so the bundled dashboard survives the sdist -> wheel round-trip.
+#
+# netadmin/_webui/ is a build artifact (produced by `python tools/build_web.py`,
+# not tracked in git), so it is grafted here explicitly rather than via VCS.
+graft netadmin/_webui
+
+# Numbered SQL migrations applied at store startup — runtime data, must ship.
+recursive-include netadmin/store/migrations *.sql
+
+include README.md
+include LICENSE
+include requirements.txt
+
+# Keep bytecode / caches out of the distribution.
+global-exclude __pycache__ *.py[cod] *.so .DS_Store

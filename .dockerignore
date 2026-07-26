@@ -1,0 +1,65 @@
+# .dockerignore — keeps secrets and cruft out of the Docker build context.
+#
+# WHY THIS MATTERS: Dockerfile.netadmin does `COPY . /app`. On the Mac mini the
+# context is a git-archive tar (tracked files only), so secrets never enter. But
+# the buildx path (deploy/build-multiarch.sh, amd64 users) can build straight from
+# a working tree, where an unignored `COPY .` would bake data/secrets.env, the live
+# SQLite DB, and node_modules into an image layer. This file makes every `docker
+# build` / `docker buildx build` from the repo root secret-safe by construction.
+#
+# Mirrors the secret/output rules in .gitignore; keep the two in sync.
+
+# --- Secrets: never, under any circumstances ---
+**/secrets.env
+**/*.env
+!**/*.env.example
+data/deploy_hosts.env
+.jwt_secret
+
+# --- Local state / generated data ---
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/netadmin.db*
+reports/
+Logging/
+**/__pycache__/
+*.pyc
+
+# --- VCS + tooling ---
+.git
+.gitignore
+.github/
+.clubhouse/
+.claude/
+.mcp.json
+
+# --- Frontend build inputs (web/dist is the only artifact the image wants;
+#     node_modules and sources are not) ---
+web/node_modules/
+web/src/
+web/public/
+web/*.config.*
+web/package*.json
+web/tsconfig*.json
+web/index.html
+web/.vite/
+
+# --- Test suite and dev-only trees (the daemon runtime imports none of these) ---
+tests/
+Archive/
+
+# --- Docker / deploy scaffolding that need not live inside the image ---
+# (Docker reads the Dockerfile named by -f regardless of these rules; they only
+# keep the scaffolding out of the COPY . layer.)
+Dockerfile
+Dockerfile.*
+.dockerignore
+docker-bake.hcl
+docker-compose.yml
+deploy/artifacts/
+
+# --- Home Assistant add-on: describes how to build an image, so it has no
+#     business being inside one. The add-on installs the published wheel. ---
+addon/
+repository.yaml

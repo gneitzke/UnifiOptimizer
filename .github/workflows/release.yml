@@ -1,0 +1,83 @@
+name: Release
+
+# Build the wheel WITH the web UI bundled inside it, then publish to PyPI on a
+# version tag using Trusted Publishing (OIDC) — no API token stored in the repo.
+#
+# ONE-TIME HUMAN SETUP (not done by this workflow):
+#   1. Create the PyPI project "unifioptimizer" (or reserve the name).
+#   2. On PyPI → the project → Publishing → add a Trusted Publisher:
+#        Owner:            gneitzke
+#        Repository:       UnifiOptimizer
+#        Workflow name:    release.yml
+#        Environment name: pypi
+#   3. Create a GitHub Environment named "pypi" (Settings → Environments).
+# After that, pushing a tag like `v0.1.0` builds and publishes automatically.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build wheel (with bundled UI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build and bundle the web UI
+        run: python tools/build_web.py
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Verify the wheel ships the bundled UI
+        run: |
+          set -euo pipefail
+          wheel="$(ls dist/*.whl)"
+          echo "inspecting $wheel"
+          if ! unzip -l "$wheel" | grep -q 'netadmin/_webui/index.html'; then
+            echo "::error::wheel is missing netadmin/_webui/index.html — the UI was not bundled"
+            exit 1
+          fi
+          echo "ok: bundled UI present in the wheel"
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI (Trusted Publishing)
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # OIDC token for Trusted Publishing
+    steps:
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

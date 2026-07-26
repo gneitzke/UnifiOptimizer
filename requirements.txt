@@ -1,0 +1,19 @@
+requests>=2.28.0
+rich>=12.0.0
+urllib3<2.0.0
+matplotlib>=3.5.0
+pyyaml>=6.0
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+websockets>=12.0
+python-jose[cryptography]>=3.3.0
+
+# netadmin rebuild (docs/ARCHITECTURE.md) — see pyproject [project].dependencies.
+# websockets is already required above (line 9); not repeated here.
+httpx>=0.27
+pydantic>=2
+pydantic-settings>=2
+APScheduler>=3.10
+dnspython>=2
+aiomqtt>=2  # Home Assistant MQTT-discovery bridge (section 11); imported lazily, off by default
