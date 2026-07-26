@@ -11,12 +11,26 @@ concurrency:
 
 jobs:
   python:
-    name: Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
+    name: Python ${{ matrix.python-version }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
+        include:
+          - python-version: "3.11"
+            runner: ubuntu-latest
+            arch: x64
+          - python-version: "3.12"
+            runner: ubuntu-latest
+            arch: x64
+          # The daemon's production home is arm64 (Apple silicon via the Apple
+          # container CLI), so the suite must actually run there rather than being
+          # assumed portable. Everything is pure Python with prebuilt wheels for
+          # both arches, and this is what proves it stays that way.
+          - python-version: "3.12"
+            runner: ubuntu-24.04-arm
+            arch: arm64
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -73,3 +87,26 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - run: npm ci
       - run: npm run build
+
+  image:
+    name: Image (amd64 + arm64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the web UI the image expects
+        run: |
+          cd web && npm ci && npm run build
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      # Arch-neutral by design: python:3.12-slim is a manifest list and every
+      # dependency ships prebuilt wheels for both, so this proves the claim on
+      # every push rather than at deploy time on the mini.
+      - name: Build for linux/amd64 and linux/arm64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.netadmin
+          platforms: linux/amd64,linux/arm64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
