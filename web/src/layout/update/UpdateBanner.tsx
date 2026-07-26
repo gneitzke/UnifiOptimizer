@@ -150,8 +150,8 @@ function AvailableRow({
     <div className="flex items-center gap-3 px-4 sm:px-6 h-11 flex-wrap sm:flex-nowrap">
       <ArrowUpCircle size={16} className="shrink-0" style={{ color: 'var(--accent)' }} aria-hidden />
       <span className="t-body" style={{ color: 'var(--fg)' }}>
-        <span style={{ fontWeight: 600 }}>UnifiOptimizer {status.latest_version}</span> is available
-        , and you're on {status.current_version}.
+        <span style={{ fontWeight: 600 }}>UnifiOptimizer {status.latest_version}</span> is
+        available. You are on {status.current_version}.
       </span>
       {status.release_url && (
         <a
