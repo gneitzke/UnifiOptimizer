@@ -10,16 +10,29 @@ import { useMeasuredWidth } from './useMeasuredWidth';
  * hairlines; mesh backhaul links are coloured by the backend-given health band and
  * labelled with their RSSI, so a weak backhaul is visible at a glance. Positions
  * are layout only; every node, link, RSSI and health value is backend data.
+ *
+ * A layer's row is sized from the MEASURED width, never assumed: box width comes
+ * out of the available width, the node count and a minimum gap, so boxes can
+ * never overlap at any count. Once boxes would fall below a readable floor, the
+ * layer wraps onto additional (vertically stacked) rows instead of shrinking
+ * further, and the SVG grows to fit — a 9-AP row reads as two balanced rows of
+ * legible boxes, never five squeezed-together slivers.
  */
 
-const NODE_W = 128;
+const NODE_W = 128; // preferred (max) box width — unchanged from the original design
 const NODE_H = 46;
+const MIN_NODE_W = 84; // floor before a row wraps rather than shrinking further
+const GAP_MIN = 14; // minimum horizontal gap between boxes, and their side margin
 // Gap sized so the full internet→gateway→switch→AP→mesh→client stack (now six
 // rows, with a dedicated mesh layer) still fits on one printed page under its
 // section header, rather than the diagram spilling to a fresh page and stranding
 // the header on an otherwise empty one.
 const LAYER_GAP = 60;
-const MAX_PER_LAYER = 8;
+const ROW_GAP = 16; // vertical gap between a layer's own wrapped rows
+// Real sites run well past 8 APs; wrapping (not truncation) is now how a crowded
+// layer stays legible, so this is a safety valve for pathological input, not the
+// everyday ceiling it used to be.
+const MAX_PER_LAYER = 24;
 const MESH_STUB = 30; // health-coloured wireless-backhaul stub above a mesh node
 
 interface Props {
@@ -31,27 +44,72 @@ interface Placed {
   node: TopoNode;
   x: number; // center
   y: number; // center
+  w: number; // this node's box width — varies with how crowded its row is
+}
+
+interface OverflowMarker {
+  x: number;
+  y: number;
+  w: number;
+  count: number;
+}
+
+type RowItem = { kind: 'node'; node: TopoNode } | { kind: 'overflow'; count: number };
+
+/** How many MIN_NODE_W-wide boxes (with GAP_MIN gaps and margins) fit across `width`. */
+function maxPerRow(width: number): number {
+  return Math.max(1, Math.floor((width - GAP_MIN) / (MIN_NODE_W + GAP_MIN)));
+}
+
+/** Split `n` items across `rows` as evenly as possible (bigger rows first), so a
+ *  wrapped layer never leaves a lonely single box on its last row. */
+function balancedRowSizes(n: number, rows: number): number[] {
+  const base = Math.floor(n / rows);
+  const remainder = n % rows;
+  return Array.from({ length: rows }, (_, i) => base + (i < remainder ? 1 : 0));
 }
 
 export function TopologyDiagram({ topology, className }: Props) {
   const [ref, width] = useMeasuredWidth();
   const layers = topology.layers.filter((l) => l.nodes.length > 0);
 
-  const height = Math.max(120, layers.length * NODE_H + (layers.length - 1) * LAYER_GAP + 24);
   const placed = new Map<string, Placed>();
-  const overflow: { y: number; count: number }[] = [];
+  const overflow: OverflowMarker[] = [];
 
+  let cursorY = 12 + NODE_H / 2;
   layers.forEach((layer, li) => {
-    const y = 12 + NODE_H / 2 + li * (NODE_H + LAYER_GAP);
     const shown = layer.nodes.slice(0, MAX_PER_LAYER);
     const hiddenCount = layer.nodes.length - shown.length;
-    const cols = shown.length + (hiddenCount > 0 ? 1 : 0);
-    const step = width / (cols + 1);
-    shown.forEach((node, i) => {
-      placed.set(node.id, { node, x: step * (i + 1), y });
+    const items: RowItem[] = shown.map((node) => ({ kind: 'node', node }) as RowItem);
+    if (hiddenCount > 0) items.push({ kind: 'overflow', count: hiddenCount });
+
+    const perRowMax = maxPerRow(width);
+    const rowCount = Math.max(1, Math.ceil(items.length / perRowMax));
+    const rowSizes = balancedRowSizes(items.length, rowCount);
+    const widestRow = Math.max(...rowSizes);
+    const boxW = Math.min(
+      NODE_W,
+      Math.max(MIN_NODE_W, (width - (widestRow + 1) * GAP_MIN) / widestRow),
+    );
+
+    if (li > 0) cursorY += NODE_H + LAYER_GAP;
+    let itemIndex = 0;
+    rowSizes.forEach((size, ri) => {
+      if (ri > 0) cursorY += NODE_H + ROW_GAP;
+      const rowWidth = size * boxW + (size - 1) * GAP_MIN;
+      const left = (width - rowWidth) / 2;
+      for (let i = 0; i < size; i++) {
+        const item = items[itemIndex++];
+        const x = left + boxW / 2 + i * (boxW + GAP_MIN);
+        if (item.kind === 'node') {
+          placed.set(item.node.id, { node: item.node, x, y: cursorY, w: boxW });
+        } else {
+          overflow.push({ x, y: cursorY, w: boxW, count: item.count });
+        }
+      }
     });
-    if (hiddenCount > 0) overflow.push({ y, count: hiddenCount });
   });
+  const height = Math.max(120, cursorY + NODE_H / 2 + 24);
 
   return (
     <div ref={ref} className={className}>
@@ -137,39 +195,36 @@ export function TopologyDiagram({ topology, className }: Props) {
         })}
 
         {/* Nodes. */}
-        {[...placed.values()].map(({ node, x, y }) => (
-          <Node key={node.id} node={node} x={x} y={y} />
+        {[...placed.values()].map(({ node, x, y, w }) => (
+          <Node key={node.id} node={node} x={x} y={y} w={w} />
         ))}
 
-        {/* Honest overflow marker per layer. */}
-        {overflow.map((o, i) => {
-          const x = width - NODE_W / 2 - 8;
-          return (
-            <g key={`ov-${i}`}>
-              <rect
-                x={x - NODE_W / 2}
-                y={o.y - NODE_H / 2}
-                width={NODE_W}
-                height={NODE_H}
-                rx={8}
-                fill="transparent"
-                stroke="var(--hairline)"
-                strokeDasharray="4 3"
-              />
-              <text
-                x={x}
-                y={o.y}
-                textAnchor="middle"
-                dominantBaseline="middle"
-                className="tnum"
-                fontSize={12}
-                fill="var(--fg-subtle)"
-              >
-                +{o.count} more
-              </text>
-            </g>
-          );
-        })}
+        {/* Honest overflow marker, one per layer that still exceeds MAX_PER_LAYER. */}
+        {overflow.map((o, i) => (
+          <g key={`ov-${i}`}>
+            <rect
+              x={o.x - o.w / 2}
+              y={o.y - NODE_H / 2}
+              width={o.w}
+              height={NODE_H}
+              rx={8}
+              fill="transparent"
+              stroke="var(--hairline)"
+              strokeDasharray="4 3"
+            />
+            <text
+              x={o.x}
+              y={o.y}
+              textAnchor="middle"
+              dominantBaseline="middle"
+              className="tnum"
+              fontSize={12}
+              fill="var(--fg-subtle)"
+            >
+              +{o.count} more
+            </text>
+          </g>
+        ))}
       </svg>
 
       {(topology.links.some((l) => l.kind === 'mesh') ||
@@ -198,19 +253,31 @@ const KIND_TAG: Record<TopoNode['kind'], string> = {
   client: 'Clients',
 };
 
-function Node({ node, x, y }: { node: TopoNode; x: number; y: number }) {
-  const left = x - NODE_W / 2;
+/** How many characters fit inside a box of width `w` at `fontSize`, so truncation
+ *  always fits the box it's drawn in rather than a fixed guess. `reserveRight`
+ *  carves out room for a badge sharing the same text line. */
+function maxCharsForWidth(w: number, fontSize: number, reserveRight = 0): number {
+  const avgAdvance = fontSize * 0.58; // Inter's roughly average glyph advance at this size
+  const usable = w - 20 - reserveRight; // 10px inner padding on each side
+  return Math.max(3, Math.floor(usable / avgAdvance));
+}
+
+function Node({ node, x, y, w }: { node: TopoNode; x: number; y: number; w: number }) {
+  const left = x - w / 2;
   const top = y - NODE_H / 2;
   // A mesh node's border carries its backhaul health, so a weak uplink reads at a
   // glance alongside the health-coloured stub and RSSI above it.
   const meshHealth = node.mesh_uplink?.health ?? null;
   const stroke = meshHealth != null ? BAND_COLOR[meshHealth] : 'var(--strong)';
+  // Room reserved on the label's line for the right-aligned client-count badge, so
+  // a long name is truncated before it ever reaches the badge, not clipped by it.
+  const badgeReserve = node.badge ? node.badge.length * 7 + 8 : 0;
   return (
     <g>
       <rect
         x={left}
         y={top}
-        width={NODE_W}
+        width={w}
         height={NODE_H}
         rx={8}
         fill="var(--surface)"
@@ -225,7 +292,7 @@ function Node({ node, x, y }: { node: TopoNode; x: number; y: number }) {
         fill="var(--fg-subtle)"
         style={{ letterSpacing: '0.03em', textTransform: 'uppercase' }}
       >
-        {KIND_TAG[node.kind]}
+        {truncate(KIND_TAG[node.kind], maxCharsForWidth(w, 9))}
       </text>
       <text
         x={left + 10}
@@ -234,16 +301,16 @@ function Node({ node, x, y }: { node: TopoNode; x: number; y: number }) {
         fontWeight={500}
         fill="var(--fg)"
       >
-        {truncate(node.label, 16)}
+        {truncate(node.label, maxCharsForWidth(w, 12, badgeReserve))}
       </text>
       {node.sublabel && (
         <text x={left + 10} y={top + 41} fontSize={9.5} fill="var(--fg-subtle)">
-          {truncate(node.sublabel, 20)}
+          {truncate(node.sublabel, maxCharsForWidth(w, 9.5))}
         </text>
       )}
       {node.badge && (
         <text
-          x={left + NODE_W - 10}
+          x={left + w - 10}
           y={top + 30}
           textAnchor="end"
           className="tnum"
@@ -257,6 +324,6 @@ function Node({ node, x, y }: { node: TopoNode; x: number; y: number }) {
   );
 }
 
-function truncate(s: string, n: number): string {
-  return s.length > n ? `${s.slice(0, n - 1)}…` : s;
+function truncate(s: string, maxChars: number): string {
+  return s.length > maxChars ? `${s.slice(0, Math.max(1, maxChars - 1))}…` : s;
 }

@@ -9,7 +9,7 @@ import {
   RelativeTime,
   fmt,
 } from '../../components/ui';
-import { getDevice, type DeviceDetail } from './api';
+import { getDevice, type ChildEntity, type DeviceDetail } from './api';
 import { sampleMap, metricMeta } from './metrics';
 import { MetricChart } from './MetricChart';
 import { RadioCard } from './RadioCard';
@@ -17,6 +17,7 @@ import { PortTable } from './PortTable';
 import { StateHistory } from './StateHistory';
 import { IssueMiniList } from './IssueMiniList';
 import { InfoRow, RangeToggle, RANGE_24H, SectionTitle } from './parts';
+import { useMeasuredWidth } from '../report/charts/useMeasuredWidth';
 
 /**
  * /devices/:id — one device in full (docs §Devices/:id). Header with live state,
@@ -41,6 +42,46 @@ function chartMetricsFor(device: DeviceDetail): string[] {
   };
   const list = preferred[device.type] ?? [];
   return list.filter((k) => present.has(k));
+}
+
+// Below this column width a radio card's fixed 120px sparkline starts visibly
+// compressing (its flex row has nowhere else to give), so the grid never picks a
+// column count that would squeeze a card thinner than this. The 3-column
+// Clients/Satisfaction/TX-retries stat row stays legible even tighter than this,
+// because its labels wrap instead of overflowing (see RadioCard's `Stat`).
+const RADIO_MIN_COL = 200;
+const RADIO_GRID_GAP = 16; // matches the grid's `gap-4`
+
+/**
+ * Columns for the radio grid: prefer laying every radio out in one row (1, 2, 3,
+ * up to 4 across), but only once each column clears RADIO_MIN_COL, and never a
+ * count that stacks evenly except for one lonely card on its own row — for 3
+ * radios that means 3-across or a single full-width column, never a 2-then-1.
+ */
+function radioGridColumns(n: number, width: number): number {
+  if (n <= 1) return 1;
+  const fits = (k: number) => k * RADIO_MIN_COL + (k - 1) * RADIO_GRID_GAP <= width;
+  for (let k = Math.min(n, 4); k >= 1; k--) {
+    if (k > 1 && n % k === 1) continue; // would strand exactly one card
+    if (fits(k)) return k;
+  }
+  return 1;
+}
+
+function RadioGrid({ radios }: { radios: ChildEntity[] }) {
+  const [ref, width] = useMeasuredWidth();
+  const cols = radioGridColumns(radios.length, width);
+  return (
+    <div
+      ref={ref}
+      className="grid gap-4"
+      style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}
+    >
+      {radios.map((r) => (
+        <RadioCard key={r.entity_id} radio={r} />
+      ))}
+    </div>
+  );
 }
 
 function StatusDot({ device }: { device: DeviceDetail }) {
@@ -179,11 +220,7 @@ export function DeviceDetailPage() {
           {radios.length > 0 && (
             <section>
               <SectionTitle>Radios</SectionTitle>
-              <div className="grid gap-4 sm:grid-cols-2">
-                {radios.map((r) => (
-                  <RadioCard key={r.entity_id} radio={r} />
-                ))}
-              </div>
+              <RadioGrid radios={radios} />
             </section>
           )}
 

@@ -25,11 +25,14 @@ function bandLabel(radio: ChildEntity): string {
 
 function Stat({ label, value }: { label: string; value: string }) {
   return (
-    <div className="flex flex-col">
-      <span className="t-caption" style={{ color: 'var(--fg-subtle)' }}>
+    <div className="flex flex-col min-w-0">
+      {/* `break-words`: "Satisfaction" is one unbreakable word — in a narrow
+          (3-up) column it must wrap onto a second line rather than overflow
+          into the next stat's column. */}
+      <span className="t-caption break-words" style={{ color: 'var(--fg-subtle)' }}>
         {label}
       </span>
-      <span className="t-body tnum" style={{ color: 'var(--fg)' }}>
+      <span className="t-body tnum break-words" style={{ color: 'var(--fg)' }}>
         {value}
       </span>
     </div>
