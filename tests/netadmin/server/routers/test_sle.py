@@ -61,7 +61,18 @@ async def test_sle_endpoint_shape_and_scores(app_with_minutes) -> None:
     assert resp.status_code == 200
     body = resp.json()
 
-    assert set(body) == {"start_ts", "end_ts", "headline", "weights", "sles"}
+    assert set(body) == {
+        "start_ts",
+        "end_ts",
+        "headline",
+        "weights",
+        "window_buckets",
+        "included_sles",
+        "excluded_below_floor",
+        "excluded_no_data",
+        "excluded_not_measurable",
+        "sles",
+    }
     # every canonical SLE is present; silent ones report score null (no data)
     for sle in ("coverage", "roaming", "capacity", "connect", "wan", "infra"):
         assert sle in body["sles"]
@@ -72,14 +83,23 @@ async def test_sle_endpoint_shape_and_scores(app_with_minutes) -> None:
     assert coverage["classifiers"] == {"ok": 4.0, "weak_signal": 1.0}
     # the failed minute is pinned on the AP (entity 1)
     assert coverage["top_offenders"][0]["attributed_entity_id"] == 1
+    # one bucket seeded inside the default 24h/288-bucket window: real exposure,
+    # but far too thin to headline with confidence
+    assert coverage["evaluated_buckets"] == 1
+    assert coverage["window_buckets"] == 288
+    assert coverage["below_floor"] is True
 
     capacity = body["sles"]["capacity"]
     assert capacity["score"] == 0.0  # all fail
     assert capacity["top_offenders"][0]["attributed_entity_id"] == 2  # the radio
+    assert capacity["below_floor"] is True
 
-    # headline blends only the SLEs that had data (coverage + capacity here)
-    assert body["headline"] is not None
-    assert 0.0 <= body["headline"] <= 1.0
+    # both scored SLEs are below the confidence floor -> excluded from the
+    # headline blend, which is honestly null rather than a confident-looking
+    # number built from a single 5-minute bucket out of 288
+    assert body["headline"] is None
+    assert body["included_sles"] == []
+    assert set(body["excluded_below_floor"]) == {"coverage", "capacity"}
 
 
 async def test_sle_endpoint_explicit_window(app_with_minutes) -> None:

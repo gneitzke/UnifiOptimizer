@@ -10,10 +10,10 @@ import { FilterFocusProvider } from './keyboard/useSlashFocus';
 import { useFocusFilter } from './keyboard/filterFocusContext';
 import { useHotkeys } from './keyboard/useHotkeys';
 import { useTheme } from '../theme';
-import { useIssueSummary } from '../api/hooks';
+import { useHealth, useIssueSummary } from '../api/hooks';
 import { WsProvider, useWsStatus, useWsFrames } from '../api/WsProvider';
 import { cn } from '../components/ui/cn';
-import { UpdateBanner } from './update';
+import { UpdateBanner, useUpdateStatus } from './update';
 
 /**
  * Application shell (docs/ARCHITECTURE.md §12; docs §Interaction). Owns the
@@ -36,6 +36,13 @@ function ShellInner() {
   const { toggle: togglePalette } = useCommandPalette();
   const focusFilter = useFocusFilter();
   const { summary, reload } = useIssueSummary();
+  // No polling: the sidebar's version footer only needs to be right on load,
+  // since it changes at most once per self-upgrade, which already restarts
+  // the daemon.
+  const health = useHealth(0);
+  // Own poll, independent of `UpdateBanner`'s below, purely to source the
+  // footer's install-method tooltip.
+  const { status: updateStatus } = useUpdateStatus();
 
   const [expanded, setExpanded] = useState(() => {
     try {
@@ -85,7 +92,14 @@ function ShellInner() {
       <UpdateBanner />
 
       <div className="flex flex-1 min-h-0">
-        <Sidebar expanded={expanded} onToggle={toggleSidebar} summary={summary} />
+        <Sidebar
+          expanded={expanded}
+          onToggle={toggleSidebar}
+          summary={summary}
+          version={health.data?.version}
+          installMethod={updateStatus?.install_method}
+          installVariant={updateStatus?.variant}
+        />
 
         <div className="flex-1 flex flex-col min-w-0">
           <header

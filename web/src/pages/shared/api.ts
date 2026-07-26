@@ -206,6 +206,21 @@ export interface SleEntryRow {
   total_minutes: number;
   ok_minutes: number;
   fail_minutes: number;
+  /** Distinct 5-minute buckets in the window that produced any judgment for
+   * this SLE (out of `window_buckets`) — the exposure the confidence floor and
+   * the sparkline's gap caption are both built from (see SleHealthBlock). */
+  evaluated_buckets: number;
+  window_buckets: number;
+  /** A real score computed from too little exposure to headline with full
+   * confidence (netadmin.sle.scores.MIN_EXPOSURE_FRACTION / _MINUTES). */
+  below_floor: boolean;
+  /** False only for `connect` while the event pipeline itself looks dead —
+   * see `unmeasurable_reason`. Never false merely because score is null. */
+  measurable: boolean;
+  unmeasurable_reason: string | null;
+  /** score === null, but positively confirmed as "fully observed, nothing
+   * happened" rather than a measurement gap (roaming/connect only). */
+  quiet_pass: boolean;
   classifiers: Record<string, number>;
   top_offenders: SleOffenderRow[];
   timeseries: SlePoint[];
@@ -216,6 +231,13 @@ export interface SleResponse {
   end_ts: number;
   headline: number | null;
   weights: Record<string, number>;
+  window_buckets: number;
+  /** Headline provenance: every SLE lands in exactly one of these three (or is
+   * silently opted out via a zero-weight config, appearing in none). */
+  included_sles: string[];
+  excluded_below_floor: string[];
+  excluded_no_data: string[];
+  excluded_not_measurable: string[];
   sles: Record<string, SleEntryRow>;
 }
 

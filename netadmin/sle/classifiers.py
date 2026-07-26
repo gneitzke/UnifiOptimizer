@@ -158,9 +158,16 @@ class SleConfig:
     bucket_seconds: int = 300
     poll_cadence_s: int = 60  # nominal stat/sta cadence -> ~5 samples/bucket
 
-    # activity gate (the "idle client contributes zero" rule, section 8)
+    # activity gate (the "idle client contributes zero" rule, section 8). Tier 1
+    # is the byte counters; on this controller they land hours late (only via the
+    # report.5minutes.user backfill -- see minutes.SleMinutesJob._is_active), so a
+    # bucket with no byte samples AT ALL falls back to tier 2: a live per-interval
+    # counter the fast poller writes every cycle. Idle stays honestly zero either
+    # way -- the fallback still applies its own floor, never a bare "has a sample".
     activity_metrics: tuple[str, ...] = ("rx_bytes", "tx_bytes")
     activity_bytes_per_min: float = 1024.0  # ~1 KB/min; a client below this is idle
+    activity_fallback_metrics: tuple[str, ...] = ("wifi_tx_attempts",)
+    activity_packets_per_min: float = 1.0  # ~1 attempted tx/min; below this is idle
 
     # coverage (absolute dBm; RSSI has no diurnal baseline)
     coverage_weak_dbm: float = -72.0

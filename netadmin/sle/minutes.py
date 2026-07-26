@@ -19,6 +19,17 @@ so the score is impact-weighted by construction and a parked phone in a dead
 corner never drags the number down. This is the whole point of the model and is
 tested explicitly.
 
+The activity gate is two-tier (:meth:`SleMinutesJob._is_active`). Tier 1 is the
+byte counters above; on a controller where those only land via the periodic
+``report.5minutes.user`` backfill (this one — the live ``stat/sta`` poll carries
+no byte counters at all, see :mod:`netadmin.ingest.mapping`), most buckets have
+**no byte samples whatsoever** at evaluation time, hours before the backfill
+sweep reaches them. A client with no tier-1 samples is not assumed idle: tier 2
+falls back to a live per-interval counter (default ``wifi_tx_attempts``, written
+every poll cycle) against its own floor. Only a client with no signal on *either*
+tier is idle — the honest-zero property holds throughout, it is just evaluated
+against whichever activity evidence the bucket actually has.
+
 Minute arithmetic
 -----------------
 Per-sample SLEs (coverage, capacity) split a client's bucket minutes across the
@@ -168,27 +179,43 @@ class SleMinutesJob:
     # ------------------------------------------------------------------ #
     # Public entry points
     # ------------------------------------------------------------------ #
-    def run_range(self, start_ts: int, end_ts: int) -> list[BucketResult]:
+    def run_range(
+        self, start_ts: int, end_ts: int, *, clear_existing: bool = False
+    ) -> list[BucketResult]:
         """Compute every 5-minute bucket that starts in ``[start_ts, end_ts)``.
 
         ``start_ts`` is snapped down to its bucket boundary; buckets are processed
         oldest-first. Each bucket is independent, so a sample lands in exactly the
         bucket its timestamp falls in (the bucket-boundary math is the same
         :func:`bucket_of` the reads use).
+
+        ``clear_existing`` is a **recompute** sweep (see :meth:`run_bucket`):
+        every bucket in range is deleted then rewritten, so buckets already
+        computed once (e.g. by the live per-tick job, on the activity gate's
+        packet fallback) get their honest byte-accurate answer once the report
+        backfill lands, instead of accumulating a stale cell alongside the new
+        ones.
         """
         b = self.cfg.bucket_seconds
         results: list[BucketResult] = []
         cur = bucket_of(int(start_ts), b)
         while cur < end_ts:
-            results.append(self.run_bucket(cur))
+            results.append(self.run_bucket(cur, clear_existing=clear_existing))
             cur += b
         return results
 
-    def run_bucket(self, bucket_ts: int) -> BucketResult:
+    def run_bucket(self, bucket_ts: int, *, clear_existing: bool = False) -> BucketResult:
         """Compute and persist all SLE minutes for one 5-minute bucket.
 
         ``bucket_ts`` is snapped to its bucket boundary. Returns a
         :class:`BucketResult`; the rows themselves are written to ``sle_minutes``.
+
+        ``clear_existing=True`` deletes the bucket's existing rows before writing
+        the freshly computed cells (delete-then-rewrite), so a cell this pass no
+        longer produces cannot strand a stale row from an earlier computation of
+        the same bucket. The live per-tick job never needs this (each bucket is
+        computed exactly once, going forward); a **recompute** after new data
+        lands for an already-computed bucket does.
         """
         b = self.cfg.bucket_seconds
         bucket_ts = bucket_of(int(bucket_ts), b)
@@ -223,29 +250,62 @@ class SleMinutesJob:
             for device in self.repo.list_entities(etype, site_id=self.site_id):
                 self._infra(cells, device, etype, bucket_ts, bucket_end)
 
-        result.rows_written = self._write(bucket_ts, cells, result)
+        result.rows_written = self._write(bucket_ts, cells, result, clear_existing=clear_existing)
         return result
 
     # ------------------------------------------------------------------ #
     # Activity gate
     # ------------------------------------------------------------------ #
     def _is_active(self, client_id: int, start: int, end: int) -> bool:
-        """True when the client moved >= the activity floor of traffic this bucket.
+        """True when the client moved traffic this bucket, on whichever activity
+        tier the bucket actually has data for.
 
-        Sums the per-interval deltas of the configured activity metrics
-        (``rx_bytes + tx_bytes`` by default) over the bucket. A client with no
-        activity-metric series at all is treated as idle (we cannot confirm
-        traffic), preserving the idle-zero property; a deployment without report
-        byte counters should point ``activity_metrics`` at a live counter such as
-        ``wifi_tx_attempts``.
+        Tier 1 (:attr:`SleConfig.activity_metrics`, default byte counters): when
+        the bucket has *any* sample on these series, the sum of their deltas must
+        reach ``activity_bytes_per_min`` × bucket minutes. This is authoritative
+        when present -- a real byte count below the floor is a real idle client.
+
+        Tier 2 (:attr:`SleConfig.activity_fallback_metrics`, default
+        ``wifi_tx_attempts``): only consulted when tier 1 has **no samples at
+        all** this bucket (the common case here -- byte counters land hours late
+        via the report backfill, see the module docstring). Judged against its
+        own ``activity_packets_per_min`` floor, never the byte floor.
+
+        A client with no samples on *either* tier is idle (we cannot confirm
+        traffic) -- the idle-zero property holds regardless of which tier ends up
+        deciding it.
         """
-        threshold = self.cfg.activity_bytes_per_min * (self.cfg.bucket_seconds / 60.0)
+        bucket_minutes = self.cfg.bucket_seconds / 60.0
+
+        total, has_samples = self._activity_total(client_id, self.cfg.activity_metrics, start, end)
+        if has_samples:
+            return total >= self.cfg.activity_bytes_per_min * bucket_minutes
+
+        total, has_samples = self._activity_total(
+            client_id, self.cfg.activity_fallback_metrics, start, end
+        )
+        if not has_samples:
+            return False
+        return total >= self.cfg.activity_packets_per_min * bucket_minutes
+
+    def _activity_total(
+        self, client_id: int, metrics: tuple[str, ...], start: int, end: int
+    ) -> tuple[float, bool]:
+        """Summed counter deltas across ``metrics`` this bucket, plus whether any
+        sample existed at all (distinct from "samples existed but summed to 0" --
+        the caller needs that distinction to decide whether to trust this tier or
+        fall back to the next one).
+        """
         total = 0.0
-        for metric in self.cfg.activity_metrics:
-            for row in self._raw(client_id, metric, start, end):
+        has_samples = False
+        for metric in metrics:
+            rows = self._raw(client_id, metric, start, end)
+            if rows:
+                has_samples = True
+            for row in rows:
                 # Counter deltas; a negative (reset) delta is not real traffic.
                 total += max(0.0, float(row["value"]))
-        return total >= threshold
+        return total, has_samples
 
     # ------------------------------------------------------------------ #
     # Per-SLE evaluation
@@ -774,14 +834,24 @@ class SleMinutesJob:
             return
         cells[(sle, classifier, entity_id)].add(minutes, attributed)
 
-    def _write(self, bucket_ts: int, cells: dict, result: BucketResult) -> int:
+    def _write(
+        self, bucket_ts: int, cells: dict, result: BucketResult, *, clear_existing: bool = False
+    ) -> int:
         """Persist every accumulated cell as one ``sle_minutes`` row (idempotent
         upsert). One ``BEGIN IMMEDIATE`` for the whole bucket.
+
+        ``clear_existing`` deletes the bucket's prior rows inside that same
+        transaction before writing -- a recompute must still clear even when this
+        pass produces zero cells (e.g. every client dropped below the
+        byte-accurate floor), so the shortcut that skips work for an empty
+        ``cells`` only applies when not recomputing.
         """
-        if not cells:
+        if not cells and not clear_existing:
             return 0
         written = 0
         with self.repo.transaction():
+            if clear_existing:
+                self.repo.delete_sle_minutes(bucket_ts)
             for (sle, classifier, entity_id), cell in cells.items():
                 self.repo.upsert_sle_minute(
                     bucket_ts=bucket_ts,

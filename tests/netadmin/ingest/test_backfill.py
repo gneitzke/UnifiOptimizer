@@ -199,6 +199,44 @@ async def test_backfill_inserts_verbatim_with_source_flag(repo: Repository):
 
 
 @pytest.mark.asyncio
+async def test_backfill_tracks_min_max_ts_of_written_buckets(repo: Repository):
+    # The "swept window" a downstream recompute (the SLE minutes job) uses --
+    # see netadmin.ingest.factory._recompute_sle_after_backfill -- must span
+    # exactly the distinct report-row timestamps actually written this run.
+    _ap(repo)
+    oid = "aa:bb:cc:00:00:01"
+    ts1, ts2 = NOW - 1800, NOW - 300
+    rows = {
+        (FIVEMIN, "ap"): [
+            {"time": ts1 * 1000, "oid": oid, "rx_bytes": 1000.0},
+            {"time": ts2 * 1000, "oid": oid, "rx_bytes": 500.0},
+        ]
+    }
+    bf = Backfiller(FakeEndpoints(rows), repo, scopes=("ap",))
+
+    result = await bf.run({"ap": NOW - 3600}, now=NOW)
+
+    scope = result.scopes["ap"]
+    assert scope.min_ts == ts1
+    assert scope.max_ts == ts2
+
+
+@pytest.mark.asyncio
+async def test_backfill_min_max_ts_absent_when_nothing_written(repo: Repository):
+    _ap(repo)
+    ep = FakeEndpoints()  # no rows for this window
+    bf = Backfiller(ep, repo, scopes=("ap",))
+
+    # last poll 100s ago -> no gap at all, nothing requested or written.
+    result = await bf.run({"ap": NOW - 100}, now=NOW)
+
+    scope = result.scopes["ap"]
+    assert scope.min_ts is None
+    assert scope.max_ts is None
+    assert scope.buckets == 0
+
+
+@pytest.mark.asyncio
 async def test_backfill_chunks_wide_windows(repo: Repository):
     _ap(repo)
     ep = FakeEndpoints()  # no rows: we only count requests

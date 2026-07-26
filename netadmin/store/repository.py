@@ -1697,6 +1697,22 @@ class Repository:
                 (bucket_ts, sle, classifier, entity_id, attributed_entity_id, minutes),
             )
 
+    def delete_sle_minutes(self, bucket_ts: int) -> int:
+        """Delete every ``sle_minutes`` row for one bucket; returns rows removed.
+
+        Used only by a bucket **recompute** (:meth:`SleMinutesJob.run_bucket` /
+        ``run_range`` with ``clear_existing=True``, e.g. after a report backfill
+        refines a bucket's activity data): the plain upsert in
+        :meth:`upsert_sle_minute` replaces a cell it writes, but it never touches
+        a cell the *previous* computation wrote that the new one no longer
+        produces (a classifier the byte-accurate pass drops, or a client the
+        byte-accurate gate now excludes). Delete-then-rewrite is the only way a
+        recompute cannot strand a stale row.
+        """
+        with self._write() as conn:
+            cur = conn.execute("DELETE FROM sle_minutes WHERE bucket_ts=?", (bucket_ts,))
+            return cur.rowcount
+
     def query_sle_minutes(
         self,
         start_ts: int,

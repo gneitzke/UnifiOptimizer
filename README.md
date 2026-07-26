@@ -101,8 +101,10 @@ For Claude Desktop, add this to `claude_desktop_config.json`:
 }
 ```
 
-It never writes to the store and never talks to your controller. Details and the tool
-list are in [`docs/MCP_SERVER.md`](docs/MCP_SERVER.md).
+It never writes to the store and never talks to your controller. Every tool, its
+parameters and when to reach for it are in
+[`docs/MCP_REFERENCE.md`](docs/MCP_REFERENCE.md); the design and safety model are in
+[`docs/MCP_SERVER.md`](docs/MCP_SERVER.md).
 
 ---
 

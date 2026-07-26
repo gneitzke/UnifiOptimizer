@@ -1,5 +1,8 @@
 # MCP Server (`netadmin/mcp/`)
 
+> Looking for what to call? [`MCP_REFERENCE.md`](MCP_REFERENCE.md) is the per-tool
+> reference. This page is the design and safety model.
+
 The authoritative design for the read-only MCP server that exposes the history
 store to the user's own Claude client. This document is the architecture as
 agreed; the implementation in `netadmin/mcp/` follows it.
@@ -8,6 +11,31 @@ agreed; the implementation in `netadmin/mcp/` follows it.
 to the user's own Claude client. Positioning: competing UniFi MCP servers are
 "Claude's hands on a live controller that keeps ~1 day of stats"; this is
 "Claude's memory".
+
+## Tool reference
+
+Every tool takes plain arguments and returns JSON led by a one-to-two sentence
+`summary`. Three parameter shapes repeat across the table below:
+
+- **Window** -- `window` (e.g. `"24h"`, `"7d"`, `"30d"`), or explicit `start`/`end`
+  (ISO-8601 or epoch seconds). Explicit `start`/`end` wins over `window`.
+- **Entity** -- `entity`: an `entity_id`, a MAC, or a device/client name
+  (substring match). An ambiguous name returns candidates instead of a guess.
+- **Limit** -- `limit`: rows per list, default 20, hard max 50.
+
+| Tool | Answers | Parameters | Reach for it when |
+|---|---|---|---|
+| `netadmin_overview` | What's the state of the network right now? | `window` (default `24h`), `start`, `end`, `limit` | Start every session here: open issues/incidents, SLE headline vs. the prior window, collector health. |
+| `netadmin_when_did_this_start` | When did *this* issue begin, what was normal before it, what changed right before onset, has it happened before? | `issue` (required), `window` (lookback before onset, default `24h`), `limit` | An issue is open and you need the story behind it, not just its current state. |
+| `netadmin_has_this_happened_before` | Every past occurrence of this issue's fingerprint: durations, fixes tried. | `issue` or `fingerprint` (pass one), `limit` | This failure looks familiar -- check the track record before proposing a new fix. |
+| `netadmin_issues` | List tracked issues, or full detail (lifecycle, evidence, investigations, fixes) on one. | `issue` (for detail), `state`, `severity`, `entity`, `open_only` (default `true`), `limit` | "What's open at P1 right now" or "show me everything about issue 42." |
+| `netadmin_incidents` | Correlated incidents: one root cause grouped with its symptom issues. | `incident` (for detail), `open_only` (default `true`), `limit` | Several issues fired together -- find out if it's one root cause or several unrelated problems. |
+| `netadmin_sle_trend` | Is health getting better or worse over a window? | `window` (default `7d`), `start`, `end`, `limit`, `bucket` (`hour` \| `day`, default automatic), `sle` (`coverage` \| `roaming` \| `capacity` \| `connect` \| `wan` \| `infra`) | "Has roaming quality gotten worse this week?" |
+| `netadmin_what_changed` | One merged timeline: firmware, channel and link-state changes, applied/reverted fixes, admin events. | `window` (default `7d`), `start`, `end`, `limit`, `entity` | Something broke and you want every config or state change in the window that could explain it. |
+| `netadmin_worst_offenders` | Which devices or clients caused the most grief in a window? | `window` (default `7d`), `start`, `end`, `limit`, `surface` (`devices` \| `clients`, default `devices`) | The health score dropped -- find out which AP or client is dragging it down. |
+| `netadmin_metric_history` | One entity's metric over time, next to its learned baseline. | `entity` (required), `metric` (required, e.g. `rssi`, `cu_total`, `wan_latency`), `window` (default `7d`), `start`, `end`, `limit` | "Show me this AP's channel utilization this week against what's normal for it." |
+| `netadmin_events_around` | What else broke at the same time? | `at` or `issue` (pass one, as the anchor), `radius` (default `30m`), `entity`, `limit` | An issue started at 3 a.m. and you want everything else the controller reported in that window. |
+| `netadmin_client_experience` | One client's story: SLE breakdown, roams/disconnects, AP history, RSSI trend. | `entity` (required), `window` (default `7d`), `start`, `end`, `limit` | "My laptop keeps dropping Wi-Fi" -- pull its whole week in one call. |
 
 ## 1. Transport / topology
 

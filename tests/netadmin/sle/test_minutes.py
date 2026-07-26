@@ -100,6 +100,51 @@ def test_activity_gate_threshold(repo: Repository) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# two-tier activity gate: byte counters land hours late via the report
+# backfill, so a bucket with no byte samples at all falls back to a live
+# per-interval counter (default wifi_tx_attempts) against its own floor.
+# --------------------------------------------------------------------------- #
+def test_activity_gate_falls_back_to_packets_when_no_byte_samples(repo: Repository) -> None:
+    ap = seed_ap(repo)
+    c = seed_client(repo, "c-fallback", parent_id=ap)
+    rssi(repo, c, [(30, -85.0)])
+    # No rx_bytes/tx_bytes at all this bucket (the common case pre-backfill),
+    # but the live packet counter clears its own floor (~1/min * 5 = 5).
+    put(repo, c, "wifi_tx_attempts", [(30, 10.0)])
+
+    SleMinutesJob(repo).run_bucket(0)
+
+    assert _rows(repo, 0, sle=SLE_COVERAGE, entity_id=c) != []
+
+
+def test_activity_gate_fallback_respects_its_own_floor(repo: Repository) -> None:
+    ap = seed_ap(repo)
+    c = seed_client(repo, "c-fallback-idle", parent_id=ap)
+    rssi(repo, c, [(30, -85.0)])
+    # No byte samples, and below the packet floor -> still honestly idle.
+    put(repo, c, "wifi_tx_attempts", [(30, 0.5)])
+
+    SleMinutesJob(repo).run_bucket(0)
+
+    assert _rows(repo, 0, entity_id=c) == []
+
+
+def test_activity_gate_prefers_bytes_over_fallback_when_both_present(repo: Repository) -> None:
+    ap = seed_ap(repo)
+    c = seed_client(repo, "c-bytes-authoritative", parent_id=ap)
+    rssi(repo, c, [(30, -85.0)])
+    # Bytes ARE present this bucket (tier 1) and below its floor, even though
+    # the fallback counter alone would clear tier 2's floor -- tier 1 wins
+    # whenever it has any sample, so a genuinely idle client stays idle.
+    put(repo, c, "rx_bytes", [(30, 100.0)])
+    put(repo, c, "wifi_tx_attempts", [(30, 1000.0)])
+
+    SleMinutesJob(repo).run_bucket(0)
+
+    assert _rows(repo, 0, entity_id=c) == []
+
+
+# --------------------------------------------------------------------------- #
 # attribution exclusivity: a failed minute is never double-counted
 # --------------------------------------------------------------------------- #
 def test_coverage_minutes_split_exactly_across_classifiers(repo: Repository) -> None:
@@ -504,3 +549,53 @@ def test_recompute_is_idempotent(repo: Repository) -> None:
     job.run_bucket(0)  # recompute same inputs
     second = _by_classifier(_rows(repo, 0, sle=SLE_COVERAGE, entity_id=c))
     assert first == second
+
+
+def test_recompute_without_clear_existing_strands_stale_cell(repo: Repository) -> None:
+    """The bug ``clear_existing`` fixes: a plain upsert only touches the cells
+    the new pass produces, so a cell an EARLIER pass wrote that the new pass no
+    longer produces (here: a client the recompute now judges idle) survives
+    untouched unless the bucket is cleared first.
+    """
+    from netadmin.sle.classifiers import SleConfig
+
+    ap = seed_ap(repo)
+    c = seed_client(repo, "c-recompute", parent_id=ap)
+    rssi(repo, c, [(30, -85.0)])  # weak signal
+    make_active(repo, c, 0, total_bytes=200.0)
+
+    lenient = SleMinutesJob(repo, config=SleConfig(activity_bytes_per_min=1.0))
+    lenient.run_bucket(0)
+    before = _by_classifier(_rows(repo, 0, sle=SLE_COVERAGE, entity_id=c))
+    assert CLS_WEAK_SIGNAL in before
+
+    # A stricter config judges the SAME stored samples idle this time (simulates
+    # byte-accurate data superseding an earlier, more lenient read).
+    strict = SleMinutesJob(repo, config=SleConfig(activity_bytes_per_min=1_000_000.0))
+
+    strict.run_bucket(0)  # no clear_existing -> the earlier row strands
+    stranded = _by_classifier(_rows(repo, 0, sle=SLE_COVERAGE, entity_id=c))
+    assert CLS_WEAK_SIGNAL in stranded
+
+    strict.run_bucket(0, clear_existing=True)  # delete-then-rewrite
+    assert _rows(repo, 0, sle=SLE_COVERAGE, entity_id=c) == []
+
+
+def test_run_range_clear_existing_recomputes_every_bucket(repo: Repository) -> None:
+    from netadmin.sle.classifiers import SleConfig
+
+    ap = seed_ap(repo)
+    c = seed_client(repo, "c-range", parent_id=ap)
+    for b in (0, B):
+        rssi(repo, c, [(b + 30, -85.0)])
+        make_active(repo, c, b, total_bytes=200.0)
+
+    lenient = SleMinutesJob(repo, config=SleConfig(activity_bytes_per_min=1.0))
+    lenient.run_range(0, 2 * B)
+    for b in (0, B):
+        assert CLS_WEAK_SIGNAL in _by_classifier(_rows(repo, b, sle=SLE_COVERAGE, entity_id=c))
+
+    strict = SleMinutesJob(repo, config=SleConfig(activity_bytes_per_min=1_000_000.0))
+    strict.run_range(0, 2 * B, clear_existing=True)
+    for b in (0, B):
+        assert _rows(repo, b, sle=SLE_COVERAGE, entity_id=c) == []

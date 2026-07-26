@@ -352,11 +352,52 @@ def _firewalled(
     return _run
 
 
+def _recompute_sle_after_backfill(
+    sle_job: Any, result: Any, ts: int, bucket_s: int, *, scope: str = "user"
+) -> None:
+    """Recompute the SLE buckets a report backfill just gave byte-accurate data.
+
+    The activity gate's primary signal (client rx/tx bytes) lands only through
+    the ``report.5minutes.user`` backfill (see
+    ``netadmin.sle.minutes.SleMinutesJob._is_active``); the live per-tick
+    ``sle_minutes`` job already scored those buckets on whatever activity
+    evidence it had at the time (usually the live packet-count fallback, tier 2).
+    Once the backfill sweep lands real bytes for a bucket, re-running it gives
+    that bucket its honest, byte-accurate answer -- delete-then-rewrite
+    (``clear_existing=True``) so a cell the byte-accurate pass no longer produces
+    cannot strand a stale row the plain upsert would never touch.
+
+    Bounded to the buckets the backfill actually touched this run (``result``'s
+    per-scope ``min_ts``/``max_ts`` -- see :class:`~netadmin.ingest.backfill.ScopeResult`)
+    and never past the bucket still filling, the same "last complete bucket"
+    discipline the live job uses. A no-op when the scope wrote nothing this run
+    (the common steady-state tick -- ``last_ts`` was already current).
+    """
+    scopes = getattr(result, "scopes", None) if result is not None else None
+    scope_result = scopes.get(scope) if scopes else None
+    if scope_result is None or not scope_result.buckets:
+        return
+    if scope_result.min_ts is None or scope_result.max_ts is None:
+        return
+
+    from netadmin.sle.minutes import bucket_of
+
+    start = bucket_of(int(scope_result.min_ts), bucket_s)
+    last_complete = bucket_of(int(ts), bucket_s)
+    end = min(bucket_of(int(scope_result.max_ts), bucket_s) + bucket_s, last_complete)
+    if end <= start:
+        return
+    sle_job.run_range(start, end, clear_existing=True)
+
+
 def _add_analysis_jobs(
     scheduler: Any,
     settings: Settings,
     store: Repository,
     issue_engine: Any,
+    *,
+    baselines: Any,
+    sle_job: Any,
 ) -> None:
     """Wire detection + baselines + SLE onto the collector's one scheduler.
 
@@ -372,16 +413,15 @@ def _add_analysis_jobs(
     * ``sle_minutes`` (5 min) — the SLE user-minute accounting for the last
       *complete* 5-minute bucket (the current bucket is still filling).
 
-    One :class:`Baselines` is built here and shared by the detector engine, the
-    baseline-update job, and the SLE minutes job, so all three read and write the
-    one ``baselines`` table through this repository. Nothing is started — the
+    ``baselines`` and ``sle_job`` are built once by the caller (:func:`build_components`)
+    and shared here with the detector engine / the reports-backfill recompute
+    hook respectively, so all three read and write the one ``baselines`` table
+    (and the one SLE job) through this repository. Nothing is started — the
     lifespan owns ``scheduler.start()``.
     """
-    from netadmin.detect.baseline import Baselines
     from netadmin.detect.engine import EngineRunConfig, build_detector_engine, schedule_detection
-    from netadmin.sle.minutes import SleMinutesJob, bucket_of
+    from netadmin.sle.minutes import bucket_of
 
-    baselines = Baselines.for_repository(store)
     det = settings.detect
 
     engine = build_detector_engine(
@@ -401,7 +441,6 @@ def _add_analysis_jobs(
     # and /api/health's staleness bound for detect_fast reads the same number.
     schedule_detection(engine, scheduler=scheduler, daily_hour=int(det.daily_hour))
 
-    sle_job = SleMinutesJob(store, baselines, settings=settings)
     bucket_s = int(sle_job.cfg.bucket_seconds)
 
     def _baseline_work(ts: int) -> None:
@@ -518,7 +557,13 @@ def build_components(
     added to the same scheduler; the detection tiers, baseline update, and SLE
     minutes jobs are wired onto that same scheduler (section 6 & 8); the WS
     supervisor and probe runner are wrapped for the lifespan's start/stop
-    contract; and a one-shot startup backfill is returned as an awaitable.
+    contract; and a one-shot startup backfill is returned as an awaitable. Both
+    the recurring ``reports_5min`` sweep and the one-shot startup backfill also
+    trigger an SLE recompute (:func:`_recompute_sle_after_backfill`) over
+    whichever buckets the ``user``-scope report just gave byte-accurate activity
+    data, so a bucket the live job scored on the packet-count fallback gets
+    upgraded once the real bytes land instead of waiting for the next full
+    ``score_window_s`` to age it out.
 
     ``issue_engine`` is the shared :class:`~netadmin.issues.engine.IssueEngine` the
     detection passes drive; the daemon passes the same instance the API routers
@@ -532,6 +577,17 @@ def build_components(
         from netadmin.issues.store_repository import StoreIssueRepository
 
         issue_engine = IssueEngine(StoreIssueRepository(store))
+
+    # Built here (not inside _add_analysis_jobs) so the reports-backfill hook
+    # below can share the same SleMinutesJob for its post-backfill recompute
+    # (section 8's activity gate is honest only once byte data lands; see
+    # _recompute_sle_after_backfill).
+    from netadmin.detect.baseline import Baselines
+    from netadmin.sle.minutes import SleMinutesJob
+
+    baselines = Baselines.for_repository(store)
+    sle_job = SleMinutesJob(store, baselines, settings=settings)
+    sle_bucket_s = int(sle_job.cfg.bucket_seconds)
 
     backfiller = Backfiller(
         endpoints,
@@ -551,10 +607,13 @@ def build_components(
         await catchup_events(store, endpoints)
 
     async def _reports_backfill(ts: int) -> None:
-        await backfiller.run(_last_ts_by_scope(), now=ts)
+        result = await backfiller.run(_last_ts_by_scope(), now=ts)
+        _recompute_sle_after_backfill(sle_job, result, ts, sle_bucket_s)
 
     async def _startup_backfill() -> Any:
-        return await backfiller.run(_last_ts_by_scope())
+        result = await backfiller.run(_last_ts_by_scope())
+        _recompute_sle_after_backfill(sle_job, result, _utcnow_ts(), sle_bucket_s)
+        return result
 
     collector = Collector(
         endpoints,
@@ -565,7 +624,9 @@ def build_components(
     )
     scheduler = build_scheduler(collector, settings.poll)
     _add_prune_job(scheduler, store, prune_hour=settings.retention.prune_hour)
-    _add_analysis_jobs(scheduler, settings, store, issue_engine)
+    _add_analysis_jobs(
+        scheduler, settings, store, issue_engine, baselines=baselines, sle_job=sle_job
+    )
     _add_correlation_job(scheduler, settings, store)
 
     def _ws_factory() -> EventsListener:

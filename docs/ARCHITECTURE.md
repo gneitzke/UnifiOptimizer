@@ -366,6 +366,25 @@ Adapted from Juniper Mist. Each 5-minute bucket, each active client contributes 
 
 "Idle client with bad RSSI = 0 failed minutes" is the property that makes the score honest: impact-weighted by construction. Headline health = weighted blend of SLE scores, always one click from its classifier breakdown; the score and the explanation are the same `sle_minutes` GROUP BY. Classifier bad-minute rates are themselves detector inputs (a classifier crossing its band opens an issue).
 
+### Two-tier activity gate
+
+`SleMinutesJob._is_active` decides "active" from `SleConfig.activity_metrics` (default `rx_bytes`/`tx_bytes`) reaching `activity_bytes_per_min` for the bucket. On controllers where the live poller carries no byte counters at all (`stat/sta` maps rssi/satisfaction/tx_retries/wifi_tx_attempts/tx_rate/rx_rate/roam_count, no bytes — see `netadmin/ingest/mapping.py`), those counters land only via the periodic `report.5minutes.user` backfill, hours after the bucket closed and long after the per-tick `sle_minutes` job already evaluated it. A bucket with no byte samples at all is not assumed idle: the gate falls back to a live per-interval counter (`activity_fallback_metrics`, default `wifi_tx_attempts`) against its own `activity_packets_per_min` floor. Tier 1 wins whenever it has any sample this bucket; tier 2 only fires when tier 1 has none. A client with no samples on either tier stays idle — the honest-zero property holds regardless of which tier decided it.
+
+Because the live job only ever computes a bucket once (the last complete bucket, per tick), the tier-2 answer is what most buckets get at evaluation time. Once the backfill sweep lands real bytes for those buckets, `netadmin/ingest/factory.py`'s `_recompute_sle_after_backfill` re-runs `SleMinutesJob.run_range` over exactly the buckets the `user`-scope report just touched (`ScopeResult.min_ts`/`max_ts`), never past the bucket still filling. The recompute is delete-then-rewrite (`run_bucket`/`run_range(..., clear_existing=True)` → `Repository.delete_sle_minutes`): a plain upsert only touches the cells the new pass produces, so a cell an earlier pass wrote that the byte-accurate pass no longer produces (a classifier that no longer applies, or a client the byte-accurate gate now excludes) would otherwise strand. Both the recurring `reports_5min` collector job and the one-shot startup backfill trigger this recompute.
+
+### Exposure and the confidence floor (`/api/sle`)
+
+`sle_scores` (`netadmin/sle/scores.py`) reports, per SLE, `evaluated_buckets` (distinct 5-minute buckets that produced any judgment) against `window_buckets` (the window's total). An SLE with a real score computed from too little of that — under `MIN_EXPOSURE_FRACTION` (20%) of the window's buckets, or under `MIN_EXPOSURE_MINUTES` (30) judged minutes — is `below_floor`: a real number, never hidden, but excluded from the headline blend (`ScoreReport.excluded_below_floor`) and never painted with a confident Good/Fair/Poor band in the UI.
+
+A `score is None` SLE is ambiguous for the per-occurrence SLEs (roaming, connect: both only ever write a row when something happens, never a per-bucket "ok, nothing occurred" row). The `/api/sle` router resolves that ambiguity two ways it cannot from `sle_minutes` alone:
+
+- **quiet pass** — roaming or connect has no data, but `coverage` (written for every active wireless client whenever RSSI is present, riding the same activity gate) cleared the exposure-fraction floor this window, so the absence reads as a confirmed "nothing happened," not a gap (`SleEntryRow.quiet_pass`).
+- **not measurable** — `connect` specifically has no data and no event of any kind has landed recently (`Repository.max_event_ts`), the signal that the WS listener (the only lifecycle-event source on UniFi OS 9.x) has stopped delivering. Reported as `measurable: false` with an explicit `unmeasurable_reason`, never silently folded into "no exposed minutes." Never overrides an SLE that DID score something (e.g. a link-local-IP DHCP failure needs no event).
+
+`web/src/pages/dashboard/SleHealthBlock.tsx` renders exactly these states: a confident score only when `measurable && !below_floor && score != null`; a neutral "Insufficient data — measured X of Y intervals" otherwise; a distinct reassuring quiet-pass line; and the explicit unmeasurable reason. The sparkline keeps its dots-with-gaps rendering but captions the chart with the same exposure count so gaps read as sampling holes, not network chaos.
+
+The WS listener itself dying after start and never restarting (`netadmin/ingest/events.py`'s `WsSupervisor`) is a separate, open issue — the exposure/measurability work above represents it honestly but does not fix it.
+
 ## 9. Fix engine (`netadmin/fixes/`)
 
 Salvages `core/change_applier.py`'s before/after snapshot discipline, now recorded in the `changes` table and linked to issues.
@@ -1278,3 +1297,17 @@ enforces server-side:
   a human would run by hand.
 
 Both light and dark themes, like every surface in this project.
+
+### Sidebar version footer (`web/src/layout/Sidebar.tsx`)
+
+A quiet `v<current_version>` line sits under the nav list, inside the sidebar
+(so it disappears when the sidebar is collapsed to icons rather than crowding
+the icon rail). `AppShell` sources the version from a one-shot, non-polling
+`useHealth(0)` call against `/api/health` -- `build_health`'s `version` field
+-- since it only needs to be right on load: it changes at most once per
+self-upgrade, and that already restarts the daemon. The footer's hover title
+names the install method (and container variant, when set) off the same
+`useUpdateStatus` data `UpdateBanner` polls, read a second time here rather
+than threaded through props, to keep `Sidebar` a plain presentational
+component. This gives the operator a fast, always-visible way to compare the
+running version against PyPI without opening Settings.

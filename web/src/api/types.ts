@@ -100,6 +100,7 @@ export interface JobHealth {
 export interface Health {
   status: HealthStatus;
   ready: boolean;
+  version: string;
   uptime_s: number;
   now: number;
   db: { path: string; size_bytes: number | null };

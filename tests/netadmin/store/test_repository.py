@@ -602,6 +602,36 @@ def test_query_sle_minutes_rejects_bad_group(repo: Repository) -> None:
         raise AssertionError("expected ValueError")
 
 
+def test_delete_sle_minutes_clears_only_its_bucket(repo: Repository, switch_entity_id: int) -> None:
+    repo.upsert_sle_minute(
+        bucket_ts=0, sle="coverage", classifier="ok", entity_id=switch_entity_id, minutes=4.0
+    )
+    repo.upsert_sle_minute(
+        bucket_ts=0,
+        sle="coverage",
+        classifier="weak_signal",
+        entity_id=switch_entity_id,
+        minutes=1.0,
+    )
+    repo.upsert_sle_minute(
+        bucket_ts=300, sle="coverage", classifier="ok", entity_id=switch_entity_id, minutes=5.0
+    )
+
+    deleted = repo.delete_sle_minutes(0)
+
+    assert deleted == 2
+    # an ungrouped query always returns one row; SUM() over no matching rows is
+    # NULL, not an empty result set
+    assert repo.query_sle_minutes(0, 300, group_by=()) == [{"minutes": None}]
+    # the other bucket is untouched
+    other = repo.query_sle_minutes(300, 600, group_by=())
+    assert other[0]["minutes"] == 5.0
+
+
+def test_delete_sle_minutes_empty_bucket_is_a_noop(repo: Repository) -> None:
+    assert repo.delete_sle_minutes(12345) == 0
+
+
 def test_investigations_crud(repo: Repository) -> None:
     iid = repo.insert_issue(
         fingerprint="fp",

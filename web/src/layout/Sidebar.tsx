@@ -4,6 +4,7 @@ import { NAV_ITEMS } from './nav';
 import { CountBadge } from '../components/ui/CountBadge';
 import { cn } from '../components/ui/cn';
 import type { IssueSummary } from '../api/hooks';
+import type { InstallMethod, UpdateVariant } from '../api/update';
 
 /**
  * Flat, collapsible sidebar (docs §Interaction: 5-9 flat destinations, quiet
@@ -16,9 +17,32 @@ interface Props {
   expanded: boolean;
   onToggle: () => void;
   summary?: IssueSummary;
+  /** From `/api/health` (`build_health`'s `version`). Undefined while loading. */
+  version?: string;
+  /** From `/api/system/update`, for the version footer's hover tooltip. */
+  installMethod?: InstallMethod;
+  installVariant?: UpdateVariant;
 }
 
-export function Sidebar({ expanded, onToggle, summary }: Props) {
+const INSTALL_METHOD_LABEL: Record<InstallMethod, string> = {
+  pip: 'Installed via pip',
+  container: 'Installed in a container',
+  addon: 'Installed as a Home Assistant add-on',
+  source: 'Running from a source checkout',
+};
+
+const INSTALL_VARIANT_LABEL: Record<'compose' | 'macmini', string> = {
+  compose: 'Docker Compose',
+  macmini: 'Mac mini deploy',
+};
+
+function installTitle(method?: InstallMethod, variant?: UpdateVariant): string | undefined {
+  if (!method) return undefined;
+  const base = INSTALL_METHOD_LABEL[method];
+  return variant ? `${base} (${INSTALL_VARIANT_LABEL[variant]})` : base;
+}
+
+export function Sidebar({ expanded, onToggle, summary, version, installMethod, installVariant }: Props) {
   return (
     <aside
       className="no-print flex flex-col shrink-0 transition-[width] duration-200"
@@ -95,6 +119,16 @@ export function Sidebar({ expanded, onToggle, summary }: Props) {
           );
         })}
       </nav>
+
+      {expanded && version && (
+        <div
+          className="px-3 py-2 t-caption truncate"
+          style={{ borderTop: '1px solid var(--hairline)', color: 'var(--fg-subtle)' }}
+          title={installTitle(installMethod, installVariant)}
+        >
+          v{version}
+        </div>
+      )}
 
       <button
         type="button"

@@ -66,7 +66,19 @@ async def test_per_sle_timeseries_present_and_scored(app_with_minutes) -> None:
 
 
 async def test_top_level_shape_unchanged(app_with_minutes) -> None:
-    # adding timeseries lives inside each SLE; the top-level contract is stable
+    # adding timeseries + exposure lives inside each SLE and a fixed top-level
+    # set of new keys; nothing else in the contract moved
     async with await _client(app_with_minutes) as c:
         resp = await c.get("/api/sle")
-    assert set(resp.json()) == {"start_ts", "end_ts", "headline", "weights", "sles"}
+    assert set(resp.json()) == {
+        "start_ts",
+        "end_ts",
+        "headline",
+        "weights",
+        "window_buckets",
+        "included_sles",
+        "excluded_below_floor",
+        "excluded_no_data",
+        "excluded_not_measurable",
+        "sles",
+    }

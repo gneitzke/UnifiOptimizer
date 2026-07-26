@@ -66,8 +66,19 @@ export function DashboardPage() {
   const report = sle.data;
   const headline100 = scoreTo100(report?.headline);
   const band = scoreBand(headline100);
-  const scoredCount = report ? Object.values(report.sles).filter((s) => s.score != null).length : 0;
+  // "Has scored at all" (any real minutes, even ones too thin to headline) is
+  // distinct from "counted in the headline blend" — the first-run banner below
+  // gates on the former so it never fires while real (if unconfident) data
+  // exists, and the caption below reports the latter honestly.
+  const anyScored = report ? Object.values(report.sles).some((s) => s.score != null) : false;
   const totalSle = report ? Object.keys(report.sles).length : 0;
+  const includedCount = report?.included_sles.length ?? 0;
+  const belowFloorCount = report?.excluded_below_floor.length ?? 0;
+  const notMeasurableCount = report?.excluded_not_measurable.length ?? 0;
+  const exclusionNote = [
+    belowFloorCount > 0 ? `${belowFloorCount} below data floor` : null,
+    notMeasurableCount > 0 ? `${notMeasurableCount} not measurable` : null,
+  ].filter((s): s is string => s != null);
 
   const orderedSles = report
     ? [
@@ -82,7 +93,7 @@ export function DashboardPage() {
   // while there is genuinely nothing scored, and only once something has loaded
   // (never during the initial skeleton, and never masking a real load error).
   const collecting =
-    !sle.error && !health.error && scoredCount === 0 && (report != null || health.data != null);
+    !sle.error && !health.error && !anyScored && (report != null || health.data != null);
 
   return (
     <div className="px-6 py-6 mx-auto flex flex-col gap-6" style={{ maxWidth: 1200 }}>
@@ -131,7 +142,8 @@ export function DashboardPage() {
           )}
           {report && (
             <span className="t-caption" style={{ color: 'var(--fg-subtle)' }}>
-              Weighted across {scoredCount}/{totalSle} service levels ·{' '}
+              Weighted across {includedCount}/{totalSle} service levels
+              {exclusionNote.length > 0 ? ` (${exclusionNote.join(', ')})` : ''} ·{' '}
               <RelativeTime ts={report.end_ts} mode="as-of" />
             </span>
           )}

@@ -19,10 +19,14 @@ from netadmin.sle.classifiers import (
     SLE_INFRA,
     SLE_WAN,
 )
-from netadmin.sle.scores import DEFAULT_WEIGHTS, load_weights, sle_scores
+from netadmin.sle.scores import DEFAULT_WEIGHTS, MIN_EXPOSURE_MINUTES, load_weights, sle_scores
 from netadmin.store.repository import Repository
 
-WIN = (0, 10_000)
+# One bucket wide: these tests seed every row at bucket_ts=0 and check the pure
+# score/offender/blend math, so the window matches exactly what was measured
+# (full exposure, one bucket) rather than tripping the confidence floor
+# (test_scores.py's dedicated exposure tests cover thin-window behaviour).
+WIN = (0, 300)
 
 
 def _put(repo: Repository, sle, classifier, entity_id, minutes, attributed=None) -> None:
@@ -111,6 +115,78 @@ def test_window_bounds_are_respected(repo: Repository) -> None:
     # a window that starts after the only row sees no data
     report = sle_scores(repo, 1, 10_000)
     assert report.sles[SLE_COVERAGE].score is None
+
+
+# --------------------------------------------------------------------------- #
+# Exposure: evaluated_buckets / window_buckets / the confidence floor
+# --------------------------------------------------------------------------- #
+def test_evaluated_and_window_buckets_reported(repo: Repository) -> None:
+    _put(repo, SLE_COVERAGE, OK, 1, 100.0)  # a single row at bucket_ts=0
+    report = sle_scores(repo, 0, 3_000)  # 10 buckets of 300s
+    cov = report.sles[SLE_COVERAGE]
+    assert report.window_buckets == 10
+    assert cov.window_buckets == 10
+    assert cov.evaluated_buckets == 1
+
+
+def test_plentiful_minutes_in_few_buckets_still_counts(repo: Repository) -> None:
+    """Clustered evidence is still evidence, so a thin bucket fraction alone must
+    not drop an SLE from the headline.
+
+    Real data clusters: client byte counters arrive in a six-hourly sweep, so on
+    the production network coverage, capacity and WAN each carried more than 4,000
+    judged client-minutes inside just 12 of 288 buckets. Disqualifying on the
+    fraction dropped all three, left infra (weight 0.05) to renormalise to 1.0,
+    and swung the headline from 72% to 100% while hiding a live roaming failure.
+    The absolute quantity of judged minutes is what decides; the fraction is
+    reported so the UI can caption how bunched the sampling was.
+    """
+    assert 100.0 >= MIN_EXPOSURE_MINUTES
+    _put(repo, SLE_COVERAGE, OK, 1, 100.0)  # 1 of 10 buckets, but 100 minutes
+    report = sle_scores(repo, 0, 3_000)
+    cov = report.sles[SLE_COVERAGE]
+
+    assert cov.score is not None
+    assert cov.below_floor is False
+    assert SLE_COVERAGE in report.included_sles
+    assert report.headline is not None
+    # The sparse sampling is still reported, just not disqualifying.
+    assert cov.evaluated_buckets < cov.window_buckets
+
+
+def test_below_floor_by_thin_minutes_even_at_full_bucket_fraction(repo: Repository) -> None:
+    # Full exposure (the window IS exactly the one seeded bucket) but well under
+    # the minutes floor: too little evidence to paint Good/Fair/Poor, however
+    # evenly it was sampled.
+    minutes = MIN_EXPOSURE_MINUTES - 1
+    _put(repo, SLE_COVERAGE, OK, 1, minutes)
+    report = sle_scores(repo, *WIN)
+    cov = report.sles[SLE_COVERAGE]
+
+    assert cov.evaluated_buckets == cov.window_buckets == 1  # 100% exposure
+    assert cov.below_floor is True
+
+
+def test_at_or_above_both_floors_is_included_in_headline(repo: Repository) -> None:
+    _put(repo, SLE_COVERAGE, OK, 1, 90.0)
+    _put(repo, SLE_COVERAGE, CLS_WEAK_SIGNAL, 1, 10.0, attributed=100)
+    report = sle_scores(repo, *WIN)  # full exposure, 100 judged minutes
+    cov = report.sles[SLE_COVERAGE]
+
+    assert cov.below_floor is False
+    assert SLE_COVERAGE in report.included_sles
+    assert SLE_COVERAGE not in report.excluded_below_floor
+    assert math.isclose(report.headline, 0.9)
+
+
+def test_no_data_sles_land_in_excluded_no_data(repo: Repository) -> None:
+    _put(repo, SLE_COVERAGE, OK, 1, 100.0)
+    report = sle_scores(repo, *WIN)
+
+    assert SLE_WAN in report.excluded_no_data
+    assert SLE_INFRA in report.excluded_no_data
+    assert SLE_WAN not in report.included_sles
+    assert SLE_WAN not in report.excluded_below_floor
 
 
 def test_load_weights_override(repo: Repository) -> None:

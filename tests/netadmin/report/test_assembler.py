@@ -244,12 +244,32 @@ def test_scorecard_counts_sum_to_total(seeded, repo) -> None:
 
 
 def test_health_score_is_round_of_headline(seeded, repo) -> None:
-    doc = report_to_dict(_report(repo))
-    # coverage 90 ok / 100 total = 0.9, the only SLE with data -> headline 90.
+    # The shared fixture seeds one 5-minute coverage bucket (90 ok / 10 weak =
+    # 0.9) — real, but far too thin to headline a 7-day report with confidence
+    # (netadmin.sle.scores's confidence floor: below 20% of the window's buckets
+    # judged, the headline excludes it). Add 9 more buckets at the same 9:1
+    # ok:weak ratio (score stays exactly 0.9) and score over a narrower window
+    # that actually clears the floor, so what's under test — headline_score =
+    # round(headline * 100) — has data that deserves a confident answer.
+    client0 = seeded["client0"]
+    for i in range(1, 10):
+        bucket = BUCKET + i * 300
+        repo.upsert_sle_minute(
+            bucket_ts=bucket, sle="coverage", classifier="ok", entity_id=client0, minutes=9.0
+        )
+        repo.upsert_sle_minute(
+            bucket_ts=bucket,
+            sle="coverage",
+            classifier="weak_signal",
+            entity_id=client0,
+            minutes=1.0,
+        )
+    doc = report_to_dict(build_report(repo, None, now=NOW, window_s=3_600))
     assert doc["health"]["headline_score"] == 90
     assert doc["executive_summary"]["scorecard"]["health_score"] == 90
     trend = doc["health"]["trend"]
-    assert len(trend) == 1 and trend[0]["score"] == 90
+    assert len(trend) == 10
+    assert all(p["score"] == 90 for p in trend)
 
 
 # --------------------------------------------------------------------------- #

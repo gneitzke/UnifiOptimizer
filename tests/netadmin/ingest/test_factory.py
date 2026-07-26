@@ -15,7 +15,13 @@ import netadmin.ingest.factory as factory
 from netadmin.config import ProbeConfig, Settings
 from netadmin.domain.entities import Entity
 from netadmin.domain.types import EntityType
-from netadmin.ingest.factory import ProbeRunner, SupervisorTask, build_components
+from netadmin.ingest.backfill import BackfillResult, ScopeResult
+from netadmin.ingest.factory import (
+    ProbeRunner,
+    SupervisorTask,
+    _recompute_sle_after_backfill,
+    build_components,
+)
 from netadmin.ingest.probes import METRIC_DNS_ANCHOR_LATENCY, METRIC_GW_RTT, ProbeSample
 from netadmin.store.repository import Repository
 
@@ -55,6 +61,91 @@ async def test_build_components_wires_all_scheduler_jobs(repo: Repository) -> No
     # and the runtime subsystems match the lifespan's start/stop contract
     assert isinstance(built.ws_supervisor, SupervisorTask)
     assert isinstance(built.probes, ProbeRunner)
+
+
+class _FakeSleJob:
+    """Records ``run_range`` calls; ``cfg.bucket_seconds`` mirrors the real job."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, int, bool]] = []
+
+    def run_range(self, start_ts: int, end_ts: int, *, clear_existing: bool = False) -> None:
+        self.calls.append((start_ts, end_ts, clear_existing))
+
+
+async def test_recompute_after_backfill_covers_swept_window_delete_then_rewrite() -> None:
+    job = _FakeSleJob()
+    result = BackfillResult(
+        scopes={"user": ScopeResult(scope="user", buckets=3, min_ts=1000, max_ts=1900)}
+    )
+
+    # ts is well after the swept window, so the whole thing is "complete".
+    _recompute_sle_after_backfill(job, result, 100_000, 300)
+
+    assert job.calls == [(900, 2100, True)]  # bucket_of(1000)=900, bucket_of(1900)+300=2100
+
+
+async def test_recompute_after_backfill_never_touches_the_filling_bucket() -> None:
+    job = _FakeSleJob()
+    # The swept window reaches right up to "now" -- its last bucket is still
+    # filling, so the recompute must not touch it (same discipline as the live
+    # per-tick job's "last complete bucket").
+    result = BackfillResult(
+        scopes={"user": ScopeResult(scope="user", buckets=1, min_ts=1000, max_ts=1000)}
+    )
+
+    _recompute_sle_after_backfill(job, result, 1050, 300)
+
+    assert job.calls == []
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        None,
+        BackfillResult(scopes={}),
+        BackfillResult(scopes={"user": ScopeResult(scope="user")}),  # wrote nothing
+    ],
+)
+async def test_recompute_after_backfill_noop_when_nothing_to_recompute(result) -> None:
+    job = _FakeSleJob()
+    _recompute_sle_after_backfill(job, result, 100_000, 300)
+    assert job.calls == []
+
+
+async def test_reports_backfill_triggers_sle_recompute(repo: Repository, monkeypatch) -> None:
+    """The recurring ``reports_5min`` job hands its swept window to the SAME
+    SleMinutesJob the live per-tick job shares (netadmin.ingest.factory:
+    _add_analysis_jobs), so a bucket the live job scored on the packet fallback
+    gets recomputed once real bytes land -- without waiting for the next tick.
+    """
+    seen: list[tuple[object, object, int, int]] = []
+
+    async def fake_run(self, last_ts_by_scope, *, now=None):
+        return BackfillResult(
+            scopes={
+                "user": ScopeResult(scope="user", buckets=1, min_ts=now - 600, max_ts=now - 600)
+            }
+        )
+
+    def fake_recompute(sle_job, result, ts, bucket_s, **kwargs):
+        seen.append((sle_job, result, ts, bucket_s))
+
+    monkeypatch.setattr(factory.Backfiller, "run", fake_run)
+    monkeypatch.setattr(factory, "_recompute_sle_after_backfill", fake_recompute)
+
+    built = build_components(_configured(), repo)
+    try:
+        await built.collector._reports_backfill(1_000_000)
+    finally:
+        if built.scheduler.running:
+            built.scheduler.shutdown(wait=False)
+
+    assert len(seen) == 1
+    _, result, ts, bucket_s = seen[0]
+    assert ts == 1_000_000
+    assert bucket_s == 300
+    assert result.scopes["user"].buckets == 1
 
 
 async def test_build_components_uses_injected_issue_engine(repo: Repository) -> None:

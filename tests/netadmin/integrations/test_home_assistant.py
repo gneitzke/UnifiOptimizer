@@ -18,7 +18,7 @@ from typing import Any, Optional
 
 import pytest
 
-from netadmin.config import Settings
+from netadmin.config import Settings, SleRuntimeConfig
 from netadmin.domain.entities import Entity
 from netadmin.domain.types import EntityType, IssueState, Severity
 from netadmin.integrations.home_assistant import _IssueView  # noqa: PLC2701 - test-internal
@@ -616,8 +616,16 @@ async def test_state_doc_carries_health_sle_and_counts(
     # A pending (unconfirmed) issue must NOT be counted.
     _seed_issue(store, fingerprint="4" * 40, severity="p1", state=IssueState.PENDING.value)
 
+    ha_settings = _settings(tmp_db_path)
+    # A narrower score window so the one seeded bucket is real, comfortable
+    # exposure (1 of 4 buckets, well above the confidence floor) rather than a
+    # single bucket lost in the default 24h/288-bucket window -- this test is
+    # about the state doc's shape and values, not exposure semantics (see
+    # netadmin/sle/scores.py's own tests for those).
+    ha_settings.sle = SleRuntimeConfig(score_window_s=1200)
+
     mqtt = FakeMqttClient()
-    pub = build_ha_publisher(_settings(tmp_db_path), store, engine, client_factory=lambda: mqtt)
+    pub = build_ha_publisher(ha_settings, store, engine, client_factory=lambda: mqtt)
     await pub._publish_state(mqtt)
 
     doc = mqtt.json_on("netadmin/state")

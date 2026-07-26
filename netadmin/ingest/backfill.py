@@ -138,7 +138,14 @@ class BackfillWindow:
 
 @dataclass
 class ScopeResult:
-    """Outcome of backfilling one scope across both tiers."""
+    """Outcome of backfilling one scope across both tiers.
+
+    ``min_ts``/``max_ts`` span every distinct report-row timestamp actually
+    written this run (across both the 5-minute and hourly tiers) -- the "swept
+    window" a caller can hand to a downstream recompute (e.g. the SLE minutes
+    job re-scoring the buckets whose activity data just arrived, see
+    ``netadmin.ingest.factory``). ``None`` when nothing was written.
+    """
 
     scope: str
     windows: int = 0
@@ -146,6 +153,8 @@ class ScopeResult:
     buckets: int = 0
     skipped_unresolved: int = 0
     errors: int = 0
+    min_ts: Optional[int] = None
+    max_ts: Optional[int] = None
 
 
 @dataclass
@@ -407,6 +416,10 @@ class Backfiller:
                 job=job_name(interval, scope), ok=True, ts=ts, source="backfill"
             )
         res.buckets += len(bucket_ts)
+        if bucket_ts:
+            lo, hi = min(bucket_ts), max(bucket_ts)
+            res.min_ts = lo if res.min_ts is None else min(res.min_ts, lo)
+            res.max_ts = hi if res.max_ts is None else max(res.max_ts, hi)
 
 
 __all__ = [
