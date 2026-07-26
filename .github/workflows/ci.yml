@@ -26,14 +26,16 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[test]"
+          pip install -e ".[test,mcp]"
           # Pin the linters to the repo's versions (.pre-commit-config.yaml) so CI
           # agrees with local formatting. `pip install black` alone pulls the
           # latest black, whose formatting drifts from the repo's 23.12.1 and would
           # spuriously flag already-formatted files (e.g. netadmin/visit/report.py).
           pip install "black==23.12.1" "isort==5.13.2" "flake8==7.0.0"
-      - name: Tests
-        run: python -m pytest tests/ -q
+      - name: Tests with coverage gate
+        run: |
+          PYTHONPATH=. python -m pytest tests/ -q \
+            --cov=netadmin --cov-report=term-missing:skip-covered --cov-fail-under=85
       - name: Format (black)
         run: black --check netadmin/ tests/netadmin/
       - name: Imports (isort)

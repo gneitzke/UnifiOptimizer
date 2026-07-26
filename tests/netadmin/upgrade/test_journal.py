@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import stat
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from netadmin.upgrade.journal import (
     PHASE_ROLLED_BACK,
     PHASE_STARTING,
     PHASE_SWAPPING,
+    STALE_AFTER_S,
     TERMINAL_PHASES,
     UpgradeJournal,
     journal_path_for,
@@ -116,3 +118,53 @@ def test_phase_sets_are_disjoint_and_exhaustive_over_known_phases() -> None:
     assert IN_PROGRESS_PHASES.isdisjoint(TERMINAL_PHASES)
     all_phases = IN_PROGRESS_PHASES | TERMINAL_PHASES
     assert len(all_phases) == len(IN_PROGRESS_PHASES) + len(TERMINAL_PHASES)
+
+
+# --------------------------------------------------------------------------- #
+# Abandonment: a killed runner must not disable upgrading forever.
+# --------------------------------------------------------------------------- #
+def test_pid_alive_reports_this_process() -> None:
+    from netadmin.upgrade.journal import _pid_alive
+
+    assert _pid_alive(os.getpid()) is True
+    assert _pid_alive(999_999) is False
+    assert _pid_alive(0) is False
+    assert _pid_alive(-1) is False
+
+
+def _inflight(**kw) -> UpgradeJournal:
+    base = dict(
+        phase=PHASE_SWAPPING,
+        target_version="1.0.0",
+        from_version="0.9.0",
+        started_ts=0,
+        updated_ts=0,
+    )
+    base.update(kw)
+    return UpgradeJournal(**base)
+
+
+def test_abandoned_when_the_runner_pid_is_gone() -> None:
+    j = _inflight(runner_pid=999_999, updated_ts=1_000)
+    assert j.is_abandoned(1_010) is True  # fresh timestamp, but no such process
+    assert j.is_active(1_010) is False
+
+
+def test_not_abandoned_while_the_runner_is_alive() -> None:
+    j = _inflight(runner_pid=os.getpid(), updated_ts=1_000)
+    assert j.is_abandoned(1_010) is False
+    assert j.is_active(1_010) is True
+
+
+def test_abandoned_by_staleness_when_no_pid_was_recorded() -> None:
+    """Covers a crash before the runner stamped its pid, and a rebooted host."""
+    j = _inflight(updated_ts=0)
+    assert j.is_abandoned(STALE_AFTER_S + 1) is True
+    assert j.is_abandoned(STALE_AFTER_S - 1) is False
+
+
+def test_a_finished_upgrade_is_never_abandoned() -> None:
+    for phase in ("done", "rolled_back", "failed"):
+        j = _inflight(phase=phase, updated_ts=0)
+        assert j.is_abandoned(10**9) is False
+        assert j.is_active(10**9) is False
