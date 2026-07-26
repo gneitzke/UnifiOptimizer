@@ -210,7 +210,7 @@ export function SleHealthBlock({
             </span>
           ) : (
             <span className="t-caption">
-              Insufficient data — measured {entry.evaluated_buckets} of {entry.window_buckets}{' '}
+              Insufficient data: measured {entry.evaluated_buckets} of {entry.window_buckets}{' '}
               intervals
             </span>
           )}

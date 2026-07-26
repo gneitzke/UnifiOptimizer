@@ -55,7 +55,7 @@ function SleMinutes({
   if (rows.length === 0) {
     return (
       <p className="t-secondary" style={{ color: 'var(--fg-muted)' }}>
-        Not a top offender in any service-level window — this client is not
+        Not a top offender in any service-level window. This client is not
         driving measured degradation.
       </p>
     );

@@ -247,7 +247,7 @@ export default function SettingsPage() {
         Settings
       </h2>
       <p className="t-secondary mb-6" style={{ color: 'var(--fg-muted)' }}>
-        The daemon's live configuration and health. Read-only in this version —
+        The daemon's live configuration and health. Read-only in this version;
         editing arrives with the config surface in a later phase.
       </p>
 
@@ -339,11 +339,11 @@ export default function SettingsPage() {
           </Section>
 
           <Section title="Home Assistant">
-            <PhasePlaceholder note="Configured in data/config.yaml under the ha: block (enabled, broker host/port, credentials, discovery prefix) — not editable here." />
+            <PhasePlaceholder note="Configured in data/config.yaml under the ha: block (enabled, broker host/port, credentials, discovery prefix). Not editable here." />
           </Section>
 
           <Section title="LLM provider">
-            <PhasePlaceholder note="No global setting — pick a provider (Manual, Copilot CLI, or Claude API) per investigation from the Investigation section on an issue's detail page. Claude API reads its key from the environment." />
+            <PhasePlaceholder note="No global setting. Pick a provider (Manual, Copilot CLI, or Claude API) per investigation from the Investigation section on an issue's detail page. Claude API reads its key from the environment." />
           </Section>
         </>
       ) : null}

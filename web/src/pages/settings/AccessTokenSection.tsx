@@ -148,7 +148,7 @@ export function AccessTokenSection() {
           </>
         ) : reveal.kind === 'shown' && !reveal.configured ? (
           <span className="t-secondary" style={{ color: 'var(--fg-muted)' }}>
-            No token set — this daemon is open on the LAN.
+            No token set. This daemon is open on the LAN.
           </span>
         ) : (
           <span className="font-mono select-none" style={{ fontSize: 13, color: 'var(--fg-subtle)' }}>

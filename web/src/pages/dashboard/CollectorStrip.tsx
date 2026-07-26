@@ -92,7 +92,7 @@ export function CollectorStrip({
             className="inline-block w-2 h-2 rounded-full"
             style={{ background: 'var(--sev-p1)' }}
           />
-          Daemon unreachable — collector status unknown
+          Daemon unreachable. Collector status unknown
         </div>
       ) : loading && !health ? (
         <div className="flex gap-2">

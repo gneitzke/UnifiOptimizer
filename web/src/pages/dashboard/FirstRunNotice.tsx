@@ -50,7 +50,7 @@ export function FirstRunNotice({ backfill }: { backfill?: string }) {
         </span>
         <p className="t-secondary" style={{ color: 'var(--fg-muted)' }}>
           Your first read appears in a few minutes. {backfillLine(backfill)} Scores and issues fill
-          in as data arrives — nothing to do but wait.
+          in as data arrives. There is nothing to do but wait.
         </p>
       </div>
     </Card>

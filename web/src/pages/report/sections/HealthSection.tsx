@@ -138,7 +138,7 @@ function SleTile({ sle }: { sle: SleScore }) {
       )}
       {underObserved && (
         <span className="t-caption" style={{ color: 'var(--health-poor)' }}>
-          Under-observed window — treat as indicative
+          Under-observed window: treat as indicative
         </span>
       )}
     </div>
