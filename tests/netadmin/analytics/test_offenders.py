@@ -58,6 +58,31 @@ def _fail_minute(
     )
 
 
+def _down_minute(repo: Repository, bucket_ts: int, device: int, minutes: float) -> None:
+    """One infra (device-axis) row: the device is its own subject AND its own
+    attribution, exactly as ``SleMinutesJob._infra`` writes it."""
+    repo.upsert_sle_minute(
+        bucket_ts=bucket_ts,
+        sle="infra",
+        classifier="ap_down",
+        entity_id=device,
+        attributed_entity_id=device,
+        minutes=minutes,
+    )
+
+
+def _up_minute(repo: Repository, bucket_ts: int, device: int, minutes: float) -> None:
+    """The infra axis's passing row -- the device was watched and was up."""
+    repo.upsert_sle_minute(
+        bucket_ts=bucket_ts,
+        sle="infra",
+        classifier="ok",
+        entity_id=device,
+        attributed_entity_id=device,
+        minutes=minutes,
+    )
+
+
 # ---------------------------------------------------------------------------- #
 # Ranking math
 # ---------------------------------------------------------------------------- #
@@ -167,6 +192,121 @@ def test_resolved_issues_do_not_count(repo: Repository) -> None:
     assert len(ranked) == 1
     assert ranked[0].score == pytest.approx(10.0)  # p2 only
     assert ranked[0].issue_counts["p1"] == 0
+
+
+# ---------------------------------------------------------------------------- #
+# Device downtime: reported, never ranked on (Gitea #38)
+# ---------------------------------------------------------------------------- #
+
+
+def test_downtime_never_outranks_client_cost(repo: Repository) -> None:
+    """THE ordering property: a quiet AP hurting many clients beats a loud one.
+
+    ``ap-loud`` was offline for 600 device-minutes and cost exactly one client
+    one minute. ``ap-quiet`` never went down and cost 28 clients a minute each.
+    Ranked on client cost alone, quiet wins 28 to 1. Add downtime to the score
+    under *any* positive exchange rate and the order inverts, which is the bug
+    this test exists to make impossible: downtime accumulates easily and says
+    nothing about how many clients noticed.
+    """
+    loud = _ap(repo, "aa:bb:cc:00:00:01", "ap-loud")
+    quiet = _ap(repo, "aa:bb:cc:00:00:02", "ap-quiet")
+
+    # ap-loud: 600 minutes down, one client, one minute.
+    _down_minute(repo, BASE, loud, 600.0)
+    one = _client(repo, "11:22:33:44:55:00", "lone-phone")
+    _fail_minute(repo, BASE, one, loud, 1.0)
+
+    # ap-quiet: up the whole window, but 28 clients lost a minute each to it.
+    _up_minute(repo, BASE, quiet, 600.0)
+    for i in range(28):
+        cid = _client(repo, f"11:22:33:44:56:{i:02x}", f"client-{i}")
+        _fail_minute(repo, BASE, cid, quiet, 1.0)
+
+    ranked = rank_offenders(repo, DEVICE_TYPES, BASE - 60, BASE + 3600)
+    assert [r.entity_id for r in ranked] == [quiet, loud]
+
+    by_id = {r.entity_id: r for r in ranked}
+    # The score is client cost only -- 28 vs 1, with the 600 nowhere in it.
+    assert by_id[quiet].score == pytest.approx(28.0)
+    assert by_id[loud].score == pytest.approx(1.0)
+    assert by_id[quiet].components["sle_minutes"] == pytest.approx(28.0)
+    assert by_id[loud].components["sle_minutes"] == pytest.approx(1.0)
+    # The downtime is still reported -- beside the score, in its own unit.
+    assert by_id[loud].down_minutes == pytest.approx(600.0)
+    assert by_id[quiet].down_minutes == pytest.approx(0.0)
+    # And it is not hiding inside fail_minutes either.
+    assert by_id[loud].fail_minutes == pytest.approx(1.0)
+    # No score component, and no serialised field, holds the two axes summed.
+    assert set(by_id[loud].components) == {"sle_minutes", "issues", "events"}
+    serialised = by_id[loud].as_dict()
+    assert 601.0 not in [v for v in serialised.values() if isinstance(v, (int, float))]
+    assert 601.0 not in serialised["components"].values()
+
+
+def test_fail_minutes_excludes_the_device_axis(repo: Repository) -> None:
+    """Infra down-minutes never land in ``fail_minutes`` (the old mixed sum)."""
+    ap = _ap(repo, "aa:bb:cc:00:00:01", "ap")
+    cli = _client(repo, "11:22:33:44:55:01", "phone")
+    _fail_minute(repo, BASE, cli, ap, 10.0)
+    _down_minute(repo, BASE, ap, 90.0)
+
+    ranked = rank_offenders(repo, DEVICE_TYPES, BASE - 60, BASE + 3600)
+    assert len(ranked) == 1
+    assert ranked[0].fail_minutes == pytest.approx(10.0)  # not 100.0
+    assert ranked[0].score == pytest.approx(10.0)
+    assert ranked[0].down_minutes == pytest.approx(90.0)
+
+
+def test_down_only_device_is_listed_at_zero_score(repo: Repository) -> None:
+    """Downtime earns a row, not a rank: listed, but strictly below client cost."""
+    dead = _ap(repo, "aa:bb:cc:00:00:01", "ap-dead")
+    busy = _ap(repo, "aa:bb:cc:00:00:02", "ap-busy")
+    cli = _client(repo, "11:22:33:44:55:01", "phone")
+    _down_minute(repo, BASE, dead, 300.0)
+    _fail_minute(repo, BASE, cli, busy, 5.0)
+
+    ranked = rank_offenders(repo, DEVICE_TYPES, BASE - 60, BASE + 3600)
+    assert [r.entity_id for r in ranked] == [busy, dead]
+    assert ranked[1].score == pytest.approx(0.0)
+    assert ranked[1].down_minutes == pytest.approx(300.0)
+
+
+def test_down_minutes_is_none_when_the_axis_was_never_judged(repo: Repository) -> None:
+    """No infra rows in the window means *not measured*, never a stand-in zero."""
+    ap = _ap(repo, "aa:bb:cc:00:00:01", "ap")
+    cli = _client(repo, "11:22:33:44:55:01", "phone")
+    _fail_minute(repo, BASE, cli, ap, 10.0)
+
+    ranked = rank_offenders(repo, DEVICE_TYPES, BASE - 60, BASE + 3600)
+    assert ranked[0].down_minutes is None
+    assert ranked[0].as_dict()["down_minutes"] is None
+
+
+def test_measured_zero_downtime_is_a_zero_not_a_none(repo: Repository) -> None:
+    """A device watched and never down reports 0.0 -- the stronger claim."""
+    ap = _ap(repo, "aa:bb:cc:00:00:01", "ap")
+    cli = _client(repo, "11:22:33:44:55:01", "phone")
+    _fail_minute(repo, BASE, cli, ap, 10.0)
+    _up_minute(repo, BASE, ap, 300.0)
+
+    ranked = rank_offenders(repo, DEVICE_TYPES, BASE - 60, BASE + 3600)
+    assert ranked[0].down_minutes == pytest.approx(0.0)
+
+
+def test_clients_have_no_downtime_axis(repo: Repository) -> None:
+    """A client has no state timeline, so its downtime is None even when the
+    infra axis was judged for the devices around it."""
+    ap = _ap(repo, "aa:bb:cc:00:00:01", "ap")
+    cli = _client(repo, "11:22:33:44:55:01", "phone")
+    _down_minute(repo, BASE, ap, 60.0)
+    repo.record_event(ts=BASE, key="EVT_WU_Disconnected", entity_id=cli, native_id="d1")
+
+    ranked = rank_offenders(repo, CLIENT_TYPES, BASE - 60, BASE + 3600)
+    assert [r.entity_id for r in ranked] == [cli]
+    assert ranked[0].down_minutes is None
+    # And nothing is ever attributed *to* a client.
+    assert ranked[0].fail_minutes == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------- #

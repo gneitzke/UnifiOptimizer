@@ -12,15 +12,73 @@ import type { IssueImpact, IssueRow } from './api';
  *  appears without context: the dashboard offenders list, the SLE "Why"
  *  breakdown. The report's Appendix glossary carries the print-safe
  *  equivalent, since a tooltip does not survive PDF export. Keep the two in
- *  sync (see `glossary` in netadmin/report/assembler.py). */
+ *  sync (see `glossary` in netadmin/report/assembler.py).
+ *
+ *  It says "one client's minute" and means it: the `infra` SLE's minutes are a
+ *  *device's* offline time and never reach a figure this sentence describes
+ *  (Gitea #36, #38). Use `DOWN_MINUTE_DEFINITION` for those. */
 export const FAIL_MINUTE_DEFINITION =
-  "One SLE fail-minute: a real client's minute that missed a service level's pass/fail target.";
+  "One SLE fail-minute: one minute one real client spent below a service level's pass/fail target. Counted per client, so five clients degraded for a minute is five fail-minutes. Device downtime is a separate figure in a separate unit and is never added in.";
+
+/** The device axis's unit, and the sentence that keeps it apart from the client
+ *  axis. Shown wherever a downtime figure appears without context. */
+export const DOWN_MINUTE_DEFINITION =
+  'One down-minute: one minute an AP, switch or gateway was itself offline, read from its own state timeline. Device time, not client time — nobody spent it as a client, so it is never added to fail-minutes.';
 
 /** Definition for the offenders leaderboard's composite ranking number, shown
  *  as a hover tooltip on the "Burden" figure so it reads as one labelled,
- *  explained number rather than an unexplained composite next to fail-min. */
+ *  explained number rather than an unexplained composite next to fail-min.
+ *
+ *  The second sentence is the non-obvious part and is why the score is a sum of
+ *  three channels rather than four: a downed AP's harm is already counted on the
+ *  client axis, because its clients did not vanish — they landed on the next AP
+ *  and burned coverage and roaming minutes *there*. Adding the dead AP's own
+ *  downtime charges one outage twice, and since downtime accumulates easily
+ *  while saying nothing about how many clients noticed, it is exactly how a loud
+ *  harmless AP comes to outrank a quiet costly one. */
 export const OFFENDER_BURDEN_DEFINITION =
-  'Composite burden score: a weighted blend of failed SLE minutes, open issues, and disconnect/roam events, used to rank offenders.';
+  'Composite burden score: failed client-minutes attributed to this entity, its open issues weighted by severity, and its disconnect/roam churn. Device downtime is deliberately not in it — the clients of a downed AP move to another one and lose their minutes there, so scoring the downtime as well would charge one outage twice.';
+
+/** SLEs whose minutes belong to a device rather than a client. Mirrors
+ *  `SLE_DEVICE_AXIS_SLES` in netadmin/store/repository.py; everything else is on
+ *  the client axis. A tile for one of these must label its minutes as downtime,
+ *  not as fail-minutes. */
+export function isDeviceAxisSle(sle: string): boolean {
+  return sle === 'infra';
+}
+
+/** A measurement window as prose for a tooltip: "24 hours", "7 days". Hours up
+ *  to two days, because "the last 1 day" is not how an operator says it. */
+export function windowPhrase(seconds: number): string {
+  const hours = Math.max(1, Math.round(seconds / 3600));
+  if (hours < 48) return hours === 1 ? '1 hour' : `${hours} hours`;
+  const days = Math.round(hours / 24);
+  return days === 1 ? '1 day' : `${days} days`;
+}
+
+/** Hover text for the offenders leaderboard's client-minutes column.
+ *
+ *  Publishes the denominator and the window, which a static constant cannot:
+ *  "655 minutes" means nothing until the reader knows whether 4 clients or 400
+ *  were being watched, and that ambiguity is what let a mixed figure pass for a
+ *  client figure in the first place. `clientsInWindow` of null means the daemon
+ *  did not report the denominator, so the sentence declines to invent one. */
+export function offenderClientMinutesNote(
+  clientsInWindow: number | null,
+  windowS: number,
+): string {
+  const denom =
+    clientsInWindow == null
+      ? 'the clients the engine judged'
+      : `the ${clientCount(clientsInWindow)} the engine judged`;
+  return `Minutes clients spent below a service level because of this entity, out of ${denom} in the last ${windowPhrase(windowS)}. Counted per client: five clients degraded for a minute is five client-minutes. This is what the burden score is built from.`;
+}
+
+/** Hover text for the offenders leaderboard's downtime column. Says the unit,
+ *  says it is excluded from the score, and says why — in that order. */
+export function offenderDownMinutesNote(windowS: number): string {
+  return `How long the AP, switch or gateway was itself offline in the last ${windowPhrase(windowS)}, from its own state timeline. Device time, not client time, so it is never added to client-minutes and is not part of the burden score: the clients of a downed device move to another one and lose their minutes there. A dash means downtime was not measured, which is not the same as zero.`;
+}
 
 /** Compact human duration: "6d", "5h 12m", "3m", "45s", "just now". */
 export function formatDuration(seconds: number): string {

@@ -11,7 +11,14 @@ import {
 import { Button, Card, EmptyState } from '../../components/ui';
 import { SeverityPill } from '../../components/ui/SeverityPill';
 import { ApiError, entityLabel } from '../shared/api';
-import { formatDuration, humanizeKey, scoreBand, scoreTo100, sleLabel } from '../shared/format';
+import {
+  formatDuration,
+  humanizeKey,
+  isDeviceAxisSle,
+  scoreBand,
+  scoreTo100,
+  sleLabel,
+} from '../shared/format';
 import {
   getVisit,
   startVisit,
@@ -553,7 +560,10 @@ function SleCard({ sleKey, entry }: { sleKey: string; entry: VisitSleEntry }) {
         </div>
       ) : (
         <span className="t-caption" style={{ color: 'var(--fg-subtle)' }}>
-          No failed minutes
+          {/* The `infra` SLE counts a DEVICE's offline time, not client
+              experience, so this tile must not borrow the client-minute word
+              (Gitea #36, #38). */}
+          {isDeviceAxisSle(sleKey) ? 'No downtime' : 'No failed minutes'}
         </span>
       )}
     </Card>

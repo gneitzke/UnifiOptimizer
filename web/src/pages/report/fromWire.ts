@@ -286,17 +286,22 @@ function rssiBins(h: WireHistogram): RssiBin[] {
   }));
 }
 
-function worstDevice(w: WireReport['clients']['worst_devices'][number]): WorstDevice {
+function worstClient(w: WireReport['clients']['worst_devices'][number]): WorstDevice {
   // These are the worst-experiencing CLIENTS. What explains a client's ranking is
   // the disconnect/roam churn it saw and the issues open on it — failed SLE minutes
   // attribute to infrastructure, not the client, so the composite and fail-minutes
   // are no longer the same number rendered twice. Show the meaningful channels.
+  //
+  // `fail_minutes` is deliberately NOT one of them. On this surface it is the
+  // minutes attributed *to* the client, and nothing is ever attributed to a
+  // client — so it is structurally 0, and a row reading "Failed minutes 0" would
+  // say this client lost nothing when in fact its lost minutes are counted
+  // against its AP (Gitea #38). Silence beats a true number that reads false.
   const metrics: EvidenceItem[] = [];
   if (w.event_count > 0) metrics.push({ label: 'Disconnects/roams', value: String(w.event_count) });
   const issues =
     w.issue_counts.total ?? (w.issue_counts.p1 ?? 0) + (w.issue_counts.p2 ?? 0) + (w.issue_counts.p3 ?? 0);
   if (issues > 0) metrics.push({ label: 'Open issues', value: String(issues) });
-  if (w.fail_minutes > 0) metrics.push({ label: 'Failed minutes', value: String(w.fail_minutes) });
   if (metrics.length === 0) metrics.push({ label: 'Burden score', value: String(w.score) });
   return { name: w.entity?.name ?? 'unknown', metrics };
 }
@@ -412,7 +417,7 @@ export function fromWire(w: WireReport): ReportModel {
   const clients: ClientsModel = {
     rssi_histogram: rssiBins(w.clients.rssi_histogram),
     per_ap_load: w.clients.clients_per_ap.map((a) => ({ ap_name: a.name, client_count: a.client_count })),
-    worst_devices: w.clients.worst_devices.map(worstDevice),
+    worst_devices: w.clients.worst_devices.map(worstClient),
     total_clients: w.clients.rssi_histogram.total,
   };
 

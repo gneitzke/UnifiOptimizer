@@ -31,7 +31,7 @@ false data** (every number traces to a real repository query) and **no slop**
    neighbour/rogue-AP density by channel (the environmental context), honestly
    framed (a rural RF-dense site is context, not 80 alarms).
 8. **Client analysis** — RSSI distribution histogram (colour the weak tail),
-   clients-per-AP load bars, and a worst-devices (top-offenders) table.
+   clients-per-AP load bars, and a worst-clients (top-offenders) table.
 9. **Detailed findings** — a summary table first (ID, title, severity, affected),
    then per-finding entries using the FIXED template below.
 10. **Recommendations / roadmap** — ranked by severity, phased (now / soon /

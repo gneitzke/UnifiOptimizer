@@ -266,7 +266,15 @@ export interface IncidentDetailResponse {
 export interface OffenderRow {
   entity_id: number;
   score: number;
+  /** Client-axis minutes attributed to this entity — time real clients spent
+   *  below a service level because of it. What `score` is built from. Never
+   *  added to `down_minutes`: different unit, different population (Gitea #38). */
   fail_minutes: number;
+  /** Device-axis minutes: how long this AP, switch or gateway was itself
+   *  offline. `null` means not measured (a client or radio has no downtime axis
+   *  at all; or the engine judged that axis nowhere in the window) — never
+   *  render it as 0. Deliberately absent from `score`. */
+  down_minutes: number | null;
   issue_counts: { p1: number; p2: number; p3: number; total: number };
   event_count: number;
   components: { sle_minutes: number; issues: number; events: number };
@@ -278,6 +286,9 @@ export interface OffendersResponse {
   end_ts: number;
   window_s: number;
   weights: Record<string, number>;
+  /** Distinct clients the SLE engine judged in the window — the denominator
+   *  every client-minute figure on this surface is quoted against. */
+  clients_in_window: number;
   count: number;
   offenders: OffenderRow[];
 }

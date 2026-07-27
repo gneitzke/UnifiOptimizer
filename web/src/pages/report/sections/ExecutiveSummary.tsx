@@ -25,7 +25,7 @@ export function ExecutiveSummary({
       index={1}
       title="Executive summary"
       site={site}
-      lead="A plain-language read on how the network is serving its users, and where attention pays off first."
+      lead="A plain-language read on how the network is serving its clients, and where attention pays off first."
     >
       <div className="flex flex-col gap-6">
         {exec.verdict && (

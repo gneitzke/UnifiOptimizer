@@ -12,13 +12,36 @@ import {
   type OffenderRow,
 } from '../shared/api';
 import { usePageAsync } from '../shared/hooks';
+import {
+  FAIL_MINUTE_DEFINITION,
+  OFFENDER_BURDEN_DEFINITION,
+  formatImpactMinutes,
+  offenderClientMinutesNote,
+  offenderDownMinutesNote,
+  windowPhrase,
+} from '../shared/format';
 
 /**
  * Offenders (`/offenders`) — the "who causes most of my grief" leaderboard (§17).
  * Entities ranked by a composite burden: failed SLE client-minutes attributed to
  * them, open issues weighted by severity, and disconnect/roam churn over a window.
- * A sortable table (score, issues, fail-minutes, events all sort); a Devices /
- * Clients toggle switches surface. Read-only; the ranking is three store GROUP BYs.
+ * A sortable table; a Devices / Clients toggle switches surface. Read-only; the
+ * ranking is store GROUP BYs.
+ *
+ * Two units, two columns, no sum (Gitea #38). "Client-minutes" is time real
+ * clients spent below a service level because of this entity, and it is the only
+ * SLE quantity the rank is built from. "Downtime" is the device's own offline
+ * time, shown beside the score and never inside it — because a downed AP's harm
+ * is already counted on the client axis (its clients moved to the next AP and
+ * burned coverage minutes *there*), so scoring the downtime as well charges one
+ * outage twice. Downtime accumulates easily and says nothing about how many
+ * clients noticed, which is exactly how a loud harmless AP would come to outrank
+ * a quiet costly one; the ordering property is pinned by a backend test.
+ *
+ * Neither column appears on the Clients surface: nothing is ever attributed *to*
+ * a client (so client-minutes is structurally 0 there, and a rendered 0 would
+ * read as "this client lost nothing", which is false — its lost minutes are
+ * attributed to its AP), and a client has no state timeline to be down on.
  */
 
 type Surface = 'devices' | 'clients';
@@ -50,9 +73,10 @@ export function OffendersPage() {
   };
 
   const rows = data?.offenders ?? [];
+  const clientsInWindow = data?.clients_in_window ?? null;
 
-  const columns: Column<OffenderRow>[] = useMemo(
-    () => [
+  const columns: Column<OffenderRow>[] = useMemo(() => {
+    const cols: Column<OffenderRow>[] = [
       {
         key: 'entity',
         header: surface === 'devices' ? 'Device' : 'Client',
@@ -61,9 +85,9 @@ export function OffendersPage() {
       },
       {
         key: 'score',
-        header: 'Burden score',
+        header: <span title={OFFENDER_BURDEN_DEFINITION}>Burden score</span>,
         numeric: true,
-        width: 130,
+        width: 128,
         sortAccessor: (r) => r.score,
         render: (r) => (
           <span className="tnum" style={{ color: 'var(--fg)' }}>
@@ -75,37 +99,60 @@ export function OffendersPage() {
         key: 'issues',
         header: 'Open issues',
         numeric: true,
-        width: 120,
+        width: 112,
         sortAccessor: (r) => r.issue_counts.total,
         render: (r) => <IssueBreakdown counts={r.issue_counts} />,
       },
-      {
-        key: 'fail_minutes',
-        header: 'Fail-minutes',
-        numeric: true,
-        width: 120,
-        sortAccessor: (r) => r.fail_minutes,
-        render: (r) => (
-          <span className="tnum" style={{ color: 'var(--fg-muted)' }}>
-            {Math.round(r.fail_minutes)}
-          </span>
-        ),
-      },
-      {
-        key: 'events',
-        header: 'Disconnect/roam',
-        numeric: true,
-        width: 140,
-        sortAccessor: (r) => r.event_count,
-        render: (r) => (
-          <span className="tnum" style={{ color: 'var(--fg-muted)' }}>
-            {r.event_count}
-          </span>
-        ),
-      },
-    ],
-    [surface],
-  );
+    ];
+
+    if (surface === 'devices') {
+      cols.push(
+        {
+          key: 'fail_minutes',
+          header: (
+            <span title={offenderClientMinutesNote(clientsInWindow, windowS)}>Client-minutes</span>
+          ),
+          numeric: true,
+          width: 132,
+          sortAccessor: (r) => r.fail_minutes,
+          render: (r) => (
+            <span
+              className="tnum"
+              style={{ color: r.fail_minutes > 0 ? 'var(--fg)' : 'var(--fg-subtle)' }}
+              title={FAIL_MINUTE_DEFINITION}
+            >
+              {formatImpactMinutes(r.fail_minutes)}
+            </span>
+          ),
+        },
+        {
+          key: 'down_minutes',
+          // The unit lives in the header, not in every cell (DataTable's rule).
+          header: <span title={offenderDownMinutesNote(windowS)}>Downtime (min)</span>,
+          numeric: true,
+          width: 128,
+          // nulls sink in both sort directions (DataTable), which is what an
+          // unmeasured figure deserves: it never claims a rank it did not earn.
+          sortAccessor: (r) => r.down_minutes,
+          render: (r) => <DownMinutesCell minutes={r.down_minutes} windowS={windowS} />,
+        },
+      );
+    }
+
+    cols.push({
+      key: 'events',
+      header: 'Disconnect/roam',
+      numeric: true,
+      width: 140,
+      sortAccessor: (r) => r.event_count,
+      render: (r) => (
+        <span className="tnum" style={{ color: 'var(--fg-muted)' }}>
+          {r.event_count}
+        </span>
+      ),
+    });
+    return cols;
+  }, [surface, windowS, clientsInWindow]);
 
   return (
     <div className="px-6 py-6 mx-auto flex flex-col gap-4" style={{ maxWidth: 1000 }}>
@@ -115,8 +162,9 @@ export function OffendersPage() {
             Top offenders
           </h2>
           <span className="t-secondary" style={{ color: 'var(--fg-muted)' }}>
-            Ranked by attributed failed client-minutes, severity-weighted open issues, and
-            disconnect/roam churn.
+            {surface === 'devices'
+              ? 'Ranked by the minutes clients lost because of them, their severity-weighted open issues, and disconnect/roam churn. A device’s own downtime is shown, never ranked on.'
+              : 'Ranked by their disconnect/roam churn and their own open issues. A client’s lost minutes are attributed to the AP that caused them, so they rank devices, not clients.'}
           </span>
         </div>
 
@@ -164,7 +212,21 @@ export function OffendersPage() {
 
       {data && (
         <span className="t-caption" style={{ color: 'var(--fg-subtle)' }}>
-          {rows.length} ranked · <RelativeTime ts={data.end_ts} mode="as-of" />
+          {rows.length} ranked
+          {/* The denominator, published where the figures are read rather than
+              only in a tooltip: a client-minute total is unreadable until you
+              know how many clients were being watched. */}
+          {surface === 'devices' && data.clients_in_window > 0 && (
+            <>
+              {' · '}
+              {data.clients_in_window === 1
+                ? '1 client judged'
+                : `${data.clients_in_window} clients judged`}
+              {` in the last ${windowPhrase(windowS)}`}
+            </>
+          )}
+          {' · '}
+          <RelativeTime ts={data.end_ts} mode="as-of" />
         </span>
       )}
 
@@ -196,6 +258,45 @@ export function OffendersPage() {
         />
       )}
     </div>
+  );
+}
+
+/**
+ * The device's own offline time, in its own unit, in its own column.
+ *
+ * `null` is not `0`: null means nothing judged this device's state timeline over
+ * the window, and rendering that as a zero would let an unwatched outage read as
+ * a device that never went down. So null renders an em dash whose reason rides
+ * along as hover text *and* as screen-reader text, and a measured zero renders a
+ * quiet zero. `relative` is load-bearing — sr-only is absolutely positioned, and
+ * without a positioned ancestor it resolves against the page, escaping the
+ * table's horizontal scroller and dragging the body's scroll width with it.
+ */
+function DownMinutesCell({ minutes, windowS }: { minutes: number | null; windowS: number }) {
+  if (minutes == null) {
+    const note = `Downtime was not measured for this entity in the last ${windowPhrase(windowS)}, which is not the same as it staying up.`;
+    return (
+      <span className="relative" style={{ color: 'var(--fg-subtle)' }} title={note}>
+        <span aria-hidden>—</span>
+        <span className="sr-only">{note}</span>
+      </span>
+    );
+  }
+  if (minutes <= 0) {
+    const note = `Measured: this device never went offline in the last ${windowPhrase(windowS)}.`;
+    return (
+      <span className="relative tnum" style={{ color: 'var(--fg-subtle)' }} title={note}>
+        <span aria-hidden>0</span>
+        <span className="sr-only">{note}</span>
+      </span>
+    );
+  }
+  const note = `Offline for ${formatImpactMinutes(minutes)} minutes in the last ${windowPhrase(windowS)}, from this device's own state timeline. Not part of the burden score, and never added to client-minutes.`;
+  return (
+    <span className="relative tnum" style={{ color: 'var(--fg)' }} title={note}>
+      <span aria-hidden>{formatImpactMinutes(minutes)}</span>
+      <span className="sr-only">{note}</span>
+    </span>
   );
 }
 

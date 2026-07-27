@@ -4,6 +4,7 @@ import { Section } from '../components/Section';
 import { NoData } from '../components/NoData';
 import { CategoryBars, type CategoryBar } from '../charts/CategoryBars';
 import { BAND_COLOR, BAND_WORD } from '../severity';
+import { isDeviceAxisSle } from '../../shared/format';
 
 /**
  * Section 6 — health & performance (docs/REPORT_SPEC.md §Health & performance):
@@ -41,7 +42,7 @@ export function HealthSection({
       index={5}
       title="Health & performance"
       site={site}
-      lead="Service-level scores over the window. Each score is the share of exposed minutes that met its target; lower means users felt it."
+      lead="Service-level scores over the window. Each score is the share of exposed minutes that met its target; lower means clients felt it."
     >
       <div className="flex flex-col gap-6">
         <div
@@ -75,7 +76,7 @@ export function HealthSection({
               contextLabel="Service-level scores"
               showValues
               height={180}
-              takeaway="Each bar is the share of exposed minutes that met its target; the lower the bar, the more users felt it."
+              takeaway="Each bar is the share of exposed minutes that met its target; the lower the bar, the more clients felt it."
             />
           </div>
         )}
@@ -101,6 +102,11 @@ export function HealthSection({
 
 function SleTile({ sle }: { sle: SleScore }) {
   const offenders = sle.top_offenders.filter((o) => o.fail_minutes > 0).slice(0, 3);
+  // The `infra` SLE's minutes are a device's own offline time, not client
+  // experience (Gitea #36, #38). Print-safe surface: no tooltip survives a PDF,
+  // so the unit has to be right in the visible text. The Appendix glossary
+  // defines both "fail-min" and "down-min".
+  const deviceAxis = isDeviceAxisSle(sle.key);
   // A perfect score over an under-observed window is unproven, not clean: say so.
   const underObserved = sle.low_confidence && sle.score === 100;
   return (
@@ -134,14 +140,20 @@ function SleTile({ sle }: { sle: SleScore }) {
             <li key={i} className="flex items-baseline justify-between gap-2 t-caption">
               <span style={{ color: 'var(--fg-muted)' }}>{o.name}</span>
               <span className="tnum" style={{ color: 'var(--fg-subtle)' }}>
-                {o.fail_minutes} fail-min
+                {o.fail_minutes} {deviceAxis ? 'down-min' : 'fail-min'}
               </span>
             </li>
           ))}
         </ul>
       ) : (
         <span className="t-caption" style={{ color: 'var(--fg-subtle)' }}>
-          {underObserved ? 'No failed minutes, but few observed' : 'No failed minutes'}
+          {deviceAxis
+            ? underObserved
+              ? 'No downtime, but few observed'
+              : 'No downtime'
+            : underObserved
+              ? 'No failed minutes, but few observed'
+              : 'No failed minutes'}
         </span>
       )}
       {underObserved && (

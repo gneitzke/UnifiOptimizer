@@ -145,9 +145,13 @@ reverted fixes, and controller events.
 
 ### `netadmin_worst_offenders`
 Devices or clients ranked by attributed failed client-minutes, open issues and
-event churn.
+event churn. Each entry also carries `down_minutes` — the device's own offline
+time, in device-minutes, reported beside the ranking and never inside it (a
+downed AP's client cost is already counted against whichever AP its clients moved
+to). `clients_in_window` is the denominator the client-minute figures are quoted
+against. `null` down-minutes means not measured, not zero.
 *Parameters:* `surface` (`devices` or `clients`), `window`.
-*Reach for it when:* "Which AP is costing my users the most?"
+*Reach for it when:* "Which AP is costing my clients the most?"
 
 ### `netadmin_metric_history`
 One entity's metric over time, downsampled, next to that series' learned baseline.

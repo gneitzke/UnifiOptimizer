@@ -22,6 +22,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from netadmin.store.repository import SLE_DEVICE_AXIS_SLES
 from netadmin.visit.runner import VisitReport
 
 _SLE_ORDER = ("coverage", "capacity", "connect", "roaming", "wan", "infra")
@@ -200,7 +201,11 @@ def _html_health(report: VisitReport) -> str:
         b = _band(sc)
         label = html.escape(_SLE_LABELS.get(key, key.capitalize()))
         val = f"{sc}" if sc is not None else "&mdash;"
-        sub = "no data" if sc is None else f"{s.get('fail_minutes', 0):.0f} fail min"
+        # The `infra` SLE's minutes are a DEVICE's own offline time, not a
+        # client's experience, so its card must not borrow the client-minute
+        # word (Gitea #36, #38). Same card, honest unit.
+        unit = "down min" if key in SLE_DEVICE_AXIS_SLES else "fail min"
+        sub = "no data" if sc is None else f"{s.get('fail_minutes', 0):.0f} {unit}"
         offenders = ""
         tops = [o for o in s.get("top_offenders", []) if o.get("entity")]
         if tops and sc is not None and sc < 100:

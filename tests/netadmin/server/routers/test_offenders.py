@@ -44,6 +44,33 @@ async def test_device_offenders_shape_and_names(rich_app) -> None:
     assert "components" in ap
 
 
+async def test_device_offenders_publish_downtime_and_the_denominator(rich_app) -> None:
+    """Two axes, never summed, plus the denominator every figure is read against.
+
+    ``down_minutes`` is present on every entry (``null`` where that axis was not
+    measured) and is absent from ``score``'s components, so no consumer can reach
+    for a combined figure -- there isn't one (Gitea #38).
+    """
+    async with await _client(rich_app) as c:
+        resp = await c.get("/api/devices/offenders")
+    body = resp.json()
+    assert "clients_in_window" in body
+    assert isinstance(body["clients_in_window"], int)
+    for off in body["offenders"]:
+        assert "down_minutes" in off
+        assert off["down_minutes"] is None or isinstance(off["down_minutes"], (int, float))
+        assert set(off["components"]) == {"sle_minutes", "issues", "events"}
+
+
+async def test_client_offenders_report_no_downtime_axis(rich_app) -> None:
+    """A client has no state timeline, so its downtime is null, never 0."""
+    async with await _client(rich_app) as c:
+        resp = await c.get("/api/clients/offenders")
+    body = resp.json()
+    assert body["offenders"]
+    assert all(off["down_minutes"] is None for off in body["offenders"])
+
+
 async def test_client_offenders_resolves_names(rich_app) -> None:
     """The flaky client (open issue) shows up on the client leaderboard by name."""
     async with await _client(rich_app) as c:

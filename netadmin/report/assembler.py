@@ -665,6 +665,11 @@ def _build_clients(
     # Failed SLE minutes attribute to infrastructure, so a client's composite is
     # driven by its own event/issue channels -- distinct from the fail-minutes
     # column, so the two are no longer degenerate duplicates.
+    #
+    # `fail_minutes` is structurally 0 on this surface (nothing is ever
+    # attributed *to* a client) and `down_minutes` is always None (a client has
+    # no state timeline the infra SLE walks), so neither reaches the rendered
+    # table -- see `worstClient` in web/src/pages/report/fromWire.ts.
     scores = rank_offenders(
         store, CLIENT_ENTITY_TYPES, start, end, top_n=WORST_DEVICES_TOP_N, settings=settings
     )
@@ -1149,13 +1154,29 @@ def _build_appendix(sle_cfg: SleConfig, weights: dict[str, float]) -> Appendix:
         },
         {
             "term": "Offender",
-            "definition": "An entity ranked by the failed-minutes/issues/events it accounts for.",
+            "definition": (
+                "An entity ranked by the failed client-minutes, open issues and "
+                "disconnect/roam churn it accounts for. A device's own downtime is "
+                "reported next to that ranking, never inside it: the clients of a downed "
+                "AP move to another one and spend their bad minutes there, so counting "
+                "the downtime as well would charge one outage twice."
+            ),
         },
         {
             "term": "fail-min",
             "definition": (
-                "One SLE fail-minute: a real client's minute that missed a service level's "
-                "pass/fail target. The raw unit behind SLE scores and the offender burden score."
+                "One SLE fail-minute: one minute one real client spent below a service "
+                "level's pass/fail target. Counted per client, so five clients degraded "
+                "for a minute is five fail-minutes. The raw unit behind SLE scores and "
+                "the offender burden score."
+            ),
+        },
+        {
+            "term": "down-min",
+            "definition": (
+                "One minute an AP, switch or gateway was itself offline, read from its own "
+                "state timeline. Device time, not client time -- nobody spent it as a "
+                "client, so it is never added to fail-minutes."
             ),
         },
         {

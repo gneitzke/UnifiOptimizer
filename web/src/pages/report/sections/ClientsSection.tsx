@@ -22,8 +22,11 @@ export function ClientsSection({
     value: a.client_count,
   }));
 
+  // "Client", never "Device": these rows ARE clients (the ranking runs over
+  // client entities), and to a UniFi admin "device" means an AP or a switch, so
+  // the old header read as a list of broken access points.
   const columns: DocColumn<WorstDevice>[] = [
-    { key: 'name', header: 'Device', render: (d) => <span style={{ fontWeight: 500 }}>{d.name}</span> },
+    { key: 'name', header: 'Client', render: (d) => <span style={{ fontWeight: 500 }}>{d.name}</span> },
     {
       key: 'metrics',
       header: 'Measured',
@@ -45,7 +48,7 @@ export function ClientsSection({
       index={7}
       title="Client analysis"
       site={site}
-      lead="How clients experience the network: the spread of signal strength, how load sits across access points, and the devices having the worst time."
+      lead="How clients experience the network: the spread of signal strength, how load sits across access points, and the clients having the worst time."
     >
       <div className="flex flex-col gap-6">
         <div className="grid gap-4 lg:grid-cols-2">
@@ -77,10 +80,10 @@ export function ClientsSection({
 
         <div>
           <h3 className="t-section mb-3" style={{ color: 'var(--fg)' }}>
-            Devices having the worst experience
+            Clients having the worst experience
           </h3>
           {clients.worst_devices.length === 0 ? (
-            <NoData label="No client stood out as a persistent offender." reason="No device crossed the worst-experience thresholds during the window." />
+            <NoData label="No client stood out as a persistent offender." reason="No client crossed the worst-experience thresholds during the window." />
           ) : (
             <DocTable columns={columns} rows={clients.worst_devices} rowKey={(_, i) => i} />
           )}

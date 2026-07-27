@@ -231,7 +231,18 @@ def _offenders_response(
     Shared by both offender endpoints: clamp the window to ``[now - window, now]``,
     call the pure ranking (:func:`rank_offenders`) over the store, then batch-
     resolve the ranked entity ids to compact name refs (section 12: the UI shows
-    names, not numeric ids). Read-only; the ranking is three repository GROUP BYs.
+    names, not numeric ids). Read-only; the ranking is repository GROUP BYs.
+
+    Each entry carries ``fail_minutes`` (client-axis minutes attributed to the
+    entity — what the score is built from) and ``down_minutes`` (the device's own
+    offline time, or ``null`` where that axis was never measured). They are
+    different units and the payload has no field holding their sum, deliberately
+    (Gitea #36, #38).
+
+    ``clients_in_window`` is the **denominator** every client-minute figure is
+    quoted against: "655 minutes" means nothing until the reader knows whether 4
+    or 400 clients were being watched, and publishing it is what stops the number
+    being read as a share of the whole site.
     """
     store = get_store(request)
     settings = getattr(request.app.state, "settings", None)
@@ -253,6 +264,7 @@ def _offenders_response(
         "end_ts": now,
         "window_s": window_s,
         "weights": load_offender_weights(settings),
+        "clients_in_window": store.sle_measured_client_count(start_ts, now),
         "count": len(offenders),
         "offenders": offenders,
     }
@@ -266,11 +278,16 @@ async def device_offenders(
 ) -> dict[str, Any]:
     """Top problem devices (ap / switch / gateway) by composite burden (section 17).
 
-    Ranked by failed SLE client-minutes attributed to the device, its open issues
-    weighted by severity, and its disconnect/roam event volume over the last
-    ``window_s`` seconds (default 24 h). ``top_n`` caps the leaderboard. Each entry
-    carries the weighted ``score``, the raw per-channel components, and the device's
-    resolved name.
+    Ranked by failed SLE **client**-minutes attributed to the device, its open
+    issues weighted by severity, and its disconnect/roam event volume over the
+    last ``window_s`` seconds (default 24 h). ``top_n`` caps the leaderboard. Each
+    entry carries the weighted ``score``, the raw per-channel components, and the
+    device's resolved name.
+
+    ``down_minutes`` rides alongside and is **not** in the score: the client cost
+    of a downed AP already lands on whichever AP its clients moved to, so scoring
+    the downtime as well would count one outage twice and let an offline-but-
+    harmless device outrank a live one that is costing clients minutes.
     """
     return _offenders_response(request, DEVICE_ENTITY_TYPES, window_s, top_n)
 
@@ -286,6 +303,9 @@ async def client_offenders(
     Same composite as :func:`device_offenders`, ranked over client entities:
     dominated in practice by disconnect/roam churn and the client's own open
     issues, since failed SLE minutes attribute to infrastructure, not clients.
+    ``fail_minutes`` is therefore structurally 0 here (nothing is ever attributed
+    *to* a client) and ``down_minutes`` is always ``null`` — a client has no
+    state timeline the infra SLE could walk.
     """
     return _offenders_response(request, CLIENT_ENTITY_TYPES, window_s, top_n)
 

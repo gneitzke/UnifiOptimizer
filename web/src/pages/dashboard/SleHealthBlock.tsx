@@ -5,7 +5,15 @@ import { TimeSeriesChart } from '../../components/ui/TimeSeriesChart';
 import type { ChartPoint } from '../../components/ui/chart-utils';
 import { fmt } from '../../components/ui/chart-utils';
 import { EntityLink } from '../shared/EntityLink';
-import { FAIL_MINUTE_DEFINITION, humanizeKey, scoreBand, scoreTo100, sleLabel } from '../shared/format';
+import {
+  DOWN_MINUTE_DEFINITION,
+  FAIL_MINUTE_DEFINITION,
+  humanizeKey,
+  isDeviceAxisSle,
+  scoreBand,
+  scoreTo100,
+  sleLabel,
+} from '../shared/format';
 import type { SleEntryRow } from '../shared/api';
 
 /**
@@ -157,6 +165,12 @@ export function SleHealthBlock({
   const failClassifiers = Object.entries(entry.classifiers)
     .filter(([k]) => k !== 'ok')
     .sort((a, b) => b[1] - a[1]);
+  // The `infra` SLE's minutes are a DEVICE's own offline time, not a client's
+  // experience (Gitea #36, #38), so its breakdown must not borrow the
+  // client-minute label or its definition. Same tile, honest unit.
+  const deviceAxis = isDeviceAxisSle(sleKey);
+  const minuteWord = deviceAxis ? 'down-min' : 'fail-min';
+  const minuteNote = deviceAxis ? DOWN_MINUTE_DEFINITION : FAIL_MINUTE_DEFINITION;
   const maxFail = failClassifiers.reduce((m, [, v]) => Math.max(m, v), 0);
   const offenders = entry.top_offenders.filter((o) => o.fail_minutes > 0);
   const hasBreakdown = failClassifiers.length > 0 || offenders.length > 0;
@@ -252,9 +266,9 @@ export function SleHealthBlock({
                         <span
                           className="t-caption tnum"
                           style={{ color: 'var(--fg-muted)' }}
-                          title={FAIL_MINUTE_DEFINITION}
+                          title={minuteNote}
                         >
-                          {fmt(minutes, minutes < 10 ? 1 : 0)} fail-min
+                          {fmt(minutes, minutes < 10 ? 1 : 0)} {minuteWord}
                         </span>
                       </div>
                       <div
@@ -277,7 +291,9 @@ export function SleHealthBlock({
               {offenders.length > 0 && (
                 <div className="flex flex-col gap-1">
                   <span className="t-micro" style={{ color: 'var(--fg-subtle)' }}>
-                    Attributed to
+                    {/* On the device axis nothing is "attributed": an infra row
+                        names the device that was itself offline. */}
+                    {deviceAxis ? 'Time offline' : 'Attributed to'}
                   </span>
                   {offenders.map((o, i) => (
                     <div
@@ -306,7 +322,7 @@ export function SleHealthBlock({
         </>
       ) : entry.score != null ? (
         <span className="t-caption" style={{ color: 'var(--fg-subtle)' }}>
-          No failed minutes in this window
+          {deviceAxis ? 'No downtime in this window' : 'No failed minutes in this window'}
         </span>
       ) : null}
     </Card>

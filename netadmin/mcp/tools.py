@@ -1173,6 +1173,20 @@ def what_changed(repo: Repository, params: Mapping[str, Any], now: int) -> dict[
 # 8. netadmin_worst_offenders
 # --------------------------------------------------------------------------- #
 def worst_offenders(repo: Repository, params: Mapping[str, Any], now: int) -> dict[str, Any]:
+    """Rank a surface by client cost, and report device downtime beside it.
+
+    ``fail_minutes`` is client-axis only and is what the ranking is built from;
+    ``down_minutes`` is the device's own offline time (``null`` where that axis
+    was never measured) and is deliberately absent from the score. An assistant
+    reading this must be able to say "this AP cost clients 655 minutes" and "this
+    AP was itself down for 55 minutes" without ever adding the two -- they are
+    different units over different populations, and a downed AP's client cost is
+    already counted against whichever AP its clients moved to (Gitea #38).
+
+    ``clients_in_window`` is the denominator the client-minute figures are quoted
+    against, so a total can be read as a share of a watched population rather
+    than of the whole site.
+    """
     start_ts, end_ts = parse_window(params, now, default="7d")
     limit = fmt.clamp_limit(params.get("limit"), default=10)
     surface = str(params.get("surface") or "devices").lower()
@@ -1180,15 +1194,18 @@ def worst_offenders(repo: Repository, params: Mapping[str, Any], now: int) -> di
         raise ToolError('surface must be "devices" or "clients".')
     types = DEVICE_ENTITY_TYPES if surface == "devices" else CLIENT_ENTITY_TYPES
 
+    clients_in_window = repo.sle_measured_client_count(start_ts, end_ts)
     ranked = rank_offenders(repo, types, start_ts, end_ts, top_n=limit)
     if not ranked:
         return {
             "summary": (
                 f"No {surface} carried any measurable burden in this window: no attributed "
-                "failed client-minutes, no open issues, no disconnect or roam events."
+                "failed client-minutes, no open issues, no disconnect or roam events, "
+                "no downtime."
             ),
             "window": _window_block(start_ts, end_ts, now),
             "surface": surface,
+            "clients_in_window": clients_in_window,
             "offenders": fmt.listing([], limit),
         }
 
@@ -1199,20 +1216,36 @@ def worst_offenders(repo: Repository, params: Mapping[str, Any], now: int) -> di
         entry["entity"] = _entity_ref(entities.get(score.entity_id))
         entry["score"] = round(entry["score"], 2)
         entry["fail_minutes"] = round(entry["fail_minutes"], 2)
+        if entry["down_minutes"] is not None:
+            entry["down_minutes"] = round(entry["down_minutes"], 2)
         entry["components"] = {k: round(v, 2) for k, v in entry["components"].items()}
         rows.append(entry)
 
     top = rows[0]
     name = top["entity"]["name"] if top["entity"] else f"entity {top['entity_id']}"
+    # The claim is now literally true: fail_minutes is client-axis only, so
+    # "client-minute(s)" names the unit correctly. Downtime is a second sentence,
+    # never an addend, and stays silent where it was never measured.
     summary = (
         f"{name} tops the {surface} ranking with {top['fail_minutes']} attributed failed "
-        f"client-minute(s), {top['issue_counts']['total']} open issue(s) and "
-        f"{top['event_count']} disconnect/roam event(s) in this window."
+        f"client-minute(s) out of {clients_in_window} client(s) judged in this window, "
+        f"{top['issue_counts']['total']} open issue(s) and "
+        f"{top['event_count']} disconnect/roam event(s)."
     )
+    # Only when there is downtime to report. A measured zero is already in the
+    # entry's `down_minutes` field; narrating "offline for 0.0 minute(s)" would
+    # spend a sentence saying nothing and read as a hedge.
+    if top["down_minutes"]:
+        summary += (
+            f" It was itself offline for {top['down_minutes']} minute(s) -- device time, "
+            "counted separately and never added to client-minutes, because the clients of a "
+            "downed device spend their bad minutes on whatever they moved to."
+        )
     return {
         "summary": summary,
         "window": _window_block(start_ts, end_ts, now),
         "surface": surface,
+        "clients_in_window": clients_in_window,
         "offenders": fmt.listing(rows, limit, total=len(rows)),
     }
 
@@ -1678,7 +1711,9 @@ _SPECS: tuple[ToolSpec, ...] = (
         name="netadmin_worst_offenders",
         description=(
             "History: which devices or clients caused the most grief in a window, ranked "
-            f"by attributed failed client-minutes, open issues and event churn. {_ROUTING}"
+            "by attributed failed client-minutes, open issues and event churn. Device "
+            "downtime is reported per entry but is never part of the ranking. "
+            f"{_ROUTING}"
         ),
         input_schema=_schema(
             _windowed(

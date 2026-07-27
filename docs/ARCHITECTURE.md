@@ -698,7 +698,12 @@ Algorithm:
   disconnect/roam event volume over the window. This is the "who causes most of my
   grief" leaderboard, computed as GROUP BYs over `sle_minutes`, `issues`, and
   `events`; no new storage. Surfaced on the dashboard ("Top offenders") and as a
-  sortable page.
+  sortable page. A device's own downtime (`down_minutes`, the `infra` SLE's
+  device axis) is reported per entry and is **never** part of the score: a downed
+  AP's clients move to the next AP and burn coverage minutes *there*, already on
+  the client axis, so scoring the downtime as well charges one outage twice — and
+  since downtime accumulates without regard for how many clients noticed, doing
+  so is exactly how a loud harmless AP comes to outrank a quiet costly one.
 
 ### Surface
 

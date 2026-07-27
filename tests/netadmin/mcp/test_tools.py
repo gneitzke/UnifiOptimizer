@@ -370,6 +370,30 @@ def test_worst_offenders_ranks_devices_by_burden(demo_repo: Repository) -> None:
     assert set(result["offenders"]["items"][0]["components"]) == {"sle_minutes", "issues", "events"}
 
 
+def test_worst_offenders_summary_names_the_unit_it_actually_reports(
+    demo_repo: Repository,
+) -> None:
+    """The "client-minute(s)" claim in the summary is now literally true.
+
+    ``fail_minutes`` is client-axis only, downtime rides in its own field, and
+    the denominator travels with them so an assistant can quote a share rather
+    than a bare total (Gitea #38).
+    """
+    result = _call(demo_repo, "netadmin_worst_offenders", window="7d")
+    assert isinstance(result["clients_in_window"], int)
+    top = result["offenders"]["items"][0]
+    assert "down_minutes" in top
+    assert f"{top['fail_minutes']} attributed failed client-minute(s)" in result["summary"]
+    assert f"{result['clients_in_window']} client(s) judged" in result["summary"]
+    # Downtime is a separate sentence, never an addend. A measured zero stays in
+    # the field and out of the prose.
+    if top["down_minutes"]:
+        assert f"offline for {top['down_minutes']} minute(s)" in result["summary"]
+        assert "never added to client-minutes" in result["summary"]
+    else:
+        assert "offline for" not in result["summary"]
+
+
 def test_worst_offenders_clients_surface_ranks_clients(demo_repo: Repository) -> None:
     result = _call(demo_repo, "netadmin_worst_offenders", window="7d", surface="clients")
     assert all(row["entity"]["type"] == "client" for row in result["offenders"]["items"])

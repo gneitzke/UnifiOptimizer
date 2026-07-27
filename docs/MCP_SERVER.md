@@ -85,8 +85,8 @@ returned ID is accepted by drill-down tools.
 7. `netadmin_what_changed` - config/state/fix timeline: firmware, channel, link
    flaps, applied/reverted fixes, admin events. (NEW
    `list_state_changes(start,end)`, `list_changes`, `query_events`)
-8. `netadmin_worst_offenders` - top-N entities by attributed fail-minutes, issue
-   count, event count.
+8. `netadmin_worst_offenders` - top-N entities by attributed client fail-minutes,
+   issue count, event count; device downtime reported alongside, never ranked on.
 9. `netadmin_metric_history` - bucketed series + baseline for one entity metric.
    (`get_series`, `read_raw`/rollups, `get_baselines`)
 10. `netadmin_events_around` - "what else broke at the same time": events near a
