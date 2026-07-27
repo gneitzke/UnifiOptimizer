@@ -114,6 +114,49 @@ async def test_fix_plan_unknown_issue_is_404(fix_env) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# GET fix-history: DB-only, never a device read (gitea #26)
+# --------------------------------------------------------------------------- #
+async def test_fix_history_before_any_apply_is_empty_and_touches_no_device(fix_env) -> None:
+    async with await _client(fix_env.app) as c:
+        resp = await c.get(f"/api/issues/{fix_env.issue_id}/fix-history")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["fix_state"] is None
+    assert body["changes"] == []
+    assert body["verification"]["status"] == "not_armed"
+    # No dry-run was ever built for this call: the reader was never touched.
+    assert fix_env.reader.calls == []
+    assert fix_env.writer.call_count == 0
+
+
+async def test_fix_history_unknown_issue_is_404(fix_env) -> None:
+    async with await _client(fix_env.app) as c:
+        resp = await c.get("/api/issues/999999/fix-history")
+    assert resp.status_code == 404
+
+
+async def test_fix_history_after_apply_matches_fix_plan_without_a_new_device_read(
+    fix_env,
+) -> None:
+    async with await _client(fix_env.app) as c:
+        plan = (await c.get(f"/api/issues/{fix_env.issue_id}/fix-plan")).json()
+        await c.post(
+            f"/api/issues/{fix_env.issue_id}/fix/apply",
+            json={"confirm": True, "confirm_token": plan["confirm_token"]},
+        )
+        reads_after_apply = len(fix_env.reader.calls)
+        resp = await c.get(f"/api/issues/{fix_env.issue_id}/fix-history")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["fix_state"] == "applied"
+    assert body["verification"]["status"] == "pending"
+    assert len(body["changes"]) == 1
+    assert body["changes"][0]["status"] == "applied"
+    # The history read is store-only: it didn't add another device read.
+    assert len(fix_env.reader.calls) == reads_after_apply
+
+
+# --------------------------------------------------------------------------- #
 # POST apply is gated
 # --------------------------------------------------------------------------- #
 async def test_apply_requires_confirm_true(fix_env) -> None:

@@ -91,6 +91,54 @@ async def test_client_detail_404_for_device_id(rich_app) -> None:
     assert resp.status_code == 404
 
 
+async def test_roam_count_24h_counts_recent_roams_not_older_ones(settings) -> None:
+    """Roams (24h) — gitea #23: a real event count, windowed, not the
+    controller's `roam_count` metric (a per-poll counter delta, see
+    store/metrics.py COUNTER_METRICS — not a meaningful total on its own)."""
+    import time
+
+    from netadmin.domain.entities import Entity
+    from netadmin.domain.types import EntityType
+    from netadmin.server.main import DaemonComponents, create_app
+    from netadmin.store.repository import Repository
+
+    now = int(time.time())
+    store = Repository.open(settings.db_path, site_id=settings.site_id)
+    ap = store.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="aa:bb:cc:00:01:00", name="ap"), ts=now
+    )
+    roamer = store.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="11:22:33:00:00:01", name="Roamer"),
+        ts=now,
+    )
+    quiet = store.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="11:22:33:00:00:02", name="Quiet"),
+        ts=now,
+    )
+    # One roam an hour ago (inside the window), one two days ago (outside it).
+    store.record_event(
+        ts=now - 3600, key="EVT_WU_Roam", entity_id=roamer, related_entity_id=ap, msg="roamed"
+    )
+    store.record_event(
+        ts=now - 2 * 86_400,
+        key="EVT_WU_Roam",
+        entity_id=roamer,
+        related_entity_id=ap,
+        msg="roamed",
+    )
+    try:
+        app = create_app(settings=settings, store=store, components=DaemonComponents())
+        async with await _client(app) as c:
+            list_resp = await c.get("/api/inventory/clients")
+            detail_resp = await c.get(f"/api/inventory/clients/{roamer}")
+        by_name = {c["name"]: c for c in list_resp.json()["clients"]}
+        assert by_name["Roamer"]["roam_count_24h"] == 1
+        assert by_name["Quiet"]["roam_count_24h"] == 0
+        assert detail_resp.json()["client"]["roam_count_24h"] == 1
+    finally:
+        store.close()
+
+
 async def test_inventory_503_when_store_absent(settings) -> None:
     from netadmin.server.main import DaemonComponents, create_app
 

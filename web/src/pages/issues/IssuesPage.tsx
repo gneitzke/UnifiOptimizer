@@ -37,9 +37,9 @@ const STATE_OPTIONS: { value: StateFilter; label: string }[] = [
 ];
 const SEV_OPTIONS: { value: '' | Severity; label: string }[] = [
   { value: '', label: 'All severities' },
-  { value: 'p1', label: 'P1 critical' },
-  { value: 'p2', label: 'P2 major' },
-  { value: 'p3', label: 'P3 minor' },
+  { value: 'p1', label: 'Critical' },
+  { value: 'p2', label: 'High' },
+  { value: 'p3', label: 'Low' },
 ];
 
 function stateMatches(state: string, filter: StateFilter): boolean {

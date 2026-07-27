@@ -12,9 +12,13 @@ import { NoData } from '../components/NoData';
 export function ExecutiveSummary({
   exec,
   site,
+  windowLabel,
 }: {
   exec: ExecutiveModel;
   site: string;
+  /** Human window label ("7 days") — captioned under the headline score so it
+   *  is never read without the span it was measured over (Gitea #22). */
+  windowLabel?: string | null;
 }) {
   return (
     <Section
@@ -34,6 +38,7 @@ export function ExecutiveSummary({
           score={exec.overall_score}
           band={exec.band}
           counts={exec.severity_counts}
+          windowLabel={windowLabel}
           lowConfidence={exec.low_confidence}
           confidenceNote={exec.confidence_note}
         />

@@ -13,7 +13,7 @@ export function fmtDate(ts: number): string {
   });
 }
 
-/** "Jul 21, 2026, 14:23". */
+/** "Jul 21, 2026, 14:23" — always 24-hour (docs §Time: standardised throughout). */
 export function fmtDateTime(ts: number): string {
   return new Date(ts * 1000).toLocaleString(undefined, {
     year: 'numeric',
@@ -21,6 +21,7 @@ export function fmtDateTime(ts: number): string {
     day: 'numeric',
     hour: '2-digit',
     minute: '2-digit',
+    hour12: false,
   });
 }
 

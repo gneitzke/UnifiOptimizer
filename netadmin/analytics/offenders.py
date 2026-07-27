@@ -58,6 +58,7 @@ from netadmin.domain.types import EntityType
 __all__ = [
     "DEFAULT_OFFENDER_WEIGHTS",
     "OFFENDER_EVENT_KEYS",
+    "ROAM_EVENT_KEYS",
     "DEVICE_ENTITY_TYPES",
     "CLIENT_ENTITY_TYPES",
     "OffenderScore",
@@ -84,6 +85,17 @@ DEFAULT_OFFENDER_WEIGHTS: dict[str, float] = {
 OFFENDER_EVENT_KEYS: tuple[str, ...] = (
     "EVT_WU_Disconnected",
     "EVT_LU_Disconnected",
+    "EVT_WU_Roam",
+    "EVT_WU_RoamRadio",
+)
+
+# Roam-only subset of the above (no disconnects): the source of truth for a
+# client's "Roams" count on the Clients list/detail (Gitea #23). The raw
+# `roam_count` metric the controller reports per client is a COUNTER (see
+# store/metrics.py's COUNTER_METRICS) -- the delta since the last poll, not a
+# meaningful lifetime total -- so counting the discrete roam events already
+# recorded for Timeline/Journey is the honest number, not a second-guessed one.
+ROAM_EVENT_KEYS: tuple[str, ...] = (
     "EVT_WU_Roam",
     "EVT_WU_RoamRadio",
 )

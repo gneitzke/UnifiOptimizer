@@ -13,8 +13,17 @@ namespace.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Optional, Protocol, Sequence, runtime_checkable
+from dataclasses import dataclass, field, replace
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    runtime_checkable,
+)
 
 from netadmin.domain.types import Cadence, EntityType, Severity
 
@@ -45,6 +54,49 @@ class Detector(Protocol):
 
 
 @dataclass(frozen=True)
+class EvidenceField:
+    """Presentation metadata for one key in a detector's ``evidence`` dict.
+
+    An optional, per-detector override so the issue detail page (Gitea #18) can
+    show "Latency (p50): 52 ms" instead of "Window P50 Ms: 52" -- a real label and
+    a unit, not a title-cased snake_case key. Narrative order (headline
+    measurement, then its comparison, then supporting facts) comes for free from
+    the evidence dict's own insertion order once it survives storage un-sorted
+    (see :meth:`~netadmin.store.repository.Repository.insert_issue`); this only
+    supplies *how* to label and unit-format a key the UI already renders in that
+    order. A key absent from a detector's ``evidence_fields`` still renders --
+    generically humanized, unitless -- so an unauthored detector never breaks.
+
+    ``percent`` marks a 0..1 fraction that should display as N.N% (multiplied by
+    100), e.g. ``loss_fraction``; leave it False for a value already on a 0-100 or
+    natural-unit scale. ``unit`` defaults to ``"%"`` when ``percent`` is set and
+    no unit was given explicitly, so a percent field can never render its
+    multiplied-out number with no sign to explain it. ``duration`` marks a
+    seconds-valued field that should display compact ("10 min", "1 h") rather
+    than a bare "N s" -- e.g. a detector's analysis window.
+    """
+
+    key: str
+    label: str
+    unit: str = ""
+    percent: bool = False
+    duration: bool = False
+
+    def __post_init__(self) -> None:
+        if self.percent and not self.unit:
+            object.__setattr__(self, "unit", "%")
+
+
+# A confounder's narrated sentence: "what was checked and what was measured"
+# (Gitea #18 item 2), computed from the issue's own evidence dict at request
+# time so the number is this issue's, not a generic template value. Returning
+# None (e.g. a referenced evidence key is missing on an older/differently-shaped
+# issue) falls back to the bare humanized confounder key -- never a crash, never
+# a fabricated number.
+ConfounderNote = Callable[[Mapping[str, Any]], Optional[str]]
+
+
+@dataclass(frozen=True)
 class Playbook:
     """The admin's field guide for a detector (ARCHITECTURE.md section 6 table).
 
@@ -53,11 +105,19 @@ class Playbook:
     is metadata *about* the detector, distinct from a :class:`Finding`'s per-issue
     ``confounders_checked`` audit trail: the playbook names every trap the class
     of problem is known for, whether or not this instance tested it.
+
+    ``evidence_fields`` and ``confounder_notes`` are the issue-detail-page
+    presentation layer (Gitea #18): an ordered label/unit for the evidence keys
+    worth calling out by name, and a one-sentence narration per confounder key.
+    Both are additive and optional -- a detector without them still renders, just
+    without the polish -- so partial authoring never breaks a detector.
     """
 
     signature: str
     confounders: str = ""
     fix_guidance: str = ""
+    evidence_fields: tuple[EvidenceField, ...] = ()
+    confounder_notes: Mapping[str, ConfounderNote] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -125,6 +185,92 @@ def build_catalog(entries: Sequence[CatalogEntry]) -> Catalog:
     return Catalog(entries)
 
 
+# --------------------------------------------------------------------------- #
+# Confounder-note formatting helpers (Gitea #18 item 2)
+#
+# Small, dependency-free formatters shared by the ``confounder_notes`` closures
+# below, so every narrated sentence renders a number the same way. They take
+# raw evidence values (already-decoded JSON: int/float/str/bool/None) and never
+# raise -- a malformed or missing value degrades to "unknown" text rather than
+# crashing the confounder note into a bare KeyError fallback.
+# --------------------------------------------------------------------------- #
+def _n(value: Any, digits: int = 1) -> str:
+    """A number as a short decimal string ("52", "2.89"), or "unknown"."""
+    if value is None:
+        return "unknown"
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if f == int(f):
+        return str(int(f))
+    return f"{f:.{digits}f}"
+
+
+def _pct(fraction: Any, digits: int = 1) -> str:
+    """A 0..1 fraction as a percent string ("0.4%"), or "unknown"."""
+    if fraction is None:
+        return "unknown"
+    try:
+        return f"{float(fraction) * 100:.{digits}f}%"
+    except (TypeError, ValueError):
+        return "unknown"
+
+
+def _dur(seconds: Any) -> str:
+    """Seconds as a short duration ("10 min", "1 h"), or "unknown"."""
+    if seconds is None:
+        return "unknown"
+    try:
+        s = float(seconds)
+    except (TypeError, ValueError):
+        return str(seconds)
+    if s < 60:
+        return f"{int(s)} s"
+    if s < 3600:
+        return f"{int(round(s / 60.0))} min"
+    return f"{int(round(s / 3600.0))} h"
+
+
+def _joined(values: Any) -> str:
+    """A list of strings joined for prose, or "" when empty/absent."""
+    if not values or not isinstance(values, (list, tuple)):
+        return ""
+    return ", ".join(str(v) for v in values)
+
+
+def _coverage_note(_ev: Mapping[str, Any]) -> str:
+    """Shared text for the many ``*coverage_gated`` confounder spellings."""
+    return (
+        "Coverage confirmed: enough recent device polls landed in the window to "
+        "trust this verdict, not a data gap."
+    )
+
+
+def _channel_plan_spread_note(per_channel: Any) -> str:
+    """``wifi.channel_plan``'s ``unavoidable_reuse_excluded`` note.
+
+    Cites the actual busiest/quietest candidate-channel load when the evidence
+    carries it (real ``per_channel`` shape: ``{"6": 3, "11": 1, ...}``), else
+    falls back to the plain claim.
+    """
+    if isinstance(per_channel, Mapping) and per_channel:
+        try:
+            loads = [int(v) for v in per_channel.values()]
+        except (TypeError, ValueError):
+            loads = []
+        if loads:
+            return (
+                f"Not forced sharing: the busiest candidate channel carries {max(loads)} of "
+                f"our radios against {min(loads)} on the quietest, room enough to spread "
+                "further."
+            )
+    return (
+        "Not forced sharing: this band has room to spread its radios further across the "
+        "candidate channels."
+    )
+
+
 # Field-guide text for every catalog-v1 detector, lifted from the ARCHITECTURE.md
 # section 6 signature table (signature + confounders) and the section 9 fix
 # planner (fix guidance). Keyed by ``detector_key`` and stitched onto each
@@ -150,13 +296,61 @@ _PLAYBOOKS: dict[str, Playbook] = {
         confounders="Known 100 Mbps device classes; counter age (a stale cumulative counter); "
         "an unmanaged-switch hop hiding the real port.",
         fix_guidance="Reseat then replace the patch cable; re-test the run. On an uplink port "
-        "this is P1 — the whole segment rides it.",
+        "this is P1: the whole segment rides it.",
+        evidence_fields=(
+            EvidenceField("errors_per_min", "Error rate", "/min"),
+            EvidenceField("errors_per_min_threshold", "Error-rate threshold", "/min"),
+            EvidenceField("error_packet_fraction", "Errors, share of packets", percent=True),
+            EvidenceField("negotiated_speed", "Negotiated speed", "Mbps"),
+            EvidenceField("port_capable_speed", "Port's rated speed", "Mbps"),
+        ),
+        confounder_notes={
+            "coverage_gated": _coverage_note,
+            "counter_reset_handled": lambda ev: (
+                "Counter resets handled: the rate comes from monotonic-counter deltas, so a "
+                "device reboot resetting the counter isn't misread as an error burst."
+            ),
+            "packet_volume_normalized": lambda ev: (
+                f"Volume-normalised: errors are also {_pct(ev.get('error_packet_fraction'), 2)} "
+                "of packet volume, not just a raw per-minute count."
+                if ev.get("error_packet_fraction") is not None
+                else None
+            ),
+            "known_100mbps_device_class": lambda ev: (
+                "Peer device class checked: the wired devices on this switch were checked "
+                "against a known 10/100-by-design list before the downshift was called a fault."
+            ),
+            "port_gigabit_capable": lambda ev: (
+                f"Port confirmed gigabit-capable: negotiated at {_n(ev.get('negotiated_speed'), 0)} "
+                f"Mbps against a {_n(ev.get('port_capable_speed'), 0)} Mbps ceiling, and no known "
+                "10/100 device explains it."
+                if ev.get("negotiated_speed") is not None
+                else None
+            ),
+        },
     ),
     "wired.duplex_mismatch": Playbook(
         signature="full_duplex=false on a modern link that should negotiate full duplex.",
         confounders="Legacy half-duplex device that is correct as-is.",
         fix_guidance="Set both ends to auto-negotiate (or matching forced full-duplex). "
         "A one-sided forced setting is the usual cause.",
+        evidence_fields=(
+            EvidenceField("speed", "Negotiated speed", "Mbps"),
+            EvidenceField("full_duplex", "Full duplex"),
+            EvidenceField("modern_speed_min", "Modern-link floor", "Mbps"),
+        ),
+        confounder_notes={
+            "coverage_gated": _coverage_note,
+            "link_up_checked": lambda ev: (
+                "Link state checked: the port is up, so this isn't a stale duplex reading "
+                "from a down link."
+            ),
+            "modern_speed_link": lambda ev: (
+                f"Modern link confirmed: negotiated at {_n(ev.get('speed'), 0)} Mbps, at or "
+                f"above the {_n(ev.get('modern_speed_min'), 0)} Mbps floor where half duplex "
+                "is no longer expected."
+            ),
+        },
     ),
     "wired.port_flapping": Playbook(
         signature="≥5 link transitions/10 min or ≥10/h from events; infra ports weighted higher; "
@@ -164,6 +358,34 @@ _PLAYBOOKS: dict[str, Playbook] = {
         confounders="A laptop docking/undocking; scheduled device reboots.",
         fix_guidance="Reseat cable/SFP; on a PoE reboot loop check the PoE budget and power-"
         "cycle the port; replace the cable if errors persist.",
+        evidence_fields=(
+            EvidenceField("transitions_short", "Transitions, short window"),
+            EvidenceField("window_short_s", "Short window", duration=True),
+            EvidenceField("transitions_long", "Transitions, long window"),
+            EvidenceField("window_long_s", "Long window", duration=True),
+            EvidenceField("poe_reboot_loop", "PoE reboot loop"),
+            EvidenceField("poe_min_w", "PoE draw, min", "W"),
+            EvidenceField("poe_max_w", "PoE draw, max", "W"),
+        ),
+        confounder_notes={
+            "coverage_gated": _coverage_note,
+            "sustained_transition_count": lambda ev: (
+                f"Sustained, not a blip: {_n(ev.get('transitions_short'), 0)} transitions in the "
+                f"last {_dur(ev.get('window_short_s'))} ({_n(ev.get('transitions_long'), 0)} in "
+                f"{_dur(ev.get('window_long_s'))})."
+            ),
+            # The evidence, not the confounder key, carries the verdict: this key only
+            # means PoE data existed to check, not that a reboot loop was confirmed
+            # (Gitea #18's "PoE Reboot Correlated" vs "PoE Reboot Loop: Yes" ambiguity).
+            "poe_reboot_correlated": lambda ev: (
+                f"PoE draw checked: it dropped to {_n(ev.get('poe_min_w'))} W between flaps "
+                f"(up to {_n(ev.get('poe_max_w'))} W). That is a powered-device reboot loop, not a "
+                "bad link."
+                if ev.get("poe_reboot_loop")
+                else "PoE draw checked across the window: no drop-to-zero pattern, so a "
+                "powered-device reboot loop is ruled out."
+            ),
+        },
     ),
     "wired.uplink_saturation": Playbook(
         signature="Uplink bps > 80%/95% of negotiated speed for 5 min+ with rising tx_dropped; "
@@ -216,10 +438,45 @@ _PLAYBOOKS: dict[str, Playbook] = {
     "wifi.sticky_client": Playbook(
         signature="RSSI < −75 sustained ≥ 10 min while a historically-better AP exists for this "
         "client; corroborated by low rates and high retries.",
-        confounders="No better AP in the client's history — that is a coverage hole, a different "
+        confounders="No better AP in the client's history, so that is a coverage hole, a different "
         "issue, not a sticky client.",
         fix_guidance="Tune min-RSSI or band steering to nudge the client off; review AP placement "
         "if it clusters on one AP.",
+        evidence_fields=(
+            EvidenceField("median_rssi", "RSSI (median)", "dBm"),
+            EvidenceField("rssi", "RSSI", "dBm"),
+            EvidenceField("rssi_floor_dbm", "Sticky floor", "dBm"),
+            EvidenceField("sustained_fraction_below", "Time below floor", percent=True),
+            EvidenceField("current_ap", "Current AP"),
+            EvidenceField("ap", "Current AP"),
+            EvidenceField("better_ap", "Better AP"),
+            EvidenceField("better_ap_median_rssi", "Better AP's RSSI", "dBm"),
+            EvidenceField("median_tx_rate_mbps", "TX rate (median)", "Mbps"),
+            EvidenceField("low_rate_corroborated", "Low rate corroborates it"),
+            EvidenceField("clustered_on_ap", "Clustered with other stuck clients"),
+        ),
+        confounder_notes={
+            "better_ap_exists": lambda ev: (
+                f"A better AP exists: this client saw {_n(ev.get('better_ap_median_rssi'), 0)} "
+                "dBm on a different AP in its own history, well above the "
+                f"{_n(ev.get('median_rssi', ev.get('rssi')), 0)} dBm it gets now."
+                if ev.get("better_ap_median_rssi") is not None
+                else "A better AP exists in this client's own roam history, not a coverage hole."
+            ),
+            "sustained_not_transient": lambda ev: (
+                "Sustained, not transient: weak signal held for "
+                f"{_pct(ev.get('sustained_fraction_below'), 0)} of the window."
+                if ev.get("sustained_fraction_below") is not None
+                else "Sustained, not transient: the weak signal held for most of the analysis "
+                "window."
+            ),
+            "low_rate_corroborated": lambda ev: (
+                f"Low PHY rate corroborates it: {_n(ev.get('median_tx_rate_mbps'))} Mbps "
+                "median tx rate."
+                if ev.get("median_tx_rate_mbps") is not None
+                else None
+            ),
+        },
     ),
     "wifi.pingpong_roamer": Playbook(
         signature="Two APs, ≥ 4 roams ≤ 10 s apart (Meraki definition); stationary devices flagged "
@@ -227,6 +484,25 @@ _PLAYBOOKS: dict[str, Playbook] = {
         confounders="A genuinely mobile device walking a boundary between cells.",
         fix_guidance="Add min-RSSI hysteresis, reduce overlapping-cell tx-power, and enable "
         "sticky-client / roaming assistance.",
+        evidence_fields=(
+            EvidenceField("roams", "Roams in window"),
+            EvidenceField("roams_per_hour", "Roam rate", "/h"),
+            EvidenceField("burst_run", "Longest burst"),
+            EvidenceField("burst_max_gap_s", "Burst gap ceiling", duration=True),
+            EvidenceField("distinct_aps", "Distinct APs"),
+            EvidenceField("reason", "Fired on"),
+        ),
+        confounder_notes={
+            "sustained_rate_over_window": lambda ev: (
+                f"Rate sustained over the window: {_n(ev.get('roams'), 0)} roams "
+                f"({_n(ev.get('roams_per_hour'))}/h), not a one-off pair."
+            ),
+            "two_ap_bounce_not_walk": lambda ev: (
+                f"Two-AP bounce, not a walk: {_n(ev.get('burst_run'), 0)} roams between exactly "
+                f"{_n(ev.get('distinct_aps'), 0)} APs, each within "
+                f"{_n(ev.get('burst_max_gap_s'), 0)} s of the last."
+            ),
+        },
     ),
     "wifi.roam_quality": Playbook(
         signature="Roam events where post-roam RSSI is > 10 dB worse, or roam latency crosses its tier.",
@@ -239,6 +515,30 @@ _PLAYBOOKS: dict[str, Playbook] = {
         confounders="A dense multi-AP site where a moderate min-RSSI is correct.",
         fix_guidance="Remove min-RSSI on mesh-uplink and single-AP sites; relax any value stricter "
         "than −70. Never raise it on a mesh AP.",
+        evidence_fields=(
+            EvidenceField("min_rssi_dbm", "min-RSSI setting", "dBm"),
+            EvidenceField("strict_floor_dbm", "Aggressive-setting floor", "dBm"),
+            EvidenceField("reason", "Fired because"),
+            EvidenceField("ap_count", "APs on site"),
+            EvidenceField("on_mesh_ap", "On a mesh-uplink AP"),
+        ),
+        confounder_notes={
+            "mesh_uplink_checked": lambda ev: (
+                "This is a mesh-uplink AP: kicking a client here can kick the AP's own "
+                "backhaul, a latent outage."
+                if ev.get("on_mesh_ap")
+                else "Checked and ruled out: this AP is not on a mesh uplink."
+            ),
+            "single_ap_site_checked": lambda ev: (
+                f"Site has {_n(ev.get('ap_count'), 0)} AP: a kicked client has nowhere else to "
+                "roam to."
+                if ev.get("ap_count") == 1
+                else f"Checked and ruled out: {_n(ev.get('ap_count'), 0)} APs on site, so a "
+                "kicked client has somewhere to roam."
+                if ev.get("ap_count") is not None
+                else None
+            ),
+        },
     ),
     "wifi.channel_plan": Playbook(
         signature="Two scopes. Per radio: a 2.4 GHz radio off the 1/6/11 grid (channel_off_grid) "
@@ -255,10 +555,51 @@ _PLAYBOOKS: dict[str, Playbook] = {
         "two ends of a conflict are never sent to the same new channel. Narrow 5 GHz width under "
         "density. A contended band is P3 config context; it is P2 only when one of the named "
         "radios is also materially congested, which is the case worth acting on first.",
+        evidence_fields=(
+            EvidenceField("subtype", "Issue type"),
+            EvidenceField("band", "Band", "GHz"),
+            EvidenceField("channel", "Channel"),
+            EvidenceField("ht_mhz", "Channel width", "MHz"),
+            EvidenceField("candidate_channels", "Candidate channels"),
+            EvidenceField("per_channel", "Radios per channel"),
+            EvidenceField("unused_candidates", "Unused candidates"),
+            EvidenceField("ap_count", "APs on site"),
+            EvidenceField("wide_channel_ap_min", "Density floor"),
+            EvidenceField("congested_radios", "Congested radios"),
+            EvidenceField("materially_congested", "Materially congested"),
+        ),
+        confounder_notes={
+            "own_radio_config_read": lambda ev: (
+                "Config read directly from the radio: channel and width came from the "
+                "controller's own reported config, not inferred."
+            ),
+            "unavoidable_reuse_excluded": lambda ev: (
+                _channel_plan_spread_note(ev.get("per_channel"))
+            ),
+            "conflicted_radio_congestion_checked": lambda ev: (
+                f"Congestion checked: {_joined(ev.get('congested_radios'))} also running at or "
+                "above the congestion threshold, which is why this is P2, not just a config note."
+                if ev.get("congested_radios")
+                else None
+            ),
+            "single_ap_site_checked": lambda ev: (
+                f"Density checked: {_n(ev.get('ap_count'), 0)} APs meet the "
+                f"{_n(ev.get('wide_channel_ap_min'), 0)}-AP floor where 80 MHz cells start "
+                "colliding."
+                if ev.get("ap_count") is not None
+                else None
+            ),
+            "wide_radio_congestion_checked": lambda ev: (
+                f"Congestion checked: {_joined(ev.get('congested_radios'))} also running at or "
+                "above the congestion threshold, which is why this is P2, not just a width note."
+                if ev.get("congested_radios")
+                else None
+            ),
+        },
     ),
     "wifi.dfs_recurring": Playbook(
         signature="EVT_AP_RadarDetected ≥ 1/day, or a repeating same-hour radar pattern.",
-        confounders="A one-off radar hit — not yet a pattern.",
+        confounders="A one-off radar hit, not yet a pattern.",
         fix_guidance="Move that AP/radio to a non-DFS channel to stop the recurring CAC blackouts.",
     ),
     "wifi.airtime_saturation": Playbook(
@@ -267,6 +608,28 @@ _PLAYBOOKS: dict[str, Playbook] = {
         confounders="A brief high-throughput burst; expected peak-hour airtime.",
         fix_guidance="If self-utilization: reduce channel width, add capacity, steer to 5/6 GHz. "
         "If non-self: mitigate the interferer or re-plan the channel.",
+        evidence_fields=(
+            EvidenceField("cu_total_median", "Channel utilization (median)", "%"),
+            EvidenceField("cu_self", "Self-generated utilization", "%"),
+            EvidenceField("cu_non_self", "Non-self utilization", "%"),
+            EvidenceField("dominant_source", "Dominant source"),
+            EvidenceField("level", "Severity tier"),
+        ),
+        confounder_notes={
+            "sustained_not_burst": lambda ev: (
+                "Sustained, not a burst: the median channel utilization over the window is "
+                f"{_n(ev.get('cu_total_median'))}%, not a single spike."
+            ),
+            "self_vs_non_self_split": lambda ev: (
+                f"Self vs. non-self split: {_n(ev.get('cu_self'))}% self-generated against "
+                f"{_n(ev.get('cu_non_self'))}% from others, so the fix targets "
+                + (
+                    "load we can shed or steer."
+                    if ev.get("dominant_source") == "self"
+                    else "the interferer or a channel change."
+                )
+            ),
+        },
     ),
     "wifi.tx_power_loud": Playbook(
         signature="Multi-AP site running High/auto-max power; corroborated by sticky-client "
@@ -292,6 +655,56 @@ _PLAYBOOKS: dict[str, Playbook] = {
         confounders="A deliberately meshed edge AP with an acceptable link.",
         fix_guidance="Improve mesh-AP placement/backhaul or add a wired drop; disable meshing on "
         "APs that are actually wired.",
+        evidence_fields=(
+            EvidenceField("median_uplink_rssi", "Uplink RSSI (median)", "dBm"),
+            EvidenceField("uplink_rssi_dbm", "Uplink RSSI", "dBm"),
+            EvidenceField("bad_rssi_dbm", "Bad-uplink floor", "dBm"),
+            EvidenceField("uplink_rssi_threshold_dbm", "Uplink RSSI floor", "dBm"),
+            EvidenceField("warn_rssi_dbm", "Warn floor", "dBm"),
+            EvidenceField("hops", "Mesh hops"),
+            EvidenceField("reconnect_cycles", "Reconnects in window"),
+            EvidenceField("reconnects_24h", "Reconnects/24h"),
+            EvidenceField("corroborated", "Corroborated"),
+            EvidenceField("uplink_type", "Uplink type"),
+            EvidenceField("mesh_enabled", "Meshing enabled"),
+        ),
+        confounder_notes={
+            "sustained_poor_rssi": lambda ev: (
+                "Sustained, not a dip: uplink RSSI held below "
+                f"{_n(ev.get('bad_rssi_dbm', ev.get('uplink_rssi_threshold_dbm')), 0)} dBm for "
+                "most of the window."
+            ),
+            "hop_depth_checked": lambda ev: (
+                f"Hop depth checked: {_n(ev.get('hops'), 0)} hops back to the gateway "
+                "corroborates a marginal backhaul."
+                if ev.get("hops") is not None
+                else None
+            ),
+            "reconnect_corroboration_checked": lambda ev: (
+                f"Reconnects checked: "
+                f"{_n(ev.get('reconnect_cycles', ev.get('reconnects_24h')), 0)} uplink "
+                "reconnects in the window."
+                if ev.get("reconnect_cycles") is not None or ev.get("reconnects_24h") is not None
+                else "Reconnect history checked: no repeated uplink reconnects found, so this "
+                "rests on the RSSI level alone."
+            ),
+            "uplink_type_read": lambda ev: (
+                f"Uplink type read from the controller: currently {ev.get('uplink_type') or '?'} "
+                "with meshing left enabled, a latent risk if it ever falls back to wireless."
+            ),
+            # Alternate spellings the same finding can carry (site-specific
+            # threshold naming); same claim as sustained_poor_rssi/uplink_type_read.
+            "sustained_over_window": lambda ev: (
+                "Sustained, not a dip: uplink RSSI held below "
+                f"{_n(ev.get('bad_rssi_dbm', ev.get('uplink_rssi_threshold_dbm')), 0)} dBm for "
+                "most of the window."
+            ),
+            "wireless_uplink_confirmed": lambda ev: (
+                f"Wireless uplink confirmed: this AP's backhaul is "
+                f"{ev.get('uplink_type') or 'wireless'}, not wired, so RSSI is the right signal "
+                "to judge it on."
+            ),
+        },
     ),
     "wifi.neighbor_density": Playbook(
         signature="Three or more strong (> −75 dBm), persistent-across-scans neighbour BSSes "
@@ -304,6 +717,58 @@ _PLAYBOOKS: dict[str, Playbook] = {
         "per-channel breakdown, narrow 2.4 GHz to 20 MHz, and cut tx-power so cells stop reaching "
         "into the neighbours' air. A crowded band is P3 context; it is P2 only when an overlapped "
         "radio is also materially congested, which is the case worth acting on first.",
+        evidence_fields=(
+            EvidenceField("band", "Band", "GHz"),
+            EvidenceField("qualifying_count", "Qualifying neighbours"),
+            EvidenceField("total_seen", "Total BSSes seen"),
+            EvidenceField("per_channel", "Neighbours per channel"),
+            EvidenceField("overlapping_radios", "Our overlapped radios"),
+            EvidenceField("congested_overlap_radios", "Congested overlapped radios"),
+            EvidenceField("materially_congested", "Materially congested"),
+        ),
+        confounder_notes={
+            "known_bssid_allowlist_checked": lambda ev: (
+                "Allowlist checked: BSSIDs on the configured known-hardware allowlist are "
+                "excluded before counting."
+            ),
+            "own_ubnt_hardware_excluded": lambda ev: (
+                "Own hardware excluded: BSSIDs matching our own Ubiquiti MAC prefixes are "
+                "cross-referenced out automatically."
+            ),
+            "transient_single_scan_excluded": lambda ev: (
+                "Transient sightings excluded: a BSS seen in only one scan doesn't count "
+                "toward the density."
+            ),
+            "persistence_over_distinct_recent_scans": lambda ev: (
+                "Persistence required: a neighbour has to reappear across multiple distinct "
+                "recent scans, not just linger in one stale reading."
+            ),
+            "weak_neighbor_excluded": lambda ev: (
+                f"Weak neighbours excluded: {_n(ev.get('total_seen'), 0)} BSSes were seen in "
+                f"total, but only the {_n(ev.get('qualifying_count'), 0)} strong enough to "
+                "matter count toward the total."
+                if ev.get("total_seen") is not None
+                else None
+            ),
+            "own_radio_channel_overlap": lambda ev: (
+                "Overlap confirmed: each qualifying neighbour was checked against our own "
+                "radios' channels (co-channel on any band, adjacent on 2.4 GHz), not just "
+                '"nearby".'
+            ),
+            "density_floor_applied": lambda ev: (
+                f"Density floor applied: {_n(ev.get('qualifying_count'), 0)} qualifying "
+                "neighbours cleared the minimum count before this fired."
+                if ev.get("qualifying_count") is not None
+                else None
+            ),
+            "overlapped_radio_congestion_checked": lambda ev: (
+                f"Congestion checked: {_joined(ev.get('congested_overlap_radios'))} of our "
+                "overlapped radios are also running hot, which is why this is P2, not just a "
+                "density note."
+                if ev.get("congested_overlap_radios")
+                else None
+            ),
+        },
     ),
     "wifi.rogue_ap": Playbook(
         signature="Two security claims, per BSSID. ssid_spoof: a foreign BSS broadcasting one of "
@@ -328,7 +793,52 @@ _PLAYBOOKS: dict[str, Playbook] = {
         "one AP = coverage hole).",
         confounders="Benign reason code 8 (normal deauth); a single dead spot mistaken for a bad device.",
         fix_guidance="Follow the attribution: patch the device driver/firmware, service the AP, or "
-        "remediate coverage — the matrix says which.",
+        "remediate coverage; the matrix says which.",
+        evidence_fields=(
+            EvidenceField("weighted_disconnects", "Weighted disconnects"),
+            EvidenceField("disconnects_24h", "Disconnects/24h"),
+            EvidenceField("window_s", "Window", duration=True),
+            EvidenceField("attribution", "Attribution"),
+            EvidenceField("ap_count", "APs involved"),
+            EvidenceField("attributed_ap", "Attributed to"),
+            EvidenceField("ap", "AP"),
+            EvidenceField("flaky_clients_on_attributed_ap", "Other flaky clients on that AP"),
+            EvidenceField("reason_codes", "Disconnect reason codes"),
+        ),
+        confounder_notes={
+            "benign_leave_downweighted": lambda ev: (
+                "Reason codes weighted: benign deauths count for less, so "
+                f"{_n(ev.get('weighted_disconnects', ev.get('disconnects_24h')))} weighted "
+                "disconnects reflect the pathological ones, not routine leaves."
+            ),
+            "reason_code_weighted": lambda ev: (
+                "Reason codes weighted: benign deauths count for less, so "
+                f"{_n(ev.get('weighted_disconnects', ev.get('disconnects_24h')))} weighted "
+                "disconnects reflect the pathological ones, not routine leaves."
+            ),
+            "poll_coverage_gated": _coverage_note,
+            "many_aps_rules_out_single_ap_fault": lambda ev: (
+                f"Ruled out a single AP: this client hit {_n(ev.get('ap_count'), 0)} different "
+                "APs, so it's the device, not one AP."
+            ),
+            "low_rssi_distinguishes_coverage_from_ap_fault": lambda ev: (
+                "RSSI checked: the client's signal was weak at the time, which points at a "
+                "coverage hole, not a faulty AP."
+            ),
+            "many_clients_one_ap_rules_out_client_fault": lambda ev: (
+                f"Other clients checked: {_n(ev.get('flaky_clients_on_attributed_ap'), 0)} "
+                "other clients are also flaky on the same AP, which rules out one bad device."
+            ),
+            "single_client_single_ap_ambiguous": lambda ev: (
+                "One client on one AP: the attribution matrix can't separate a bad device from "
+                "a local dead spot from this alone."
+            ),
+            "attribution_matrix_applied": lambda ev: (
+                "Attribution matrix applied: classified as "
+                f"{str(ev.get('attribution') or '').replace('_', ' ')} from the AP/client "
+                "fan-out."
+            ),
+        },
     ),
     "client.dhcp": Playbook(
         signature="169.254.x self-assigned addresses, association-without-IP > 30 s, or pool "
@@ -355,6 +865,53 @@ _PLAYBOOKS: dict[str, Playbook] = {
         fix_guidance="Confirm it is upstream (check the dish for obstructions/alignment on Starlink), "
         "then open an ISP ticket; fail over to a secondary WAN if one exists. No local fix. Sustained "
         "heavy loss escalates to P1.",
+        evidence_fields=(
+            EvidenceField("window_p50_ms", "Latency (p50)", "ms"),
+            EvidenceField("baseline_p50_ms", "Baseline (p50, 7d)", "ms"),
+            EvidenceField("ratio", "Ratio to baseline", "×"),
+            EvidenceField("loss_fraction", "Probe loss", percent=True),
+            EvidenceField("baseline_loss_fraction", "Baseline loss", percent=True),
+            EvidenceField("sustained_windows_required", "Windows required to fire"),
+            EvidenceField("latency_metric", "Latency source"),
+            EvidenceField("latency_fired", "Fired on latency"),
+            EvidenceField("loss_fired", "Fired on loss"),
+        ),
+        confounder_notes={
+            "rolling_window_p50_robust_to_handoff_spikes": lambda ev: (
+                "Robust to handoff spikes: judged on a 15-minute rolling p50, so Starlink's "
+                "~15 s dish-handoff blips don't move it."
+            ),
+            "trend_vs_own_7d_baseline_not_absolute": lambda ev: (
+                f"Judged against its own baseline: {_n(ev.get('window_p50_ms'), 0)} ms against "
+                f"a {_n(ev.get('baseline_p50_ms'), 0)} ms 7-day baseline for this site, not a "
+                "fixed number."
+                if ev.get("baseline_p50_ms") is not None
+                else "Judged against this site's own 7-day baseline, not a fixed number."
+            ),
+            "absolute_hold_floor_prevents_baseline_drift_autoresolve": lambda ev: (
+                "Drift-proofed: latency has to hold below the degraded floor to auto-resolve, "
+                "so a baseline that drifted up to match the fault can't quietly absorb it."
+            ),
+            "sustained_multi_window_required": lambda ev: (
+                "Sustained, not a blip: elevated latency held for at least "
+                f"{_n(ev.get('sustained_windows_required'), 0)} separate 15-minute windows."
+            ),
+            "per_window_min_probe_count_and_lost_probe_floor": lambda ev: (
+                "Enough probes to trust: each window needed a minimum probe count and lost-"
+                "probe floor before loss was judged, so one dropped probe in a small sample "
+                "can't fire it."
+            ),
+            "loss_from_probe_run_accounting_not_gap": lambda ev: (
+                f"Loss counted from failed probes: {_pct(ev.get('loss_fraction'))} of probes "
+                "failed outright, not from a data gap."
+                if ev.get("loss_fraction") is not None
+                else None
+            ),
+            "starlink_jitter_profile": lambda ev: (
+                "Tuned for Starlink: ordinary dish-handoff jitter is absorbed by the window "
+                "median, so only a genuine, sustained shift fires."
+            ),
+        },
     ),
     "wan.bufferbloat": Playbook(
         signature="Probe RTT loaded-minus-idle > 200 ms while WAN throughput sits near the plan rate.",
@@ -374,13 +931,69 @@ _PLAYBOOKS: dict[str, Playbook] = {
         "(then it is upstream, not local).",
         fix_guidance="If local: fix/replace the resolver. If upstream: switch the forwarders to a "
         "faster upstream DNS.",
+        evidence_fields=(
+            EvidenceField("resolver_p50_ms", "Resolver latency (p50)", "ms"),
+            EvidenceField("anchor_p50_ms", "Public anchor latency (p50)", "ms"),
+            EvidenceField("localised", "Localised to"),
+            EvidenceField("severity_tier", "Severity tier"),
+        ),
+        confounder_notes={
+            "anchor_comparison_localises_fault": lambda ev: (
+                f"Localised with a public anchor: the anchor resolved in "
+                f"{_n(ev.get('anchor_p50_ms'))} ms while the gateway resolver took "
+                f"{_n(ev.get('resolver_p50_ms'))} ms, pointing at the "
+                f"{ev.get('localised') or 'local'} resolver."
+                if ev.get("anchor_p50_ms") is not None
+                else "Localised against a public DNS anchor to separate a local resolver "
+                "problem from an upstream one."
+            ),
+            "probe_coverage_gated": _coverage_note,
+        },
     ),
     "net.coverage_hole": Playbook(
         signature="Cisco CHD adapted per-AP client-RSSI histogram: p25 < −75 or > 20% of "
         "client-hours < −80, and no better AP in those clients' history.",
         confounders="A transient cluster of far clients; a room nobody normally uses.",
-        fix_guidance="Add or relocate an AP to fill the hole; raise power only as a stopgap — "
+        fix_guidance="Add or relocate an AP to fill the hole; raise power only as a stopgap, "
         "placement is the real fix.",
+        evidence_fields=(
+            EvidenceField("client_rssi_p25", "Client RSSI (p25)", "dBm"),
+            EvidenceField("p25_rssi_dbm", "Client RSSI (p25)", "dBm"),
+            EvidenceField("weak_line_dbm", "Weak-signal line", "dBm"),
+            EvidenceField("very_weak_share", "Share very weak", percent=True),
+            EvidenceField("very_weak_line_dbm", "Very-weak line", "dBm"),
+            EvidenceField("client_hours_below_80_pct", "Client-hours below floor", "%"),
+            EvidenceField("stuck_clients", "Stuck clients"),
+            EvidenceField("sample_count", "RSSI samples"),
+            EvidenceField("no_better_ap_in_history", "No better AP available"),
+        ),
+        confounder_notes={
+            "no_better_ap_in_history_gate": lambda ev: (
+                f"No better AP available: the {_n(ev.get('stuck_clients'), 0)} stuck clients "
+                "have no history of a stronger AP, which rules out a sticky-client explanation."
+                if ev.get("stuck_clients") is not None
+                else "No better AP available in these clients' own history, which rules out a "
+                "sticky-client explanation."
+            ),
+            "no_better_ap_available": lambda ev: (
+                "No better AP available in these clients' own history, which rules out a "
+                "sticky-client explanation."
+            ),
+            "sticky_client_excluded": lambda ev: (
+                "Sticky client excluded: a client that has reached a better AP before is a "
+                "sticky client, not a coverage hole, and isn't counted here."
+            ),
+            "min_samples_required": lambda ev: (
+                f"Enough samples to trust it: {_n(ev.get('sample_count'), 0)} RSSI readings "
+                "behind this p25."
+                if ev.get("sample_count") is not None
+                else "A minimum RSSI sample count was required before judging this AP's coverage."
+            ),
+            "sta_coverage_gated": _coverage_note,
+            "sustained_over_window": lambda ev: (
+                "Sustained over the analysis window, not a momentary dip."
+            ),
+        },
     ),
     "net.firmware_regression": Playbook(
         signature="Change-point on upgrade events: 7 d pre/post per device on disconnects/client-"
@@ -389,6 +1002,35 @@ _PLAYBOOKS: dict[str, Playbook] = {
         confounders="Normal post-upgrade settling in the first 2 hours; an unrelated coincident change.",
         fix_guidance="Roll the affected device(s) back to the prior known-good firmware and hold "
         "fleet-wide upgrades on that build.",
+        evidence_fields=(
+            EvidenceField("post_disconnects_per_hour", "Disconnects/h, after upgrade", "/h"),
+            EvidenceField("pre_disconnects_per_hour", "Disconnects/h, before upgrade", "/h"),
+            EvidenceField("post_port_errors", "Port errors, after upgrade"),
+            EvidenceField("pre_port_errors", "Port errors, before upgrade"),
+            EvidenceField("version", "New firmware"),
+            EvidenceField("model", "Model"),
+            EvidenceField("fleet_devices_regressed", "Devices regressed on this build"),
+            EvidenceField("fleet_wide", "Fleet-wide"),
+        ),
+        confounder_notes={
+            "settle_window_excluded_2h": lambda ev: (
+                "Settle window excluded: the first 2 hours after the upgrade are skipped, so "
+                "normal post-reboot churn doesn't count as a regression."
+            ),
+            "pre_post_same_device_baseline": lambda ev: (
+                "Same-device baseline: this device's own pre-upgrade rate "
+                f"({_n(ev.get('pre_disconnects_per_hour'))}/h) is the comparison, not a fleet "
+                "average."
+                if ev.get("pre_disconnects_per_hour") is not None
+                else "This device's own pre-upgrade rate is the baseline, not a fleet average."
+            ),
+            "device_coverage_gated": _coverage_note,
+            "same_model_version_fleet_correlated": lambda ev: (
+                f"Fleet-correlated: {_n(ev.get('fleet_devices_regressed'), 0)} devices on the "
+                f"same {ev.get('model') or '?'} / {ev.get('version') or '?'} build regressed "
+                "together, which is why this reads as a bad build, not one unlucky device."
+            ),
+        },
     ),
     "wan.latency_shift": Playbook(
         signature="A sustained CUSUM change-point in WAN latency: the post-shift regime sits well "

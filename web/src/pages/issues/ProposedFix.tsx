@@ -7,14 +7,17 @@ import {
   Wrench,
   X,
 } from 'lucide-react';
+import type { IssueState } from '../../api/types';
 import { Button } from '../../components/ui/Button';
 import { Skeleton } from '../../components/ui/Skeleton';
 import { ApiError } from '../shared/api';
 import {
   applyFix,
+  getFixHistory,
   getFixPlan,
   revertFix,
   type FixChange,
+  type FixHistoryResponse,
   type FixPlanResponse,
   type FixPlanStep,
   type FixVerification,
@@ -23,15 +26,19 @@ import { humanizeKey } from '../shared/format';
 import { usePageAsync } from '../shared/hooks';
 
 /**
- * Proposed fix (ARCHITECTURE.md §9). The fix engine's remediation for one issue:
- * an advisory note when the fix is physical/manual, or the exact controller calls
- * a dry-run renders (each with a before→after of the changed keys and a risk chip)
- * behind a single guarded Apply button and a confirm modal that restates the
- * change. Applied changes show their verification state and a Revert control.
+ * Proposed fix (ARCHITECTURE.md §9, Gitea #26). Two independent reads:
  *
- * The plan is fetched only when the operator asks (a read-only device GET), never
- * on every page load, and an apply happens only through the confirm modal here —
- * this button and the CLI are the sole apply triggers; the daemon never self-applies.
+ * - **History** (`getFixHistory`, DB-only, never touches a device): whatever the
+ *   ledger already knows for this issue — applied changes with their
+ *   verification state and a Revert control. Loaded unconditionally, so a
+ *   resolved issue shows what actually happened the instant the page opens,
+ *   rather than gating real history behind a "preview" click.
+ * - **Plan** (`getFixPlan`, a read-only device GET): the exact controller calls a
+ *   fresh dry-run renders for a *new* remediation, behind a single guarded Apply
+ *   button and a confirm modal. Only relevant while the issue is still open —
+ *   there is nothing left to propose against a resolved one — and only fetched
+ *   once the operator asks, never on page load; an apply happens only through
+ *   the confirm modal here, the sole trigger besides the CLI.
  */
 
 const RISK_TONE: Record<string, string> = {
@@ -278,7 +285,56 @@ function applyErrorMessage(e: unknown): string {
   return (e as Error).message || 'Apply failed';
 }
 
-export function ProposedFix({ issueId, onChanged }: { issueId: number; onChanged: () => void }) {
+/** A resolved issue with no ledger entry never went through the fix engine at
+ * all — it cleared on its own (a flaky upstream, a transient condition) or its
+ * only remediation is physical. Either way there is nothing to show but this. */
+function NoFixApplied() {
+  return (
+    <p className="t-secondary" style={{ color: 'var(--fg-muted)' }}>
+      This issue resolved without an automatic fix being applied.
+    </p>
+  );
+}
+
+function AppliedChangesList({
+  changes,
+  verification,
+  onRevert,
+  busy,
+  bordered,
+}: {
+  changes: FixChange[];
+  verification: FixVerification;
+  onRevert: (id: number) => void;
+  busy: boolean;
+  bordered: boolean;
+}) {
+  if (changes.length === 0) return null;
+  return (
+    <div
+      className="flex flex-col pt-1"
+      style={bordered ? { borderTop: '1px solid var(--hairline)' } : undefined}
+    >
+      <span className="t-micro mt-2 mb-0.5" style={{ color: 'var(--fg-subtle)' }}>
+        Applied changes
+      </span>
+      {changes.map((c) => (
+        <AppliedChange key={c.id} change={c} verification={verification} onRevert={onRevert} busy={busy} />
+      ))}
+    </div>
+  );
+}
+
+/** The live preview -> confirm -> apply flow for a *new* remediation. Only
+ * meaningful while the issue is still open; a resolved issue has nothing left
+ * to propose. */
+function FixPlanPreview({
+  issueId,
+  onApplied,
+}: {
+  issueId: number;
+  onApplied: () => void;
+}) {
   const [armed, setArmed] = useState(false);
   // The fetch is a read-only device GET, so it fires only once the operator asks
   // (armed): until then the fn resolves undefined and reaches no controller.
@@ -289,14 +345,13 @@ export function ProposedFix({ issueId, onChanged }: { issueId: number; onChanged
   const [modalOpen, setModalOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [applyError, setApplyError] = useState<string | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
 
   if (!armed) {
     return (
       <div className="flex flex-col gap-3">
         <p className="t-secondary" style={{ color: 'var(--fg-muted)' }}>
-          Render the exact remediation the fix engine proposes for this issue. This
-          reads the device configuration read-only; nothing is changed until you
+          Preview the exact change this fix would make on the controller. This
+          only reads the current device configuration; nothing is sent until you
           apply it.
         </p>
         <Button variant="secondary" size="sm" className="self-start" onClick={() => setArmed(true)}>
@@ -339,7 +394,6 @@ export function ProposedFix({ issueId, onChanged }: { issueId: number; onChanged
 
   if (!plan) return null;
 
-  const activeChanges = plan.changes;
   const actionable = !plan.manual_action_required && plan.steps.length > 0;
 
   async function doApply() {
@@ -350,23 +404,9 @@ export function ProposedFix({ issueId, onChanged }: { issueId: number; onChanged
       await applyFix(issueId, plan.confirm_token);
       setModalOpen(false);
       reload();
-      onChanged();
+      onApplied();
     } catch (e) {
       setApplyError(applyErrorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function doRevert(changeId: number) {
-    setBusy(true);
-    setActionError(null);
-    try {
-      await revertFix(issueId, changeId);
-      reload();
-      onChanged();
-    } catch (e) {
-      setActionError((e as Error).message || 'Revert failed');
     } finally {
       setBusy(false);
     }
@@ -413,29 +453,6 @@ export function ProposedFix({ issueId, onChanged }: { issueId: number; onChanged
         </p>
       )}
 
-      {activeChanges.length > 0 && (
-        <div className="flex flex-col pt-1" style={{ borderTop: '1px solid var(--hairline)' }}>
-          <span className="t-micro mt-2 mb-0.5" style={{ color: 'var(--fg-subtle)' }}>
-            Applied changes
-          </span>
-          {activeChanges.map((c) => (
-            <AppliedChange
-              key={c.id}
-              change={c}
-              verification={plan.verification}
-              onRevert={doRevert}
-              busy={busy}
-            />
-          ))}
-        </div>
-      )}
-
-      {actionError && (
-        <span className="t-caption" style={{ color: 'var(--sev-p1)' }}>
-          {actionError}
-        </span>
-      )}
-
       {modalOpen && (
         <ConfirmModal
           plan={plan}
@@ -447,6 +464,84 @@ export function ProposedFix({ issueId, onChanged }: { issueId: number; onChanged
           }}
           onConfirm={doApply}
         />
+      )}
+    </div>
+  );
+}
+
+export function ProposedFix({
+  issueId,
+  issueState,
+  onChanged,
+}: {
+  issueId: number;
+  issueState: IssueState;
+  onChanged: () => void;
+}) {
+  const isOpen = issueState !== 'resolved';
+  // Store-only: safe to fetch unconditionally, on every issue-detail load,
+  // resolved or not — it never reaches a device (see getFixHistory).
+  const { data: history, error: historyError, loading: historyLoading, reload: reloadHistory } =
+    usePageAsync<FixHistoryResponse>(() => getFixHistory(issueId), [issueId]);
+  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  if (historyLoading && !history) {
+    return <Skeleton className="h-24 w-full" />;
+  }
+
+  if (historyError || !history) {
+    return (
+      <p className="t-secondary" style={{ color: 'var(--fg-muted)' }}>
+        {historyError?.status === 404
+          ? 'This issue no longer exists.'
+          : 'Could not load this issue’s fix history.'}
+      </p>
+    );
+  }
+
+  const appliedChanges = history.changes;
+
+  async function doRevert(changeId: number) {
+    setBusy(true);
+    setActionError(null);
+    try {
+      await revertFix(issueId, changeId);
+      reloadHistory();
+      onChanged();
+    } catch (e) {
+      setActionError((e as Error).message || 'Revert failed');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      {isOpen ? (
+        <FixPlanPreview
+          issueId={issueId}
+          onApplied={() => {
+            reloadHistory();
+            onChanged();
+          }}
+        />
+      ) : (
+        appliedChanges.length === 0 && <NoFixApplied />
+      )}
+
+      <AppliedChangesList
+        changes={appliedChanges}
+        verification={history.verification}
+        onRevert={doRevert}
+        busy={busy}
+        bordered={isOpen}
+      />
+
+      {actionError && (
+        <span className="t-caption" style={{ color: 'var(--sev-p1)' }}>
+          {actionError}
+        </span>
       )}
     </div>
   );

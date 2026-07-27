@@ -259,6 +259,31 @@ class RevertBody(BaseModel):
 # --------------------------------------------------------------------------- #
 # Routes
 # --------------------------------------------------------------------------- #
+@router.get("/issues/{issue_id}/fix-history")
+async def get_fix_history(request: Request, issue_id: int) -> dict[str, Any]:
+    """Already-applied changes + verification for an issue. Store-only, ever.
+
+    Unlike ``fix-plan`` this builds no reader and touches no device: ``changes``
+    and ``verification`` are both pure ledger/engine reads, so a resolved issue's
+    "what was applied, offer revert" can render the instant the issue page loads
+    -- gitea #26 -- rather than forcing the operator through the live-dry-run
+    gate meant for previewing a *new* remediation, just to see history the
+    ledger already has. 404 for an unknown issue.
+    """
+    store = get_store(request)
+    row = store.get_issue(issue_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"issue {issue_id} not found")
+    engine = _engine(request, store)
+    service = FixService(store, engine)  # no device_reader/writer: DB reads only
+    return {
+        "issue_id": issue_id,
+        "fix_state": row["fix_state"],
+        "verification": _verification_dict(service, issue_id),
+        "changes": _changes_for(store, issue_id),
+    }
+
+
 @router.get("/issues/{issue_id}/fix-plan")
 async def get_fix_plan(request: Request, issue_id: int) -> dict[str, Any]:
     """The dry-run fix plan for an issue: exact payloads, token, verification.

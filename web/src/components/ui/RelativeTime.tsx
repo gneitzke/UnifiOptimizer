@@ -5,14 +5,25 @@ import { useEffect, useState } from 'react';
  * HH:MM:SS', never presented as live"). Timestamps are epoch seconds (UTC in the
  * store); display is local time (global rule: store UTC, show local).
  *
- * - mode="as-of"    → "as of 14:23:07" — a fixed capture time, does not tick.
+ * - mode="as-of"    → "as of 14:23:07" (or "as of Jul 23, 14:23:07" when not
+ *                     today) — a fixed capture time, does not tick. Stale data
+ *                     can be more than a day old, so the date is never dropped
+ *                     silently (Gitea #25).
  * - mode="relative" → "3m ago" — refreshes on an interval.
  * - mode="at"       → "14:23" (or "Jul 23, 14:23" when not today) — an absolute
  *                     wall-clock time, used for future targets like a snooze
  *                     deadline where "3m ago" / "as of" would read as the past.
+ * - mode="exact"    → "14:23:07" (or "Jul 23, 14:23:07" when not today) — a
+ *                     definitive historical instant, e.g. a lifecycle-trail
+ *                     entry: the date matters there because an issue can span
+ *                     midnight, unlike "at"'s always-recent future target.
+ *
+ * Every mode is 24-hour (never locale AM/PM) and, wherever a value can be more
+ * than a day old, includes the date once it stops being today — one formatting
+ * rule for the whole app instead of each page re-implementing its own clock.
  */
 
-type Mode = 'as-of' | 'relative' | 'at';
+type Mode = 'as-of' | 'relative' | 'at' | 'exact';
 
 interface Props {
   /** Epoch seconds. */
@@ -49,17 +60,29 @@ function iso(ts: number): string {
   return new Date(ts * 1000).toLocaleString();
 }
 
+function sameLocalDay(a: Date, b: Date): boolean {
+  return (
+    a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate()
+  );
+}
+
 /** Absolute wall-clock: "HH:MM" today, else "Mon D, HH:MM". */
 function atLocal(ts: number): string {
   const d = new Date(ts * 1000);
-  const now = new Date();
   const hm = `${two(d.getHours())}:${two(d.getMinutes())}`;
-  const sameDay =
-    d.getFullYear() === now.getFullYear() &&
-    d.getMonth() === now.getMonth() &&
-    d.getDate() === now.getDate();
-  if (sameDay) return hm;
+  if (sameLocalDay(d, new Date())) return hm;
   return `${d.toLocaleString(undefined, { month: 'short' })} ${d.getDate()}, ${hm}`;
+}
+
+/** Exact wall-clock with seconds: "HH:MM:SS" today, else "Mon D, HH:MM:SS" —
+ * a past instant that keeps its date once it's not today (an issue can span
+ * midnight, so the lifecycle trail must not silently drop it). Shared by
+ * mode="exact" and mode="as-of", and reusable wherever else the app needs the
+ * same "24-hour, dated once stale" stamp (e.g. the timeline). */
+export function exactLocal(ts: number): string {
+  const d = new Date(ts * 1000);
+  if (sameLocalDay(d, new Date())) return clockLocal(ts);
+  return `${d.toLocaleString(undefined, { month: 'short' })} ${d.getDate()}, ${clockLocal(ts)}`;
 }
 
 export function RelativeTime({
@@ -83,10 +106,12 @@ export function RelativeTime({
 
   const text =
     mode === 'as-of'
-      ? `as of ${clockLocal(ts)}`
+      ? `as of ${exactLocal(ts)}`
       : mode === 'at'
         ? atLocal(ts)
-        : relative(ts, now);
+        : mode === 'exact'
+          ? exactLocal(ts)
+          : relative(ts, now);
 
   return (
     <time

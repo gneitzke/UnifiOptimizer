@@ -2,7 +2,7 @@
 
 Four independent decisions live here, in the order a transition meets them:
 
-1. **Classification** (:func:`classify`) -- which of the engine's eleven
+1. **Classification** (:func:`classify`) -- which of the engine's twelve
    ``EventKind`` values is worth telling a human about, and as what.
 2. **Filtering** -- the channel's ``min_severity`` floor and ``events`` allow-list.
 3. **Dedupe** -- the invariant that kills every re-fire path in one rule: a channel

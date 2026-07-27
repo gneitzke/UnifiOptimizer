@@ -290,6 +290,10 @@ class Finding:
 
 Confounder checks are structural: a detector lists the traps it tested in `confounders_checked`, and the investigator dossier (section 10) prints them. This is what separates an admin from alarm spam.
 
+**Evidence is stored, and the API returns it, in the detector's own insertion order** — narrative order (the headline measurement first, then its comparison, then supporting facts), never alphabetised. `Repository.insert_issue`/`update_issue`/`record_issue_event` deliberately do not pass `sort_keys=True` to `json.dumps` for `evidence`/`issue_events.detail`, so a detector author's field order survives to the issue detail page unchanged.
+
+Each `Playbook` (the field-guide entries in `catalog.py`, keyed by `detector_key`) can additionally carry `evidence_fields: tuple[EvidenceField, ...]` — a proper label/unit/order override for the evidence keys worth calling out by name — and `confounder_notes: Mapping[str, ConfounderNote]`, one narrated sentence per confounder key computed from the issue's own evidence at request time (e.g. `"PoE draw checked: it dropped to 0 W between flaps (up to 8.5 W) — a powered-device reboot loop, not a bad link."`). `GET /api/issues/{id}` resolves both against the issue's live evidence and returns them as `evidence_layout` / `confounder_notes`; a detector without either still renders fine — the issue detail page falls back to a generically humanized key with a conservative unit inferred from its suffix (`_ms`, `_dbm`, `_fraction`, `_s` → compact duration).
+
 ### Detector catalog v1 (from the July 2026 playbook research; thresholds cited there)
 
 | Key | Signature (compressed) | Sev |
@@ -342,7 +346,7 @@ Pure logic, no I/O beyond the repository. The heart of "relentless."
 - **Fingerprint**: `sha1(detector_key | site_id | entity native_id | sorted(dims))`. One open issue per fingerprint (partial unique index enforces it).
 - **Upsert**: finding arrives → open issue with that fingerprint exists? bump `last_seen_ts`, `occurrences`, refresh evidence, reset `clear_streak`. Else create in `pending`.
 - **pending → active**: condition holds M consecutive evaluations (per-detector M, default 3).
-- **active → resolving → resolved**: detector's clear condition (absence of the finding, or explicit clear signal) increments `clear_streak`; resolved at K clean evaluations (default 6). A fire during `resolving` snaps back to `active`.
+- **active → resolving → resolved**: detector's clear condition (absence of the finding, or explicit clear signal) increments `clear_streak`; resolved at K clean evaluations (default 6). A fire during `resolving` snaps back to `active`. The *first* clean check writes a `resolving` `issue_events` row (`{clear_streak, k}`) — every later clean check while still resolving advances `clear_streak` on the issue row with no new event, so the issue detail's lifecycle trail pairs this one event with the issue's live `clear_streak` to show "N of K" clearing progress without a row per tick (Gitea #26).
 - **Reopen window**: same fingerprint fires within 24-48 h of `resolved` → reopen the old row (`reopened_from` links), not a fresh issue. Flap damping at the issue level.
 - **Inhibition**: `infra.controller_down` suppresses all issue creation and all clear-streak advancement (absence of evidence is not evidence of absence). `infra.device_down` for a switch suppresses that switch's port issues. Rules are data, not code: `(cause_key, suppressed_scope)` pairs.
 - **Snooze/ack** mute notifications, never evaluation.
@@ -392,6 +396,7 @@ Salvages `core/change_applier.py`'s before/after snapshot discipline, now record
 - **Planner**: maps detector/classifier → remediation template with parameters filled from evidence (channel plan proposal, tx_power step-down, min-RSSI removal on mesh AP, PoE port cycle, port disable/enable, WLAN setting change). A plan is a *list* of steps: a site-scoped issue whose subject is a band, not a device, renders one step per device it moves and the steps are ordered deterministically so the confirm token is reproducible (see the channel-plan split in §17).
 - **Safety rails**: never touch mesh-uplink APs' min-RSSI except to remove it; never change more than N devices per apply, and a template that could exceed the guard caps itself rather than render a plan the applier would refuse; every apply captures the full before-state for revert, per step, so each change reverts independently; a step that fails stops the plan with the prior steps' `change_ids` recorded; dry-run renders the exact API payloads; applying requires explicit user action in UI/CLI (the daemon never self-applies in v1).
 - **Verifier**: section 7's fix-verification arm. Revert is one click and re-uses the stored before-state.
+- **History vs. plan, as two separate reads** (Gitea #26): `GET .../fix-history` returns the ledger (`changes`) and `verification` for an issue straight from the store — no device reader is built, so it never reaches the controller and is safe to fetch unconditionally on every issue-detail load, resolved or not. `GET .../fix-plan` is the live, read-only dry-run for a *new* remediation and stays behind the operator's explicit "preview" click, since it is the one GET that actually talks to a device. The issue-detail UI uses history to show "what was applied, offer revert" immediately, and only shows the plan-preview flow while the issue is still open.
 
 ## 10. LLM investigator (`netadmin/llm/`)
 
@@ -424,7 +429,9 @@ MQTT discovery (the NetAlertX-style route, no custom HA component needed):
 
 ### Backend (`netadmin/server/`)
 
-FastAPI, mounted routers: `inventory`, `metrics` (windowed series for charts), `issues` (list/detail/ack/snooze/investigate), `sle`, `fixes` (propose/dry-run/apply/revert), `events`, `ondemand` (tech-visit runs), `system` (`/api/health`: last-poll age, WS state, DB size, consecutive failures). One real WebSocket (`/ws`) pushing issue transitions and poll heartbeats to the UI; the 2-second polling loop dies.
+FastAPI, mounted routers: `inventory`, `metrics` (windowed series for charts), `issues` (list/detail/ack/snooze/investigate), `sle`, `fixes` (history/propose/dry-run/apply/revert), `events`, `ondemand` (tech-visit runs), `system` (`/api/health`: last-poll age, WS state, DB size, consecutive failures). One real WebSocket (`/ws`) pushing issue transitions and poll heartbeats to the UI; the 2-second polling loop dies.
+
+`inventory`'s device/client rollups (Gitea #23): an AP's `num_sta`/`satisfaction` are reported by the controller *both* per-radio (`radio_table_stats`) and at the device's own top level (`stat/device`) — confirmed against a real recorded payload, `tests/netadmin/unifi/fixtures/stat_device.json` — but `map_device` (`netadmin/ingest/mapping.py`) only ever emitted the per-radio series, so the devices list's "Load" summary and the AP detail's satisfaction/client-count charts always read empty, even though the same numbers already existed one level down. Both are now also emitted on the device entity. A client's "Roams" figure is a windowed count of that client's own `EVT_WU_Roam*` events (`Repository.event_counts_by_entity` / `event_count_for_entity`, last 24 h) — not the controller's `roam_count` metric, which `store/metrics.py` registers as a COUNTER (a per-poll delta, not a meaningful total) — so it always has a receipt in the client's own Journey/Timeline.
 
 Web security fixes over the old server: JWT expiry 7 days (not 90), rate limiting on `/api/auth/*` (slowapi), CORS pinned to configured origins, controller credentials never stored in browser localStorage (JWT only, `SameSite` cookie preferred), API-key auth preferred over password so the daemon can hold a revocable key instead of an admin password. Secrets live in `data/secrets.env` chmod 600 (or macOS Keychain when available), never in git.
 
@@ -435,7 +442,7 @@ Keep React 19 + Vite + Tailwind + Zustand. Restructure around the issue-centric 
 | Route | Content |
 |---|---|
 | `/` dashboard | SLE health blocks with classifier breakdowns, active issues by severity, live event ticker |
-| `/issues`, `/issues/:id` | The core surface. Detail = full lifecycle trail, evidence charts, confounders checked, investigation thread, fix propose/dry-run/apply/verify status |
+| `/issues`, `/issues/:id` | The core surface. Detail = full lifecycle trail (each transition humanized to a sentence, e.g. "Escalated after 3 occurrences" / "Resolved after 6 clean checks", exact timestamp plus date once the entry isn't from today), evidence charts, confounders checked (narrated per-detector where the catalog supplies it, §6), investigation thread, fix propose/dry-run/apply/verify status. A `fix_applied`/`fix_proposed` change id links to `/changes?id=<id>`, which auto-expands and scrolls to that row |
 | `/devices`, `/devices/:id` | Per-device page at last: state history, port/radio metrics charts, issues past and present, config |
 | `/clients/:id` | Journey timeline, RSSI/roam history, SLE minutes, issues |
 | `/timeline` | Network-wide event density (salvage the existing visualization) |

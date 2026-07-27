@@ -151,6 +151,11 @@ class Device(_Base):
     uptime: Optional[int] = None
     last_seen: Optional[int] = None
     satisfaction: Optional[float] = None
+    # Device-level client count (AP only): the controller reports this at
+    # ``stat/device`` top level, alongside (not instead of) each
+    # ``radio_table_stats`` entry's own per-band ``num_sta`` -- confirmed against
+    # a real recorded payload (tests/netadmin/unifi/fixtures/stat_device.json).
+    num_sta: Optional[int] = None
 
     port_table: list[PortEntry] = Field(default_factory=list)
     radio_table_stats: list[RadioTableStat] = Field(default_factory=list)

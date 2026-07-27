@@ -572,25 +572,37 @@ class _Seeder:
             self._write(ap["id"], "cpu", cpu, "percent")
             self._write(ap["id"], "mem", mem, "percent")
             self._write(ap["id"], "temp", temp, "celsius")
+            # Device-level client-count/satisfaction accumulators: the real
+            # controller reports `num_sta`/`satisfaction` on the device itself
+            # (stat/device top level -- confirmed against
+            # tests/netadmin/unifi/fixtures/stat_device.json), not just per radio,
+            # and mapping.py now emits both there (Gitea #23). num_sta sums
+            # across bands; satisfaction is the client-count-weighted mean, since
+            # an idle radio's satisfaction should not out-vote the band actually
+            # carrying load.
+            dev_nsta = [0.0] * len(self.grid)
+            dev_sat_weighted = [0.0] * len(self.grid)
             for band, radio in ap["radios"].items():
                 saturated = name == "Living Room" and band == "ng"
                 cu = []
                 nsta = []
                 sat = []
                 retr = []
-                for ts in self.grid:
+                for i, ts in enumerate(self.grid):
                     if saturated:
                         base_cu = self._diurnal(ts, 40, 70, 21) + self._jit(4)
                     else:
                         base_cu = self._diurnal(ts, 6, 30, 21) + self._jit(4)
                     cu.append((ts, _clamp(base_cu, 1, 95)))
-                    nsta.append(
-                        (ts, round(_clamp(self._diurnal(ts, 1, 9, 21) + self._jit(1), 0, 20)))
-                    )
-                    sat.append((ts, _clamp((70 if saturated else 94) + self._jit(4), 30, 100)))
+                    n = round(_clamp(self._diurnal(ts, 1, 9, 21) + self._jit(1), 0, 20))
+                    nsta.append((ts, n))
+                    s = _clamp((70 if saturated else 94) + self._jit(4), 30, 100)
+                    sat.append((ts, s))
                     retr.append(
                         (ts, max(0.0, self._diurnal(ts, 20, 400, 21) * self.rng.uniform(0.5, 1.5)))
                     )
+                    dev_nsta[i] += n
+                    dev_sat_weighted[i] += s * n
                 self._write(radio["id"], "cu_total", cu, "percent")
                 self._write(radio["id"], "num_sta", nsta, "clients")
                 self._write(radio["id"], "satisfaction", sat, "percent")
@@ -608,6 +620,9 @@ class _Seeder:
                         [(ts, _clamp(v * 0.12, 0, 40)) for ts, v in cu],
                         "percent",
                     )
+            dev_sat = [(w / n) if n > 0 else 100.0 for n, w in zip(dev_nsta, dev_sat_weighted)]
+            self._write(ap["id"], "num_sta", list(zip(self.grid, dev_nsta)), "clients")
+            self._write(ap["id"], "satisfaction", list(zip(self.grid, dev_sat)), "percent")
 
     def _series_clients(self) -> None:
         # Give ~15 clients byte counters for chart depth; all wireless get rssi/sat.
@@ -1203,6 +1218,17 @@ class _Seeder:
         )
         self._detected(iid, first, Severity.P2)
         self._escalated(iid, first + 3 * 900, 3)
+        # First clean check after the last fire (Gitea #23/#26): this is the one
+        # event that explains the Resolving pill on the issue detail's trail. The
+        # issue's own `clear_streak` (3, set on `_insert` above) is live and keeps
+        # advancing past this event without a new row per check; the trail pairs
+        # this event's `k` with that live count to show "N of K" progress.
+        self.repo.record_issue_event(
+            iid,
+            EventKind.RESOLVING,
+            ts=self.now - 3 * HOUR + 900,
+            detail={"clear_streak": 1, "k": 6},
+        )
 
     def _issue_duplex_resolved(self) -> None:
         first = self.now - 5 * DAY

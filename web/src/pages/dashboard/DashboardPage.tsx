@@ -10,7 +10,7 @@ import { useWsFrames } from '../../api/WsProvider';
 import { getSle } from '../shared/api';
 import { usePageAsync } from '../shared/hooks';
 import { scoreBand, scoreTo100 } from '../shared/format';
-import { SleHealthBlock } from './SleHealthBlock';
+import { SleHealthBlock, windowLabel } from './SleHealthBlock';
 import { CollectorStrip } from './CollectorStrip';
 import { FirstRunNotice } from './FirstRunNotice';
 import { IncidentsSummary } from './IncidentsSummary';
@@ -19,11 +19,14 @@ import { EventTicker, type TickerTransition } from './EventTicker';
 import { REPORT_ROUTE } from '../report/exportReport';
 
 /**
- * Dashboard (`/`): SLE health blocks with inline classifier breakdowns, a fixed
- * 0-100 24h trend per SLE, active-issues-by-severity, a live activity ticker fed
- * by the WebSocket, and a collector-health strip. One WebSocket subscription for
- * the whole page: issue transitions both nudge the issue summary to refetch and
- * stream into the ticker.
+ * Dashboard (`/`): network health and active incidents lead, side by side, so
+ * "is anything wrong" answers within the first screenful. SLE blocks with
+ * inline classifier breakdowns follow, then top offenders and a live activity
+ * ticker fed by the WebSocket. Collector job health is a single status chip in
+ * the header, linking to Settings' full cadence table rather than competing
+ * for top billing. One WebSocket subscription for the whole page: issue
+ * transitions both nudge the incidents summary to refetch and stream into the
+ * ticker.
  */
 
 const SLE_ORDER = ['coverage', 'capacity', 'connect', 'roaming', 'wan', 'infra'];
@@ -97,7 +100,8 @@ export function DashboardPage() {
 
   return (
     <div className="px-6 py-6 mx-auto flex flex-col gap-6" style={{ maxWidth: 1200 }}>
-      <div className="flex justify-end">
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <CollectorStrip health={health.data} loading={health.loading} error={!!health.error} />
         <Button
           variant="secondary"
           size="sm"
@@ -110,8 +114,13 @@ export function DashboardPage() {
 
       {collecting && <FirstRunNotice backfill={health.data?.backfill} />}
 
-      {/* Headline + collectors */}
-      <section className="grid gap-4 lg:grid-cols-[minmax(260px,1fr)_2fr] items-stretch">
+      {/* Headline + active incidents: the two "is anything wrong" answers, together.
+          The left column stacks the score with the offenders that explain it, so it
+          fills beside an incident list that can run to six or more rows. Stretching
+          a short health card to match would open a gap inside the card; leaving it
+          unstretched opened one beside it. Stacking solves both. */}
+      <section className="grid gap-4 lg:grid-cols-[minmax(260px,1fr)_2fr] items-start">
+        <div className="flex flex-col gap-4">
         <Card data-tour="network-health" pad="md" className="flex flex-col justify-between gap-2">
           <span className="t-label" style={{ color: 'var(--fg-muted)' }}>
             Network health
@@ -142,14 +151,17 @@ export function DashboardPage() {
           )}
           {report && (
             <span className="t-caption" style={{ color: 'var(--fg-subtle)' }}>
-              Weighted across {includedCount}/{totalSle} service levels
+              Over the last {windowLabel(SLE_WINDOW_S)}, weighted across {includedCount}/
+              {totalSle} service levels
               {exclusionNote.length > 0 ? ` (${exclusionNote.join(', ')})` : ''} ·{' '}
               <RelativeTime ts={report.end_ts} mode="as-of" />
             </span>
           )}
         </Card>
+          <TopOffenders />
+        </div>
 
-        <CollectorStrip health={health.data} loading={health.loading} error={!!health.error} />
+        <IncidentsSummary reloadKey={issueNonce} />
       </section>
 
       {/* Service levels */}
@@ -196,15 +208,9 @@ export function DashboardPage() {
         )}
       </section>
 
-      {/* Incidents + activity */}
-      <section className="grid gap-4 lg:grid-cols-[2fr_3fr] items-start">
-        <IncidentsSummary reloadKey={issueNonce} />
+      {/* Top offenders + recent activity, side by side so neither leaves a gap. */}
+      <section>
         <EventTicker transitions={transitions} />
-      </section>
-
-      {/* Top offenders */}
-      <section className="grid gap-4 lg:grid-cols-[2fr_3fr] items-start">
-        <TopOffenders />
       </section>
     </div>
   );

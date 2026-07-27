@@ -40,7 +40,7 @@ export default function ReportPage() {
       <Toolbar generatedTs={m.meta.generated_ts} />
 
       <CoverSection meta={m.meta} />
-      <ExecutiveSummary exec={m.executive} site={site} />
+      <ExecutiveSummary exec={m.executive} site={site} windowLabel={m.meta.window.label} />
       <ScopeSection scope={m.scope} meta={m.meta} site={site} />
       <InventorySection inventory={m.inventory} site={site} />
       <TopologySection topology={m.topology} site={site} />

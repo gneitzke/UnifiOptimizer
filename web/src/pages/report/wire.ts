@@ -32,7 +32,7 @@ export interface WireCover {
 export interface WireScorecard {
   health_score: number | null;
   posture: string;
-  findings_by_severity: Record<string, number>; // { critical, high, medium, low, info }
+  findings_by_severity: Record<string, number>; // { critical, high, low, info }
   total_findings: number;
   coverage_pct: number | null;
   low_confidence: boolean;

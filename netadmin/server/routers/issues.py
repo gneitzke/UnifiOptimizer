@@ -29,15 +29,18 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
+from netadmin.detect.catalog import DEFAULT_CATALOG
 from netadmin.domain.types import IssueState, Severity
 from netadmin.issues.engine import IssueEngine
 from netadmin.llm import service as investigations
 from netadmin.llm.provider import ProviderError, ProviderUnavailableError, available_providers
+from netadmin.logging import get_logger
 from netadmin.server.auth import extract_bearer, token_matches
 from netadmin.server.serialize import decode_json, entity_ref_map, get_store
 from netadmin.store.repository import Repository
 
 router = APIRouter(prefix="/api", tags=["issues"])
+_log = get_logger("server.routers.issues")
 
 
 def _engine(request: Request, store: Repository) -> IssueEngine:
@@ -93,6 +96,67 @@ class ImportResponseBody(BaseModel):
 def _investigation_dict(row: Optional[sqlite3.Row]) -> Optional[dict[str, Any]]:
     """Serialise an ``investigations`` row (all columns, JSON-safe as-is)."""
     return None if row is None else dict(row)
+
+
+def _presentation(
+    detector_key: str, evidence: Any, confounders: list[str]
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Evidence display order/labels and narrated confounder sentences (Gitea #18).
+
+    Resolves the detector's catalog :class:`~netadmin.detect.catalog.Playbook`
+    presentation metadata against this issue's own evidence:
+
+    * ``evidence_layout`` — the subset of evidence keys the playbook has a label
+      for, in the playbook's narrative order. The detail page renders these
+      first, in this order, then falls back to its generic renderer (still in
+      the evidence dict's own -- now narrative -- insertion order) for anything
+      not listed. An empty/missing list is not an error: the UI's generic path
+      covers a detector with no authored layout.
+    * ``confounder_notes`` — a one-sentence narration per confounder key the
+      playbook knows how to explain, keyed by that confounder string. A key
+      absent here falls back to its bare humanized label client-side.
+
+    A detector with no registered playbook, or a note callable that raises on
+    an evidence shape it didn't expect, degrades silently (logged, not raised)
+    rather than breaking the issue page — this is presentation polish, never
+    load-bearing for the underlying evidence/confounders the response also
+    carries verbatim.
+    """
+    layout: list[dict[str, Any]] = []
+    notes: dict[str, str] = {}
+    if not isinstance(evidence, dict):
+        return layout, notes
+    try:
+        playbook = DEFAULT_CATALOG.get(detector_key).playbook
+    except KeyError:
+        playbook = None
+    if playbook is None:
+        return layout, notes
+    for f in playbook.evidence_fields:
+        if f.key in evidence:
+            layout.append(
+                {
+                    "key": f.key,
+                    "label": f.label,
+                    "unit": f.unit,
+                    "percent": f.percent,
+                    "duration": f.duration,
+                }
+            )
+    for key in confounders:
+        note_fn = playbook.confounder_notes.get(key)
+        if note_fn is None:
+            continue
+        try:
+            note = note_fn(evidence)
+        except Exception:  # noqa: BLE001 - a bad note must never break the issue page
+            _log.warning(
+                "confounder note raised", extra={"detector_key": detector_key, "confounder": key}
+            )
+            note = None
+        if note:
+            notes[key] = note
+    return layout, notes
 
 
 @router.get("/issues")
@@ -160,11 +224,14 @@ async def get_issue(request: Request, issue_id: int) -> dict[str, Any]:
     )
     issue["incident_id"] = incident["id"] if incident else None
     issue["incident_role"] = incident["role"] if incident else None
+    evidence_layout, confounder_notes = _presentation(issue["detector_key"], evidence, confounders)
     return {
         "issue": issue,
         "entity": entity,
         "evidence": evidence,
+        "evidence_layout": evidence_layout,
         "confounders": list(confounders),
+        "confounder_notes": confounder_notes,
         "events": [_event_dict(e) for e in events],
         "incident": incident,
     }

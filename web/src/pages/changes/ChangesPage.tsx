@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { Check, ChevronDown, ChevronRight, TriangleAlert } from 'lucide-react';
-import { Button, Card, EmptyState, Skeleton } from '../../components/ui';
+import { Button, Card, EmptyState, Skeleton, exactLocal } from '../../components/ui';
 import { listChanges, useAsync, type ChangeRecord } from '../../api';
 import { useListNavigation } from '../../layout/keyboard/useListNavigation';
 import { DiffView } from './DiffView';
@@ -12,17 +13,15 @@ import { DiffView } from './DiffView';
  * page (ProposedFix), not from this ledger — this row's control stays
  * disabled with a note pointing there. Read-only here, keyboard-traversable
  * (j/k/arrows, Enter expands).
+ *
+ * `?id=<change id>` (the issue detail page's lifecycle trail links here —
+ * Gitea #18 item 4) auto-expands and scrolls to that one row, marked with an
+ * accent rail so landing here from a link is unambiguous.
+ *
+ * Time column uses the shared `exactLocal` stamp (24-hour, dated once it's not
+ * today) — the same clock the health card and the timeline use, not a
+ * locale-dependent (and previously AM/PM-leaking) format of its own (Gitea #25).
  */
-
-function fullTime(ts: number): string {
-  return new Date(ts * 1000).toLocaleString([], {
-    month: 'short',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  });
-}
 
 function StatusChip({ status }: { status: ChangeRecord['status'] }) {
   const base =
@@ -69,8 +68,23 @@ function humanizeAction(action: string): string {
 export default function ChangesPage() {
   const { data, loading, error, reload } = useAsync(() => listChanges(), []);
   const [expanded, setExpanded] = useState<Set<number>>(() => new Set());
+  const [searchParams] = useSearchParams();
+  const rawId = searchParams.get('id');
+  const linkedId = rawId != null && /^\d+$/.test(rawId) ? Number(rawId) : null;
+  const linkedRowRef = useRef<HTMLDivElement | null>(null);
+  const scrolledToLinked = useRef(false);
 
   const changes = data?.changes ?? [];
+
+  // Deep link from a lifecycle-trail "change #N": expand that row and bring it
+  // into view once, the first time it's present in a loaded page of changes.
+  useEffect(() => {
+    if (linkedId == null || scrolledToLinked.current) return;
+    if (!changes.some((c) => c.id === linkedId)) return;
+    setExpanded((prev) => (prev.has(linkedId) ? prev : new Set(prev).add(linkedId)));
+    linkedRowRef.current?.scrollIntoView({ block: 'center' });
+    scrolledToLinked.current = true;
+  }, [linkedId, changes]);
 
   function toggle(id: number) {
     setExpanded((prev) => {
@@ -152,11 +166,15 @@ export default function ChangesPage() {
             {changes.map((c, i) => {
               const rp = nav.getRowProps(i);
               const isActive = i === nav.activeIndex;
+              const isLinked = c.id === linkedId;
               const open = expanded.has(c.id);
               return (
                 <div
                   key={c.id}
-                  ref={rp.ref as (el: HTMLDivElement | null) => void}
+                  ref={(el: HTMLDivElement | null) => {
+                    (rp.ref as (el: HTMLDivElement | null) => void)(el);
+                    if (isLinked) linkedRowRef.current = el;
+                  }}
                   aria-selected={rp['aria-selected']}
                   onMouseEnter={rp.onMouseEnter}
                   style={{ borderBottom: '1px solid var(--hairline)' }}
@@ -170,14 +188,18 @@ export default function ChangesPage() {
                     style={{
                       gridTemplateColumns: '24px 180px 1fr 140px 110px',
                       gap: 12,
-                      background: isActive ? 'var(--canvas)' : undefined,
+                      background: isLinked
+                        ? 'color-mix(in srgb, var(--accent) 10%, transparent)'
+                        : isActive
+                          ? 'var(--canvas)'
+                          : undefined,
                     }}
                   >
                     <span style={{ color: 'var(--fg-subtle)' }} aria-hidden>
                       {open ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
                     </span>
                     <span className="tnum t-secondary" style={{ color: 'var(--fg-muted)' }}>
-                      {fullTime(c.ts)}
+                      {exactLocal(c.ts)}
                     </span>
                     <span style={{ color: 'var(--fg)' }} className="truncate">
                       {humanizeAction(c.action)}
@@ -204,7 +226,7 @@ export default function ChangesPage() {
                         </Button>
                         <span className="t-caption" style={{ color: 'var(--fg-subtle)' }}>
                           {c.status === 'reverted' && c.reverted_ts
-                            ? `Reverted ${fullTime(c.reverted_ts)}.`
+                            ? `Reverted ${exactLocal(c.reverted_ts)}.`
                             : "This ledger is read-only. Revert from the issue's detail page."}
                         </span>
                       </div>

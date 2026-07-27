@@ -12,12 +12,16 @@ export function Scorecard({
   score,
   band,
   counts,
+  windowLabel,
   lowConfidence = false,
   confidenceNote = null,
 }: {
   score: number | null;
   band: Band;
   counts: SeverityCounts;
+  /** Human window label ("7 days"), captioned under the score so a headline
+   *  number is never read without the span it was measured over. */
+  windowLabel?: string | null;
   lowConfidence?: boolean;
   confidenceNote?: string | null;
 }) {
@@ -53,6 +57,11 @@ export function Scorecard({
           />
           {BAND_WORD[band]}
         </span>
+        {windowLabel && (
+          <span className="t-caption" style={{ color: 'var(--fg-subtle)' }}>
+            Over {windowLabel}
+          </span>
+        )}
         {lowConfidence && (
           <span className="t-caption" style={{ color: 'var(--health-poor)', fontWeight: 500 }}>
             Under-observed window
@@ -65,7 +74,7 @@ export function Scorecard({
         <span className="t-label" style={{ color: 'var(--fg-muted)' }}>
           Findings by severity
         </span>
-        <div className="grid grid-cols-5 gap-3 mt-3">
+        <div className="grid grid-cols-4 gap-3 mt-3">
           {SEVERITY_ORDER.map((sev) => {
             const n = counts[sev];
             const c = SEVERITY_COLORS[sev];

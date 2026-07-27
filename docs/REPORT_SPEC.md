@@ -41,8 +41,8 @@ false data** (every number traces to a real repository query) and **no slop**
 
 ## The findings template (every finding, identical shape)
 
-`ID` (stable, e.g. WLAN-03) · `Severity` (Critical/High/Medium/Low/Info, CVSS
-colours) · `Affected assets` · `Observation` (the measured fact + its chart/evidence)
+`ID` (stable, e.g. WLAN-03) · `Severity` (Critical/High/Low/Info — see below)
+· `Affected assets` · `Observation` (the measured fact + its chart/evidence)
 · `Impact` (user-experience terms) · `Root cause` · `Recommendation` (specific,
 ordered). A finding without a concrete, specific recommendation is not done.
 
@@ -61,12 +61,21 @@ per-SLE score bars; mesh-uplink-RSSI trend (the key evidence); client-RSSI
 histogram (weak tail coloured); channel-utilisation bars by band; neighbour
 density by channel; clients-per-AP bars; worst-devices table.
 
-## Severity colours (CVSS-aligned, one system end to end)
+## Severity ladder (one taxonomy, the report and the app agree)
 
-Critical = deep red (`#d70015`), High = orange (`#b25000`), Medium = amber,
-Low = green (`#1e7a34`), Info = grey. The same chip colour in the scorecard, the
-findings table, and any per-entity status. Map netadmin P1→Critical/High,
-P2→High/Medium, P3→Low, per the SLE impact.
+The report and the in-app issues list speak the SAME severity words — this used
+to be two vocabularies (the app's P1/P2/P3, the report's own five-level scale
+re-derived from measured impact) that could disagree about the same finding.
+Now it is a fixed, static rename: P1 → Critical, P2 → High, P3 → Low. `Info` is
+reserved for the one aggregated environmental finding (neighbour density +
+channel-plan contention) — context, never an action item, regardless of the
+P-level of the issues it summarises. A finding's measured impact (fail-minutes,
+affected clients) still travels with it; it no longer changes the severity word.
+
+Colours match the app's `SeverityPill` exactly: Critical = deep red (`#d70015`),
+High = orange (`#c93400`), Low = amber (`#b25000`), Info = grey. The same chip
+colour (and shape glyph — octagon/triangle/circle/bar, never colour alone) in
+the scorecard, the findings table, and any per-entity status.
 
 ## Honesty conventions
 

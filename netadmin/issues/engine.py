@@ -419,13 +419,31 @@ class IssueEngine:
             return
 
         k = self.cfg.k_for(issue.detector_key)
+        prev_state = issue.state
         issue.clear_streak += 1
         if issue.clear_streak >= k:
             self._resolve(issue, now, transitions)
+        elif prev_state is IssueState.ACTIVE:
+            # First clean check after firing: enters RESOLVING. This is the one
+            # event in the streak worth a trail entry -- it is what explains the
+            # Resolving pill (section 7/12: every state a card can show needs a
+            # trail entry a human can read). Every subsequent clean check while
+            # still RESOLVING advances clear_streak with no new event; the issue
+            # detail combines this event's `k` with the issue's own live
+            # clear_streak to show clearing progress without an event per tick.
+            issue.state = IssueState.RESOLVING
+            self.repo.update_issue(issue)
+            self._emit(
+                transitions,
+                issue,
+                EventKind.RESOLVING,
+                now,
+                IssueState.ACTIVE,
+                IssueState.RESOLVING,
+                {"clear_streak": issue.clear_streak, "k": k},
+            )
         else:
-            if issue.state is IssueState.ACTIVE:
-                issue.state = IssueState.RESOLVING
-            self.repo.update_issue(issue)  # interim resolving, no transition event
+            self.repo.update_issue(issue)  # still resolving, no new transition event
 
     def _resolve(self, issue: Issue, now: Timestamp, transitions: list[Transition]) -> None:
         prev_state = issue.state

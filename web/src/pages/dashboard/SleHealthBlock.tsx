@@ -5,7 +5,7 @@ import { TimeSeriesChart } from '../../components/ui/TimeSeriesChart';
 import type { ChartPoint } from '../../components/ui/chart-utils';
 import { fmt } from '../../components/ui/chart-utils';
 import { EntityLink } from '../shared/EntityLink';
-import { humanizeKey, scoreBand, scoreTo100, sleLabel } from '../shared/format';
+import { FAIL_MINUTE_DEFINITION, humanizeKey, scoreBand, scoreTo100, sleLabel } from '../shared/format';
 import type { SleEntryRow } from '../shared/api';
 
 /**
@@ -27,13 +27,16 @@ import type { SleEntryRow } from '../shared/api';
  * exactly the "no data reads as scoring badly" bug this block exists to avoid.
  */
 
+// Same band words as DashboardPage's headline score and the exported report
+// (Gitea #22: this block used to say "Good/Poor" while everywhere else said
+// "Healthy/Degraded" for the identical band).
 const BAND_META: Record<
   ReturnType<typeof scoreBand>,
   { color: string; word: string }
 > = {
-  good: { color: 'var(--sev-healthy)', word: 'Good' },
+  good: { color: 'var(--sev-healthy)', word: 'Healthy' },
   fair: { color: 'var(--sev-p3)', word: 'Fair' },
-  poor: { color: 'var(--sev-p2)', word: 'Poor' },
+  poor: { color: 'var(--sev-p2)', word: 'Degraded' },
   none: { color: 'var(--fg-subtle)', word: 'No data' },
 };
 
@@ -54,8 +57,9 @@ function capitalize(s: string): string {
 
 /** Compact window phrase ("24h", "7d", "45m") for captions — derived from the
  *  actual query span rather than a hardcoded "24h", so a future window change
- *  never leaves stale text behind. */
-function windowLabel(seconds: number): string {
+ *  never leaves stale text behind. Exported so the dashboard headline card
+ *  (same SLE_WINDOW_S span) captions itself with the identical phrase. */
+export function windowLabel(seconds: number): string {
   if (seconds >= 86_400 && seconds % 86_400 === 0) {
     const days = seconds / 86_400;
     return days === 1 ? '24h' : `${days}d`;
@@ -248,6 +252,7 @@ export function SleHealthBlock({
                         <span
                           className="t-caption tnum"
                           style={{ color: 'var(--fg-muted)' }}
+                          title={FAIL_MINUTE_DEFINITION}
                         >
                           {fmt(minutes, minutes < 10 ? 1 : 0)} fail-min
                         </span>

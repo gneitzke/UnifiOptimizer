@@ -28,6 +28,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from netadmin.analytics.offenders import (
     CLIENT_ENTITY_TYPES,
     DEVICE_ENTITY_TYPES,
+    ROAM_EVENT_KEYS,
     load_offender_weights,
     rank_offenders,
 )
@@ -59,6 +60,16 @@ _CHILD_TYPES = {EntityType.PORT.value, EntityType.RADIO.value}
 
 # Recent events shown on a client's journey / a device's activity.
 _JOURNEY_LIMIT = 100
+
+# Window the "Roams" figure counts over (section 12 / Gitea #23). The
+# controller's own `roam_count` metric is a per-poll counter delta, not a
+# meaningful total (store/metrics.py COUNTER_METRICS), so Roams is instead a
+# count of the client's own `EVT_WU_Roam*` events -- the same events the
+# Timeline and this client's Journey already render, so the number always has a
+# receipt. Bounded to a recent window (matching the offenders default) rather
+# than all-time, so it stays consistent with a journey that itself caps at
+# ``_JOURNEY_LIMIT`` events and doesn't grow unboundedly for a years-old client.
+_ROAM_WINDOW_S = 86_400  # 24 h
 
 
 def _base(row: sqlite3.Row) -> dict[str, Any]:
@@ -167,7 +178,11 @@ async def list_clients(request: Request) -> dict[str, Any]:
     ids = [int(r["entity_id"]) for r in rows]
     states = store.current_states_bulk(ids)
     samples = store.latest_samples_bulk(ids)
+    now = int(time.time())
+    roams = store.event_counts_by_entity(now - _ROAM_WINDOW_S, now, ROAM_EVENT_KEYS)
     clients = [_rollup(row, counts, states, samples) for row in rows]
+    for client in clients:
+        client["roam_count_24h"] = roams.get(client["entity_id"], 0)
     return {"clients": clients, "count": len(clients)}
 
 
@@ -180,6 +195,10 @@ async def get_client(request: Request, entity_id: int) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"client {entity_id} not found")
 
     detail = _detail(store, row)
+    now = int(time.time())
+    detail["roam_count_24h"] = store.event_count_for_entity(
+        entity_id, now - _ROAM_WINDOW_S, now, ROAM_EVENT_KEYS
+    )
     events = store.query_events(entity_id=entity_id, limit=_JOURNEY_LIMIT)
     ref_ids = {int(e["related_entity_id"]) for e in events if e["related_entity_id"] is not None}
     refs = entity_ref_map(store, ref_ids)

@@ -1133,7 +1133,11 @@ class Repository:
         fix_state: Optional[str] = None,
         reopened_from: Optional[int] = None,
     ) -> int:
-        evidence_json = json.dumps(evidence or {}, sort_keys=True)
+        # NOT sort_keys: each detector writes its evidence dict in narrative order
+        # (headline measurement, then its comparison, then supporting facts) and
+        # the issue detail page renders it in that same order — alphabetising here
+        # would silently throw that ordering away on every write.
+        evidence_json = json.dumps(evidence or {})
         with self._write() as conn:
             cur = conn.execute(
                 "INSERT INTO issues "
@@ -1191,7 +1195,8 @@ class Repository:
         if unknown:
             raise ValueError(f"unknown issue column(s): {sorted(unknown)}")
         if isinstance(fields.get("evidence"), (dict, list)):
-            fields["evidence"] = json.dumps(fields["evidence"], sort_keys=True)
+            # Preserve the detector's narrative key order (see insert_issue).
+            fields["evidence"] = json.dumps(fields["evidence"])
         assignments = ", ".join(f"{col}=?" for col in fields)
         params = list(fields.values()) + [issue_id]
         with self._write() as conn:
@@ -1288,7 +1293,9 @@ class Repository:
     ) -> int:
         """Append one entry to an issue's lifecycle trail (section 7)."""
         ts = _now() if ts is None else ts
-        detail_json = json.dumps(detail or {}, sort_keys=True)
+        # NOT sort_keys: the lifecycle trail reads this back in the order the
+        # engine wrote it (e.g. escalated's "reason" before its "occurrences").
+        detail_json = json.dumps(detail or {})
         with self._write() as conn:
             cur = conn.execute(
                 "INSERT INTO issue_events (issue_id, ts, kind, detail) VALUES (?,?,?,?)",
@@ -1510,6 +1517,27 @@ class Repository:
             (start_ts, end_ts, *key_list),
         ).fetchall()
         return {int(r["eid"]): int(r["c"]) for r in rows}
+
+    def event_count_for_entity(
+        self, entity_id: int, start_ts: int, end_ts: int, keys: Sequence[str]
+    ) -> int:
+        """Count one entity's events in ``[start_ts, end_ts)`` for ``keys``.
+
+        The single-entity form of :meth:`event_counts_by_entity` (a client detail
+        page needs one count, not the whole site's), riding the same
+        ``idx_events_entity_ts`` index. An empty ``keys`` yields ``0``.
+        """
+        key_list = [k for k in keys if k]
+        if not key_list:
+            return 0
+        placeholders = ",".join("?" for _ in key_list)
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM events "
+            "WHERE entity_id=? AND ts>=? AND ts<? "
+            f"AND key IN ({placeholders})",
+            (entity_id, start_ts, end_ts, *key_list),
+        ).fetchone()
+        return int(row["c"]) if row is not None else 0
 
     def query_events(
         self,

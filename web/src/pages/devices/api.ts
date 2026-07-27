@@ -123,6 +123,10 @@ export const getDevice = (id: number) =>
 export interface ClientRollup extends EntityBase {
   type: 'client';
   issue_counts: IssueCounts;
+  /** Count of this client's own EVT_WU_Roam* events in the last 24h -- not the
+   * controller's `roam_count` metric (a per-poll counter delta, see
+   * store/metrics.py COUNTER_METRICS), which is not a meaningful total. */
+  roam_count_24h: number;
 }
 
 export interface EntityRef {
@@ -149,6 +153,8 @@ export interface ClientDetail extends EntityBase {
   issues_resolved: InvIssue[];
   journey: JourneyEvent[];
   current_ap: EntityRef | null;
+  /** See ClientRollup.roam_count_24h. */
+  roam_count_24h: number;
 }
 
 export const listClients = () =>

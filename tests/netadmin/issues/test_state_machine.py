@@ -79,6 +79,13 @@ def test_first_clear_moves_active_to_resolving(engine, repo, make_finding) -> No
     issue = repo.get_open_issue_by_fingerprint(fp)
     assert issue.state is IssueState.RESOLVING
     assert issue.clear_streak == 1
+    # The trail gets an entry explaining the Resolving pill (Gitea #26) instead
+    # of going silent between "escalated" and "resolved" — the "k" it carries
+    # lets the issue detail show clearing progress without a row per tick.
+    kinds = repo.event_kinds(issue.id)
+    assert kinds == [_EventKind.DETECTED, _EventKind.ESCALATED, _EventKind.RESOLVING]
+    resolving_event = next(e for e in repo.all_events(issue.id) if e.kind == _EventKind.RESOLVING)
+    assert resolving_event.detail == {"clear_streak": 1, "k": 6}
 
 
 def test_resolving_until_k_minus_one(engine, repo, make_finding) -> None:
@@ -92,6 +99,9 @@ def test_resolving_until_k_minus_one(engine, repo, make_finding) -> None:
     issue = repo.get_open_issue_by_fingerprint(fp)
     assert issue.state is IssueState.RESOLVING
     assert issue.clear_streak == 5
+    # Only the first clean check emits a `resolving` event; the other four
+    # clean checks advance clear_streak on the same row, no new event per tick.
+    assert repo.event_kinds(issue.id).count(_EventKind.RESOLVING) == 1
 
 
 def test_resolves_on_kth_clear(engine, repo, make_finding) -> None:

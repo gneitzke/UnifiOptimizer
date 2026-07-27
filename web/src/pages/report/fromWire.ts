@@ -40,9 +40,9 @@ import type {
   WireTopology,
 } from './wire';
 
-const CVSS = new Set<ReportSeverity>(['critical', 'high', 'medium', 'low', 'info']);
+const SEVERITIES = new Set<ReportSeverity>(['critical', 'high', 'low', 'info']);
 function asSeverity(s: string | null | undefined): ReportSeverity {
-  return s != null && CVSS.has(s as ReportSeverity) ? (s as ReportSeverity) : 'info';
+  return s != null && SEVERITIES.has(s as ReportSeverity) ? (s as ReportSeverity) : 'info';
 }
 
 function bandOf(score: number | null): Band {
@@ -325,7 +325,6 @@ export function fromWire(w: WireReport): ReportModel {
     severity_counts: {
       critical: w.executive_summary.scorecard.findings_by_severity.critical ?? 0,
       high: w.executive_summary.scorecard.findings_by_severity.high ?? 0,
-      medium: w.executive_summary.scorecard.findings_by_severity.medium ?? 0,
       low: w.executive_summary.scorecard.findings_by_severity.low ?? 0,
       info: w.executive_summary.scorecard.findings_by_severity.info ?? 0,
     },

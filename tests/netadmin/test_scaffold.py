@@ -14,11 +14,21 @@ from netadmin.domain.types import Cadence, EntityType, FixState, IssueState, Sev
 
 
 def test_package_version() -> None:
-    """__version__ is derived from installed package metadata (never a literal),
-    so it can never again silently drift from pyproject.toml's [project].version."""
-    from importlib.metadata import version
+    """__version__ tracks the code that is actually running, never a literal.
 
-    assert netadmin.__version__ == version("unifioptimizer")
+    Resolution order is an explicit NETADMIN_VERSION override, then a source
+    checkout's own pyproject, then installed metadata. The checkout rung matters:
+    running with PYTHONPATH=. against a stale site-packages copy would otherwise
+    report the installed version while executing checkout code, which is the same
+    drift this is meant to prevent.
+    """
+    import tomllib
+    from pathlib import Path
+
+    pyproject = Path(netadmin.__file__).resolve().parent.parent / "pyproject.toml"
+    with pyproject.open("rb") as fh:
+        expected = str(tomllib.load(fh)["project"]["version"])
+    assert netadmin.__version__ == expected
 
 
 def test_enum_serialized_values() -> None:

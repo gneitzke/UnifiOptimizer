@@ -97,11 +97,29 @@ export interface IssueIncidentRef {
   severity: Severity;
 }
 
+/** One evidence key's presentation metadata (netadmin.detect.catalog.EvidenceField),
+ * resolved server-side against this issue's own evidence. See EvidenceView. */
+export interface EvidenceFieldLayout {
+  key: string;
+  label: string;
+  unit: string;
+  percent: boolean;
+  /** Seconds -> compact duration ("10 min", "1 h") instead of a bare unit suffix. */
+  duration: boolean;
+}
+
 export interface IssueDetailResponse {
   issue: IssueRow;
   entity: EntityRef | null;
   evidence: Record<string, unknown>;
+  /** Narrative label/unit/order for the evidence keys the detector's catalog
+   * playbook documents, in that order. Keys not listed still appear in
+   * `evidence` — the UI falls back to its generic renderer for those. */
+  evidence_layout: EvidenceFieldLayout[];
   confounders: string[];
+  /** One narrated sentence per confounder key the playbook can explain, using
+   * this issue's own evidence numbers. A key absent here has no note. */
+  confounder_notes: Record<string, string>;
   events: IssueEventRow[];
   incident: IssueIncidentRef | null;
 }
@@ -493,6 +511,18 @@ export interface FixApplyResponse {
   verification: FixVerification;
   changes: FixChange[];
 }
+
+export interface FixHistoryResponse {
+  issue_id: number;
+  fix_state: FixState | null;
+  verification: FixVerification;
+  changes: FixChange[];
+}
+
+/** Already-applied changes + verification, store-only (no device read, ever) --
+ * safe to fetch unconditionally on issue-detail load, unlike `getFixPlan`. */
+export const getFixHistory = (issueId: number) =>
+  request<FixHistoryResponse>(`/api/issues/${issueId}/fix-history`);
 
 /** The dry-run plan for an issue: exact calls, confirm token, verification. */
 export const getFixPlan = (issueId: number) =>

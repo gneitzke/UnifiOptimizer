@@ -5,7 +5,7 @@ the policy and format layers can be tested as plain functions.
 
 The central shape is :class:`AlertEvent`: a lifecycle :class:`~netadmin.issues.models.Transition`
 paired with the *normalised* event class an operator actually cares about
-(``opened`` / ``reopened`` / ``resolved``). The engine's eleven ``EventKind`` values
+(``opened`` / ``reopened`` / ``resolved``). The engine's twelve ``EventKind`` values
 are an audit trail; these three are the notification vocabulary.
 """
 

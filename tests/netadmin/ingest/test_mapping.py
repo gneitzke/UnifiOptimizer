@@ -112,6 +112,10 @@ def test_radio_and_system_metrics_from_stat_device(stat_devices):
     dev = _samples_for(mapping.batch, ap.mac)
     assert dev["cpu"].value == 10.8
     assert dev["mem"].value == 46.1
+    # Device-level client load (Gitea #23): the controller reports these at
+    # stat/device top level too, distinct from each radio's own per-band figure.
+    assert dev["num_sta"].value == 3.0
+    assert dev["satisfaction"].value == 99.0
 
     ng_radio = next(r for r in radios if r.entity.native_id.endswith(":ng"))
     assert ng_radio.parent_ref == (EntityType.AP, ap.mac)

@@ -396,9 +396,9 @@ function ReportView({
 
         <Card pad="md" className="flex items-center gap-6">
           <IssueStat label="Open" value={report.issue_counts.open} />
-          <IssueStat label="P1" value={report.issue_counts.p1} tone="p1" />
-          <IssueStat label="P2" value={report.issue_counts.p2} tone="p2" />
-          <IssueStat label="P3" value={report.issue_counts.p3} tone="p3" />
+          <IssueStat label="Critical" value={report.issue_counts.p1} tone="p1" />
+          <IssueStat label="High" value={report.issue_counts.p2} tone="p2" />
+          <IssueStat label="Low" value={report.issue_counts.p3} tone="p3" />
           <div className="ml-auto text-right">
             <div className="t-metric" style={{ color: 'var(--fg)' }}>
               {report.topology.entity_count}

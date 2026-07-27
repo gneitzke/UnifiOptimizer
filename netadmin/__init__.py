@@ -40,6 +40,21 @@ def _resolve_version() -> str:
        PYTHONPATH.
     4. A sentinel, which is honest about not being a real versioned install.
     """
+    # An explicit build/operator override wins over everything inferred.
+    baked_first = os.environ.get("NETADMIN_VERSION")
+    if baked_first:
+        return baked_first.strip()
+    # Otherwise a source checkout wins over installed metadata. Running with PYTHONPATH=. against
+    # a stale site-packages copy would otherwise report the INSTALLED version while
+    # executing checkout code, which is the same drift this function exists to stop.
+    here = Path(__file__).resolve()
+    if not any(part in {"site-packages", "dist-packages"} for part in here.parts):
+        try:
+            pyproject = here.parent.parent / "pyproject.toml"
+            with pyproject.open("rb") as fh:
+                return str(tomllib.load(fh)["project"]["version"])
+        except Exception:  # noqa: BLE001 - fall through to metadata
+            pass
     try:
         return _pkg_version("unifioptimizer")
     except PackageNotFoundError:

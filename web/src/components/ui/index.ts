@@ -3,7 +3,7 @@ export { Card } from './Card';
 export { Button } from './Button';
 export { Skeleton } from './Skeleton';
 export { CountBadge } from './CountBadge';
-export { RelativeTime } from './RelativeTime';
+export { RelativeTime, exactLocal } from './RelativeTime';
 export { SeverityPill, SeverityGlyph } from './SeverityPill';
 export { StatePill } from './StatePill';
 export { EmptyState } from './EmptyState';

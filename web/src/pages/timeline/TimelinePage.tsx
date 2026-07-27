@@ -6,6 +6,7 @@ import {
   DataTable,
   EmptyState,
   Skeleton,
+  exactLocal,
   type Column,
 } from '../../components/ui';
 import { useHealth, type NetEvent } from '../../api';
@@ -27,20 +28,13 @@ import { useTimelineEvents } from './useTimelineEvents';
  * filter by key family, switch zoom windows, and click a bar to drill into that
  * slice's events. Honest empty/loading/error states throughout; the event table
  * keyboard-traverses via the shared DataTable.
+ *
+ * Every timestamp on this page goes through the shared `exactLocal` stamp
+ * (24-hour, dated once it's not today) rather than a locale time string — the
+ * 7D window can hold events from a different calendar day, and a bare
+ * locale-formatted "04:27:00 PM" both leaked AM/PM and dropped the date
+ * (Gitea #25).
  */
-
-function timeFmt(ts: number): string {
-  const d = new Date(ts * 1000);
-  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-}
-
-function asOfStamp(ts: number): string {
-  return new Date(ts * 1000).toLocaleTimeString([], {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  });
-}
 
 export default function TimelinePage() {
   const [windowIdx, setWindowIdx] = useState(2); // default 24H
@@ -80,8 +74,8 @@ export default function TimelinePage() {
     const start = Math.min(...cands);
     const label =
       monitoringSince != null && start === monitoringSince
-        ? `monitoring since ${asOfStamp(start)}`
-        : `data from ${asOfStamp(start)}`;
+        ? `monitoring since ${exactLocal(start)}`
+        : `data from ${exactLocal(start)}`;
     return { coverageStart: start, coverageLabel: label };
   }, [events, capped, health.data, nowTs]);
 
@@ -120,23 +114,26 @@ export default function TimelinePage() {
           className="tnum t-secondary whitespace-nowrap"
           style={{ color: 'var(--fg-muted)' }}
         >
-          {timeFmt(e.ts)}
+          {exactLocal(e.ts)}
         </span>
       ),
     },
     {
-      key: 'key',
+      // Sentence primary, code secondary in mono (Gitea #25: this used to lead
+      // with the machine code — "WU Roam Radio" — and bury the human sentence
+      // in a separate, truncated "Detail" column that duplicated Entity).
+      key: 'event',
       header: 'Event',
-      width: 220,
-      sortAccessor: (e) => e.key,
+      sortAccessor: (e) => e.msg ?? humanizeKey(e.key),
       render: (e) => {
         const fault = isFaultKey(e.key);
+        const sentence = e.msg ?? humanizeKey(e.key);
         return (
-          <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+          <span className="inline-flex items-baseline gap-1.5 min-w-0" title={sentence}>
             {fault ? (
               <TriangleAlert
                 size={13}
-                className="shrink-0"
+                className="shrink-0 self-center"
                 style={{ color: 'var(--sev-p2)' }}
                 aria-label="fault"
               />
@@ -147,7 +144,15 @@ export default function TimelinePage() {
                 style={{ width: 6, height: 6, background: 'var(--fg-subtle)' }}
               />
             )}
-            <span style={{ color: 'var(--fg)' }}>{humanizeKey(e.key)}</span>
+            <span className="truncate" style={{ maxWidth: 420 }}>
+              <span style={{ color: 'var(--fg)' }}>{sentence}</span>
+              <code
+                className="t-caption font-mono ml-2"
+                style={{ color: 'var(--fg-subtle)' }}
+              >
+                {humanizeKey(e.key)}
+              </code>
+            </span>
           </span>
         );
       },
@@ -177,23 +182,10 @@ export default function TimelinePage() {
         );
       },
     },
-    {
-      key: 'msg',
-      header: 'Detail',
-      render: (e) => (
-        <span
-          className="t-secondary block truncate"
-          style={{ color: 'var(--fg-muted)', maxWidth: 420 }}
-          title={e.msg ?? undefined}
-        >
-          {e.msg ?? '—'}
-        </span>
-      ),
-    },
   ];
 
   const listTitle = selectedBucket
-    ? `Events ${timeFmt(selectedBucket.t0)}–${timeFmt(selectedBucket.t1)}`
+    ? `Events ${exactLocal(selectedBucket.t0)}–${exactLocal(selectedBucket.t1)}`
     : 'Recent events';
 
   return (
@@ -306,7 +298,7 @@ export default function TimelinePage() {
             buckets={buckets}
             selected={selected}
             onSelect={setSelected}
-            asOf={asOfStamp(fetchedAt)}
+            asOf={exactLocal(fetchedAt)}
             coverageStart={coverageStart}
             coverageLabel={coverageLabel}
           />

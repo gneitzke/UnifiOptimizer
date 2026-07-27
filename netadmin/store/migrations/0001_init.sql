@@ -86,7 +86,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_issues_open_fp ON issues(fingerprint) WHER
 
 CREATE TABLE IF NOT EXISTS issue_events (
   id INTEGER PRIMARY KEY, issue_id INTEGER NOT NULL REFERENCES issues(id),
-  ts INTEGER NOT NULL, kind TEXT NOT NULL,   -- detected | escalated | acked | snoozed | fix_proposed | fix_applied | fix_verified | fix_failed | resolved | reopened | investigated
+  ts INTEGER NOT NULL, kind TEXT NOT NULL,   -- detected | escalated | resolving | acked | snoozed | fix_proposed | fix_applied | fix_verified | fix_failed | resolved | reopened | investigated
   detail TEXT NOT NULL DEFAULT '{}'
 );
 

@@ -6,6 +6,7 @@ import { Skeleton } from '../../components/ui/Skeleton';
 import { EntityLink } from '../shared/EntityLink';
 import { listDeviceOffenders, type OffenderRow } from '../shared/api';
 import { usePageAsync } from '../shared/hooks';
+import { FAIL_MINUTE_DEFINITION, OFFENDER_BURDEN_DEFINITION } from '../shared/format';
 
 /**
  * Top offenders (dashboard). The "who causes most of my grief" leaderboard
@@ -67,12 +68,32 @@ export function TopOffenders() {
   );
 }
 
-function burdenLabel(o: OffenderRow): string {
-  const parts: string[] = [];
-  if (o.issue_counts.total > 0) parts.push(`${o.issue_counts.total} open issue${o.issue_counts.total === 1 ? '' : 's'}`);
-  if (o.fail_minutes > 0) parts.push(`${Math.round(o.fail_minutes)} fail-min`);
-  if (o.event_count > 0) parts.push(`${o.event_count} disconnect/roam`);
-  return parts.join(' · ') || 'burden below threshold';
+interface BurdenPart {
+  key: string;
+  text: string;
+  /** Reachable definition for a term that isn't self-explanatory (fail-min). */
+  title?: string;
+}
+
+function burdenParts(o: OffenderRow): BurdenPart[] {
+  const parts: BurdenPart[] = [];
+  if (o.issue_counts.total > 0) {
+    parts.push({
+      key: 'issues',
+      text: `${o.issue_counts.total} open issue${o.issue_counts.total === 1 ? '' : 's'}`,
+    });
+  }
+  if (o.fail_minutes > 0) {
+    parts.push({
+      key: 'fail-min',
+      text: `${Math.round(o.fail_minutes)} fail-min`,
+      title: FAIL_MINUTE_DEFINITION,
+    });
+  }
+  if (o.event_count > 0) {
+    parts.push({ key: 'events', text: `${o.event_count} disconnect/roam` });
+  }
+  return parts;
 }
 
 function OffenderRowItem({
@@ -96,8 +117,12 @@ function OffenderRowItem({
       <div className="flex flex-col min-w-0 flex-1 gap-1">
         <div className="flex items-baseline justify-between gap-2">
           <EntityLink entity={offender.entity} className="truncate" />
-          <span className="t-caption tnum" style={{ color: 'var(--fg-muted)' }}>
-            {Math.round(offender.score)}
+          <span
+            className="t-caption tnum shrink-0"
+            style={{ color: 'var(--fg-muted)' }}
+            title={OFFENDER_BURDEN_DEFINITION}
+          >
+            <span style={{ color: 'var(--fg-subtle)' }}>Burden</span> {Math.round(offender.score)}
           </span>
         </div>
         <div
@@ -111,7 +136,16 @@ function OffenderRowItem({
           />
         </div>
         <span className="t-micro truncate" style={{ color: 'var(--fg-subtle)' }}>
-          {burdenLabel(offender)}
+          {(() => {
+            const parts = burdenParts(offender);
+            if (parts.length === 0) return 'burden below threshold';
+            return parts.map((p, i) => (
+              <span key={p.key}>
+                {i > 0 && ' · '}
+                <span title={p.title}>{p.text}</span>
+              </span>
+            ));
+          })()}
         </span>
       </div>
     </li>

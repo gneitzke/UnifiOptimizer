@@ -178,8 +178,10 @@ export function ClientDetailPage() {
               <InfoRow label="Satisfaction">
                 {val('satisfaction') == null ? '—' : `${fmt(val('satisfaction'), 0)}%`}
               </InfoRow>
-              <InfoRow label="Roams">
-                {val('roam_count') == null ? '—' : fmt(val('roam_count'), 0)}
+              <InfoRow label="Roams (24h)">
+                <span title="AP-to-AP roam events in the last 24 hours; see Journey below for each one">
+                  {fmt(client.roam_count_24h, 0)}
+                </span>
               </InfoRow>
               {client.state?.ip && (
                 <InfoRow label="IP">

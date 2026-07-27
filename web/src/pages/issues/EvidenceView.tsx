@@ -1,5 +1,6 @@
 import { Fragment, type ReactNode } from 'react';
-import { humanizeKey } from '../shared/format';
+import { formatWithUnit, humanizeKeyForUnit, inferUnit, scalarText } from '../shared/format';
+import type { EvidenceFieldLayout } from '../shared/api';
 
 /**
  * Renders an issue's `evidence` blob as compact labeled numbers + small tables —
@@ -7,6 +8,15 @@ import { humanizeKey } from '../shared/format';
  * consumed elsewhere (confounders, chart hints) are omitted so this stays the
  * "supporting measurements" view. Scalars right-align tabular; nested objects
  * become sub-groups; arrays of objects become mini tables.
+ *
+ * `layout` (from the API's `evidence_layout`, sourced from the detector's
+ * catalog Playbook — Gitea #18) supplies a proper label, unit, and narrative
+ * order for the keys a detector has documented; those render first, in that
+ * order. Everything else still renders — in the evidence dict's own insertion
+ * order, which is the detector's narrative order once it survives storage
+ * un-sorted — generically humanized, with a conservative unit inferred from
+ * the key's suffix (`_ms`, `_dbm`, `_fraction`, …) when one applies. A
+ * detector with no layout at all still renders exactly as before.
  */
 
 const OMIT_KEYS = new Set(['confounders_checked', 'series_hints', 'signals']);
@@ -15,24 +25,29 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
-function numberStr(n: number): string {
-  if (Number.isInteger(n)) return String(n);
-  const r = Math.round(n * 1000) / 1000;
-  return String(r);
-}
-
-function scalarText(v: unknown): string {
-  if (v == null) return '—';
-  if (typeof v === 'boolean') return v ? 'Yes' : 'No';
-  if (typeof v === 'number') return Number.isFinite(v) ? numberStr(v) : '—';
-  return String(v);
-}
-
 function isScalar(v: unknown): boolean {
   return v == null || ['number', 'string', 'boolean'].includes(typeof v);
 }
 
-function ScalarRow({ label, value }: { label: string; value: unknown }) {
+/** A scalar's display text: an explicit unit wins, else infer one from `key`. */
+function scalarTextFor(key: string, value: unknown): string {
+  const inferred = inferUnit(key);
+  if (inferred && typeof value === 'number') {
+    return formatWithUnit(value, inferred.unit, inferred.percent, inferred.duration);
+  }
+  return scalarText(value);
+}
+
+function ScalarRow({
+  label,
+  value,
+  display,
+}: {
+  label: string;
+  value: unknown;
+  /** Pre-formatted display text; falls back to `scalarText(value)`. */
+  display?: string;
+}) {
   const numeric = typeof value === 'number';
   return (
     <div
@@ -46,7 +61,7 @@ function ScalarRow({ label, value }: { label: string; value: unknown }) {
         className={numeric ? 't-body tnum text-right' : 't-body text-right'}
         style={{ color: 'var(--fg)', wordBreak: 'break-word' }}
       >
-        {scalarText(value)}
+        {display ?? scalarText(value)}
       </span>
     </div>
   );
@@ -66,6 +81,14 @@ function ScalarArrayRow({ label, value }: { label: string; value: unknown[] }) {
       </span>
     </div>
   );
+}
+
+/** A table column header: the humanized key, plus an inferred unit in parens
+ * ("RSSI (dBm)") so a mini-table's numbers carry the same honesty as a row. */
+function columnLabel(key: string): string {
+  const inferred = inferUnit(key);
+  const base = humanizeKeyForUnit(key, inferred);
+  return inferred?.unit ? `${base} (${inferred.unit})` : base;
 }
 
 function ObjectArrayTable({ label, rows }: { label: string; rows: Record<string, unknown>[] }) {
@@ -90,7 +113,7 @@ function ObjectArrayTable({ label, rows }: { label: string; rows: Record<string,
                   className="text-left px-2 py-1 t-micro font-medium"
                   style={{ color: 'var(--fg-subtle)', borderBottom: '1px solid var(--hairline)' }}
                 >
-                  {humanizeKey(c)}
+                  {columnLabel(c)}
                 </th>
               ))}
             </tr>
@@ -119,9 +142,27 @@ function ObjectArrayTable({ label, rows }: { label: string; rows: Record<string,
   );
 }
 
-function renderEntry(key: string, value: unknown, depth: number): ReactNode {
-  const label = humanizeKey(key);
-  if (isScalar(value)) return <ScalarRow key={key} label={label} value={value} />;
+/** One evidence key -> its row/table/sub-group, recursing into nested objects.
+ * `field` (from `evidence_layout`, when this key was reached via the laid-out
+ * pass) supplies the label and — for a scalar value — the unit; absent, the
+ * label falls back to `humanizeKeyForUnit` (the key humanized minus a unit-
+ * bearing suffix, so a "_dbm" key never repeats itself next to its own unit).
+ * Only the scalar branch consumes the unit: a laid-out key whose value turns
+ * out to be an object/array (a detector's evidence shape drifted) still routes
+ * through the matching table/sub-group renderer, never mis-renders as text. */
+function renderEntry(
+  key: string,
+  value: unknown,
+  depth: number,
+  field?: EvidenceFieldLayout,
+): ReactNode {
+  const label = field?.label ?? humanizeKeyForUnit(key, inferUnit(key));
+  if (isScalar(value)) {
+    const display = field
+      ? formatWithUnit(value, field.unit, field.percent, field.duration)
+      : scalarTextFor(key, value);
+    return <ScalarRow key={key} label={label} value={value} display={display} />;
+  }
   if (Array.isArray(value)) {
     if (value.length === 0) return <ScalarRow key={key} label={label} value="—" />;
     if (value.every(isScalar)) return <ScalarArrayRow key={key} label={label} value={value} />;
@@ -148,18 +189,38 @@ function renderEntry(key: string, value: unknown, depth: number): ReactNode {
   return <ScalarRow key={key} label={label} value={JSON.stringify(value)} />;
 }
 
-export function EvidenceView({ evidence }: { evidence: Record<string, unknown> }) {
-  const entries = Object.entries(evidence).filter(([k]) => !OMIT_KEYS.has(k));
-  if (entries.length === 0) {
+export function EvidenceView({
+  evidence,
+  layout = [],
+}: {
+  evidence: Record<string, unknown>;
+  /** Narrative label/unit/order for this detector's evidence, from the API's
+   * `evidence_layout` (netadmin.detect.catalog.Playbook.evidence_fields). */
+  layout?: EvidenceFieldLayout[];
+}) {
+  const allEntries = Object.entries(evidence).filter(([k]) => !OMIT_KEYS.has(k));
+  if (allEntries.length === 0) {
     return (
       <p className="t-secondary" style={{ color: 'var(--fg-subtle)' }}>
         No supporting measurements were attached to this issue.
       </p>
     );
   }
+  const evidenceMap = new Map(allEntries);
+  const fieldByKey = new Map(layout.map((f) => [f.key, f]));
+  // The playbook's order first (its narrative), then whatever it didn't name —
+  // in the evidence dict's own order, which is the detector's own narrative
+  // order once storage stops alphabetising it.
+  const laidOutKeys = layout.filter((f) => evidenceMap.has(f.key)).map((f) => f.key);
+  const usedKeys = new Set(laidOutKeys);
+  const rest = allEntries.filter(([k]) => !usedKeys.has(k));
+
   return (
     <div className="flex flex-col">
-      {entries.map(([k, v]) => renderEntry(k, v, 0))}
+      {laidOutKeys.map((k) => (
+        <Fragment key={k}>{renderEntry(k, evidenceMap.get(k), 0, fieldByKey.get(k))}</Fragment>
+      ))}
+      {rest.map(([k, v]) => renderEntry(k, v, 0))}
     </div>
   );
 }

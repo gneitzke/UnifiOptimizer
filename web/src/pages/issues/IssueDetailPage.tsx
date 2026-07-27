@@ -124,7 +124,8 @@ export function IssueDetailPage() {
 
   if (!data) return null;
 
-  const { issue, entity, evidence, confounders, events, incident } = data;
+  const { issue, entity, evidence, evidence_layout, confounders, confounder_notes, events, incident } =
+    data;
   const durSecs = issueDurationSeconds(issue, now);
   const snoozed = issue.snooze_until_ts != null && issue.snooze_until_ts > now;
   const hints = metricHintsForIssue(issue);
@@ -285,7 +286,7 @@ export function IssueDetailPage() {
       <div className="grid gap-4 lg:grid-cols-[3fr_2fr] items-start">
         <div className="flex flex-col gap-4">
           <SectionCard title="Evidence">
-            <EvidenceView evidence={evidence} />
+            <EvidenceView evidence={evidence} layout={evidence_layout} />
           </SectionCard>
 
           <SectionCard title="Related metrics">
@@ -293,7 +294,7 @@ export function IssueDetailPage() {
           </SectionCard>
 
           <SectionCard title="Proposed fix">
-            <ProposedFix issueId={issueId} onChanged={reload} />
+            <ProposedFix issueId={issueId} issueState={issue.state} onChanged={reload} />
           </SectionCard>
 
           <SectionCard title="Investigation">
@@ -303,7 +304,7 @@ export function IssueDetailPage() {
 
         <div className="flex flex-col gap-4">
           <SectionCard title="Lifecycle">
-            <LifecycleTrail events={events} />
+            <LifecycleTrail events={events} currentState={issue.state} clearStreak={issue.clear_streak} />
           </SectionCard>
 
           <SectionCard title="Ruled out">
@@ -317,7 +318,7 @@ export function IssueDetailPage() {
                   <li key={c} className="flex items-start gap-2">
                     <Check size={15} className="mt-0.5 shrink-0" style={{ color: 'var(--sev-healthy)' }} />
                     <span className="t-body" style={{ color: 'var(--fg)' }}>
-                      {humanizeKey(c)}
+                      {confounder_notes[c] ?? humanizeKey(c)}
                     </span>
                   </li>
                 ))}

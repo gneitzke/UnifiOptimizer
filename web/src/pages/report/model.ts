@@ -11,14 +11,17 @@
  * be able to fill are nullable / allowed-empty so a partial report still renders.
  */
 
-/* ---- Severity (CVSS-aligned, five levels) ------------------------------- */
+/* ---- Severity (one taxonomy, shared with the app's P1/P2/P3) ------------ */
 
 /**
- * The report's five-level CVSS severity. The backend maps netadmin's internal
- * P1/P2/P3 onto this per the SLE impact (P1→critical/high, P2→high/medium,
- * P3→low, advisories→info). Colours are resolved in `severity.ts`.
+ * The report's severity word — a fixed, static rename of netadmin's internal
+ * P1/P2/P3 (P1→critical, P2→high, P3→low), identical to the app's
+ * `SeverityPill` vocabulary and colours. `info` is reserved for the one
+ * aggregated environmental finding; it is never derived from measured impact
+ * (Gitea #22: the old impact-conditioned mapping let the same P1 render as
+ * different words in different places). Colours are resolved in `severity.ts`.
  */
-export type ReportSeverity = 'critical' | 'high' | 'medium' | 'low' | 'info';
+export type ReportSeverity = 'critical' | 'high' | 'low' | 'info';
 
 /** Score band, given by the backend — never derived in the UI from a raw score. */
 export type Band = 'good' | 'fair' | 'poor' | 'none';
@@ -26,7 +29,6 @@ export type Band = 'good' | 'fair' | 'poor' | 'none';
 export interface SeverityCounts {
   critical: number;
   high: number;
-  medium: number;
   low: number;
   info: number;
 }

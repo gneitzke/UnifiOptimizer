@@ -56,14 +56,13 @@ from netadmin.report.models import (
 from netadmin.report.playbook import finding_guidance
 from netadmin.report.severity import (
     CRITICAL,
-    CVSS_ORDER,
     HIGH,
     INFO,
     LOW,
-    MEDIUM,
-    cvss_rank,
+    SEVERITY_ORDER,
+    severity_rank,
     severity_rubric,
-    to_cvss,
+    to_severity_label,
 )
 from netadmin.sle.classifiers import ALL_SLES, OK, SleConfig
 from netadmin.sle.scores import load_weights, sle_scores
@@ -130,10 +129,9 @@ _FAMILY_PREFIX: dict[str, str] = {
 
 _SEV_RANK: dict[str, int] = {"p1": 0, "p2": 1, "p3": 2}
 
-_PHASE_BY_CVSS: dict[str, str] = {
+_PHASE_BY_SEVERITY: dict[str, str] = {
     CRITICAL: "now",
-    HIGH: "now",
-    MEDIUM: "soon",
+    HIGH: "soon",
     LOW: "strategic",
     INFO: "strategic",
 }
@@ -713,7 +711,7 @@ def _incident_finding(
         netadmin_sev = root_brief["incident_severity"]
     else:
         netadmin_sev = root["severity"]
-    cvss = to_cvss(netadmin_sev, fail_minutes=impact.fail_minutes)
+    sev_label = to_severity_label(netadmin_sev)
 
     guidance = finding_guidance(root["detector_key"], correlated_symptoms=len(symptom_issues))
     evidence = _decode_json(root["evidence"])
@@ -751,7 +749,7 @@ def _incident_finding(
     finding = Finding(
         id="",
         title=root["title"],
-        severity=cvss,
+        severity=sev_label,
         netadmin_severity=netadmin_sev,
         detector_key=root["detector_key"],
         affected_assets=affected,
@@ -767,7 +765,7 @@ def _incident_finding(
         source_issue_ids=[int(i["id"]) for i in issues],
     )
     sort_key = (
-        cvss_rank(cvss),
+        severity_rank(sev_label),
         -impact.fail_minutes,
         int(root["first_seen_ts"] or 0),
         int(root["id"]),
@@ -788,8 +786,11 @@ def _environmental_finding(
     aff_ids = [int(i["entity_id"]) for i in env_issues if i["entity_id"] is not None]
     impact = _finding_impact(aff_ids, impact_index)
 
+    # Provenance only (recorded on the finding as netadmin_severity): the
+    # environmental finding is always Info regardless of the worst underlying
+    # P-level, since it summarises RF readings, not one actionable fault.
     most_severe = min((i["severity"] for i in env_issues), key=lambda s: _SEV_RANK.get(s, 9))
-    cvss = to_cvss(most_severe, fail_minutes=impact.fail_minutes, environmental=True)
+    sev_label = to_severity_label(most_severe, environmental=True)
 
     rec_parts = []
     if chan:
@@ -819,7 +820,7 @@ def _environmental_finding(
     finding = Finding(
         id="",
         title="RF neighbourhood and channel-plan contention",
-        severity=cvss,
+        severity=sev_label,
         netadmin_severity=most_severe,
         detector_key="wifi.rf_environment",
         affected_assets=affected,
@@ -839,7 +840,7 @@ def _environmental_finding(
         symptoms=[],
         source_issue_ids=[int(i["id"]) for i in env_issues],
     )
-    sort_key = (cvss_rank(cvss), -impact.fail_minutes, earliest, 0)
+    sort_key = (severity_rank(sev_label), -impact.fail_minutes, earliest, 0)
     return sort_key, finding, "ENV"
 
 
@@ -904,7 +905,7 @@ def _build_findings(
 def _build_roadmap(findings: list[Finding]) -> RoadmapSection:
     phases: dict[str, list[Recommendation]] = {"now": [], "soon": [], "strategic": []}
     for f in findings:
-        phase = _PHASE_BY_CVSS.get(f.severity, "strategic")
+        phase = _PHASE_BY_SEVERITY.get(f.severity, "strategic")
         phases[phase].append(
             Recommendation(
                 finding_id=f.id,
@@ -915,7 +916,7 @@ def _build_roadmap(findings: list[Finding]) -> RoadmapSection:
             )
         )
     for bucket in phases.values():
-        bucket.sort(key=lambda r: (cvss_rank(r.severity), r.finding_id))
+        bucket.sort(key=lambda r: (severity_rank(r.severity), r.finding_id))
     return RoadmapSection(now=phases["now"], soon=phases["soon"], strategic=phases["strategic"])
 
 
@@ -963,7 +964,7 @@ def _build_exec(
     coverage_pct: Optional[int] = None,
     low_confidence: bool = False,
 ) -> ExecutiveSummary:
-    counts = {level: 0 for level in CVSS_ORDER}
+    counts = {level: 0 for level in SEVERITY_ORDER}
     for f in findings:
         counts[f.severity] = counts.get(f.severity, 0) + 1
     total = len(findings)
@@ -1121,8 +1122,18 @@ def _build_appendix(sle_cfg: SleConfig, weights: dict[str, float]) -> Appendix:
             "definition": "An entity ranked by the failed-minutes/issues/events it accounts for.",
         },
         {
-            "term": "CVSS ladder",
-            "definition": "Critical/High/Medium/Low/Info severity, mapped from P1/P2/P3.",
+            "term": "fail-min",
+            "definition": (
+                "One SLE fail-minute: a real client's minute that missed a service level's "
+                "pass/fail target. The raw unit behind SLE scores and the offender burden score."
+            ),
+        },
+        {
+            "term": "Severity ladder",
+            "definition": (
+                "Critical/High/Low, a direct rename of the app's P1/P2/P3; Info is "
+                "reserved for aggregated environmental context."
+            ),
         },
     ]
     return Appendix(

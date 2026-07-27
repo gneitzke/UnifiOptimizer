@@ -121,10 +121,24 @@ export function ClientsPage() {
       numeric: true,
       align: 'right',
       render: (c) => {
+        if (isWired(c)) {
+          return (
+            <span style={{ color: 'var(--fg-subtle)' }} title="Wired clients have no RF signal to measure">
+              n/a
+            </span>
+          );
+        }
         const v = sampleMap(c.metrics).get('rssi')?.value ?? null;
-        return <span style={{ color: v == null ? 'var(--fg-subtle)' : 'var(--fg)' }}>{v == null ? '—' : fmt(v, 0)}</span>;
+        return (
+          <span style={{ color: v == null ? 'var(--fg-subtle)' : 'var(--fg)' }} title={v == null ? 'No signal reading yet' : undefined}>
+            {v == null ? '—' : fmt(v, 0)}
+          </span>
+        );
       },
-      sortAccessor: (c) => sampleMap(c.metrics).get('rssi')?.value ?? -999,
+      // Wired rows sort as neither best nor worst signal -- below every real
+      // reading, above "no reading yet" (-999), so they cluster predictably
+      // rather than scattering to whichever end -999 would otherwise pin them.
+      sortAccessor: (c) => (isWired(c) ? -998 : sampleMap(c.metrics).get('rssi')?.value ?? -999),
     },
     {
       key: 'satisfaction',
@@ -139,14 +153,18 @@ export function ClientsPage() {
     },
     {
       key: 'roams',
-      header: 'Roams',
+      header: 'Roams (24h)',
       numeric: true,
       align: 'right',
-      render: (c) => {
-        const v = sampleMap(c.metrics).get('roam_count')?.value ?? null;
-        return <span style={{ color: v ? 'var(--fg)' : 'var(--fg-subtle)' }}>{v == null ? '—' : fmt(v, 0)}</span>;
-      },
-      sortAccessor: (c) => sampleMap(c.metrics).get('roam_count')?.value ?? -1,
+      render: (c) => (
+        <span
+          style={{ color: c.roam_count_24h > 0 ? 'var(--fg)' : 'var(--fg-subtle)' }}
+          title="AP-to-AP roam events in the last 24 hours; see Journey for the individual events"
+        >
+          {fmt(c.roam_count_24h, 0)}
+        </span>
+      ),
+      sortAccessor: (c) => c.roam_count_24h,
     },
     {
       key: 'issues',

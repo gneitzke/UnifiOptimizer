@@ -1,41 +1,34 @@
 /**
- * CVSS severity presentation for the report (docs/REPORT_SPEC.md §Severity
- * colours) — one colour system end to end: the scorecard chips, the findings
- * table, and any per-entity status all resolve here.
+ * Severity presentation for the report — the SAME taxonomy and colours as the
+ * app's `SeverityPill` (Gitea #22: these used to be two vocabularies, the
+ * app's P1/P2/P3 and the report's own five-level scale re-derived from
+ * measured impact, and they could disagree about the same finding). The
+ * report's words are a fixed rename — P1→critical, P2→high, P3→low — done
+ * once in the backend (`netadmin/report/severity.py`); `info` is reserved for
+ * the one aggregated environmental finding. One colour system end to end: the
+ * scorecard chips, the findings table, and any per-entity status all resolve
+ * here.
  *
- * The five levels map onto the design foundation's AA-verified severity ramp
- * (docs/DESIGN_FOUNDATION.md §Color tokens), which is monotonic and re-picked per
- * theme, so both light and dark are first-class and the ramp stays
- * distinguishable:
+ * Colours are identical to `SeverityPill`'s P1/P2/P3 (red/orange/amber), re-
+ * picked per theme per the design foundation's AA-verified severity ramp
+ * (docs/DESIGN_FOUNDATION.md §Color tokens):
  *
  *   critical → red     (--sev-p1)       light #D70015 / dark #FF6961
  *   high     → orange  (--sev-p2)       light #C93400 / dark #FFB340
- *   medium   → amber   (--sev-p3)       light #B25000 / dark #FFD426
- *   low      → green   (--sev-healthy)  light #1E7A34 / dark #30DB5B
+ *   low      → amber   (--sev-p3)       light #B25000 / dark #FFD426
  *   info     → grey    (--sev-neutral)  light #6E6E73 / dark #8E8E93
  *
- * This matches REPORT_SPEC's stated hexes for critical (#d70015), low (#1e7a34)
- * and info (grey), and its word "amber" for medium. REPORT_SPEC labels high as
- * "orange (#b25000)"; #b25000 is the ramp's amber (medium), so using it for high
- * would collide high and medium and break the ramp. High resolves to the truer
- * orange #C93400 the spec names, keeping the ramp readable and colour-blind-safe
- * (each level also carries a distinct shape glyph, never colour alone).
+ * Each level also carries a distinct shape glyph (octagon/triangle/circle/bar
+ * — matching `SeverityPill`'s glyphs for P1/P2/P3), never colour alone.
  */
 
 import type { Band, ReportSeverity } from './model';
 
-export const SEVERITY_ORDER: ReportSeverity[] = [
-  'critical',
-  'high',
-  'medium',
-  'low',
-  'info',
-];
+export const SEVERITY_ORDER: ReportSeverity[] = ['critical', 'high', 'low', 'info'];
 
 export const SEVERITY_LABEL: Record<ReportSeverity, string> = {
   critical: 'Critical',
   high: 'High',
-  medium: 'Medium',
   low: 'Low',
   info: 'Info',
 };
@@ -50,8 +43,7 @@ interface SeverityColors {
 export const SEVERITY_COLORS: Record<ReportSeverity, SeverityColors> = {
   critical: { color: 'var(--sev-p1)', fill: 'var(--sev-p1-fill)' },
   high: { color: 'var(--sev-p2)', fill: 'var(--sev-p2-fill)' },
-  medium: { color: 'var(--sev-p3)', fill: 'var(--sev-p3-fill)' },
-  low: { color: 'var(--sev-healthy)', fill: 'var(--sev-healthy-fill)' },
+  low: { color: 'var(--sev-p3)', fill: 'var(--sev-p3-fill)' },
   info: { color: 'var(--sev-neutral)', fill: 'var(--sev-neutral-fill)' },
 };
 

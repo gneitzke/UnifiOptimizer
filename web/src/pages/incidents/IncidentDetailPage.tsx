@@ -156,7 +156,11 @@ export function IncidentDetailPage() {
           ) : null}
           .
         </p>
-        <ProposedFix issueId={recommended_fix.issue_id} onChanged={reload} />
+        <ProposedFix
+          issueId={recommended_fix.issue_id}
+          issueState={root?.issue.state ?? 'active'}
+          onChanged={reload}
+        />
       </SectionCard>
 
       {/* Symptoms */}

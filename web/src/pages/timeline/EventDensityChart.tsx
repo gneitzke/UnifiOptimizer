@@ -1,6 +1,18 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
-import { clockLabel, fmt, linScale, niceYScale } from '../../components/ui';
+import { clockLabel, dayTimeLabel, fmt, linScale, niceYScale } from '../../components/ui';
 import type { Bucket } from './buckets';
+
+/** Whether two epoch-second instants fall on different local calendar days —
+ *  the 7D window can span several, so its axis/annotation labels need the
+ *  date; the 1H/6H/24H windows never do (Gitea #25: a bare "14:23" is
+ *  ambiguous once a value can be more than a day old). */
+function sameLocalDay(aTs: number, bTs: number): boolean {
+  const a = new Date(aTs * 1000);
+  const b = new Date(bTs * 1000);
+  return (
+    a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate()
+  );
+}
 
 /**
  * Hand-rolled SVG event-density chart (DESIGN_FOUNDATION §Charts — no chart
@@ -93,10 +105,14 @@ export function EventDensityChart({
 
   const active = hover ?? selected;
 
-  // Time labels: first, ~middle, last band start.
+  // Time labels: first, ~middle, last band start. A window whose buckets span
+  // more than one local calendar day (the 7D zoom) dates every label; shorter
+  // windows stay time-only.
   const first = buckets[0];
   const last = buckets[buckets.length - 1];
   const mid = buckets[Math.floor(buckets.length / 2)];
+  const spansMultipleDays = buckets.length > 0 && !sameLocalDay(first.t0, last.t0);
+  const timeLabel = spansMultipleDays ? dayTimeLabel : clockLabel;
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -324,7 +340,7 @@ export function EventDensityChart({
               className="tnum"
               style={{ fontSize: 11, fill: 'var(--fg-subtle)' }}
             >
-              {clockLabel(ann.t0)}
+              {timeLabel(ann.t0)}
             </text>
           </g>
         )}
@@ -343,7 +359,7 @@ export function EventDensityChart({
               className="tnum"
               style={{ fontSize: 11, fill: 'var(--fg-subtle)' }}
             >
-              {clockLabel(b.t0)}
+              {timeLabel(b.t0)}
             </text>
           );
         })}

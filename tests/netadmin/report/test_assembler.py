@@ -311,7 +311,7 @@ def test_correlated_issues_group_into_one_finding(seeded, repo) -> None:
     assert mesh["incident_id"] == seeded["incident"]
     assert len(mesh["symptoms"]) == 2
     assert set(mesh["source_issue_ids"]) == {seeded["mesh"], seeded["cov"], seeded["flaky"]}
-    # P2 with 10 failed client-minutes attributed to the AP -> High, one client.
+    # P2 root -> High (a fixed rename, independent of the 10 failed client-minutes).
     assert mesh["severity"] == "high"
     assert mesh["impact"]["fail_minutes"] == 10.0
     assert mesh["impact"]["affected_clients"] == 1
@@ -358,7 +358,7 @@ def test_pending_issue_is_excluded(seeded, repo) -> None:
 
 def test_three_findings_and_stable_ids(seeded, repo) -> None:
     doc = report_to_dict(_report(repo))
-    # mesh incident (High), bad_cable solo (Medium), environmental (Low).
+    # mesh incident (P2 -> High), bad_cable solo (P2 -> High), environmental (Info).
     assert len(doc["findings"]) == 3
     ids = [f["id"] for f in doc["findings"]]
     assert ids == ["WLAN-01", "LAN-01", "ENV-01"]
@@ -368,7 +368,7 @@ def test_findings_template_is_complete(seeded, repo) -> None:
     doc = report_to_dict(_report(repo))
     for f in doc["findings"]:
         assert f["id"] and f["title"]
-        assert f["severity"] in ("critical", "high", "medium", "low", "info")
+        assert f["severity"] in ("critical", "high", "low", "info")
         assert f["affected_assets"]  # at least one asset
         assert f["observation"].strip()
         assert isinstance(f["evidence"], dict)
@@ -380,15 +380,26 @@ def test_findings_template_is_complete(seeded, repo) -> None:
 
 
 def test_roadmap_phases_trace_to_findings(seeded, repo) -> None:
+    # The base fixture has no P1, so add one standalone critical fault to
+    # exercise all three phases in one report.
+    repo.insert_issue(
+        fingerprint="fp-gw-down",
+        detector_key="wan.gateway_down",
+        severity="p1",
+        state="active",
+        first_seen_ts=BUCKET,
+        last_seen_ts=SEEN,
+        title="Gateway lost its internet uplink",
+    )
     doc = report_to_dict(_report(repo))
     finding_ids = {f["id"] for f in doc["findings"]}
     for phase in ("now", "soon", "strategic"):
         for rec in doc["roadmap"][phase]:
             assert rec["finding_id"] in finding_ids
             assert rec["text"].strip()
-    # High -> now, Medium -> soon, Low -> strategic.
-    assert [r["finding_id"] for r in doc["roadmap"]["now"]] == ["WLAN-01"]
-    assert [r["finding_id"] for r in doc["roadmap"]["soon"]] == ["LAN-01"]
+    # Critical -> now, High -> soon, Info -> strategic.
+    assert [r["finding_id"] for r in doc["roadmap"]["now"]] == ["WAN-01"]
+    assert [r["finding_id"] for r in doc["roadmap"]["soon"]] == ["LAN-01", "WLAN-01"]
     assert [r["finding_id"] for r in doc["roadmap"]["strategic"]] == ["ENV-01"]
 
 

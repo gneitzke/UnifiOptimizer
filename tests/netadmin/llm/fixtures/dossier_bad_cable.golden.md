@@ -80,7 +80,7 @@ Inventory: 1 ap, 1 port, 1 switch.
 
 - **Signature:** rx_errors delta rate > 10/min sustained or > 0.001% of packets; OR a gigabit-capable peer negotiated at 10/100 (broken-pair downshift).
 - **Confounders to rule out:** Known 100 Mbps device classes; counter age (a stale cumulative counter); an unmanaged-switch hop hiding the real port.
-- **Fix guidance:** Reseat then replace the patch cable; re-test the run. On an uplink port this is P1 — the whole segment rides it.
+- **Fix guidance:** Reseat then replace the patch cable; re-test the run. On an uplink port this is P1: the whole segment rides it.
 
 ## STRUCTURED QUESTIONS
 

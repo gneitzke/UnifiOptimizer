@@ -404,6 +404,13 @@ def map_device(device: Device, ts: int, *, site_id: str = "default") -> Mapping:
     if device.system_stats:
         _emit(samples, dev_ref, "cpu", device.system_stats.get("cpu"))
         _emit(samples, dev_ref, "mem", device.system_stats.get("mem"))
+    # Device-level client load: parsed onto the model (satisfaction) or added to
+    # it (num_sta) but never emitted -- an AP's own rollup (the devices list, its
+    # detail page's chart) read these at device granularity and always saw
+    # nothing, even though the controller reports both here in addition to each
+    # radio's own per-band figures (Gitea #23).
+    _emit(samples, dev_ref, "satisfaction", device.satisfaction)
+    _emit(samples, dev_ref, "num_sta", device.num_sta)
 
     # Chassis temperature. The controller reports it at the device **top level**
     # (``general_temperature``); ``system-stats`` is only a fallback for firmware

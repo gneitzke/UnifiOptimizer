@@ -30,6 +30,7 @@ class EventKind:
 
     DETECTED = "detected"
     ESCALATED = "escalated"
+    RESOLVING = "resolving"
     ACKED = "acked"
     SNOOZED = "snoozed"
     FIX_PROPOSED = "fix_proposed"

@@ -3,13 +3,16 @@ import { SEVERITY_COLORS, SEVERITY_LABEL } from '../severity';
 import { cn } from '../../../components/ui/cn';
 
 /**
- * CVSS severity chip (docs/REPORT_SPEC.md §Severity colours) — the one severity
- * presentation used in the scorecard and the findings table. Colour never stands
- * alone: each level carries a distinct shape glyph so it survives colour-blindness
- * and greyscale printing (docs/DESIGN_FOUNDATION.md never-do rule 2).
+ * Severity chip (docs/REPORT_SPEC.md §Severity ladder) — the one severity
+ * presentation used in the scorecard and the findings table, matching the
+ * app's `SeverityPill` shapes exactly (P1 octagon, P2 triangle, P3 circle) so
+ * a Critical chip here and a P1 pill in the issues list read as the same
+ * severity. Colour never stands alone: each level carries a distinct shape
+ * glyph so it survives colour-blindness and greyscale printing
+ * (docs/DESIGN_FOUNDATION.md never-do rule 2).
  */
 
-/** The shape alone, filled with currentColor. Five distinct silhouettes. */
+/** The shape alone, filled with currentColor. */
 export function SeverityGlyph({
   severity,
   size = 11,
@@ -36,9 +39,6 @@ export function SeverityGlyph({
       )}
       {severity === 'high' && (
         <polygon points="6,0.5 11.7,11.2 0.3,11.2" fill="currentColor" />
-      )}
-      {severity === 'medium' && (
-        <polygon points="6,0 12,6 6,12 0,6" fill="currentColor" />
       )}
       {severity === 'low' && <circle cx="6" cy="6" r="4.6" fill="currentColor" />}
       {severity === 'info' && (

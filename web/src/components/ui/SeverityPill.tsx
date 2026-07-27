@@ -8,12 +8,18 @@ import { cn } from './cn';
  *   (never-do rule 2).
  * - Mid/low urgency = tinted text/icon on a neutral tint (10%/16% per theme).
  * - Solid fill is reserved for P1 only (the highest-urgency smallest element).
+ *
+ * Labels read the same word the exported report uses for the same severity
+ * (Gitea #22: P1/P2/P3 in the app vs. Critical/High/Medium/Low/Info in the
+ * report used to be two vocabularies with a lossy mapping between them — the
+ * same P1 could render as "High" in the report). Both surfaces now speak one
+ * ladder: P1 = Critical, P2 = High, P3 = Low.
  */
 
 const META: Record<Severity, { label: string; color: string; fill: string }> = {
-  p1: { label: 'P1', color: 'var(--sev-p1)', fill: 'var(--sev-p1-fill)' },
-  p2: { label: 'P2', color: 'var(--sev-p2)', fill: 'var(--sev-p2-fill)' },
-  p3: { label: 'P3', color: 'var(--sev-p3)', fill: 'var(--sev-p3-fill)' },
+  p1: { label: 'Critical', color: 'var(--sev-p1)', fill: 'var(--sev-p1-fill)' },
+  p2: { label: 'High', color: 'var(--sev-p2)', fill: 'var(--sev-p2-fill)' },
+  p3: { label: 'Low', color: 'var(--sev-p3)', fill: 'var(--sev-p3-fill)' },
 };
 
 /** The shape glyph alone (filled with currentColor). Reusable in table cells. */
