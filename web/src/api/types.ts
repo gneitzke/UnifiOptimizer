@@ -30,6 +30,10 @@ export interface EntityRef {
   type: EntityType | string | null;
   native_id: string | null;
   model: string | null;
+  /** The device a structural child belongs to (a port's switch, a radio's AP),
+   * null for a top-level entity. */
+  parent_id: number | null;
+  parent_name: string | null;
 }
 
 /* ---- Issues ------------------------------------------------------------- */

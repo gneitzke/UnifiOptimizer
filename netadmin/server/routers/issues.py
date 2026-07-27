@@ -37,10 +37,16 @@ from netadmin.llm.provider import ProviderError, ProviderUnavailableError, avail
 from netadmin.logging import get_logger
 from netadmin.server.auth import extract_bearer, token_matches
 from netadmin.server.serialize import decode_json, entity_ref_map, get_store
-from netadmin.store.repository import Repository
+from netadmin.store.repository import SLE_ATTRIBUTED_ENTITY_TYPES, Repository
 
 router = APIRouter(prefix="/api", tags=["issues"])
 _log = get_logger("server.routers.issues")
+
+# How far back an issue's impact figure looks. Matches the offenders leaderboard
+# window (``netadmin.analytics.offenders``) so the two surfaces can never quote
+# different fail-minute totals for the same recent grief, and bounds the
+# ``sle_minutes`` scan to a day of buckets however old the issue itself is.
+IMPACT_WINDOW_S = 86_400
 
 
 def _engine(request: Request, store: Repository) -> IssueEngine:
@@ -73,6 +79,69 @@ def _event_dict(row: sqlite3.Row) -> dict[str, Any]:
     data = dict(row)
     data["detail"] = decode_json(data.get("detail"), {})
     return data
+
+
+def _impact_basis(ref: Optional[dict[str, Any]]) -> Optional[str]:
+    """Which side of the SLE ledger an issue's entity sits on, or None.
+
+    ``"own"`` for a client (the failed minutes are its own), ``"attributed"``
+    for the infrastructure a failed minute gets pinned on. None means the SLE
+    engine records nothing against this kind of entity at all -- a port, a WLAN,
+    the site-wide RF pseudo-entity, or an issue with no entity — so there is no
+    fail-minute figure to quote. That is deliberately **not** the same answer as
+    zero, and the payload keeps them apart.
+    """
+    if ref is None:
+        return None
+    etype = ref.get("type")
+    if etype not in SLE_ATTRIBUTED_ENTITY_TYPES:
+        return None
+    return "own" if etype == "client" else "attributed"
+
+
+def _impact(
+    row: sqlite3.Row,
+    ref: Optional[dict[str, Any]],
+    fail_minutes: dict[int, float],
+    span: Optional[tuple[int, int]],
+    window_start: int,
+    window_end: int,
+) -> dict[str, Any]:
+    """One issue's impact block: what it has cost, or why that is unknown.
+
+    ``measured`` is the whole point. An issue can carry no number for three
+    honest reasons -- its entity is one the SLE engine never scores
+    (:func:`_impact_basis`), its open window does not reach into the impact
+    window at all (resolved before it opened), or the engine produced no
+    judgement in the overlap (fresh install, daemon was down, backfill still
+    running). In every one of those cases ``fail_minutes`` is **null**, never
+    ``0.0``: a zero here means "the window was judged and nothing failed", and a
+    UI that cannot tell the two apart will report an unmeasured outage as
+    harmless.
+    """
+    basis = _impact_basis(ref)
+    unmeasured: dict[str, Any] = {
+        "window_s": window_end - window_start,
+        "basis": basis,
+        "measured": False,
+        "fail_minutes": None,
+    }
+    if basis is None or span is None:
+        return unmeasured
+    # The issue's own life, clipped to the impact window — the same clipping
+    # Repository.issue_fail_minutes applies to the buckets it sums.
+    start = max(int(row["first_seen_ts"]), window_start)
+    resolved = row["resolved_ts"]
+    end = min(int(resolved), window_end) if resolved is not None else window_end
+    lo, hi = span
+    if start >= end or start > hi or end <= lo:
+        return unmeasured
+    return {
+        "window_s": window_end - window_start,
+        "basis": basis,
+        "measured": True,
+        "fail_minutes": round(fail_minutes.get(int(row["id"]), 0.0), 1),
+    }
 
 
 class SnoozeBody(BaseModel):
@@ -170,7 +239,11 @@ async def list_issues(
 
     ``state`` / ``severity`` are enum-validated by FastAPI (bad value -> 422).
     Each issue's owning entity is resolved to a ``{entity_id, name, type, ...}``
-    ref so the list can show names, not numeric ids.
+    ref so the list can show names, not numeric ids, and each carries an
+    ``impact`` block — the failed SLE client-minutes it accounts for over the
+    last :data:`IMPACT_WINDOW_S`, or an explicit "not measured" (see
+    :func:`_impact`). That figure is the column the list is read by, so it is
+    computed here rather than left to the client to guess at.
     """
     store = get_store(request)
     rows = store.list_issues(
@@ -182,11 +255,18 @@ async def list_issues(
     # Incident membership (section 17) is a join on the read model, never a stored
     # column — so issue lifecycle stays untouched. One batched query for the set.
     incidents = store.incident_brief_for_issues([r["id"] for r in rows])
+    window_end = int(time.time())
+    window_start = window_end - IMPACT_WINDOW_S
+    fail_minutes = store.issue_fail_minutes(
+        [r["id"] for r in rows], start_ts=window_start, end_ts=window_end
+    )
+    span = store.sle_minutes_span(window_start, window_end)
     issues = []
     for r in rows:
         item = _issue_dict(r)
         eid = r["entity_id"]
         item["entity"] = refs.get(int(eid)) if eid is not None else None
+        item["impact"] = _impact(r, item["entity"], fail_minutes, span, window_start, window_end)
         inc = incidents.get(int(r["id"]))
         item["incident_id"] = int(inc["incident_id"]) if inc is not None else None
         item["incident_role"] = inc["incident_role"] if inc is not None else None
@@ -244,6 +324,21 @@ async def get_issue(request: Request, issue_id: int) -> dict[str, Any]:
     )
     issue["incident_id"] = incident["id"] if incident else None
     issue["incident_role"] = incident["role"] if incident else None
+    # Also inside the issue object, not just beside it: the list's issues carry
+    # their own `entity`, and anything reading an issue from either endpoint
+    # (the impact figure below, the client's shared IssueRow type) would
+    # otherwise have to know which of the two shapes it was handed.
+    issue["entity"] = entity
+    window_end = int(time.time())
+    window_start = window_end - IMPACT_WINDOW_S
+    issue["impact"] = _impact(
+        row,
+        entity,
+        store.issue_fail_minutes([issue_id], start_ts=window_start, end_ts=window_end),
+        store.sle_minutes_span(window_start, window_end),
+        window_start,
+        window_end,
+    )
     evidence_layout, confounder_notes = _presentation(issue["detector_key"], evidence, confounders)
     return {
         "issue": issue,

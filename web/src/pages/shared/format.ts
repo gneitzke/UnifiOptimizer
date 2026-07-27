@@ -6,7 +6,7 @@
  */
 
 import type { IssueState, Severity } from '../../api/types';
-import type { IssueRow } from './api';
+import type { IssueImpact, IssueRow } from './api';
 
 /** Definition surfaced (as a hover tooltip) everywhere the raw "fail-min" unit
  *  appears without context: the dashboard offenders list, the SLE "Why"
@@ -64,6 +64,90 @@ export function issueDurationSeconds(issue: IssueRow, nowSec: number): number {
 export function ongoingLabel(issue: IssueRow, nowSec: number): string {
   const dur = formatDuration(issueDurationSeconds(issue, nowSec));
   return issue.state === 'resolved' ? `lasted ${dur}` : `ongoing ${dur}`;
+}
+
+/* ---- Issue impact (the Issues list's Impact column, Gitea #24) ----------- */
+
+/** What the Impact column measures, as a sentence — the column header's hover
+ *  text. The window is left to each figure's own tooltip (it comes from the
+ *  payload, so the header cannot state it without going stale); what the header
+ *  owes the reader is the unit and the dash rule. */
+export const ISSUE_IMPACT_DEFINITION =
+  'Failed SLE client-minutes this issue accounts for — real minutes real clients spent degraded while it was open. A dash means nothing was measured, which is not the same as zero.';
+
+/** The impact window as prose. Hours, not `formatDurationLong`'s "1 day": the
+ *  sentences read "within the last 24 hours", which is how an operator thinks
+ *  about a measurement window, and "the last 1 day" is not English. */
+function impactWindowLabel(seconds: number): string {
+  const hours = Math.round(seconds / 3600);
+  return hours === 1 ? '1 hour' : `${hours} hours`;
+}
+
+/** Fail-minutes as display text. Precision follows what the number can carry: a
+ *  large total rounds to whole minutes (a tenth of a minute is noise against
+ *  it), a small one keeps its decimal so a real-but-small cost does not round
+ *  away to a zero it would then be mistaken for. */
+export function formatFailMinutes(minutes: number): string {
+  if (minutes <= 0) return '0';
+  if (minutes < 0.05) return '<0.1';
+  if (minutes < 10) return String(Math.round(minutes * 10) / 10);
+  return Math.round(minutes).toLocaleString();
+}
+
+export interface ImpactDisplay {
+  /** The figure as text, or null when nothing was measured — in which case the
+   *  caller renders a dash. Never a stand-in zero. */
+  text: string | null;
+  /** True only for a real, measured zero, so it can read quieter than a cost. */
+  zero: boolean;
+  /** The sentence that qualifies the figure, or explains its absence. */
+  note: string;
+}
+
+/** An issue's impact as the list column and the detail page both show it.
+ *
+ *  One function so the two surfaces cannot drift, and so every "no figure"
+ *  branch is forced to say *why*. "Nothing was measured" and "it was measured
+ *  and cost nobody anything" are different facts; presenting the first as the
+ *  second would let an unwatched outage read as harmless. */
+export function impactDisplay(issue: IssueRow, nowSec: number): ImpactDisplay {
+  const impact: IssueImpact | null | undefined = issue.impact;
+  const absent = (note: string): ImpactDisplay => ({ text: null, zero: false, note });
+
+  if (!impact) return absent('This daemon did not report an impact figure for this issue.');
+  if (!issue.entity) {
+    return absent('Network-wide: there is no entity to attribute failed client-minutes to.');
+  }
+  if (impact.basis === null) {
+    const what =
+      issue.entity.type === 'port'
+        ? 'a port'
+        : issue.entity.type === 'wlan'
+          ? 'a WLAN'
+          : 'this kind of entity';
+    return absent(
+      `Failed client-minutes are never recorded against ${what}, so this issue has no figure of its own.`,
+    );
+  }
+  if (!impact.measured || impact.fail_minutes == null) {
+    if (issue.resolved_ts != null && issue.resolved_ts <= nowSec - impact.window_s) {
+      return absent(
+        `This issue closed before the last ${impactWindowLabel(impact.window_s)} began, so none of its life falls in the measured window.`,
+      );
+    }
+    return absent('No SLE measurements cover the hours this issue was open.');
+  }
+
+  const zero = impact.fail_minutes === 0;
+  return {
+    text: formatFailMinutes(impact.fail_minutes),
+    zero,
+    note: zero
+      ? 'Measured over the window: no failed client-minutes are attributed to this issue.'
+      : impact.basis === 'own'
+        ? `This client's own failed SLE minutes over the hours this issue was open, within the last ${impactWindowLabel(impact.window_s)}.`
+        : `Failed SLE client-minutes attributed to this entity over the hours this issue was open, within the last ${impactWindowLabel(impact.window_s)}.`,
+  };
 }
 
 /** Sort key: most severe first (p1 < p2 < p3). */

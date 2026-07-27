@@ -21,12 +21,32 @@ import type { Severity } from '../../api/types';
  * filter; j/k + Enter traverse and open rows.
  */
 
+/**
+ * The state filter, read off the lifecycle itself (§7: pending -> active ->
+ * resolving -> resolved). "Open" and "Active" are not the same set and never
+ * were — Open is everything not resolved, Active is only the confirmed,
+ * still-firing middle of that — but two bare labels, one of which is a subset of
+ * the other, gave a reader no way to know that (Gitea #24). So the subset says
+ * it is one, and every option carries the states it actually matches.
+ */
 type StateFilter = 'open' | 'active' | 'resolved' | 'all';
-const STATE_OPTIONS: { value: StateFilter; label: string }[] = [
-  { value: 'open', label: 'Open' },
-  { value: 'active', label: 'Active' },
-  { value: 'resolved', label: 'Resolved' },
-  { value: 'all', label: 'All' },
+const STATE_OPTIONS: { value: StateFilter; label: string; hint: string }[] = [
+  {
+    value: 'open',
+    label: 'Open',
+    hint: 'Everything not resolved: pending, active and resolving issues.',
+  },
+  {
+    value: 'active',
+    label: 'Active only',
+    hint: 'The confirmed, still-firing subset of Open. Excludes pending (not yet confirmed) and resolving (clearing).',
+  },
+  {
+    value: 'resolved',
+    label: 'Resolved',
+    hint: 'Closed after the detector reported the condition clear for enough consecutive cycles.',
+  },
+  { value: 'all', label: 'All', hint: 'Every issue, resolved history included.' },
 ];
 const SEV_OPTIONS: { value: '' | Severity; label: string }[] = [
   { value: '', label: 'All severities' },
@@ -257,8 +277,10 @@ export function IssuesPage() {
                 <button
                   key={o.value}
                   type="button"
+                  aria-pressed={active}
+                  title={o.hint}
                   onClick={() => patch({ state: o.value === 'open' ? null : o.value })}
-                  className="h-8 px-2.5 t-caption cursor-pointer transition-colors"
+                  className="h-8 px-2.5 t-caption cursor-pointer transition-colors whitespace-nowrap"
                   style={{
                     background: active ? 'var(--accent)' : 'transparent',
                     color: active ? 'var(--accent-fg)' : 'var(--fg-muted)',

@@ -31,14 +31,27 @@ export interface EntityRef {
   type: EntityType | string | null;
   native_id: string | null;
   model: string | null;
+  /** The device a structural child belongs to — a port's switch, a radio's AP.
+   * Null for a top-level entity. */
+  parent_id: number | null;
+  parent_name: string | null;
 }
 
-/** Which detail route an entity ref links to, or null when it has no own page. */
+/** Which detail route an entity ref links to, or null when it has no own page.
+ *
+ * A radio and a port have no page of their own, but they are not orphans: the
+ * device detail page is where their card / table row actually lives, so they
+ * link there rather than sitting as dead plain text next to linked APs and
+ * clients. A WLAN (and the site-wide RF pseudo-entity) has neither a page nor a
+ * parent device, so it stays text — the one honest exception. */
 export function entityHref(ref: EntityRef | null | undefined): string | null {
   if (!ref) return null;
   const t = ref.type;
   if (t === 'ap' || t === 'switch' || t === 'gateway') return `/devices/${ref.entity_id}`;
   if (t === 'client') return `/clients/${ref.entity_id}`;
+  if ((t === 'radio' || t === 'port') && ref.parent_id != null) {
+    return `/devices/${ref.parent_id}`;
+  }
   return null;
 }
 
@@ -50,6 +63,28 @@ export function entityLabel(ref: EntityRef | null | undefined): string {
 /* ---- Issues ------------------------------------------------------------- */
 
 export type IncidentRole = 'root' | 'symptom';
+
+/** Which side of the SLE ledger an issue's entity sits on. `attributed` — the
+ * failed client-minutes the engine pins on this AP/switch/gateway/radio;
+ * `own` — a client's own failed minutes; `null` — the engine records nothing
+ * against this kind of entity (a port, a WLAN, a network-wide issue), so there
+ * is no figure to quote. */
+export type ImpactBasis = 'attributed' | 'own';
+
+/** What an issue has cost, or an explicit statement that nobody knows.
+ *
+ * `measured: false` always comes with `fail_minutes: null`, never `0` — a zero
+ * here means "the window was judged and nothing failed", and an unmeasured
+ * outage rendered as a zero would read as harmless. Source of truth:
+ * `netadmin/server/routers/issues.py::_impact`. */
+export interface IssueImpact {
+  /** How far back the figure looks, in seconds (the API uses 24 h). */
+  window_s: number;
+  basis: ImpactBasis | null;
+  measured: boolean;
+  /** Failed SLE client-minutes, counted only while the issue was open. */
+  fail_minutes: number | null;
+}
 
 export interface IssueRow {
   id: number;
@@ -70,6 +105,9 @@ export interface IssueRow {
   evidence: Record<string, unknown>;
   fix_state: FixState | null;
   reopened_from: number | null;
+  /** Optional so a UI ahead of its daemon degrades to "not measured" rather
+   * than crashing on an older `/api/issues` payload. */
+  impact?: IssueImpact | null;
   /** Incident membership (section 17) — a join on the read model, so an issue's
    * own lifecycle is untouched. Null when the issue is in no open incident. */
   incident_id?: number | null;

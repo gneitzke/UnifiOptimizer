@@ -10,7 +10,12 @@ import { Skeleton } from '../../components/ui/Skeleton';
 import { RelativeTime } from '../../components/ui/RelativeTime';
 import { useWsFrames } from '../../api/WsProvider';
 import { EntityLink } from '../shared/EntityLink';
-import { formatDurationLong, humanizeKey, issueDurationSeconds } from '../shared/format';
+import {
+  formatDurationLong,
+  humanizeKey,
+  impactDisplay,
+  issueDurationSeconds,
+} from '../shared/format';
 import { ackIssue, getIssue, snoozeIssue } from '../shared/api';
 import { usePageAsync, useNowSeconds } from '../shared/hooks';
 import { EvidenceView } from './EvidenceView';
@@ -127,6 +132,7 @@ export function IssueDetailPage() {
   const { issue, entity, evidence, evidence_layout, confounders, confounder_notes, events, incident } =
     data;
   const durSecs = issueDurationSeconds(issue, now);
+  const impact = impactDisplay(issue, now);
   const snoozed = issue.snooze_until_ts != null && issue.snooze_until_ts > now;
   const hints = metricHintsForIssue(issue);
   const isOpen = issue.state !== 'resolved';
@@ -261,6 +267,24 @@ export function IssueDetailPage() {
         >
           <MetaItem label="Entity">
             {entity ? <EntityLink entity={entity} /> : <span style={{ color: 'var(--fg-subtle)' }}>network-wide</span>}
+          </MetaItem>
+          {/* The figure the Issues list is read by, repeated here with the
+              sentence that qualifies it — otherwise the column is a number the
+              reader can click on and learn nothing more about. */}
+          <MetaItem label="Impact">
+            {impact.text === null ? (
+              <span style={{ color: 'var(--fg-subtle)' }} title={impact.note}>
+                <span aria-hidden>—</span>
+                <span className="sr-only">{impact.note}</span>
+              </span>
+            ) : (
+              <span className="tnum" title={impact.note} style={{ color: impact.zero ? 'var(--fg-muted)' : 'var(--fg)' }}>
+                {impact.text}
+                <span className="t-micro" style={{ color: 'var(--fg-subtle)' }}>
+                  {' fail-min'}
+                </span>
+              </span>
+            )}
           </MetaItem>
           <MetaItem label="Detector">
             <code className="t-caption" style={{ color: 'var(--fg-muted)' }}>

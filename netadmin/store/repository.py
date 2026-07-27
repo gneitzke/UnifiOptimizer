@@ -49,10 +49,27 @@ __all__ = [
     "Repository",
     "HOUR_SECONDS",
     "DAY_SECONDS",
+    "SLE_ATTRIBUTED_ENTITY_TYPES",
 ]
 
 HOUR_SECONDS = 3600
 DAY_SECONDS = 86400
+
+# Entity types a failed SLE minute can be traced to at all (section 8). A client
+# owns its own failed minutes (``sle_minutes.entity_id``); an AP, switch,
+# gateway or radio is what the engine pins them on
+# (``sle_minutes.attributed_entity_id``). Nothing is ever recorded against a
+# port or a WLAN, so an issue on one of those has no fail-minute figure -- which
+# is a different statement from "it cost nothing", and callers must keep the two
+# apart. Used by :meth:`Repository.issue_fail_minutes` and by the issues router,
+# which reads the same tuple rather than repeating the list.
+SLE_ATTRIBUTED_ENTITY_TYPES = (
+    EntityType.CLIENT.value,
+    EntityType.AP.value,
+    EntityType.SWITCH.value,
+    EntityType.GATEWAY.value,
+    EntityType.RADIO.value,
+)
 
 
 def _now() -> int:
@@ -1487,6 +1504,84 @@ class Repository:
             (start_ts, end_ts),
         ).fetchall()
         return {int(r["eid"]): float(r["m"] or 0.0) for r in rows}
+
+    def sle_minutes_span(self, start_ts: int, end_ts: int) -> Optional[tuple[int, int]]:
+        """First and last ``sle_minutes`` bucket inside ``[start_ts, end_ts)``, or None.
+
+        The exposure probe behind every "not measured" answer: a caller asking
+        what a window cost cannot tell an honest zero (the SLE engine judged the
+        window and found nothing wrong) from a measurement gap (the engine never
+        judged it at all -- fresh install, stopped daemon, backfill still
+        running) without knowing whether the window holds any judgement at all.
+        Two index seeks on the ``bucket_ts``-leading primary key, so it stays
+        cheap on a table with a month of buckets in it.
+        """
+        row = self._conn.execute(
+            "SELECT MIN(bucket_ts) AS lo, MAX(bucket_ts) AS hi FROM sle_minutes "
+            "WHERE bucket_ts>=? AND bucket_ts<?",
+            (start_ts, end_ts),
+        ).fetchone()
+        if row is None or row["lo"] is None:
+            return None
+        return int(row["lo"]), int(row["hi"])
+
+    def issue_fail_minutes(
+        self, issue_ids: Iterable[int], *, start_ts: int, end_ts: int
+    ) -> dict[int, float]:
+        """Failed SLE client-minutes each issue accounts for in ``[start_ts, end_ts)``.
+
+        The per-issue form of :meth:`sle_fail_minutes_by_attributed`, and the
+        number the issue list is ranked and read by. Two things make it an
+        *issue's* impact rather than its entity's:
+
+        * **Clipped to the issue's own life.** Only buckets in
+          ``[first_seen_ts, resolved_ts or end_ts)`` count, so an issue opened an
+          hour ago is never charged with a day of its AP's grief, and one
+          resolved before the window opened returns nothing at all (absent from
+          the result -- never a zero, which would read as "cost nobody
+          anything").
+        * **Blame follows what the SLE engine can actually pin.** For an issue
+          on infrastructure the minutes are the ones *attributed* to it
+          (``attributed_entity_id``); for an issue on a client they are that
+          client's *own* failed minutes (``entity_id``). The engine never
+          attributes to a port or a WLAN, so issues on those entity types are
+          absent here rather than reported as zero -- see
+          :data:`SLE_ATTRIBUTED_ENTITY_TYPES`.
+
+        ``[start_ts, end_ts)`` bounds the ``sle_minutes`` scan; pass a recent
+        window (the API uses 24 h) rather than all of history, since the table
+        holds every bucket the daemon has ever computed.
+        """
+        ids = [int(i) for i in dict.fromkeys(issue_ids)]
+        if not ids:
+            return {}
+        id_places = ",".join("?" for _ in ids)
+        type_places = ",".join("?" for _ in SLE_ATTRIBUTED_ENTITY_TYPES)
+        rows = self._conn.execute(
+            "SELECT i.id AS issue_id, SUM(m.minutes) AS m "
+            "FROM issues i "
+            "JOIN entities e ON e.entity_id = i.entity_id "
+            "JOIN sle_minutes m "
+            "  ON m.bucket_ts >= i.first_seen_ts "
+            " AND m.bucket_ts < COALESCE(i.resolved_ts, ?) "
+            " AND ((e.entity_type = ? AND m.entity_id = i.entity_id) "
+            "   OR (e.entity_type != ? AND m.attributed_entity_id = i.entity_id)) "
+            f"WHERE i.id IN ({id_places}) "
+            f"  AND e.entity_type IN ({type_places}) "
+            "  AND m.classifier != 'ok' "
+            "  AND m.bucket_ts >= ? AND m.bucket_ts < ? "
+            "GROUP BY i.id",
+            (
+                end_ts,
+                EntityType.CLIENT.value,
+                EntityType.CLIENT.value,
+                *ids,
+                *SLE_ATTRIBUTED_ENTITY_TYPES,
+                start_ts,
+                end_ts,
+            ),
+        ).fetchall()
+        return {int(r["issue_id"]): float(r["m"] or 0.0) for r in rows}
 
     def event_counts_by_entity(
         self, start_ts: int, end_ts: int, keys: Sequence[str]

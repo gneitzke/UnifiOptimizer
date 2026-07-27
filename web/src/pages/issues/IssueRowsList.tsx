@@ -7,7 +7,12 @@ import { RelativeTime } from '../../components/ui/RelativeTime';
 import { useListNavigation } from '../../layout/keyboard/useListNavigation';
 import { EntityLink } from '../shared/EntityLink';
 import type { IssueRow } from '../shared/api';
-import { formatDuration, ongoingLabel } from '../shared/format';
+import {
+  ISSUE_IMPACT_DEFINITION,
+  formatDuration,
+  impactDisplay,
+  ongoingLabel,
+} from '../shared/format';
 import type { Severity } from '../../api/types';
 
 /**
@@ -26,6 +31,13 @@ import type { Severity } from '../../api/types';
  * ever needs — see IssuesPage), and a heterogeneous row set breaks a generic
  * per-column sortAccessor cleanly. j/k + Enter traversal is preserved via the
  * same primitive DataTable uses.
+ *
+ * Columns (Gitea #24): the detector id no longer holds a wide monospace column
+ * here — it is an implementation handle, it is on the detail page, and it was
+ * spending width that the title needed. What sits there now is Impact, the
+ * failed-client-minute figure this product exists to compute; a list that
+ * scores issues by user impact and then does not show it buries its own point.
+ * The reclaimed width went to the title, which was truncating mid-phrase.
  */
 
 export interface IssueGroup {
@@ -39,7 +51,15 @@ export interface IssueGroup {
 
 export type DisplayRow = { kind: 'issue'; issue: IssueRow } | { kind: 'group'; group: IssueGroup };
 
-const COLS = '56px 100px minmax(220px,2.2fr) minmax(120px,1fr) minmax(130px,1fr) 120px 100px 96px';
+// Sev / State / Issue / Entity / Impact / Duration / Last seen / expander.
+// Sev is 72px because the widest pill ("Critical") is 68px and was spilling
+// under the State pill next to it.
+const COLS = '72px 100px minmax(280px,3fr) minmax(130px,1.15fr) 104px 140px 84px 96px';
+/** Below this the columns would start crushing each other, so the list scrolls
+ *  inside its own container rather than pushing the page sideways. Kept under
+ *  1012px, which is what the page's own max-width leaves at a 1280px viewport:
+ *  a laptop should read this table without a scrollbar at all. */
+const MIN_TABLE_WIDTH = 1006;
 
 export function IssueRowsList({ rows, now }: { rows: DisplayRow[]; now: number }) {
   const navigate = useNavigate();
@@ -61,7 +81,7 @@ export function IssueRowsList({ rows, now }: { rows: DisplayRow[]; now: number }
       role={nav.containerProps.role}
       onKeyDown={nav.containerProps.onKeyDown}
     >
-      <div style={{ minWidth: 960 }}>
+      <div style={{ minWidth: MIN_TABLE_WIDTH }}>
         <div
           className="grid px-3 h-9 items-center t-label font-medium"
           style={{
@@ -74,7 +94,9 @@ export function IssueRowsList({ rows, now }: { rows: DisplayRow[]; now: number }
           <span>State</span>
           <span>Issue</span>
           <span>Entity</span>
-          <span>Detector</span>
+          <span className="text-right" title={ISSUE_IMPACT_DEFINITION}>
+            Impact
+          </span>
           <span className="text-right">Duration</span>
           <span className="text-right">Last seen</span>
           <span />
@@ -121,6 +143,45 @@ function EntityCell({ entity }: { entity: IssueRow['entity'] }) {
   return <EntityLink entity={entity} className="truncate" />;
 }
 
+/**
+ * The Impact figure, or a dash that says why there isn't one.
+ *
+ * The dash is load-bearing: the unmeasured case never renders a number, and its
+ * reason rides along as hover text *and* as screen-reader text rather than
+ * being left for the reader to infer from an em dash.
+ */
+function ImpactCell({ issue, now }: { issue: IssueRow; now: number }) {
+  const { text, zero, note } = impactDisplay(issue, now);
+
+  if (text === null) {
+    // `relative` is load-bearing: sr-only is absolutely positioned, and without a
+    // positioned ancestor it resolves against the page rather than this cell —
+    // escaping the table's own horizontal scroller and dragging the page's
+    // scroll width out with it.
+    return (
+      <span
+        className="t-body text-right relative"
+        style={{ color: 'var(--fg-subtle)' }}
+        title={note}
+      >
+        <span aria-hidden>—</span>
+        <span className="sr-only">{note}</span>
+      </span>
+    );
+  }
+
+  return (
+    <span className="text-right whitespace-nowrap" title={note}>
+      <span className="t-body tnum" style={{ color: zero ? 'var(--fg-muted)' : 'var(--fg)' }}>
+        {text}
+      </span>
+      <span className="t-micro" style={{ color: 'var(--fg-subtle)' }}>
+        {' fail-min'}
+      </span>
+    </span>
+  );
+}
+
 interface RowActivationProps {
   rowRef: RefCallback<HTMLElement>;
   isActive: boolean;
@@ -157,10 +218,8 @@ function SoloIssueRow({
         {issue.title}
       </span>
       <EntityCell entity={issue.entity} />
-      <code className="t-caption truncate" style={{ color: 'var(--fg-muted)' }}>
-        {issue.detector_key}
-      </code>
-      <span className="t-body tnum text-right" style={{ color: 'var(--fg-muted)' }}>
+      <ImpactCell issue={issue} now={now} />
+      <span className="t-body tnum text-right pl-3 whitespace-nowrap" style={{ color: 'var(--fg-muted)' }}>
         {ongoingLabel(issue, now)}
       </span>
       <RelativeTime ts={issue.last_seen_ts} mode="relative" className="t-caption tnum text-right" />
@@ -210,10 +269,12 @@ function GroupRow({
           </span>
         </div>
         <EntityCell entity={group.root.entity} />
-        <code className="t-caption truncate" style={{ color: 'var(--fg-muted)' }}>
-          {group.root.detector_key}
-        </code>
-        <span className="t-body tnum text-right" style={{ color: 'var(--fg-muted)' }}>
+        {/* The group row already speaks for its root everywhere else — entity,
+            state, age — so its impact is the root's too, rather than a sum this
+            page would have to invent (members routinely share one entity, and
+            an unmeasured member would silently understate the total). */}
+        <ImpactCell issue={group.root} now={now} />
+        <span className="t-body tnum text-right pl-3 whitespace-nowrap" style={{ color: 'var(--fg-muted)' }}>
           ongoing {formatDuration(now - group.root.first_seen_ts)}
         </span>
         <RelativeTime ts={lastSeen} mode="relative" className="t-caption tnum text-right" />
