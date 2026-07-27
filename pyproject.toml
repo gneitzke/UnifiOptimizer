@@ -94,10 +94,13 @@ namespaces = false
 include-package-data = true
 
 [tool.setuptools.package-data]
-# The prebuilt web UI (no Node needed at runtime) AND the numbered SQL migrations
-# the store applies at startup via netadmin/store/db.py:MIGRATIONS_DIR — both are
-# non-.py runtime data that must ship inside the wheel or `netadmin` cannot boot.
-netadmin = ["_webui/**/*", "store/migrations/*.sql"]
+# The prebuilt web UI (no Node needed at runtime), the numbered SQL migrations
+# the store applies at startup via netadmin/store/db.py:MIGRATIONS_DIR, AND the
+# device-capability KB located by netadmin/detect/device_kb.py — all non-.py
+# runtime data that must ship inside the wheel. Without the first two `netadmin`
+# cannot boot; without the third the known_pathology and bad-cable detectors
+# silently run with no device knowledge base.
+netadmin = ["_webui/**/*", "store/migrations/*.sql", "data/*.json"]
 
 [tool.black]
 line-length = 100

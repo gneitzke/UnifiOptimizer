@@ -9,12 +9,19 @@ driven deterministically without spinning the whole EWMA engine.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 
+import pytest
+
+from netadmin import config
+from netadmin.detect import device_kb
 from netadmin.detect.baseline import Band
 from netadmin.detect.context import DetectorContext
 from netadmin.detect.detectors.wired import (
+    _KNOWN_100MBPS_HINTS,
     KEY_BAD_CABLE,
     KEY_BROADCAST_STORM,
     KEY_DUPLEX_MISMATCH,
@@ -31,6 +38,7 @@ from netadmin.detect.detectors.wired import (
     SfpDegradedDetector,
     StpLoopDetector,
     UplinkSaturationDetector,
+    _known_100mbps_patterns,
 )
 from netadmin.detect.engine import UNKNOWN
 from netadmin.domain.entities import Entity
@@ -795,3 +803,96 @@ def test_thresholds_are_overridable(repo: Repository) -> None:
     settings = SimpleNamespace(thresholds={KEY_BAD_CABLE: {"errors_per_min": 3.0}}, poll=None)
     findings = BadCableDetector().evaluate(_ctx(repo, settings=settings))
     assert len(findings) == 1
+
+
+# ====================================================================== #
+# the device-KB half of the 10/100 hint list
+# ====================================================================== #
+# _known_100mbps_patterns is lru_cached, so a test that resolves the KB under a
+# patched DATA_DIR would otherwise poison every later test in the session.
+@pytest.fixture(autouse=True)
+def _clear_pattern_cache():
+    _known_100mbps_patterns.cache_clear()
+    yield
+    _known_100mbps_patterns.cache_clear()
+
+
+def _write_kb(data_dir: Path, payload: dict) -> None:
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / device_kb.KB_FILENAME).write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_patterns_absorb_the_kb_2_4ghz_only_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The KB half of the hint list -- the symptom no wheel install ever had.
+
+    The existing suppression tests use names ("ESP32", "Sure Petcare") that the
+    built-in tuple already covers, so they pass with the KB contributing nothing.
+    """
+    data_dir = tmp_path / "data"
+    _write_kb(data_dir, {"known_2.4ghz_only": {"patterns": ["Widgetron", "ESP32"]}})
+    monkeypatch.setattr(config, "DATA_DIR", data_dir)
+
+    patterns = _known_100mbps_patterns()
+    assert "widgetron" in patterns  # KB enriches...
+    assert "petcare" in patterns  # ...without displacing the built-ins
+    assert patterns.count("esp32") == 1  # overlap de-dupes
+
+
+def test_patterns_fall_back_to_builtins_when_no_kb_is_readable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "absent")
+    monkeypatch.setattr(device_kb, "PACKAGED_KB_PATH", tmp_path / "also-absent.json")
+    assert _known_100mbps_patterns() == _KNOWN_100MBPS_HINTS
+
+
+@pytest.mark.parametrize(
+    "section",
+    [["esp32"], {"patterns": "esp32"}, {"patterns": None}, "esp32"],
+    ids=["bare-list", "string-patterns", "null-patterns", "bare-string"],
+)
+def test_patterns_ignore_a_malformed_kb_section(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, section
+) -> None:
+    """A hand-edit of the wrong shape must not disturb the built-in list."""
+    data_dir = tmp_path / "data"
+    _write_kb(data_dir, {"known_2.4ghz_only": section})
+    monkeypatch.setattr(config, "DATA_DIR", data_dir)
+    assert _known_100mbps_patterns() == _KNOWN_100MBPS_HINTS
+
+
+def test_an_empty_kb_pattern_cannot_match_everything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``"" in haystack`` is always True.
+
+    One stray empty string -- valid JSON, easy to leave behind in a hand-edit --
+    would otherwise make every entity look like a by-design 10/100 peer and
+    suppress every bad_cable finding on the site, silently.
+    """
+    data_dir = tmp_path / "data"
+    _write_kb(data_dir, {"known_2.4ghz_only": {"patterns": ["esp32", "", "   "]}})
+    monkeypatch.setattr(config, "DATA_DIR", data_dir)
+    assert "" not in _known_100mbps_patterns()
+
+
+def test_bad_cable_suppression_can_come_from_the_kb_alone(
+    repo: Repository, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end: a peer matched only by a KB pattern still suppresses the finding.
+
+    "widgetron" is in no built-in hint, so this fires only if the KB actually
+    reached the detector -- the user-visible behaviour the packaging bug removed.
+    """
+    data_dir = tmp_path / "data"
+    _write_kb(data_dir, {"known_2.4ghz_only": {"patterns": ["widgetron"]}})
+    monkeypatch.setattr(config, "DATA_DIR", data_dir)
+
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, meta={"max_speed": 1000}, speed=100)
+    make_client(repo, sw_id=sw, name="Widgetron-9000")
+    seed_counter(repo, pid, "rx_errors", step=0)
+    assert BadCableDetector().evaluate(_ctx(repo)) == []

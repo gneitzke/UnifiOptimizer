@@ -37,11 +37,10 @@ not yet persist) rather than fabricate a finding.
 
 from __future__ import annotations
 
-import json
-import os
 from functools import lru_cache
 from typing import Any, Iterable, Optional
 
+from netadmin.detect import device_kb
 from netadmin.detect.baseline import hour_label
 from netadmin.detect.engine import COVERAGE_MIN, UNKNOWN, EvalResult
 from netadmin.domain.entities import Entity, Finding
@@ -64,7 +63,7 @@ _COVERAGE_JOB = "fast_device"
 # Device-name / OUI substrings whose peers commonly negotiate 10/100 by design, so
 # a gigabit-capable switch port sitting at 100 Mbps to one of them is NOT a
 # broken-pair downshift. Seeded with common wired IoT/legacy classes and augmented
-# best-effort from data/wifi_device_capabilities.json's known-2.4GHz-only list
+# best-effort from wifi_device_capabilities.json's known-2.4GHz-only list
 # (those classes — smart plugs, ESP modules, legacy consoles — are the same
 # fast-ethernet-at-best population).
 _KNOWN_100MBPS_HINTS: tuple[str, ...] = (
@@ -103,28 +102,30 @@ _KNOWN_100MBPS_HINTS: tuple[str, ...] = (
 def _known_100mbps_patterns() -> tuple[str, ...]:
     """Built-in 10/100 device hints plus the capabilities-file 2.4GHz-only list.
 
-    Loaded once, best-effort: the file lives at the repo's
-    ``data/wifi_device_capabilities.json`` but this module never depends on the
-    cwd, so a missing/unparseable file simply yields the built-in list. The
-    2.4GHz-only classes there (ESP modules, smart plugs, legacy consoles) overlap
-    the wired fast-ethernet population, so they are a usable supplementary hint.
+    Loaded once, best-effort, via :mod:`netadmin.detect.device_kb`: a missing or
+    unparseable KB simply yields the built-in list. The 2.4GHz-only classes there
+    (ESP modules, smart plugs, legacy consoles) overlap the wired fast-ethernet
+    population, so they are a usable supplementary hint.
+
+    This reads the default KB location only. The ``client.known_pathology``
+    ``kb_path`` override does not apply here: the result is process-cached and
+    this helper has no DetectorContext to read thresholds from.
+
+    A failure is worth one line now that a baseline always ships inside the
+    package: it means the operator's copy is corrupt or the install is damaged,
+    neither of which is routine. ``client.known_pathology`` cannot be relied on
+    to report it -- it returns UNKNOWN on low coverage before ever loading the
+    KB, and under a ``kb_path`` override it reads a different file entirely.
     """
     patterns = list(_KNOWN_100MBPS_HINTS)
-    path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "..",
-        "..",
-        "..",
-        "data",
-        "wifi_device_capabilities.json",
-    )
-    try:
-        with open(os.path.normpath(path), "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        extra = data.get("known_2.4ghz_only", {}).get("patterns", [])
-        patterns.extend(str(p).lower() for p in extra)
-    except (OSError, ValueError, AttributeError):
-        pass  # built-in hints are enough; the file is an optional enrichment
+    kb = device_kb.load_kb()
+    if kb is None:
+        _log.warning(
+            "bad_cable: device KB at %s is missing or unparseable; falling back to "
+            "built-in 10/100 hints only",
+            device_kb.default_kb_path(),
+        )
+    patterns.extend(device_kb.section_patterns(kb, "known_2.4ghz_only"))
     return tuple(dict.fromkeys(patterns))  # de-dup, order-stable
 
 

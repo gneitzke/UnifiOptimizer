@@ -398,9 +398,10 @@ explains why and what the frontend needs first.
 
 ## Configuration
 
-Two files under `data/`, both read at runtime, neither ever committed. `data/` is
-resolved relative to the directory you run the daemon from (so a `pip install` picks
-up the files you create next to it, and the database persists across upgrades). To
+Three files under `data/`, all read at runtime, none ever committed — the third
+optional. `data/` is resolved relative to the directory you run the daemon from
+(so a `pip install` picks up the files you create next to it, and the database
+persists across upgrades). To
 pin a fixed location — under systemd, or a shared data volume — set
 `NETADMIN_DATA_DIR=/path/to/data`.
 
@@ -429,6 +430,13 @@ pin a fixed location — under systemd, or a shared data volume — set
     wan_plan_down_mbps: null       # set your plan rate to enable WAN saturation
     wan_plan_up_mbps: null         # and bufferbloat detection (null = those detectors abstain)
   ```
+
+- **`data/wifi_device_capabilities.json`** (optional) overrides the device-capability
+  database — the pattern list that lets the detectors tell a 2.4-GHz-only IoT chip
+  from a coverage fault. A baseline ships inside the package, so the detectors work
+  without this file; create it only to add your own device patterns, and
+  `pip install --upgrade` will leave it untouched. See
+  [`docs/DEVICE_DATABASE.md`](docs/DEVICE_DATABASE.md).
 
 Environment variables override YAML: `DB_PATH`, `LOG_LEVEL`, `SITE_ID`,
 `SERVER_HOST`, `SERVER_PORT` map directly to the field names (no prefix).
@@ -603,7 +611,10 @@ path is exercised against mocks and dry-run rendering only.
 - [`docs/BACKUP.md`](docs/BACKUP.md): backing up and restoring the database.
 - [`SECURITY.md`](SECURITY.md): credential handling and the safety model.
 - [`docs/DEVICE_DATABASE.md`](docs/DEVICE_DATABASE.md): the device-capability
-  database.
+  database that tells 2.4-GHz-only IoT chips from coverage faults. Ships with the
+  package, so it works out of the box; drop your own
+  `data/wifi_device_capabilities.json` next to `secrets.env` to extend it and
+  upgrades will leave it alone.
 
 ---
 
