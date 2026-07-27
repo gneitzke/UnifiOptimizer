@@ -66,7 +66,7 @@ from netadmin.report.severity import (
 )
 from netadmin.sle.classifiers import ALL_SLES, OK, SleConfig
 from netadmin.sle.scores import load_weights, sle_scores
-from netadmin.store.repository import Repository
+from netadmin.store.repository import SLE_CLIENT_AXIS_SLES, Repository
 
 __all__ = ["build_report", "DEFAULT_WINDOW_S"]
 
@@ -358,13 +358,28 @@ def _impact_index(store: Repository, start: int, end: int) -> dict[int, dict[str
     attributed infrastructure entity. This is the impact term for every finding:
     real minutes real clients spent degraded, pinned by the SLE engine -- never a
     guess (unattributed minutes are excluded).
+
+    **Client-axis SLEs only** (Gitea #36, #37). The ``infra`` SLE writes the
+    *device* into both ``entity_id`` and ``attributed_entity_id``, because what it
+    measures is a box being down rather than a client having a bad time. Including
+    it here did two wrong things at once: it added device down-minutes to a total
+    described as client-minutes, and it put the device itself into ``clients``, so
+    a report about an access point said "1 client affected" -- counting the AP as
+    one of its own victims. Filtering to the client axis fixes both, and makes
+    ``entity_id`` a client by construction rather than by assumption.
+
+    Nothing is lost by excluding it. A down AP has no clients associated, so the
+    harm it causes surfaces on this axis anyway, as the coverage and roaming
+    minutes those clients then burn on whatever AP they land on next.
     """
     rows = store.query_sle_minutes(
-        start, end, group_by=("attributed_entity_id", "entity_id", "classifier")
+        start, end, group_by=("attributed_entity_id", "entity_id", "classifier", "sle")
     )
     idx: dict[int, dict[str, Any]] = {}
     for r in rows:
         if r["classifier"] == OK:
+            continue
+        if r["sle"] not in SLE_CLIENT_AXIS_SLES:
             continue
         attr = r["attributed_entity_id"]
         if attr is None:

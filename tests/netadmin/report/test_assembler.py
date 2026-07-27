@@ -489,3 +489,48 @@ def test_empty_store_returns_honest_empties(repo) -> None:
     assert doc["appendix"]["severity_rubric"]
     assert doc["scope"]["limitations"]
     json.dumps(doc)
+
+
+def test_an_ap_is_never_counted_as_one_of_its_own_affected_clients(repo) -> None:
+    """Gitea #37: the report said "1 client affected" about an access point.
+
+    The ``infra`` SLE writes the *device* into both ``entity_id`` and
+    ``attributed_entity_id``, because it measures a box being down rather than a
+    client having a bad time. ``_impact_index`` collected ``entity_id`` into its
+    client set unconditionally, so the AP landed in its own victim list, and its
+    down-minutes were added to a total described as client-minutes.
+    """
+    from netadmin.report.assembler import _impact_index
+
+    ap = repo.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="ap-impact-37", name="Studio")
+    )
+    client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="client-impact-37", name="Laptop")
+    )
+    bucket = 1_700_000_000
+
+    # A real client having a real bad time, pinned on the AP.
+    repo.add_sle_minutes(
+        bucket_ts=bucket,
+        sle="coverage",
+        classifier="weak_signal",
+        entity_id=client,
+        attributed_entity_id=ap,
+        minutes=30.0,
+    )
+    # The AP itself down: device time, device in both id columns.
+    repo.add_sle_minutes(
+        bucket_ts=bucket,
+        sle="infra",
+        classifier="device_down",
+        entity_id=ap,
+        attributed_entity_id=ap,
+        minutes=325.0,
+    )
+
+    cell = _impact_index(repo, bucket - 60, bucket + 60)[ap]
+
+    assert ap not in cell["clients"], "the AP was counted as one of its own affected clients"
+    assert cell["clients"] == {client}
+    assert cell["minutes"] == 30.0, "device down-minutes leaked into a client-minute total"
