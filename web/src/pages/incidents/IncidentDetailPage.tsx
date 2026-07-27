@@ -1,4 +1,4 @@
-import { Link, useNavigate, useParams } from 'react-router-dom';
+import { Link, Navigate, useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, ArrowRight, Search } from 'lucide-react';
 import { Card } from '../../components/ui/Card';
 import { SeverityPill, SeverityGlyph } from '../../components/ui/SeverityPill';
@@ -14,11 +14,14 @@ import { getIncident, type IncidentMember } from '../shared/api';
 import { usePageAsync, useNowSeconds } from '../shared/hooks';
 
 /**
- * Incident detail (`/incidents/:id`): the whole story in one place (§17). The
- * root cause sits at the top as the thing to fix; the symptoms are grouped below,
- * each with the human rationale for why it is attributed to this root; and there
- * is exactly ONE recommended fix — the root's — because clearing the root clears
- * the symptoms. An incident-of-one shows only its single issue.
+ * Incident detail (`/incidents/:id`): the whole story for a genuine incident —
+ * the root cause at the top as the thing to fix, the symptoms grouped below each
+ * with the human rationale for why it is attributed to this root, and exactly
+ * ONE recommended fix (the root's), because clearing the root clears the
+ * symptoms. "Incident" is reserved for a 2+ member group (Gitea #21): a deep
+ * link that resolves to an incident-of-one redirects straight to its issue —
+ * the page already knows `root_issue_id`, so old bookmarks keep working instead
+ * of 404ing or showing a page about a "story" with no symptoms to tell.
  */
 
 function SectionCard({
@@ -90,8 +93,15 @@ export function IncidentDetailPage() {
   if (!data) return null;
 
   const { incident, root, symptoms, recommended_fix, investigation } = data;
-  const durSecs = Math.max(0, now - incident.first_seen_ts);
   const isGroup = symptoms.length > 0;
+
+  // Not a genuine incident (Gitea #21): redirect to the issue instead of
+  // narrating a "story" that is really just one issue talking to itself.
+  if (!isGroup) {
+    return <Navigate to={`/issues/${incident.root_issue_id}`} replace />;
+  }
+
+  const durSecs = Math.max(0, now - incident.first_seen_ts);
 
   return (
     <div className="px-6 py-6 mx-auto flex flex-col gap-4" style={{ maxWidth: 1000 }}>
@@ -102,9 +112,7 @@ export function IncidentDetailPage() {
         <div className="flex items-center gap-2 flex-wrap">
           <SeverityPill severity={incident.severity} />
           <span className="t-caption" style={{ color: 'var(--fg-subtle)' }}>
-            {isGroup
-              ? `${symptoms.length} related symptom${symptoms.length === 1 ? '' : 's'}`
-              : 'Standalone issue'}
+            {symptoms.length} related symptom{symptoms.length === 1 ? '' : 's'}
           </span>
         </div>
         <h1 className="t-page-title" style={{ color: 'var(--fg)' }}>
@@ -138,7 +146,7 @@ export function IncidentDetailPage() {
         >
           <MemberItem member={root} emphasise />
           <p className="t-caption" style={{ color: 'var(--fg-subtle)' }}>
-            Fixing this is expected to clear the {symptoms.length || 'related'} symptom
+            Fixing this is expected to clear the {symptoms.length} symptom
             {symptoms.length === 1 ? '' : 's'} below.
           </p>
         </SectionCard>
@@ -164,17 +172,15 @@ export function IncidentDetailPage() {
       </SectionCard>
 
       {/* Symptoms */}
-      {isGroup && (
-        <SectionCard title={`Symptoms (${symptoms.length})`}>
-          <ul className="flex flex-col gap-3">
-            {symptoms.map((m) => (
-              <li key={m.issue.id}>
-                <MemberItem member={m} />
-              </li>
-            ))}
-          </ul>
-        </SectionCard>
-      )}
+      <SectionCard title={`Symptoms (${symptoms.length})`}>
+        <ul className="flex flex-col gap-3">
+          {symptoms.map((m) => (
+            <li key={m.issue.id}>
+              <MemberItem member={m} />
+            </li>
+          ))}
+        </ul>
+      </SectionCard>
 
       {/* Investigation hook */}
       <SectionCard title="Investigate">

@@ -475,6 +475,13 @@ def overview(repo: Repository, params: Mapping[str, Any], now: int) -> dict[str,
     open_issues = repo.list_issues(open_only=True)
     open_incidents = repo.list_incidents(open_only=True)
     entities = _entity_map(repo, open_issues)
+    incident_counts = repo.incident_member_counts([int(r["id"]) for r in open_incidents])
+    genuine_incidents = [
+        r
+        for r in open_incidents
+        if Repository.is_genuine_incident(incident_counts.get(int(r["id"]), 0))
+    ]
+    grouped_issue_count = sum(incident_counts.get(int(r["id"]), 0) for r in genuine_incidents)
 
     report = sle_scores(repo, start_ts, end_ts)
     span = end_ts - start_ts
@@ -492,10 +499,20 @@ def overview(repo: Repository, params: Mapping[str, Any], now: int) -> dict[str,
             "collector runs in the window. Run `netadmin` to start collecting."
         )
     else:
+        # Honest split (Gitea #21): "N open incidents" used to count every
+        # incident-of-one as an incident (11 rows for 1 real group + 10 solo
+        # issues); this instead says how many issues are genuinely grouped.
+        if not genuine_incidents:
+            incident_clause = "no correlated incidents (every issue stands alone)"
+        elif len(genuine_incidents) == 1:
+            incident_clause = f"1 incident grouping {grouped_issue_count} of them"
+        else:
+            incident_clause = (
+                f"{len(genuine_incidents)} incidents grouping {grouped_issue_count} of them"
+            )
         first = (
             f"{len(open_issues)} open issue(s) "
-            f"(P1 {counts['p1']}, P2 {counts['p2']}, P3 {counts['p3']}) and "
-            f"{len(open_incidents)} open incident(s)."
+            f"(P1 {counts['p1']}, P2 {counts['p2']}, P3 {counts['p3']}); {incident_clause}."
         )
         if headline is None:
             second = "No SLE minutes recorded in this window, so there is no health score."
@@ -883,11 +900,17 @@ def incidents(repo: Repository, params: Mapping[str, Any], now: int) -> dict[str
         return _incident_detail(repo, params, now, limit)
 
     open_only = _as_bool(params.get("open_only"), default=True)
-    rows = repo.list_incidents(open_only=open_only)
+    # Genuine groups (2+ members) by default (Gitea #21) -- the same predicate
+    # the REST API and the store share, so this tool's narration cannot drift
+    # from what the UI shows. include_singletons=true restores the engine's
+    # uniform one-row-per-root projection.
+    include_singletons = _as_bool(params.get("include_singletons"), default=False)
+    rows = repo.list_incidents(open_only=open_only, genuine_only=not include_singletons)
     if not rows:
         scope = "open " if open_only else ""
+        kind = "" if include_singletons else "genuine "
         return {
-            "summary": f"No {scope}incidents recorded in this history store.",
+            "summary": f"No {scope}{kind}incidents recorded in this history store.",
             "incidents": fmt.listing([], limit),
         }
     counts = repo.incident_member_counts([int(row["id"]) for row in rows])
@@ -897,10 +920,21 @@ def incidents(repo: Repository, params: Mapping[str, Any], now: int) -> dict[str
         brief["member_count"] = counts.get(int(row["id"]), 0)
         briefs.append(brief)
     newest = max(int(row["last_seen_ts"]) for row in rows)
-    summary = (
-        f"{len(rows)} {'open ' if open_only else ''}incident(s), each grouping a root "
-        f"cause with its symptoms. The most recent was last seen {fmt.ago(newest, now)}."
-    )
+    if include_singletons:
+        summary = (
+            f"{len(rows)} {'open ' if open_only else ''}incident(s), each grouping a root "
+            f"cause with its symptoms. The most recent was last seen {fmt.ago(newest, now)}."
+        )
+    else:
+        # The honest split: how many issues are actually grouped, versus every
+        # open issue that stands alone and never shows up here at all.
+        grouped_issues = sum(counts.values())
+        noun = "incident" if len(rows) == 1 else "incidents"
+        base = f"{len(rows)} {noun} grouping {grouped_issues} issue(s)"
+        if open_only:
+            standalone = len(repo.list_issues(open_only=True)) - grouped_issues
+            base = f"{base}; {standalone} standalone open issue(s)"
+        summary = f"{base}. The most recent group was last seen {fmt.ago(newest, now)}."
     return {
         "summary": summary,
         "incidents": fmt.listing(briefs, limit, total=len(rows)),
@@ -1588,8 +1622,9 @@ _SPECS: tuple[ToolSpec, ...] = (
     ToolSpec(
         name="netadmin_incidents",
         description=(
-            "History: correlated incidents, each grouping one root cause with the symptom "
-            f"issues it explains. List them, or open one to see its members. {_ROUTING}"
+            "History: genuine correlated incidents (2+ issues grouped under one root "
+            "cause), each with the symptom issues it explains. List them, or open one to "
+            f"see its members. {_ROUTING}"
         ),
         input_schema=_schema(
             {
@@ -1597,6 +1632,14 @@ _SPECS: tuple[ToolSpec, ...] = (
                 "open_only": {
                     "type": "boolean",
                     "description": "List only non-resolved incidents. Default true.",
+                },
+                "include_singletons": {
+                    "type": "boolean",
+                    "description": (
+                        "Also list issues the engine could not group with anything else "
+                        "(one-member incidents-of-one). Default false: only genuine 2+ "
+                        "member groups are listed, so this tool never inflates the count."
+                    ),
                 },
                 "limit": _LIMIT_PROP,
             }

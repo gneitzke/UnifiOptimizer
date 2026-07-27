@@ -1,31 +1,24 @@
 import { useMemo } from 'react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { useSearchParams } from 'react-router-dom';
 import { Search } from 'lucide-react';
-import { DataTable, type Column } from '../../components/ui/DataTable';
-import { SeverityPill } from '../../components/ui/SeverityPill';
-import { StatePill } from '../../components/ui/StatePill';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { Skeleton } from '../../components/ui/Skeleton';
-import { RelativeTime } from '../../components/ui/RelativeTime';
 import { useRegisterFilter } from '../../layout/keyboard/filterFocusContext';
 import { useWsFrames } from '../../api/WsProvider';
-import { EntityLink } from '../shared/EntityLink';
-import {
-  issueDurationSeconds,
-  ongoingLabel,
-  severityRank,
-  stateRank,
-} from '../shared/format';
-import { listIssues, entityLabel, type IssueRow } from '../shared/api';
+import { issueDurationSeconds, severityRank } from '../shared/format';
+import { entityLabel, listIssues, type IssueRow } from '../shared/api';
 import { usePageAsync, useNowSeconds } from '../shared/hooks';
+import { IssueRowsList, type DisplayRow, type IssueGroup } from './IssueRowsList';
 import type { Severity } from '../../api/types';
 
 /**
- * Issues list (`/issues`) — the product's heart. A filterable, sortable table
- * over every issue: severity + state pills, the owning entity, the detector, an
- * "ongoing 6d" duration, and last-seen. `/` focuses the text filter; j/k + Enter
- * traverse and open rows (via DataTable's list-navigation). Filters live in the
- * URL so a dashboard link like `?severity=p1&state=active` lands pre-filtered.
+ * Issues list (`/issues`) — the product's heart, and (Gitea #21) the only
+ * place open work lives: there is no separate Incidents nav destination. A
+ * genuine incident (2+ correlated issues) folds its members into one group
+ * row, expandable inline; a standalone issue renders exactly as it always
+ * has. Filters live in the URL so a dashboard link like
+ * `?severity=p1&state=active` lands pre-filtered. `/` focuses the text
+ * filter; j/k + Enter traverse and open rows.
  */
 
 type StateFilter = 'open' | 'active' | 'resolved' | 'all';
@@ -48,8 +41,43 @@ function stateMatches(state: string, filter: StateFilter): boolean {
   return state === filter;
 }
 
+/** Group issues that share a genuine `incident_brief` into `IssueGroup`s, and
+ * return the remaining (ungrouped) issues separately. Purely a client-side
+ * fold over one `/api/issues` response — no second fetch, since root +
+ * symptoms are all already in `issues`. */
+function groupIssues(issues: IssueRow[]): { groups: IssueGroup[]; solo: IssueRow[] } {
+  const byIncident = new Map<number, IssueRow[]>();
+  for (const issue of issues) {
+    const brief = issue.incident_brief;
+    if (!brief) continue;
+    const members = byIncident.get(brief.id) ?? [];
+    members.push(issue);
+    byIncident.set(brief.id, members);
+  }
+
+  const groups: IssueGroup[] = [];
+  const groupedIds = new Set<number>();
+  for (const [incidentId, members] of byIncident) {
+    const root = members.find((m) => m.incident_role === 'root');
+    // Defensive: a brief always carries its own root as a member in the same
+    // response. Skip silently rather than fabricate one if it somehow didn't.
+    if (!root) continue;
+    for (const m of members) groupedIds.add(m.id);
+    groups.push({
+      incidentId,
+      title: root.incident_brief!.title,
+      summary: root.incident_brief!.summary,
+      severity: root.incident_brief!.severity,
+      root,
+      symptoms: members.filter((m) => m.id !== root.id),
+    });
+  }
+
+  const solo = issues.filter((i) => !groupedIds.has(i.id));
+  return { groups, solo };
+}
+
 export function IssuesPage() {
-  const navigate = useNavigate();
   const registerFilter = useRegisterFilter();
   const [params, setParams] = useSearchParams();
 
@@ -75,107 +103,71 @@ export function IssuesPage() {
     setParams(p, { replace: true });
   };
 
+  const { groups, solo } = useMemo(() => groupIssues(data?.issues ?? []), [data]);
+
+  const displayRows = useMemo<DisplayRow[]>(() => {
+    const groupRows: DisplayRow[] = groups.map((group) => ({ kind: 'group', group }));
+    const soloRows: DisplayRow[] = solo.map((issue) => ({ kind: 'issue', issue }));
+    return [...groupRows, ...soloRows];
+  }, [groups, solo]);
+
   const filtered = useMemo(() => {
-    const all = data?.issues ?? [];
     const q = query.trim().toLowerCase();
-    const rows = all.filter((i) => {
-      if (!stateMatches(i.state, stateFilter)) return false;
-      if (sevFilter && i.severity !== sevFilter) return false;
+    const rows = displayRows.filter((r) => {
+      const state = r.kind === 'group' ? r.group.root.state : r.issue.state;
+      if (!stateMatches(state, stateFilter)) return false;
+      const severity = r.kind === 'group' ? r.group.severity : r.issue.severity;
+      if (sevFilter && severity !== sevFilter) return false;
       if (q) {
-        const hay = `${i.title} ${i.detector_key} ${entityLabel(i.entity)}`.toLowerCase();
+        const hay =
+          r.kind === 'group'
+            ? [
+                r.group.title,
+                r.group.summary,
+                r.group.root.detector_key,
+                entityLabel(r.group.root.entity),
+                ...r.group.symptoms.map((s) => s.title),
+              ]
+                .join(' ')
+                .toLowerCase()
+            : `${r.issue.title} ${r.issue.detector_key} ${entityLabel(r.issue.entity)}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
     });
-    // Default order: most severe first, then longest-running.
+    // Default order: most severe first, then longest-running (a group's age is
+    // its root's — the incident's identity is the root's fingerprint).
     return rows.sort((a, b) => {
-      const s = severityRank(a.severity) - severityRank(b.severity);
+      const sevA = a.kind === 'group' ? a.group.severity : a.issue.severity;
+      const sevB = b.kind === 'group' ? b.group.severity : b.issue.severity;
+      const s = severityRank(sevA) - severityRank(sevB);
       if (s !== 0) return s;
-      return issueDurationSeconds(b, now) - issueDurationSeconds(a, now);
+      const durA = a.kind === 'group' ? now - a.group.root.first_seen_ts : issueDurationSeconds(a.issue, now);
+      const durB = b.kind === 'group' ? now - b.group.root.first_seen_ts : issueDurationSeconds(b.issue, now);
+      return durB - durA;
     });
-  }, [data, stateFilter, sevFilter, query, now]);
-
-  const columns: Column<IssueRow>[] = useMemo(
-    () => [
-      {
-        key: 'severity',
-        header: 'Sev',
-        width: 64,
-        sortAccessor: (r) => severityRank(r.severity),
-        render: (r) => <SeverityPill severity={r.severity} />,
-      },
-      {
-        key: 'state',
-        header: 'State',
-        width: 108,
-        sortAccessor: (r) => stateRank(r.state),
-        render: (r) => <StatePill state={r.state} severity={r.severity} />,
-      },
-      {
-        key: 'title',
-        header: 'Issue',
-        sortAccessor: (r) => r.title.toLowerCase(),
-        render: (r) => (
-          <span className="block truncate max-w-[36ch]" style={{ color: 'var(--fg)' }}>
-            {r.title}
-          </span>
-        ),
-      },
-      {
-        key: 'entity',
-        header: 'Entity',
-        sortAccessor: (r) => entityLabel(r.entity).toLowerCase(),
-        render: (r) =>
-          r.entity ? (
-            <EntityLink entity={r.entity} />
-          ) : (
-            <span style={{ color: 'var(--fg-subtle)' }}>network-wide</span>
-          ),
-      },
-      {
-        key: 'detector',
-        header: 'Detector',
-        sortAccessor: (r) => r.detector_key,
-        render: (r) => (
-          <code className="t-caption" style={{ color: 'var(--fg-muted)' }}>
-            {r.detector_key}
-          </code>
-        ),
-      },
-      {
-        key: 'duration',
-        header: 'Duration',
-        numeric: true,
-        align: 'left',
-        width: 130,
-        sortAccessor: (r) => issueDurationSeconds(r, now),
-        render: (r) => (
-          <span className="tnum" style={{ color: 'var(--fg-muted)' }}>
-            {ongoingLabel(r, now)}
-          </span>
-        ),
-      },
-      {
-        key: 'last_seen',
-        header: 'Last seen',
-        numeric: true,
-        align: 'left',
-        width: 110,
-        sortAccessor: (r) => r.last_seen_ts,
-        render: (r) => (
-          <RelativeTime
-            ts={r.last_seen_ts}
-            mode="relative"
-            className="t-caption tnum"
-          />
-        ),
-      },
-    ],
-    [now],
-  );
+  }, [displayRows, stateFilter, sevFilter, query, now]);
 
   const total = data?.issues.length ?? 0;
   const hasActiveFilters = !!sevFilter || !!query.trim() || stateFilter !== 'open';
+
+  // The reconciliation line (Gitea #21): one honest number in the nav badge,
+  // and here the sentence that explains it — "14 open issues · 1 incident
+  // groups 4 of them" — instead of two nav destinations quietly disagreeing.
+  const openIssueCount = (data?.issues ?? []).filter((i) => i.state !== 'resolved').length;
+  const openGroups = groups.filter((g) => g.root.state !== 'resolved');
+  const groupedOpenIssueCount = openGroups.reduce((n, g) => n + 1 + g.symptoms.length, 0);
+  // Once a filter or search narrows the list, the standing reconciliation is no
+  // longer what the reader is looking at, so report the result of their query
+  // instead. A "No matches" state under a header still claiming 14 open issues is
+  // the page contradicting itself.
+  const filtering = query.trim() !== '' || filtered.length !== total;
+  const reconciliation =
+    openGroups.length === 0
+      ? `${openIssueCount} open issue${openIssueCount === 1 ? '' : 's'}`
+      : `${openIssueCount} open issue${openIssueCount === 1 ? '' : 's'} · ` +
+        `${openGroups.length} incident${openGroups.length === 1 ? '' : 's'} ` +
+        `group${openGroups.length === 1 ? 's' : ''} ${groupedOpenIssueCount} of them`;
 
   function renderEmpty() {
     if (total === 0) {
@@ -200,12 +192,7 @@ export function IssuesPage() {
       );
     }
     // Default view (open) with nothing open, but resolved history exists.
-    return (
-      <EmptyState
-        variant="healthy"
-        title="No open issues"
-      />
-    );
+    return <EmptyState variant="healthy" title="No open issues" />;
   }
 
   return (
@@ -217,7 +204,7 @@ export function IssuesPage() {
           </h2>
           {data && (
             <span className="t-secondary tnum" style={{ color: 'var(--fg-muted)' }}>
-              {filtered.length} shown
+              {filtering ? `${filtered.length} shown of ${total}` : reconciliation}
             </span>
           )}
         </div>
@@ -297,15 +284,10 @@ export function IssuesPage() {
             <Skeleton key={i} className="h-11 w-full" />
           ))}
         </div>
+      ) : filtered.length === 0 ? (
+        renderEmpty()
       ) : (
-        <DataTable
-          columns={columns}
-          rows={filtered}
-          rowKey={(r) => r.id}
-          rowHeight={44}
-          onRowActivate={(r) => navigate(`/issues/${r.id}`)}
-          empty={renderEmpty()}
-        />
+        <IssueRowsList rows={filtered} now={now} />
       )}
     </div>
   );

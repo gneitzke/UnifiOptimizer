@@ -1867,11 +1867,38 @@ class Repository:
             (fingerprint,),
         ).fetchone()
 
-    def list_incidents(self, *, open_only: bool = False) -> list[sqlite3.Row]:
+    # An incident earns the presentation-tier word "incident" only once it
+    # actually groups something: the root plus at least one symptom. Below that
+    # it is the engine's own incident-of-one bookkeeping (correlate/engine.py --
+    # real and load-bearing there, so it is never deleted), but everywhere this
+    # repository is asked "is this a genuine incident", the answer is this one
+    # predicate. The incidents router, the issues read-model join and MCP all
+    # call through it (directly or via `genuine_only=`) so "genuine" cannot
+    # drift between them (Gitea #21).
+    GENUINE_INCIDENT_MIN_MEMBERS = 2
+
+    @classmethod
+    def is_genuine_incident(cls, member_count: int) -> bool:
+        return member_count >= cls.GENUINE_INCIDENT_MIN_MEMBERS
+
+    def list_incidents(
+        self, *, open_only: bool = False, genuine_only: bool = False
+    ) -> list[sqlite3.Row]:
+        """Incident rows, most-recently-seen first.
+
+        ``genuine_only`` applies :meth:`is_genuine_incident` -- only rows with
+        2+ members survive. This filters in Python against a batched member
+        count rather than a SQL ``HAVING``, so the one genuineness predicate
+        lives in exactly one place instead of being re-expressed as SQL here.
+        """
         where = "WHERE state != 'resolved' " if open_only else ""
-        return self._conn.execute(
+        rows = self._conn.execute(
             f"SELECT * FROM incidents {where}ORDER BY last_seen_ts DESC, id DESC"
         ).fetchall()
+        if not genuine_only:
+            return rows
+        counts = self.incident_member_counts([int(r["id"]) for r in rows])
+        return [r for r in rows if self.is_genuine_incident(counts.get(int(r["id"]), 0))]
 
     def insert_incident(
         self,
@@ -1976,10 +2003,15 @@ class Repository:
         never a stored column, so issue lifecycle stays untouched).
 
         Returns ``{issue_id: row}`` where each row carries ``incident_id``,
-        ``incident_role``, ``incident_title`` and ``incident_severity`` for the one
-        *open* incident that issue belongs to. Issues in no open incident are
-        simply absent from the map (callers default them to ``None``). One ``IN``
-        query, so a list endpoint never fans into N per-row lookups.
+        ``incident_role``, ``incident_title``, ``incident_summary``,
+        ``incident_severity`` and ``incident_member_count`` for the one *open*
+        incident that issue belongs to. ``incident_member_count`` is what callers
+        pass to :meth:`is_genuine_incident` to decide whether to surface a
+        presentation-tier "incident" (Gitea #21) -- it is a correlated subquery
+        here rather than a second batched call so the join stays one query.
+        Issues in no open incident are simply absent from the map (callers
+        default them to ``None``). One ``IN`` query, so a list endpoint never
+        fans into N per-row lookups.
         """
         ids = [int(i) for i in dict.fromkeys(issue_ids) if i is not None]
         if not ids:
@@ -1988,7 +2020,9 @@ class Repository:
         rows = self._conn.execute(
             "SELECT im.issue_id AS issue_id, im.incident_id AS incident_id, "
             "im.role AS incident_role, i.title AS incident_title, "
-            "i.severity AS incident_severity "
+            "i.summary AS incident_summary, i.severity AS incident_severity, "
+            "(SELECT COUNT(*) FROM incident_members im2 WHERE im2.incident_id = i.id) "
+            "  AS incident_member_count "
             "FROM incident_members im JOIN incidents i ON i.id = im.incident_id "
             f"WHERE i.state != 'resolved' AND im.issue_id IN ({placeholders})",
             ids,

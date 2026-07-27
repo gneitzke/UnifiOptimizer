@@ -2,13 +2,20 @@
 
 An **incident** groups the confirmed open issues that share one root cause: one
 member is the *root* (the thing to fix), the rest are *symptoms* that clear when
-it clears. The correlation engine writes them; this router reads them:
+it clears. The correlation engine writes one incident row per ultimate root,
+uniformly -- including a one-member "incident-of-one" for an issue it could not
+attribute anywhere, which is load-bearing bookkeeping (it is what lets that
+issue keep its identity if it later gains a symptom). "Incident" is reserved as
+a presentation-tier word for a *genuine* group of 2+ members
+(:meth:`~netadmin.store.repository.Repository.is_genuine_incident`, Gitea #21);
+this router reads the engine's uniform rows and applies that filter:
 
-* ``GET /api/incidents`` — open incidents, severity-ranked, each with its root
-  (issue + resolved entity), a member count, and the plain-language summary. This
-  is what the dashboard leads with ("3 things need attention", not "11 scattered
-  issues"). A standalone issue the engine could not attribute is a one-member
-  incident-of-one, surfaced here uniformly so the dashboard can group everything.
+* ``GET /api/incidents`` — genuine incidents only by default (severity-ranked,
+  each with its root, a member count, and the plain-language summary): this is
+  what the dashboard's "Active incidents" card leads with. Pass
+  ``include_singletons=true`` to restore the uniform projection (every
+  incident-of-one included too) -- the dashboard's "Needs attention" card uses
+  this for its honest, all-open-work triage view.
 * ``GET /api/incidents/{id}`` — the whole story: the root at top, the symptoms
   each with the correlation ``rule`` + human ``rationale`` that linked them, and
   two hooks pointing at the root issue — the ONE recommended fix (the root's fix
@@ -76,16 +83,21 @@ def _root_ref(
 async def list_incidents(
     request: Request,
     include_resolved: bool = Query(default=False),
+    include_singletons: bool = Query(default=False),
 ) -> dict[str, Any]:
-    """Open incidents, most-severe first (ties broken by most-recently-seen).
+    """Genuine incidents, most-severe first (ties broken by most-recently-seen).
 
     Each card carries the root's fix-target ref, the member count (root included),
     and the correlation-generated summary line. ``include_resolved=true`` also
-    returns resolved incidents (newest last), for history views; the default is
-    the open set the dashboard leads with.
+    returns resolved incidents (newest last), for history views. ``include_
+    singletons=true`` restores the engine's uniform one-row-per-root projection
+    (every incident-of-one included too); the default is genuine groups only
+    (2+ members) -- see :meth:`Repository.is_genuine_incident`.
     """
     store = get_store(request)
-    incidents = store.list_incidents(open_only=not include_resolved)
+    incidents = store.list_incidents(
+        open_only=not include_resolved, genuine_only=not include_singletons
+    )
 
     # Resolve every root issue + every root entity in two batched reads, not N.
     all_issues = {int(r["id"]): r for r in store.list_issues()}

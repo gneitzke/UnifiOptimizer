@@ -123,6 +123,18 @@ def test_overview_leads_with_counts_health_and_collector_state(demo_repo: Reposi
     assert result["summary"].count(".") <= 3
 
 
+def test_overview_gives_the_honest_incident_split_not_a_raw_count(
+    demo_repo: Repository,
+) -> None:
+    """Gitea #21: the summary must not narrate every incident-of-one as an
+    "incident" (the demo has 1 genuine group of 4 out of 11 incident rows)."""
+    result = _call(demo_repo, "netadmin_overview", window="24h")
+    genuine = demo_repo.list_incidents(open_only=True, genuine_only=True)
+    assert len(genuine) == 1  # the demo's Back Porch mesh cluster
+    assert "1 incident grouping" in result["summary"]
+    assert "open incident(s)" not in result["summary"]
+
+
 def test_overview_compares_against_the_immediately_prior_window(
     demo_repo: Repository,
 ) -> None:
@@ -252,14 +264,22 @@ def test_issue_detail_carries_lifecycle_fixes_and_investigations(
 # --------------------------------------------------------------------------- #
 # 5. netadmin_incidents
 # --------------------------------------------------------------------------- #
-def test_incidents_list_reports_member_counts(demo_repo: Repository) -> None:
+def test_incidents_list_defaults_to_genuine_groups_only(demo_repo: Repository) -> None:
     result = _call(demo_repo, "netadmin_incidents")
+    genuine = demo_repo.list_incidents(open_only=True, genuine_only=True)
+    assert result["incidents"]["total"] == len(genuine)
+    assert all(row["member_count"] >= 2 for row in result["incidents"]["items"])
+    assert "standalone" in result["summary"]
+
+
+def test_incidents_list_include_singletons_restores_uniform_view(demo_repo: Repository) -> None:
+    result = _call(demo_repo, "netadmin_incidents", include_singletons=True)
     assert result["incidents"]["total"] == len(demo_repo.list_incidents(open_only=True))
     assert all(row["member_count"] >= 1 for row in result["incidents"]["items"])
 
 
 def test_incident_detail_separates_root_from_symptoms(demo_repo: Repository) -> None:
-    incident_id = int(demo_repo.list_incidents(open_only=True)[0]["id"])
+    incident_id = int(demo_repo.list_incidents(open_only=True, genuine_only=True)[0]["id"])
     result = _call(demo_repo, "netadmin_incidents", incident=incident_id)
     roles = [member["role"] for member in result["members"]["items"]]
     assert roles[0] == "root"

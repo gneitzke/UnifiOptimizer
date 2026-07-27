@@ -602,8 +602,12 @@ Algorithm:
    A fixed rule priority, documented, so it is reproducible.
 5. Emit incidents: each with its root, members + per-member rule/rationale, a
    generated plain-language `title`/`summary`, severity = max member severity.
-   Every issue not attributed to any root becomes a standalone incident-of-one
-   (so the dashboard can uniformly show "incidents").
+   Every issue not attributed to any root becomes a standalone incident-of-one —
+   engine bookkeeping, load-bearing for idempotency (identity = `sha1(root
+   fingerprint)`, and the retained-incident path below depends on the row
+   already existing if a solo issue later gains a symptom). This is uniform at
+   the engine/store layer; the presentation layer reserves the word "incident"
+   for a genuine 2+ member group (see Surface, Gitea #21).
 6. Incident lifecycle: an incident resolves when all its members resolve; the LLM
    investigator (§10) can be pointed at an incident (not just an issue) to narrate
    the whole story on demand — but the clustering itself is never LLM-driven.
@@ -698,17 +702,43 @@ Algorithm:
 
 ### Surface
 
-- API: `GET /api/incidents` (open incidents, severity-ranked, each with root +
-  member count + summary), `GET /api/incidents/{id}` (root, members with
-  role/rationale, the root's proposed fix, investigation hook); issue read model
-  gains `incident_id` + `incident_role`.
-- UI: the dashboard's "Active issues" becomes **incident-grouped** — each card is
-  an incident showing its root-cause line and a "+N related" affordance expanding
-  to the symptoms; a standalone issue renders as an incident-of-one. An incident
-  detail page shows the story (root at top, symptoms grouped, one recommended fix =
-  the root's fix). Every issue detail gains a "Part of: <incident>" link. Both
-  themes; the adversarial UX review gate applies. The "Top offenders" panel lands
-  on the dashboard and a dedicated page.
+- API: `GET /api/incidents` returns **genuine incidents only** by default —
+  `member_count >= 2`, via the one repository-level predicate
+  `Repository.is_genuine_incident` (also used by `incident_brief_for_issues` and
+  MCP, so "genuine" cannot drift between surfaces). `include_singletons=true`
+  restores the engine's uniform one-row-per-root projection, for the dashboard's
+  "Needs attention" card. `GET /api/incidents/{id}` (root, members with
+  role/rationale, the root's proposed fix, investigation hook) is unchanged and
+  serves both genuine incidents and singletons by id. The issue read model's
+  `GET /api/issues` gains `incident_id` + `incident_role` (unconditional, as
+  before) and `incident_brief` (`{id, title, summary, severity, symptom_count}`,
+  present only when the incident is genuine) so the Issues list can group root +
+  symptoms into one row with no second fetch. `GET /api/issues/{id}`'s
+  `incident` ref gains `symptom_count`.
+- UI (Gitea #21): no standalone "Incidents" nav entry or list page — on a real
+  capture that list has one row while ten other open issues sit elsewhere, which
+  is the "11 vs 14" confusion this closes. Issues (`/issues`) is the one place
+  every open issue lives: a genuine incident renders as one group row (the
+  engine's title, its correlation summary as a second line, severity = the
+  incident's, a "N issues" expander revealing the root — labeled — and its
+  indented symptoms inline); a standalone issue renders exactly as before. The
+  page header carries the reconciliation in prose ("14 open issues · 1 incident
+  groups 4 of them") so the count is never ambiguous. Incident detail
+  (`/incidents/:id`) still exists as the "whole story" page (root at top,
+  symptoms grouped, the one recommended fix), reachable from a group row and
+  from an issue's "Part of" line; a deep link that resolves to a singleton
+  redirects to the issue instead of 404ing or showing a one-member "story". The
+  issue detail "Part of" line renders only when `symptom_count > 0`, with
+  role-specific copy ("Root cause of: … (N symptoms)" / "Symptom of: …") — a
+  genuinely solo issue shows no line, so there is no self-link. The dashboard's
+  "Needs attention" card (formerly "Active incidents") uses the uniform
+  `include_singletons=true` projection for honest all-open-work triage, with an
+  "All issues" link to `/issues`. MCP's `netadmin_incidents` and
+  `netadmin_overview` narrate the same genuine/standalone split instead of
+  counting every incident-of-one as an "incident". No migration: this is a
+  read-time filter over unchanged engine/store rows. Both themes; the
+  adversarial UX review gate applies. The "Top offenders" panel lands on the
+  dashboard and a dedicated page.
 
 ## 18. First-run web onboarding & controller connect (§12 addendum)
 

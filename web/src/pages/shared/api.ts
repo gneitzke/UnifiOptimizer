@@ -74,6 +74,21 @@ export interface IssueRow {
    * own lifecycle is untouched. Null when the issue is in no open incident. */
   incident_id?: number | null;
   incident_role?: IncidentRole | null;
+  /** Present only when this issue's incident is genuine (2+ members, Gitea
+   * #21) — lets the Issues list group root + symptoms into one row with no
+   * second fetch. Null for a standalone issue, even one with its own
+   * incident-of-one bookkeeping row. */
+  incident_brief?: IssueIncidentBrief | null;
+}
+
+export interface IssueIncidentBrief {
+  id: number;
+  title: string;
+  summary: string;
+  severity: Severity;
+  /** Members other than the root; >= 1 always true when this field is present
+   * at all (a null incident_brief means "not a genuine group"). */
+  symptom_count: number;
 }
 
 export interface IssueEventRow {
@@ -89,12 +104,16 @@ export interface IssueListResponse {
   count: number;
 }
 
-/** The incident an issue is part of, for the "Part of:" link on issue detail. */
+/** The incident an issue is part of, for the "Part of:" link on issue detail.
+ * `symptom_count === 0` means this is a genuine incident-of-one (Gitea #21):
+ * real engine bookkeeping, but not a presentation-tier "incident" — the
+ * detail page renders no line for it, so there is no self-link. */
 export interface IssueIncidentRef {
   id: number;
   role: IncidentRole;
   title: string;
   severity: Severity;
+  symptom_count: number;
 }
 
 /** One evidence key's presentation metadata (netadmin.detect.catalog.EvidenceField),
@@ -397,9 +416,16 @@ export const getIssue = (id: number) =>
 
 /* ---- Incidents + offenders (section 17) --------------------------------- */
 
-export const listIncidents = (includeResolved = false) =>
+/** `includeSingletons` restores the engine's uniform one-row-per-root
+ * projection (every incident-of-one included); the default is genuine groups
+ * only (2+ members, Gitea #21). The dashboard's "Needs attention" card passes
+ * `true` for the honest, everything-open-work triage view. */
+export const listIncidents = (includeResolved = false, includeSingletons = false) =>
   request<IncidentListResponse>(
-    `/api/incidents${qs({ include_resolved: includeResolved ? true : undefined })}`,
+    `/api/incidents${qs({
+      include_resolved: includeResolved ? true : undefined,
+      include_singletons: includeSingletons ? true : undefined,
+    })}`,
   );
 
 export const getIncident = (id: number) =>

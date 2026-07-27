@@ -11,19 +11,22 @@ import { IncidentRow } from '../incidents/IncidentRow';
 import type { Severity } from '../../api/types';
 
 /**
- * Active incidents (dashboard). The section §17 says the dashboard leads with:
- * each card is an INCIDENT (one root cause + its symptoms), not a scatter of
- * issues. A multi-member incident shows its root-cause line and a "+N related"
- * expander that reveals the symptoms; a standalone issue is a one-member
- * incident-of-one that links straight to the issue. A clean network gets the
- * honest one-line positive, never a fabricated all-clear.
+ * "Needs attention" (dashboard). Every piece of open work, honestly labeled
+ * (Gitea #21): a genuine incident (2+ members) shows its root-cause line and a
+ * "+N related" expander that reveals the symptoms; a standalone issue is a
+ * one-member incident-of-one that links straight to the issue. This card
+ * intentionally uses the engine's uniform projection
+ * (`include_singletons=true`) rather than the genuine-only default — its job
+ * is triage across everything open, not to lead with "incidents" as a concept
+ * (that is the Issues page's job now). A clean network gets the honest
+ * one-line positive, never a fabricated all-clear.
  */
 
 const SEVS: Severity[] = ['p1', 'p2', 'p3'];
 const PREVIEW = 6;
 
 export function IncidentsSummary({ reloadKey }: { reloadKey: number }) {
-  const { data, loading, error } = usePageAsync(() => listIncidents(), [reloadKey], {
+  const { data, loading, error } = usePageAsync(() => listIncidents(false, true), [reloadKey], {
     pollMs: 30_000,
   });
   const now = useNowSeconds();
@@ -42,21 +45,21 @@ export function IncidentsSummary({ reloadKey }: { reloadKey: number }) {
     <Card pad="md" className="flex flex-col gap-3 min-w-0">
       <div className="flex items-baseline justify-between">
         <h2 className="t-section" style={{ color: 'var(--fg)' }}>
-          Active incidents
+          Needs attention
         </h2>
         <Link
-          to="/incidents"
+          to="/issues"
           className="inline-flex items-center gap-0.5 t-caption hover:underline"
           style={{ color: 'var(--accent)' }}
         >
-          All incidents
+          All issues
           <ChevronRight size={13} />
         </Link>
       </div>
 
       {error ? (
         <div className="t-secondary" style={{ color: 'var(--fg-muted)' }}>
-          Could not load incidents.
+          Could not load open issues.
         </div>
       ) : loading && !data ? (
         <div className="flex flex-col gap-2">
@@ -91,11 +94,11 @@ export function IncidentsSummary({ reloadKey }: { reloadKey: number }) {
               {incidents.length > top.length && (
                 <li className="pt-2">
                   <Link
-                    to="/incidents"
+                    to="/issues"
                     className="t-caption hover:underline"
                     style={{ color: 'var(--accent)' }}
                   >
-                    +{incidents.length - top.length} more incidents
+                    +{incidents.length - top.length} more
                   </Link>
                 </li>
               )}

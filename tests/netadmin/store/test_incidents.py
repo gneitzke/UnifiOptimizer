@@ -235,6 +235,56 @@ def test_engine_end_to_end_over_real_store(repo: Repository) -> None:
     assert again[0]["id"] == inc["id"]
 
 
+# --------------------------------------------------------------------------- #
+# Genuine-incident predicate (Gitea #21): "incident" is a presentation-tier
+# word reserved for 2+ member groups; the engine's incident-of-one bookkeeping
+# is untouched, but genuine_only/is_genuine_incident is the one place that
+# filters it out for display.
+# --------------------------------------------------------------------------- #
+def test_is_genuine_incident_predicate() -> None:
+    assert Repository.is_genuine_incident(0) is False
+    assert Repository.is_genuine_incident(1) is False
+    assert Repository.is_genuine_incident(2) is True
+    assert Repository.is_genuine_incident(5) is True
+
+
+def test_list_incidents_genuine_only_excludes_singletons(repo: Repository) -> None:
+    ap = _ap(repo, "aa:bb:cc:00:00:01", "AP-Genuine")
+    c1 = _client(repo, "11:11:11:11:11:11", "Thermostat", ap)
+    _issue(repo, fp="mesh", key="wifi.mesh_uplink", entity_id=ap, state="active", sev="p2")
+    _issue(
+        repo, fp="cov", key="net.coverage_hole", entity_id=ap, state="active", sev="p2", ts=TS + 10
+    )
+    _issue(repo, fp="isp", key="wan.isp_degraded", entity_id=ap, state="active", ts=TS + 20)
+
+    engine = CorrelationEngine(StoreCorrelationRepository(repo))
+    engine.run(TS + 100)
+
+    uniform = repo.list_incidents(open_only=True)
+    genuine = repo.list_incidents(open_only=True, genuine_only=True)
+    assert len(uniform) == 2  # the mesh group + the standalone ISP incident-of-one
+    assert len(genuine) == 1
+    assert repo.list_incident_members(int(genuine[0]["id"]))[0]["role"] == "root"
+
+    _ = c1  # topology only; not asserted directly
+
+
+def test_incident_brief_for_issues_carries_member_count(repo: Repository) -> None:
+    ap = _ap(repo, "aa:bb:cc:00:00:01", "AP-Brief")
+    root = _issue(repo, fp="mesh", key="wifi.mesh_uplink", entity_id=ap, state="active", sev="p2")
+    sym = _issue(
+        repo, fp="cov", key="net.coverage_hole", entity_id=ap, state="active", sev="p2", ts=TS + 10
+    )
+
+    engine = CorrelationEngine(StoreCorrelationRepository(repo))
+    engine.run(TS + 100)
+
+    briefs = repo.incident_brief_for_issues([root, sym])
+    assert briefs[root]["incident_member_count"] == 2
+    assert briefs[sym]["incident_member_count"] == 2
+    assert briefs[root]["incident_summary"]
+
+
 def test_engine_resolves_incident_over_real_store(repo: Repository) -> None:
     ap = _ap(repo, "aa:bb:cc:00:00:01", "AP-Shed")
     c1 = _client(repo, "11:11:11:11:11:11", "Sensor", ap)

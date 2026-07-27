@@ -190,6 +190,22 @@ async def list_issues(
         inc = incidents.get(int(r["id"]))
         item["incident_id"] = int(inc["incident_id"]) if inc is not None else None
         item["incident_role"] = inc["incident_role"] if inc is not None else None
+        # "incident_brief" — only when the group is genuine (Gitea #21) — lets the
+        # Issues list render one group row for a real incident, inline, without a
+        # second fetch: the member issues (root + symptoms) are already in this
+        # same response, so the client groups them by `incident_brief.id`.
+        member_count = int(inc["incident_member_count"]) if inc is not None else 0
+        item["incident_brief"] = (
+            {
+                "id": int(inc["incident_id"]),
+                "title": inc["incident_title"],
+                "summary": inc["incident_summary"],
+                "severity": inc["incident_severity"],
+                "symptom_count": member_count - 1,
+            }
+            if inc is not None and Repository.is_genuine_incident(member_count)
+            else None
+        )
         issues.append(item)
     return {"issues": issues, "count": len(issues)}
 
@@ -211,6 +227,9 @@ async def get_issue(request: Request, issue_id: int) -> dict[str, Any]:
         entity = entity_ref_map(store, [eid]).get(int(eid))
     # The incident this issue is part of (section 17), for the "Part of:" link on
     # the detail page. A join on the read model — issue lifecycle is untouched.
+    # `symptom_count` lets the client decide whether to render the line at all:
+    # a genuine incident-of-one (Gitea #21) has `symptom_count == 0`, and the
+    # page shows nothing rather than a confusing self-link to its own incident.
     inc = store.incident_brief_for_issues([issue_id]).get(issue_id)
     incident = (
         {
@@ -218,6 +237,7 @@ async def get_issue(request: Request, issue_id: int) -> dict[str, Any]:
             "role": inc["incident_role"],
             "title": inc["incident_title"],
             "severity": inc["incident_severity"],
+            "symptom_count": int(inc["incident_member_count"]) - 1,
         }
         if inc is not None
         else None

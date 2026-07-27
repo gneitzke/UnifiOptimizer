@@ -100,13 +100,25 @@ async def test_list_incidents_groups_and_ranks(incident_app) -> None:
         resp = await c.get("/api/incidents")
     assert resp.status_code == 200
     body = resp.json()
-    # The mesh cluster (2 members) + the standalone ISP issue (incident-of-one).
-    assert body["count"] == 2
+    # Genuine groups only by default (Gitea #21): the mesh cluster (2 members),
+    # not the standalone ISP issue (an incident-of-one).
+    assert body["count"] == 1
     mesh = next(i for i in body["incidents"] if i["root"]["detector_key"] == "wifi.mesh_uplink")
     assert mesh["member_count"] == 2
     assert mesh["symptom_count"] == 1
     assert mesh["root"]["entity"]["name"] == "Back Porch"
     assert mesh["summary"]  # a plain-language causal line
+
+
+async def test_list_incidents_include_singletons_restores_the_uniform_view(
+    incident_app,
+) -> None:
+    async with await _client(incident_app) as c:
+        resp = await c.get("/api/incidents?include_singletons=true")
+    assert resp.status_code == 200
+    body = resp.json()
+    # The mesh cluster (2 members) + the standalone ISP issue (incident-of-one).
+    assert body["count"] == 2
     standalone = next(
         i for i in body["incidents"] if i["root"]["detector_key"] == "wan.isp_degraded"
     )
@@ -146,16 +158,33 @@ async def test_issue_read_model_carries_incident(incident_app, incident_store) -
     async with await _client(incident_app) as c:
         listing = (await c.get("/api/issues")).json()
         by_id = {i["id"]: i for i in listing["issues"]}
-        # The symptom carries incident_id + role=symptom.
+        # The symptom carries incident_id + role=symptom, and a genuine
+        # incident_brief (Gitea #21: the mesh group has 2 members) so the
+        # Issues list can group it inline with no second fetch.
         sym = by_id[incident_store.symptom_id]
         assert sym["incident_id"] is not None
         assert sym["incident_role"] == "symptom"
-        # The root carries role=root.
-        assert by_id[incident_store.root_id]["incident_role"] == "root"
+        assert sym["incident_brief"] is not None
+        assert sym["incident_brief"]["symptom_count"] == 1
+        # The root carries role=root and the same brief.
+        root_row = by_id[incident_store.root_id]
+        assert root_row["incident_role"] == "root"
+        assert root_row["incident_brief"]["id"] == sym["incident_brief"]["id"]
+        # The standalone issue is in an incident-of-one: no genuine brief.
+        assert by_id[incident_store.standalone_id]["incident_id"] is not None
+        assert by_id[incident_store.standalone_id]["incident_brief"] is None
 
         # The detail view exposes the "Part of: <incident>" object.
         detail = (await c.get(f"/api/issues/{incident_store.symptom_id}")).json()
         assert detail["incident"] is not None
         assert detail["incident"]["role"] == "symptom"
         assert detail["incident"]["title"]
+        assert detail["incident"]["symptom_count"] == 1
         assert detail["issue"]["incident_id"] == detail["incident"]["id"]
+
+        # The standalone issue's incident is a genuine incident-of-one: it has
+        # an incident (the engine's bookkeeping row) but symptom_count == 0, so
+        # the client renders no "Part of" line for it.
+        solo_detail = (await c.get(f"/api/issues/{incident_store.standalone_id}")).json()
+        assert solo_detail["incident"] is not None
+        assert solo_detail["incident"]["symptom_count"] == 0

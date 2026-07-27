@@ -161,22 +161,26 @@ export function IssueDetailPage() {
               {issue.state === 'resolved' ? 'Lasted' : 'Ongoing'} {formatDurationLong(durSecs)}
               {issue.occurrences > 1 ? ` · ${issue.occurrences} occurrences` : ''}
             </span>
-            {incident && (
+            {/* Rendered only for a genuine incident (2+ members, Gitea #21) —
+                an incident-of-one has symptom_count 0, and showing a line
+                that links to a "story" containing only this same issue is a
+                self-link, not information. Role-specific copy: the root
+                names how many symptoms it explains; a symptom just names
+                its root. */}
+            {incident && incident.symptom_count > 0 && (
               <Link
                 to={`/incidents/${incident.id}`}
                 className="inline-flex items-center gap-1.5 t-caption self-start hover:underline"
                 style={{ color: 'var(--accent)' }}
               >
                 <Layers size={13} />
-                Part of: {incident.title}
                 {incident.role === 'root' ? (
-                  <span className="t-micro" style={{ color: 'var(--fg-subtle)' }}>
-                    (root cause)
-                  </span>
+                  <>
+                    Root cause of: {incident.title} ({incident.symptom_count} symptom
+                    {incident.symptom_count === 1 ? '' : 's'})
+                  </>
                 ) : (
-                  <span className="t-micro" style={{ color: 'var(--fg-subtle)' }}>
-                    (symptom)
-                  </span>
+                  <>Symptom of: {incident.title}</>
                 )}
               </Link>
             )}

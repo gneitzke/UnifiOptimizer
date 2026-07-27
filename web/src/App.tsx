@@ -4,7 +4,7 @@ import { TokenPrompt } from './api/TokenPrompt';
 import AppShell from './layout/AppShell';
 import { DashboardPage } from './pages/dashboard';
 import { IssueDetailPage, IssuesPage } from './pages/issues';
-import { IncidentDetailPage, IncidentsPage } from './pages/incidents';
+import { IncidentDetailPage } from './pages/incidents';
 import { OffendersPage } from './pages/offenders';
 import { DevicesPage, DeviceDetailPage } from './pages/devices';
 import { ClientsPage, ClientDetailPage } from './pages/clients';
@@ -31,7 +31,6 @@ export default function App() {
             <Route index element={<DashboardPage />} />
             <Route path="issues" element={<IssuesPage />} />
             <Route path="issues/:id" element={<IssueDetailPage />} />
-            <Route path="incidents" element={<IncidentsPage />} />
             <Route path="incidents/:id" element={<IncidentDetailPage />} />
             <Route path="offenders" element={<OffendersPage />} />
             <Route path="devices" element={<DevicesPage />} />

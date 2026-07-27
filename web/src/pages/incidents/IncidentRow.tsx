@@ -17,9 +17,11 @@ import {
  * One incident, rendered as a row: root-cause line + entity/duration, with a
  * "+N related" expander that lazily loads and reveals the symptoms. A standalone
  * issue (incident-of-one) links straight to the issue and shows its state pill.
- * Shared verbatim by the dashboard's Active-incidents card and the full
- * `/incidents` list so the two never drift (§17: the operator sees the same
- * incident affordance wherever incidents appear).
+ * Used by the dashboard's "Needs attention" card, which requests the engine's
+ * uniform projection (`include_singletons=true`) so every open issue shows up
+ * here one way or another. The genuine-incident case in the Issues list (Gitea
+ * #21) is a different, denser presentation (`IssueRowsList`'s `GroupRow`) built
+ * from the issue list's own data rather than this `IncidentSummary` shape.
  */
 export function IncidentRow({
   incident,
