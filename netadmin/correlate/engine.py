@@ -233,6 +233,11 @@ class CorrelationEngine:
             produced_fingerprints.add(fp)
             severity = max_severity([m.issue.severity for m in comp.members])
             title, summary = self._render(comp, topo)
+            # An incident's "last seen" is its newest member evidence, never the
+            # pass clock: ``issue.last_seen_ts`` advances only when a detector
+            # fires, so this goes static the moment the evidence stops instead of
+            # advertising a freshness the rollup invented by running.
+            evidence_ts = max(m.issue.last_seen_ts for m in comp.members)
 
             prev = existing.get(fp)
             if prev is None:
@@ -243,7 +248,7 @@ class CorrelationEngine:
                         severity=severity,
                         state=IncidentState.OPEN,
                         first_seen_ts=now,
-                        last_seen_ts=now,
+                        last_seen_ts=evidence_ts,
                         title=title,
                         summary=summary,
                     )
@@ -253,7 +258,7 @@ class CorrelationEngine:
                 prev.root_issue_id = comp.root.id  # type: ignore[assignment]
                 prev.severity = severity
                 prev.state = IncidentState.OPEN
-                prev.last_seen_ts = now
+                prev.last_seen_ts = max(prev.last_seen_ts, evidence_ts)
                 prev.resolved_ts = None
                 prev.title = title
                 prev.summary = summary
@@ -283,7 +288,13 @@ class CorrelationEngine:
         for inc, members, surviving in retained:
             produced_fingerprints.add(inc.fingerprint)
             inc.state = IncidentState.OPEN
-            inc.last_seen_ts = now
+            # Same evidence-only rule as above. The root is resolved and is not in
+            # ``open_by_id``, so its final sighting is carried by the incident's
+            # own stored value — which is why this maxes rather than assigns, and
+            # is what keeps the timestamp monotonic when membership shrinks.
+            inc.last_seen_ts = max(
+                inc.last_seen_ts, *(open_by_id[i].last_seen_ts for i in surviving)
+            )
             inc.resolved_ts = None
             inc.severity = max_severity([open_by_id[i].severity for i in surviving])
             self.store.update_incident(inc)

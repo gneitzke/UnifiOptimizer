@@ -209,6 +209,8 @@ export interface WireClients {
 
 export interface WireAffectedAsset {
   entity_id: number;
+  /** The printed label, already qualified server-side for a radio or a port
+   * (`Loft / wifi0`) — every AP has a `wifi0`, so the bare name names nothing. */
   name: string;
   type: string;
   role: string;

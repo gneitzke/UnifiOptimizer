@@ -55,9 +55,29 @@ export function entityHref(ref: EntityRef | null | undefined): string | null {
   return null;
 }
 
+/** Entity types whose own name only means something next to their parent. */
+const CHILD_ENTITY_TYPES = new Set(['radio', 'port']);
+
+/** How an entity is named to a human: `Loft / wifi0` for a radio or a port.
+ *
+ * Every AP names its radios `wifi0`/`wifi1` and every switch has a `Port 2`, so
+ * four genuinely distinct saturated radios all render as `wifi0` and read as
+ * duplicate rows. Prefixing the parent is the disambiguation, and it stays short
+ * enough for the width-constrained Entity column — which is why it is a prefix
+ * and not a parenthetical.
+ *
+ * A child whose parent the server could not resolve degrades to the bare name,
+ * never to `null / wifi0` — and one an admin already named after its device
+ * ("Loft 5G" under "Loft") is left alone, because that name already identifies.
+ * Mirrors `entity_display_label` in `netadmin/domain/entities.py`; the two must
+ * agree. */
 export function entityLabel(ref: EntityRef | null | undefined): string {
   if (!ref) return 'unknown';
-  return ref.name || ref.native_id || `#${ref.entity_id}`;
+  const name = ref.name || ref.native_id || `#${ref.entity_id}`;
+  const parent = ref.parent_name;
+  if (!ref.type || !CHILD_ENTITY_TYPES.has(ref.type) || !parent) return name;
+  if (name.toLowerCase().includes(parent.toLowerCase())) return name;
+  return `${parent} / ${name}`;
 }
 
 /* ---- Issues ------------------------------------------------------------- */

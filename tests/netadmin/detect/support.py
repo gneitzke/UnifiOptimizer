@@ -153,6 +153,32 @@ def seed_device(
     return eid
 
 
+def seed_client(
+    repo: Repository,
+    *,
+    native_id: str,
+    last_seen_ts: int,
+    parent_id: Optional[int] = None,
+    name: Optional[str] = None,
+) -> int:
+    """Upsert a client entity last sighted at ``last_seen_ts``. Returns the id.
+
+    ``last_seen_ts`` is the whole point: the detection engine reads client
+    departure from it, so a test sets it to whenever the client was last on the
+    air rather than to "now".
+    """
+    return repo.upsert_entity(
+        Entity(
+            entity_type=EntityType.CLIENT,
+            native_id=native_id,
+            site_id="default",
+            name=name,
+            parent_id=parent_id,
+        ),
+        ts=last_seen_ts,
+    )
+
+
 def seed_coverage(
     repo: Repository,
     *,

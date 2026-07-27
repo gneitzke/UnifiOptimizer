@@ -11,17 +11,21 @@ import { entityHref, entityLabel, type EntityRef } from './api';
  * a WLAN, which has neither a page nor a parent device, stays plain text.
  *
  * The name is resolved server-side; we fall back to the native id, then the
- * numeric id — never a bare number presented as a name. A child's tooltip names
- * its parent, because "wifi1" on its own does not say which AP it is on.
+ * numeric id — never a bare number presented as a name. A child is labelled
+ * `Loft / wifi0` by `entityLabel`, because "wifi0" on its own does not say which
+ * AP it is on — and every AP has one.
  *
  * INTEGRATE NOTE: candidate to promote into `src/components/ui`.
  */
 
-/** Hover text: the native id (a MAC), and the device a child belongs to. */
-function entityTitle(entity: EntityRef): string | undefined {
-  const parts = [entity.native_id, entity.parent_name ? `on ${entity.parent_name}` : null].filter(
-    Boolean,
-  );
+/** Hover text: the full label, then the native id (a MAC).
+ *
+ * The label leads because the Issues list's Entity column is narrow and clips
+ * `Primary Bedroom / wifi1` mid-word — the hover has to be able to finish the
+ * sentence the cell started. `entityLabel` already carries the parent, so there
+ * is nothing to append about it. */
+function entityTitle(entity: EntityRef, label: string): string | undefined {
+  const parts = [label, entity.native_id].filter(Boolean);
   return parts.length ? parts.join(' · ') : undefined;
 }
 
@@ -48,7 +52,7 @@ export function EntityLink({
 
   if (!href) {
     return (
-      <span className={cn('t-body', className)} style={{ color }} title={entityTitle(entity)}>
+      <span className={cn('t-body', className)} style={{ color }} title={entityTitle(entity, label)}>
         {label}
       </span>
     );
@@ -59,7 +63,7 @@ export function EntityLink({
       to={href}
       className={cn('t-body hover:underline', className)}
       style={{ color: muted ? 'var(--fg-muted)' : 'var(--accent)' }}
-      title={entityTitle(entity)}
+      title={entityTitle(entity, label)}
       onClick={(e) => e.stopPropagation()}
     >
       {label}

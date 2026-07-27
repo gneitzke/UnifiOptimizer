@@ -19,11 +19,12 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from netadmin import __version__
 from netadmin.analytics.offenders import CLIENT_ENTITY_TYPES, rank_offenders
 from netadmin.config import PollIntervals
+from netadmin.domain.entities import entity_display_label
 from netadmin.domain.types import EntityType
 from netadmin.report import charts
 from netadmin.report.models import (
@@ -161,14 +162,40 @@ def _as_int(value: Any) -> Optional[int]:
         return None
 
 
-def _entity_ref(row: Any) -> Optional[dict[str, Any]]:
-    """Compact ``{entity_id, name, type, native_id, model}`` ref (name falls back to MAC)."""
+def _parent_name(row: Any, ents: Optional[Mapping[int, Any]]) -> Optional[str]:
+    """The display name of ``row``'s parent, when the caller resolved it."""
+    parent_id = row["parent_id"]
+    parent = (ents or {}).get(int(parent_id)) if parent_id is not None else None
+    return None if parent is None else str(parent["name"] or parent["native_id"])
+
+
+def _with_parents(store: Repository, found: dict[int, Any]) -> dict[int, Any]:
+    """Add the parents of any structural children to a resolved entity map.
+
+    A report names radios and ports (a saturated ``wifi0``, a flapping ``Port 2``),
+    and those names repeat on every device -- so the parent has to come along or
+    the reader cannot tell four faults from one restated four times (Gitea #44).
+    One extra batched query, skipping parents already fetched.
+    """
+    wanted = {int(r["parent_id"]) for r in found.values() if r["parent_id"] is not None}
+    missing = wanted - set(found)
+    if missing:
+        found.update(store.entities_by_ids(missing))
+    return found
+
+
+def _entity_ref(row: Any, ents: Optional[Mapping[int, Any]] = None) -> Optional[dict[str, Any]]:
+    """Compact ``{entity_id, name, type, native_id, model}`` ref (name falls back to MAC).
+
+    ``name`` is what the report prints, so a radio or a port carries the device it
+    is on (``"Loft / wifi0"``) whenever ``ents`` holds the parent.
+    """
     if row is None:
         return None
-    name = row["name"]
+    name = row["name"] or row["native_id"]
     return {
         "entity_id": int(row["entity_id"]),
-        "name": name if name else row["native_id"],
+        "name": entity_display_label(str(name), row["entity_type"], _parent_name(row, ents)),
         "type": row["entity_type"],
         "native_id": row["native_id"],
         "model": row["model"],
@@ -538,7 +565,7 @@ def _build_health(
         for off in s.top_offenders
         if off.get("attributed_entity_id") is not None
     ]
-    names = store.entities_by_ids(off_ids)
+    names = _with_parents(store, store.entities_by_ids(off_ids))
 
     sles: list[SleScoreView] = []
     for sle in ALL_SLES:
@@ -550,7 +577,7 @@ def _build_health(
                 "attributed_entity_id": off.get("attributed_entity_id"),
                 "fail_minutes": round(float(off["fail_minutes"]), 1),
                 "entity": (
-                    _entity_ref(names.get(int(off["attributed_entity_id"])))
+                    _entity_ref(names.get(int(off["attributed_entity_id"])), names)
                     if off.get("attributed_entity_id") is not None
                     else None
                 ),
@@ -673,10 +700,10 @@ def _build_clients(
     scores = rank_offenders(
         store, CLIENT_ENTITY_TYPES, start, end, top_n=WORST_DEVICES_TOP_N, settings=settings
     )
-    names = store.entities_by_ids([s.entity_id for s in scores])
+    names = _with_parents(store, store.entities_by_ids([s.entity_id for s in scores]))
     worst = [
         {
-            "entity": _entity_ref(names.get(s.entity_id)),
+            "entity": _entity_ref(names.get(s.entity_id), names),
             "score": round(s.score, 1),
             "fail_minutes": round(s.fail_minutes, 1),
             "issue_counts": dict(s.issue_counts),
@@ -695,12 +722,13 @@ def _build_clients(
 # --------------------------------------------------------------------------- #
 # Findings
 # --------------------------------------------------------------------------- #
-def _affected_asset(row: Any) -> Optional[AffectedAsset]:
+def _affected_asset(row: Any, ents: Optional[Mapping[int, Any]] = None) -> Optional[AffectedAsset]:
     if row is None:
         return None
+    name = row["name"] or row["native_id"]
     return AffectedAsset(
         entity_id=int(row["entity_id"]),
-        name=row["name"] if row["name"] else row["native_id"],
+        name=entity_display_label(str(name), row["entity_type"], _parent_name(row, ents)),
         type=row["entity_type"],
         role=row["entity_type"],
     )
@@ -758,7 +786,7 @@ def _incident_finding(
 
     affected = [
         a
-        for a in (_affected_asset(ent_map.get(eid)) for eid in dict.fromkeys(aff_ids))
+        for a in (_affected_asset(ent_map.get(eid), ent_map) for eid in dict.fromkeys(aff_ids))
         if a is not None
     ]
     symptoms = [
@@ -767,7 +795,7 @@ def _incident_finding(
             detector_key=si["detector_key"],
             title=si["title"],
             entity=(
-                _entity_ref(ent_map.get(int(si["entity_id"])))
+                _entity_ref(ent_map.get(int(si["entity_id"])), ent_map)
                 if si["entity_id"] is not None
                 else None
             ),
@@ -839,7 +867,7 @@ def _environmental_finding(
 
     affected = [
         a
-        for a in (_affected_asset(ent_map.get(eid)) for eid in dict.fromkeys(aff_ids))
+        for a in (_affected_asset(ent_map.get(eid), ent_map) for eid in dict.fromkeys(aff_ids))
         if a is not None
     ]
     channels = len(neighbor_density["by_channel"])
@@ -903,7 +931,7 @@ def _build_findings(
     )
 
     entity_ids = {int(i["entity_id"]) for i in confirmed if i["entity_id"] is not None}
-    ent_map = store.entities_by_ids(entity_ids)
+    ent_map = _with_parents(store, store.entities_by_ids(entity_ids))
 
     # Group core issues by incident; a standalone issue is its own group.
     groups: dict[tuple[str, int], list[dict[str, Any]]] = {}

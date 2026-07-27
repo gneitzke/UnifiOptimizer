@@ -379,6 +379,31 @@ def test_findings_template_is_complete(seeded, repo) -> None:
         assert len(f["recommendation"].strip()) > 10
 
 
+def test_affected_radio_names_the_ap_it_is_on(seeded, repo) -> None:
+    """Gitea #44: a radio's own name repeats on every AP, so the report qualifies it.
+
+    The environmental finding is built from the channel-plan issue, which sits on
+    Core AP's 2.4 GHz radio -- unqualified it is a bare ``ap:core:ng`` that the
+    reader cannot place.
+    """
+    doc = report_to_dict(_report(repo))
+    env = next(f for f in doc["findings"] if f["id"] == "ENV-01")
+    radio = next(a for a in env["affected_assets"] if a["type"] == "radio")
+    assert radio["name"] == "Core AP / ap:core:ng"
+
+
+def test_a_device_asset_is_not_prefixed(seeded, repo) -> None:
+    doc = report_to_dict(_report(repo))
+    names = {
+        a["name"]
+        for f in doc["findings"]
+        for a in f["affected_assets"]
+        if a["type"] in ("ap", "switch", "gateway", "client")
+    }
+    assert "Mesh AP" in names
+    assert all(" / " not in name for name in names), names
+
+
 def test_roadmap_phases_trace_to_findings(seeded, repo) -> None:
     # The base fixture has no P1, so add one standalone critical fault to
     # exercise all three phases in one report.

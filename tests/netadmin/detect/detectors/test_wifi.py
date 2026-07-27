@@ -179,7 +179,14 @@ def roam(repo: Repository, client_id: int, ts: int, from_ap_id: Optional[int]) -
 # ====================================================================== #
 # wifi.sticky_client
 # ====================================================================== #
-def _sticky_client(repo: Repository, native_id: str, ap_mac: str, *, better: bool) -> int:
+def _sticky_client(
+    repo: Repository,
+    native_id: str,
+    ap_mac: str,
+    *,
+    better: bool,
+    tx_rate_kbps: float = 12_000.0,
+) -> int:
     cid = mk_client(repo, native_id, ap_mac=ap_mac)
     if better:
         # A prior attachment to a different AP where the client saw a strong signal.
@@ -187,7 +194,8 @@ def _sticky_client(repo: Repository, native_id: str, ap_mac: str, *, better: boo
         repo.record_state_change(cid, "ap_mac", ap_mac, ts=NOW - 3000)
         repo.record_samples([SampleReading(cid, "rssi", NOW - 4800, -58.0)])
     gauge(repo, cid, "rssi", [-82.0] * 8)
-    gauge(repo, cid, "tx_rate", [12.0] * 8)
+    # tx_rate is stored in kbps (netadmin.ingest.mapping.METRICS), never Mbps.
+    gauge(repo, cid, "tx_rate", [tx_rate_kbps] * 8)
     return cid
 
 
@@ -225,6 +233,31 @@ def test_sticky_client_unknown_on_low_coverage(repo: Repository) -> None:
     seed_low_cov(repo)
     _sticky_client(repo, "cli-1", "ap-near", better=True)
     assert StickyClientDetector().evaluate(_ctx(repo)) is UNKNOWN
+
+
+def test_sticky_client_rate_confounder_reads_kbps_as_mbps(repo: Repository) -> None:
+    """The rate confounder must judge Mbps, not the raw kbps the store holds.
+
+    A real 1152.9 Mbps link arrives as 1_152_900; compared straight against the
+    24 Mbps threshold it would have had to be 24 kbps to corroborate, so the
+    check was dead for every sticky client ever raised (Gitea #41).
+    """
+    seed_cov(repo)
+    # 1_152_900 kbps = 1152.9 Mbps: a fast client, nothing to corroborate.
+    _sticky_client(repo, "cli-fast", "ap-near", better=True, tx_rate_kbps=1_152_900.0)
+    (fast,) = StickyClientDetector().evaluate(_ctx(repo))
+    assert fast.evidence["median_tx_rate_mbps"] == 1152.9
+    assert fast.evidence["low_rate_corroborated"] is False
+
+
+def test_sticky_client_low_rate_corroborates(repo: Repository) -> None:
+    seed_cov(repo)
+    # 12_000 kbps = 12 Mbps, under the 24 Mbps floor -> the confounder fires.
+    _sticky_client(repo, "cli-slow", "ap-near", better=True, tx_rate_kbps=12_000.0)
+    (slow,) = StickyClientDetector().evaluate(_ctx(repo))
+    assert slow.evidence["median_tx_rate_mbps"] == 12.0
+    assert slow.evidence["low_rate_corroborated"] is True
+    assert "low_rate_corroborated" in slow.confounders_checked
 
 
 # ====================================================================== #
@@ -769,13 +802,15 @@ def test_tx_power_unknown_on_low_coverage(repo: Repository) -> None:
 def test_legacy_rates_fires_on_11b_client(repo: Repository) -> None:
     seed_cov(repo)
     cid = mk_client(repo, "cli-1")
-    gauge(repo, cid, "tx_rate", [11.0] * 8)
+    # 11_000 kbps = 11 Mbps, the top 802.11b rate, as the store holds it.
+    gauge(repo, cid, "tx_rate", [11_000.0] * 8)
 
     findings = LegacyRatesDetector().evaluate(_ctx(repo))
     assert len(findings) == 1
     f = findings[0]
     assert f.detector_key == KEY_LEGACY_RATES
     assert f.severity is Severity.P3
+    assert f.evidence["median_tx_rate_mbps"] == 11.0
     assert f.evidence["matches_11b_rate"] is True
     assert "rate_sustained_not_momentary" in f.confounders_checked
 
@@ -783,21 +818,34 @@ def test_legacy_rates_fires_on_11b_client(repo: Repository) -> None:
 def test_legacy_rates_suppressed_for_fast_client(repo: Repository) -> None:
     seed_cov(repo)
     cid = mk_client(repo, "cli-1")
-    gauge(repo, cid, "tx_rate", [300.0] * 8)
+    gauge(repo, cid, "tx_rate", [300_000.0] * 8)  # 300 Mbps
+    assert LegacyRatesDetector().evaluate(_ctx(repo)) == []
+
+
+def test_legacy_rates_converts_kbps_exactly_once(repo: Repository) -> None:
+    """A modern client must not be mistaken for 802.11b by a double conversion.
+
+    866_700 kbps is 866.7 Mbps; divide by 1000 twice and it reads 0.87 Mbps,
+    under the 11 Mbps ceiling, and every fast client on the site becomes a
+    legacy-rate finding.
+    """
+    seed_cov(repo)
+    cid = mk_client(repo, "cli-1")
+    gauge(repo, cid, "tx_rate", [866_700.0] * 8)
     assert LegacyRatesDetector().evaluate(_ctx(repo)) == []
 
 
 def test_legacy_rates_excludes_wired(repo: Repository) -> None:
     seed_cov(repo)
     cid = mk_client(repo, "cli-1", is_wired=True)
-    gauge(repo, cid, "tx_rate", [11.0] * 8)
+    gauge(repo, cid, "tx_rate", [11_000.0] * 8)
     assert LegacyRatesDetector().evaluate(_ctx(repo)) == []
 
 
 def test_legacy_rates_unknown_on_low_coverage(repo: Repository) -> None:
     seed_low_cov(repo)
     cid = mk_client(repo, "cli-1")
-    gauge(repo, cid, "tx_rate", [11.0] * 8)
+    gauge(repo, cid, "tx_rate", [11_000.0] * 8)
     assert LegacyRatesDetector().evaluate(_ctx(repo)) is UNKNOWN
 
 

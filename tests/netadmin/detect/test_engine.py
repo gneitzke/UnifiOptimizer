@@ -7,9 +7,17 @@ exercised end-to-end, not mocked.
 
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
+
 from netadmin.detect.catalog import build_catalog
-from netadmin.detect.engine import UNKNOWN, DetectorEngine, DetectorResult
-from netadmin.domain.types import Cadence, IssueState, Severity
+from netadmin.detect.engine import (
+    DEFAULT_CLIENT_ABSENT_AFTER_S,
+    UNKNOWN,
+    DetectorEngine,
+    DetectorResult,
+)
+from netadmin.domain.types import Cadence, EntityType, IssueState, Severity
 from netadmin.issues.engine import fingerprint
 from netadmin.issues.models import EngineConfig
 from netadmin.store.repository import Repository
@@ -18,6 +26,7 @@ from tests.netadmin.detect.support import (
     build_stack,
     entry,
     make_finding,
+    seed_client,
     seed_device,
 )
 
@@ -31,6 +40,15 @@ def _boom(ctx):
 def _open_issue(repo: Repository, detector_key: str):
     rows = [r for r in repo.list_issues(open_only=True) if r["detector_key"] == detector_key]
     return rows[0] if rows else None
+
+
+def _resolved_issue_id(repo: Repository, detector_key: str) -> int:
+    rows = [
+        r
+        for r in repo.list_issues(state=IssueState.RESOLVED.value)
+        if r["detector_key"] == detector_key
+    ]
+    return int(rows[0]["id"])
 
 
 # ---------------------------------------------------------------------- #
@@ -263,6 +281,239 @@ def test_empty_pass_with_no_issues_is_a_noop(repo: Repository) -> None:
     assert result.cleared == []
     assert result.transitions == []
     assert result.ok is True
+
+
+# ---------------------------------------------------------------------- #
+# Departure — a client that left the network (Gitea #43)
+# ---------------------------------------------------------------------- #
+def _client_stack(repo: Repository, holder: dict, *, settings=None) -> DetectorEngine:
+    det = StubDetector("t.client", Cadence.WINDOW, lambda ctx: holder["r"])
+    return build_stack(
+        repo,
+        catalog=build_catalog([entry(det)]),
+        issue_config=EngineConfig(default_m=1, default_k=2),
+        settings=settings,
+    ).detector_engine
+
+
+def test_departed_client_clears_the_issue_a_detector_can_only_freeze(repo: Repository) -> None:
+    # The live defect: the client leaves, every client-scoped detector reports it
+    # as unknown for want of samples, and the issue sits active for ever. Absence
+    # of the client itself outranks that freeze and resolves the issue.
+    cid = seed_client(repo, native_id="client-a", last_seen_ts=NOW)
+    finding = make_finding(
+        "t.client", native_id="client-a", entity_type=EntityType.CLIENT, entity_id=cid
+    )
+    holder: dict = {"r": [finding]}
+    engine = _client_stack(repo, holder)
+
+    engine.run_window(NOW)  # fire -> active (M=1)
+    assert _open_issue(repo, "t.client")["state"] == IssueState.ACTIVE.value
+
+    # The client is gone: no samples, so the detector says "cannot judge", and the
+    # entity's own last sighting is now older than the absence threshold.
+    holder["r"] = DetectorResult(findings=[], unknown_entities={cid})
+    later = NOW + DEFAULT_CLIENT_ABSENT_AFTER_S + 60
+    result = engine.run_window(later)
+    assert result.absent == [fingerprint(finding)]
+    assert result.frozen == []
+    resolving = _open_issue(repo, "t.client")
+    assert resolving["state"] == IssueState.RESOLVING.value
+    assert resolving["clear_streak"] == 1
+
+    # K=2: the second absent pass resolves it, and the trail says why.
+    engine.run_window(later + 900)
+    assert _open_issue(repo, "t.client") is None
+    events = repo.list_issue_events(_resolved_issue_id(repo, "t.client"))
+    reasons = {e["kind"]: json.loads(e["detail"] or "{}").get("reason") for e in events}
+    assert reasons["resolving"] == "entity_absent"
+    assert reasons["resolved"] == "entity_absent"
+
+
+def test_client_seen_within_the_threshold_still_freezes(repo: Repository) -> None:
+    # A client that is here but quiet (power-save, a sparse poll) is not gone: the
+    # per-entity freeze must still win, or every dozing phone loses its issue.
+    cid = seed_client(repo, native_id="client-a", last_seen_ts=NOW)
+    finding = make_finding(
+        "t.client", native_id="client-a", entity_type=EntityType.CLIENT, entity_id=cid
+    )
+    holder: dict = {"r": [finding]}
+    engine = _client_stack(repo, holder)
+    engine.run_window(NOW)
+
+    holder["r"] = DetectorResult(findings=[], unknown_entities={cid})
+    result = engine.run_window(NOW + DEFAULT_CLIENT_ABSENT_AFTER_S - 60)
+    assert result.absent == []
+    assert result.frozen == [fingerprint(finding)]
+    assert _open_issue(repo, "t.client")["clear_streak"] == 0
+
+
+def test_a_stale_ap_is_never_treated_as_departed(repo: Repository) -> None:
+    # APs and switches have their own down semantics (infra.device_down plus the
+    # inhibition it triggers). Clearing their issues by absence would resolve the
+    # whole site's findings the moment the controller stopped reporting them.
+    ap_id = seed_device(repo, native_id="ap-a", entity_type=EntityType.AP, last_seen_ts=NOW)
+    finding = make_finding("t.client", native_id="ap-a", entity_type=EntityType.AP, entity_id=ap_id)
+    holder: dict = {"r": [finding]}
+    engine = _client_stack(repo, holder)
+    engine.run_window(NOW)
+
+    holder["r"] = DetectorResult(findings=[], unknown_entities={ap_id})
+    result = engine.run_window(NOW + 10 * DEFAULT_CLIENT_ABSENT_AFTER_S)
+    assert result.absent == []
+    assert result.frozen == [fingerprint(finding)]
+
+
+def test_absent_pending_issue_is_discarded(repo: Repository) -> None:
+    # The orphan-pending gap: an unconfirmed row whose client left had no path to
+    # removal, because only a clear discards it and absence never produced one.
+    cid = seed_client(repo, native_id="client-a", last_seen_ts=NOW)
+    finding = make_finding(
+        "t.client", native_id="client-a", entity_type=EntityType.CLIENT, entity_id=cid
+    )
+    holder: dict = {"r": [finding]}
+    det = StubDetector("t.client", Cadence.WINDOW, lambda ctx: holder["r"])
+    engine = build_stack(
+        repo,
+        catalog=build_catalog([entry(det)]),
+        issue_config=EngineConfig(default_m=3, default_k=6),  # never confirmed
+    ).detector_engine
+
+    engine.run_window(NOW)
+    assert _open_issue(repo, "t.client")["state"] == IssueState.PENDING.value
+
+    holder["r"] = DetectorResult(findings=[], unknown_entities={cid})
+    engine.run_window(NOW + DEFAULT_CLIENT_ABSENT_AFTER_S + 60)
+    assert repo.list_issues() == []
+
+
+def test_absence_threshold_is_configurable(repo: Repository) -> None:
+    cid = seed_client(repo, native_id="client-a", last_seen_ts=NOW)
+    finding = make_finding(
+        "t.client", native_id="client-a", entity_type=EntityType.CLIENT, entity_id=cid
+    )
+    holder: dict = {"r": [finding]}
+    settings = SimpleNamespace(thresholds={"engine": {"client_absent_after_s": 300}}, poll=None)
+    engine = _client_stack(repo, holder, settings=settings)
+    engine.run_window(NOW)
+
+    holder["r"] = DetectorResult(findings=[], unknown_entities={cid})
+    assert engine.run_window(NOW + 240).absent == []  # inside the configured window
+    assert engine.run_window(NOW + 600).absent == [fingerprint(finding)]
+
+
+def test_a_garbage_threshold_falls_back_to_the_default(repo: Repository) -> None:
+    # Tunables never raise (the DetectorContext contract): a mistyped setting
+    # must not take the detection pass down with it.
+    cid = seed_client(repo, native_id="client-a", last_seen_ts=NOW)
+    finding = make_finding(
+        "t.client", native_id="client-a", entity_type=EntityType.CLIENT, entity_id=cid
+    )
+    holder: dict = {"r": [finding]}
+    settings = SimpleNamespace(thresholds={"engine": {"client_absent_after_s": "soon"}}, poll=None)
+    engine = _client_stack(repo, holder, settings=settings)
+    engine.run_window(NOW)
+
+    holder["r"] = DetectorResult(findings=[], unknown_entities={cid})
+    assert engine.run_window(NOW + DEFAULT_CLIENT_ABSENT_AFTER_S - 60).absent == []
+    assert engine.run_window(NOW + DEFAULT_CLIENT_ABSENT_AFTER_S + 60).absent == [
+        fingerprint(finding)
+    ]
+
+
+def test_absence_can_be_switched_off(repo: Repository) -> None:
+    cid = seed_client(repo, native_id="client-a", last_seen_ts=NOW)
+    finding = make_finding(
+        "t.client", native_id="client-a", entity_type=EntityType.CLIENT, entity_id=cid
+    )
+    holder: dict = {"r": [finding]}
+    settings = SimpleNamespace(thresholds={"engine": {"client_absent_after_s": 0}}, poll=None)
+    engine = _client_stack(repo, holder, settings=settings)
+    engine.run_window(NOW)
+
+    holder["r"] = DetectorResult(findings=[], unknown_entities={cid})
+    result = engine.run_window(NOW + 30 * DEFAULT_CLIENT_ABSENT_AFTER_S)
+    assert result.absent == []
+    assert result.frozen == [fingerprint(finding)]
+
+
+def test_ap_outage_does_not_mass_resolve_its_clients_issues(repo: Repository) -> None:
+    """A power cut takes an AP down; all its clients vanish at once.
+
+    Every one of those clients is absent by the letter of the rule, so without
+    inhibition the site would silently resolve every client issue under that AP
+    while the operator is still holding a torch. ``infra.device_down`` freezes the
+    lot, and they come back the moment the AP does.
+    """
+    ap_id = seed_device(repo, native_id="ap-a", entity_type=EntityType.AP, last_seen_ts=NOW)
+    clients = [
+        seed_client(repo, native_id=f"client-{n}", last_seen_ts=NOW, parent_id=ap_id)
+        for n in range(3)
+    ]
+    findings = [
+        make_finding(
+            "t.client", native_id=f"client-{n}", entity_type=EntityType.CLIENT, entity_id=cid
+        )
+        for n, cid in enumerate(clients)
+    ]
+    down = make_finding(
+        "infra.device_down", native_id="ap-a", entity_type=EntityType.AP, entity_id=ap_id
+    )
+
+    client_holder: dict = {"r": list(findings)}
+    down_holder: dict = {"r": []}
+    catalog = build_catalog(
+        [
+            entry(StubDetector("t.client", Cadence.WINDOW, lambda ctx: client_holder["r"])),
+            entry(StubDetector("infra.device_down", Cadence.WINDOW, lambda ctx: down_holder["r"])),
+        ]
+    )
+    engine = build_stack(
+        repo,
+        catalog=catalog,
+        issue_config=EngineConfig(default_m=1, default_k=2),
+    ).detector_engine
+
+    engine.run_window(NOW)  # three client issues -> active
+    assert len({fingerprint(f) for f in findings}) == 3
+
+    # The AP dies. Its clients disappear with it, and stay gone well past K.
+    down_holder["r"] = [down]
+    client_holder["r"] = DetectorResult(findings=[], unknown_entities=set(clients))
+    outage = NOW + DEFAULT_CLIENT_ABSENT_AFTER_S + 60
+    for cycle in range(6):
+        result = engine.run_window(outage + cycle * 900)
+        assert sorted(result.absent) == sorted(fingerprint(f) for f in findings)
+
+    rows = [r for r in repo.list_issues(open_only=True) if r["detector_key"] == "t.client"]
+    assert len(rows) == 3, "no client issue resolved while its AP was down"
+    assert {r["state"] for r in rows} == {IssueState.ACTIVE.value}
+    assert {r["clear_streak"] for r in rows} == {0}, "inhibition froze the streak"
+
+
+def test_returning_client_snaps_its_issue_back(repo: Repository) -> None:
+    cid = seed_client(repo, native_id="client-a", last_seen_ts=NOW)
+    finding = make_finding(
+        "t.client", native_id="client-a", entity_type=EntityType.CLIENT, entity_id=cid
+    )
+    holder: dict = {"r": [finding]}
+    engine = _client_stack(repo, holder)
+    engine.run_window(NOW)
+
+    holder["r"] = DetectorResult(findings=[], unknown_entities={cid})
+    gone = NOW + DEFAULT_CLIENT_ABSENT_AFTER_S + 60
+    engine.run_window(gone)
+    assert _open_issue(repo, "t.client")["state"] == IssueState.RESOLVING.value
+
+    # It comes back and the condition is still there: same row, streak reset.
+    back = gone + 900
+    seed_client(repo, native_id="client-a", last_seen_ts=back)
+    holder["r"] = [finding]
+    engine.run_window(back)
+    row = _open_issue(repo, "t.client")
+    assert row["state"] == IssueState.ACTIVE.value
+    assert row["clear_streak"] == 0
+    assert row["first_seen_ts"] == NOW, "continuity: the same issue, not a fresh one"
 
 
 # ---------------------------------------------------------------------- #

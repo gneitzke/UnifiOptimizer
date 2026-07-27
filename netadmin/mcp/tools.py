@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from netadmin.analytics.offenders import CLIENT_ENTITY_TYPES, DEVICE_ENTITY_TYPES, rank_offenders
+from netadmin.domain.entities import entity_display_label
 from netadmin.domain.types import EntityType
 from netadmin.mcp import format as fmt
 from netadmin.sle.scores import sle_scores
@@ -274,6 +275,10 @@ def resolve_entity(repo: Repository, ref: Any, *, field: str = "entity") -> sqli
 
     rows = repo.list_entities()
     lowered = text.lower()
+    # Every entity is already in hand, so parents resolve without a second query --
+    # and this is where the parent matters most: "wifi0" matches one radio per AP,
+    # and a list of four identical names is not a choice anyone can make.
+    by_id = {int(r["entity_id"]): r for r in rows}
 
     def _pick(candidates: list[sqlite3.Row]) -> Optional[sqlite3.Row]:
         if len(candidates) == 1:
@@ -282,7 +287,7 @@ def resolve_entity(repo: Repository, ref: Any, *, field: str = "entity") -> sqli
             raise AmbiguousEntity(
                 f"{len(candidates)} entities match {text!r}. Re-run with one of "
                 "these entity_ids.",
-                candidates=[_entity_ref(row) for row in candidates[: fmt.MAX_LIMIT]],
+                candidates=[_entity_ref(row, by_id) for row in candidates[: fmt.MAX_LIMIT]],
             )
         return None
 
@@ -317,18 +322,45 @@ def resolve_entity(repo: Repository, ref: Any, *, field: str = "entity") -> sqli
 # --------------------------------------------------------------------------- #
 # Row -> payload helpers
 # --------------------------------------------------------------------------- #
-def _entity_ref(row: Optional[sqlite3.Row]) -> Optional[dict[str, Any]]:
-    """Compact ``{entity_id, name, type, native_id}``; ``name`` falls back to MAC."""
+def _entity_ref(
+    row: Optional[sqlite3.Row],
+    entities: Optional[Mapping[int, sqlite3.Row]] = None,
+) -> Optional[dict[str, Any]]:
+    """Compact ``{entity_id, name, type, native_id}``; ``name`` falls back to MAC.
+
+    ``name`` is the *display* label, so a radio or a port arrives qualified by the
+    device it is on (``"Loft / wifi0"``). Without that, four saturated radios on
+    four different APs are four identical ``wifi0`` strings and a model asked
+    "which AP is saturated" has nothing to answer with (Gitea #44). The parent row
+    comes from ``entities`` -- :func:`_entity_map` and :func:`_with_parents` put it
+    there -- so this stays a dict lookup, never a query.
+    """
     if row is None:
         return None
-    name = row["name"]
-    native_id = row["native_id"]
+    name = row["name"] or row["native_id"]
+    parent_id = row["parent_id"]
+    parent = (entities or {}).get(int(parent_id)) if parent_id is not None else None
+    parent_name = (parent["name"] or parent["native_id"]) if parent is not None else None
     return {
         "entity_id": int(row["entity_id"]),
-        "name": name if name else native_id,
+        "name": entity_display_label(str(name), row["entity_type"], parent_name),
         "type": row["entity_type"],
-        "native_id": native_id,
+        "native_id": row["native_id"],
     }
+
+
+def _with_parents(repo: Repository, found: dict[int, sqlite3.Row]) -> dict[int, sqlite3.Row]:
+    """Add the parents of any structural children to a resolved entity map.
+
+    One extra batched query for the whole payload, never one per child, and only
+    for parents the caller did not already ask for -- a response naming both an AP
+    and one of its radios does not fetch the AP twice.
+    """
+    wanted = {int(r["parent_id"]) for r in found.values() if r["parent_id"] is not None}
+    missing = wanted - set(found)
+    if missing:
+        found.update(repo.entities_by_ids(missing))
+    return found
 
 
 def _entity_map(
@@ -336,7 +368,12 @@ def _entity_map(
 ) -> dict[int, sqlite3.Row]:
     """Batch-resolve a row set's ``entity_id`` column in one query, never N."""
     ids = [row[column] for row in rows if row[column] is not None]
-    return repo.entities_by_ids(ids) if ids else {}
+    return _with_parents(repo, repo.entities_by_ids(ids)) if ids else {}
+
+
+def _solo_ref(repo: Repository, row: sqlite3.Row) -> Optional[dict[str, Any]]:
+    """One entity's ref with its parent resolved (the batch path is :func:`_entity_map`)."""
+    return _entity_ref(row, _with_parents(repo, {int(row["entity_id"]): row}))
 
 
 def _issue_brief(
@@ -361,7 +398,9 @@ def _issue_brief(
         "detector": row["detector_key"],
         "severity": row["severity"],
         "state": row["state"],
-        "entity": _entity_ref(entities.get(int(entity_id))) if entity_id is not None else None,
+        "entity": (
+            _entity_ref(entities.get(int(entity_id)), entities) if entity_id is not None else None
+        ),
         "first_seen": fmt.stamp(first_seen_ts, now) if headline else fmt.iso(first_seen_ts),
         "last_seen": fmt.iso(row["last_seen_ts"]),
         "occurrences": int(row["occurrences"]),
@@ -383,7 +422,9 @@ def _event_brief(row: sqlite3.Row, entities: Mapping[int, sqlite3.Row]) -> dict[
     return {
         "at": fmt.iso(row["ts"]),
         "key": row["key"],
-        "entity": _entity_ref(entities.get(int(entity_id))) if entity_id is not None else None,
+        "entity": (
+            _entity_ref(entities.get(int(entity_id)), entities) if entity_id is not None else None
+        ),
         "msg": row["msg"],
     }
 
@@ -407,7 +448,9 @@ def _state_change_brief(row: sqlite3.Row, entities: Mapping[int, sqlite3.Row]) -
         "attr": row["attr"],
         "from": row["old_value"],
         "to": row["new_value"],
-        "entity": _entity_ref(entities.get(int(entity_id))) if entity_id is not None else None,
+        "entity": (
+            _entity_ref(entities.get(int(entity_id)), entities) if entity_id is not None else None
+        ),
     }
 
 
@@ -1108,7 +1151,7 @@ def what_changed(repo: Repository, params: Mapping[str, Any], now: int) -> dict[
     if params.get("entity") not in (None, ""):
         row = resolve_entity(repo, params.get("entity"))
         entity_id = int(row["entity_id"])
-        entity = _entity_ref(row)
+        entity = _solo_ref(repo, row)
 
     state_rows = repo.list_state_changes(
         start_ts, end_ts, entity_id=entity_id, limit=fmt.MAX_LIMIT * 4
@@ -1123,9 +1166,12 @@ def what_changed(repo: Repository, params: Mapping[str, Any], now: int) -> dict[
         entity_id=entity_id,
         limit=fmt.MAX_LIMIT * 4,
     )
-    entities = repo.entities_by_ids(
-        [row["entity_id"] for row in state_rows if row["entity_id"] is not None]
-        + [row["entity_id"] for row in event_rows if row["entity_id"] is not None]
+    entities = _with_parents(
+        repo,
+        repo.entities_by_ids(
+            [row["entity_id"] for row in state_rows if row["entity_id"] is not None]
+            + [row["entity_id"] for row in event_rows if row["entity_id"] is not None]
+        ),
     )
 
     timeline: list[dict[str, Any]] = []
@@ -1209,11 +1255,11 @@ def worst_offenders(repo: Repository, params: Mapping[str, Any], now: int) -> di
             "offenders": fmt.listing([], limit),
         }
 
-    entities = repo.entities_by_ids([score.entity_id for score in ranked])
+    entities = _with_parents(repo, repo.entities_by_ids([score.entity_id for score in ranked]))
     rows = []
     for score in ranked:
         entry = score.as_dict()
-        entry["entity"] = _entity_ref(entities.get(score.entity_id))
+        entry["entity"] = _entity_ref(entities.get(score.entity_id), entities)
         entry["score"] = round(entry["score"], 2)
         entry["fail_minutes"] = round(entry["fail_minutes"], 2)
         if entry["down_minutes"] is not None:
@@ -1257,7 +1303,7 @@ def metric_history(repo: Repository, params: Mapping[str, Any], now: int) -> dic
     start_ts, end_ts = parse_window(params, now, default="7d")
     entity_row = resolve_entity(repo, params.get("entity"))
     entity_id = int(entity_row["entity_id"])
-    entity = _entity_ref(entity_row)
+    entity = _solo_ref(repo, entity_row)
 
     metric = params.get("metric")
     available = _entity_metrics(repo, entity_id)
@@ -1393,7 +1439,7 @@ def client_experience(repo: Repository, params: Mapping[str, Any], now: int) -> 
     limit = fmt.clamp_limit(params.get("limit"))
     entity_row = resolve_entity(repo, params.get("entity"))
     entity_id = int(entity_row["entity_id"])
-    entity = _entity_ref(entity_row)
+    entity = _solo_ref(repo, entity_row)
 
     rows = repo.query_sle_minutes(start_ts, end_ts, group_by=("entity_id", "sle", "classifier"))
     mine = [

@@ -15,7 +15,10 @@ State machine, per fingerprint::
     resolved + fire within 24 h   -> reopen the same row (parentage preserved)
 
 Cross-cutting behaviours: inhibition freezes both directions while a cause is in
-effect; UNKNOWN verdicts advance nothing; a ``fix_applied`` event arms a 48 h
+effect; UNKNOWN verdicts advance nothing; an issue whose subject has left the
+network takes the clear path carrying ``reason: entity_absent`` on its trail
+events, so a departure resolves through the same K streak as any other clear
+rather than needing a state of its own; a ``fix_applied`` event arms a 48 h
 verification window (resolve inside it -> ``fix_verified``, refire ->
 ``fix_failed``); snooze/ack only set mute flags; every state change and fix event
 writes an ``issue_events`` row and is broadcast to the ``on_transition``
@@ -49,6 +52,12 @@ _log = get_logger("issues.engine")
 
 TransitionCallback = Callable[[Transition], None]
 
+# ``detail["reason"]`` on the resolving/resolved events of an issue cleared
+# because its subject left, not because the condition was observed to stop. The
+# trail is the audit surface for that distinction; the state machine has no
+# separate state for it (a departure is a resolution, not a way of being open).
+REASON_ENTITY_ABSENT = "entity_absent"
+
 
 def fingerprint(finding: Finding) -> str:
     """``sha1(detector_key | site_id | entity native_id | sorted(dims))`` (section 7).
@@ -63,6 +72,13 @@ def fingerprint(finding: Finding) -> str:
         finding.entity.native_id,
         finding.dims,
     )
+
+
+def _with_reason(detail: dict[str, Any], reason: Optional[str]) -> dict[str, Any]:
+    """``detail`` plus ``reason`` when one was given (unannotated clears stay bare)."""
+    if reason is None:
+        return detail
+    return {**detail, "reason": reason}
 
 
 def _fingerprint(detector_key: str, site_id: str, native_id: str, dims: dict[str, str]) -> str:
@@ -132,6 +148,7 @@ class IssueEngine:
         *,
         cleared: Iterable[str] = (),
         unknown: Iterable[str] = (),
+        absent: Iterable[str] = (),
     ) -> list[Transition]:
         """Apply one evaluation cycle and return the transitions it produced.
 
@@ -139,7 +156,10 @@ class IssueEngine:
         evaluated with the problem absent (advance the clear streak). ``unknown``
         are fingerprints the detector could not evaluate (a gap / < 50 % samples)
         — they advance nothing, exactly like a fingerprint left unmentioned.
-        FIRE wins over CLEAR for the same fingerprint in one cycle.
+        ``absent`` are fingerprints whose *subject* is gone (a client that left
+        the network): they take the clear path with a recorded reason, because a
+        condition on something that is no longer here is over. FIRE wins over
+        both CLEAR and ABSENT for the same fingerprint in one cycle.
         """
         findings = list(findings)
         transitions: list[Transition] = []
@@ -151,10 +171,20 @@ class IssueEngine:
             fired_fingerprints.add(fp)
             self._process_fire(finding, fp, now, inhibition, transitions)
 
+        # One clear per fingerprint per cycle, whichever bucket it arrived in --
+        # a fingerprint routed to both must never advance the streak twice.
+        seen: set[str] = set(fired_fingerprints)
         for fp in cleared:
-            if fp in fired_fingerprints:
+            if fp in seen:
                 continue  # a fire this cycle overrides a stale clear
+            seen.add(fp)
             self._process_clear(fp, now, inhibition, transitions)
+
+        for fp in absent:
+            if fp in seen:
+                continue
+            seen.add(fp)
+            self._process_clear(fp, now, inhibition, transitions, reason=REASON_ENTITY_ABSENT)
 
         # ``unknown`` is intentionally a no-op: a gap advances nothing in either
         # direction. It is accepted explicitly so callers can be unambiguous.
@@ -403,6 +433,8 @@ class IssueEngine:
         now: Timestamp,
         inhibition: InhibitionContext,
         transitions: list[Transition],
+        *,
+        reason: Optional[str] = None,
     ) -> None:
         issue = self.repo.get_open_issue_by_fingerprint(fp)
         if issue is None:
@@ -422,7 +454,7 @@ class IssueEngine:
         prev_state = issue.state
         issue.clear_streak += 1
         if issue.clear_streak >= k:
-            self._resolve(issue, now, transitions)
+            self._resolve(issue, now, transitions, reason=reason)
         elif prev_state is IssueState.ACTIVE:
             # First clean check after firing: enters RESOLVING. This is the one
             # event in the streak worth a trail entry -- it is what explains the
@@ -440,12 +472,19 @@ class IssueEngine:
                 now,
                 IssueState.ACTIVE,
                 IssueState.RESOLVING,
-                {"clear_streak": issue.clear_streak, "k": k},
+                _with_reason({"clear_streak": issue.clear_streak, "k": k}, reason),
             )
         else:
             self.repo.update_issue(issue)  # still resolving, no new transition event
 
-    def _resolve(self, issue: Issue, now: Timestamp, transitions: list[Transition]) -> None:
+    def _resolve(
+        self,
+        issue: Issue,
+        now: Timestamp,
+        transitions: list[Transition],
+        *,
+        reason: Optional[str] = None,
+    ) -> None:
         prev_state = issue.state
         armed = self._fix_armed(issue, now)
         issue.state = IssueState.RESOLVED
@@ -458,7 +497,7 @@ class IssueEngine:
             now,
             prev_state,
             IssueState.RESOLVED,
-            {"clear_streak": issue.clear_streak},
+            _with_reason({"clear_streak": issue.clear_streak}, reason),
         )
         if armed:
             issue.fix_state = FixState.VERIFIED
@@ -651,6 +690,7 @@ class IssueEngine:
 
 
 __all__ = [
+    "REASON_ENTITY_ABSENT",
     "IssueEngine",
     "TransitionCallback",
     "fingerprint",

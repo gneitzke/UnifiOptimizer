@@ -108,6 +108,58 @@ def test_unknown_entity_is_reported_not_guessed(demo_repo: Repository) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Entity naming (Gitea #44)
+# --------------------------------------------------------------------------- #
+def _port_row(repo: Repository) -> Any:
+    return repo.list_entities("port")[0]
+
+
+def test_a_port_ref_names_the_switch_it_is_on(demo_repo: Repository) -> None:
+    """Every switch has a Port 2; a bare one answers no question a model asks."""
+    port = _port_row(demo_repo)
+    switch = demo_repo.get_entity(int(port["parent_id"]))
+    ref = tools._solo_ref(demo_repo, port)
+    assert ref is not None
+    assert ref["name"] == f"{switch['name']} / {port['name']}"
+    assert ref["native_id"] == port["native_id"]  # identity is untouched
+
+
+def test_ambiguous_candidates_are_told_apart_by_their_parent(demo_repo: Repository) -> None:
+    with pytest.raises(tools.AmbiguousEntity) as excinfo:
+        tools.resolve_entity(demo_repo, "Port 2")
+    names = [c["name"] for c in excinfo.value.payload()["candidates"]]
+    assert len(names) > 1
+    assert len(set(names)) == len(names), f"identical candidates are unchoosable: {names}"
+    assert all(" / Port 2" in name for name in names)
+
+
+def test_a_top_level_entity_ref_is_not_prefixed(demo_repo: Repository) -> None:
+    ap = demo_repo.list_entities("ap")[0]
+    ref = tools._solo_ref(demo_repo, ap)
+    assert ref is not None
+    assert ref["name"] == ap["name"]
+
+
+def test_issue_briefs_place_every_port_on_its_switch(demo_repo: Repository) -> None:
+    """Two switches, both with a "Port 2": the briefs must not be interchangeable.
+
+    (The demo's radios are named after their AP already -- "Living Room 2.4G" --
+    so they are deliberately left unprefixed; a real controller's ``wifi0`` is
+    covered by :func:`test_a_port_ref_names_the_switch_it_is_on` and the domain
+    rule's own tests.)
+    """
+    result = _call(demo_repo, "netadmin_overview", window="24h")
+    named = [
+        issue["entity"]["name"]
+        for issue in result["open_issues"]["items"]
+        if issue.get("entity") and issue["entity"]["type"] == "port"
+    ]
+    assert named, "the demo has open port issues"
+    assert all(" / " in name for name in named), named
+    assert len(set(named)) == len(named), f"two ports rendered the same: {named}"
+
+
+# --------------------------------------------------------------------------- #
 # 1. netadmin_overview
 # --------------------------------------------------------------------------- #
 def test_overview_leads_with_counts_health_and_collector_state(demo_repo: Repository) -> None:

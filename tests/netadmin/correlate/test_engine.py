@@ -524,7 +524,7 @@ def test_idempotent_rerun_same_incident_id(topo: TopologyBuilder) -> None:
     assert len(again) == 1, "re-running does not duplicate the incident"
     assert again[0].id == first_id, "identity preserved by root fingerprint"
     assert again[0].first_seen_ts == first_first_seen, "age keeps counting"
-    assert again[0].last_seen_ts == NOW + 300, "last_seen advances"
+    assert again[0].last_seen_ts == T + 20, "last_seen is member evidence, not the pass clock"
 
 
 # --------------------------------------------------------------------------- #
@@ -640,7 +640,7 @@ def test_root_resolves_while_symptom_persists_keeps_incident_open(
     assert inc.id == inc_id, "identity preserved -- not a new incident-of-one"
     assert inc.state == IncidentState.OPEN, "still open: a member is still active"
     assert inc.first_seen_ts == first_seen, "age keeps counting; the clock does not reset"
-    assert inc.last_seen_ts == NOW + 5000
+    assert inc.last_seen_ts == T + 10, "the surviving symptom's evidence, not the pass clock"
     member_ids = {m.issue_id for m in _members(store, inc_id)}
     assert member_ids == {10, 11}, "root shown resolved (10) + surviving symptom (11)"
 
@@ -680,3 +680,100 @@ def test_forward_window_rejects_much_later_symptom(topo: TopologyBuilder) -> Non
     incidents = {i.root_issue_id: i for i in windowed.all_incidents()}
     assert set(incidents) == {10, 11}
     assert len(_members(windowed, incidents[10].id)) == 1
+
+
+# --------------------------------------------------------------------------- #
+# last_seen is evidence, never the pass clock (Gitea #43)
+# --------------------------------------------------------------------------- #
+def test_last_seen_is_the_newest_member_evidence(topo: TopologyBuilder) -> None:
+    ap = topo.add(1, "ap", name="AP-Garage-Mesh")
+    client = topo.add(2, "client", parent_id=ap, name="Thermostat")
+    issues = [
+        make_issue(10, "wifi.mesh_uplink", ap, first_seen_ts=T, last_seen_ts=T + 100),
+        make_issue(11, "net.coverage_hole", ap, first_seen_ts=T + 10, last_seen_ts=T + 500),
+        make_issue(12, "client.flaky", client, first_seen_ts=T + 20, last_seen_ts=T + 300),
+    ]
+    store = InMemoryCorrelationStore(issues, topo.build())
+    CorrelationEngine(store).run(NOW)
+
+    incident = store.all_incidents()[0]
+    assert incident.last_seen_ts == T + 500, "the newest member's evidence"
+    assert incident.first_seen_ts == NOW, "first_seen still marks when the grouping began"
+
+
+def test_last_seen_does_not_advance_without_member_evidence(topo: TopologyBuilder) -> None:
+    """The reported defect: an incident advertising a freshness nothing observed.
+
+    Correlation runs every pass whether or not anything fired. Stamping ``now``
+    made every incident look freshly seen, so an issue wedged open with evidence
+    hours old still read as "last seen a minute ago".
+    """
+    ap = topo.add(1, "ap", name="AP-Garage-Mesh")
+    issues = [
+        make_issue(10, "wifi.mesh_uplink", ap, first_seen_ts=T, last_seen_ts=T + 100),
+        make_issue(11, "net.coverage_hole", ap, first_seen_ts=T + 10, last_seen_ts=T + 100),
+    ]
+    store = InMemoryCorrelationStore(issues, topo.build())
+    engine = CorrelationEngine(store)
+    engine.run(NOW)
+
+    # Three more passes with no member refiring: the timestamp must not move.
+    for offset in (300, 600, 900):
+        engine.run(NOW + offset)
+    assert store.all_incidents()[0].last_seen_ts == T + 100
+
+    # A member fires again -> the incident tracks that real observation.
+    issues[1].last_seen_ts = NOW + 1200
+    store.set_issues(issues)
+    engine.run(NOW + 1200)
+    assert store.all_incidents()[0].last_seen_ts == NOW + 1200
+
+
+def test_last_seen_never_moves_backwards_when_membership_shrinks(topo: TopologyBuilder) -> None:
+    ap = topo.add(1, "ap", name="AP-Garage-Mesh")
+    client = topo.add(2, "client", parent_id=ap, name="Thermostat")
+    issues = [
+        make_issue(10, "wifi.mesh_uplink", ap, first_seen_ts=T, last_seen_ts=T + 100),
+        make_issue(12, "client.flaky", client, first_seen_ts=T + 20, last_seen_ts=T + 900),
+    ]
+    store = InMemoryCorrelationStore(issues, topo.build())
+    engine = CorrelationEngine(store)
+    engine.run(NOW)
+    assert store.all_incidents()[0].last_seen_ts == T + 900
+
+    # The client's issue resolves; only the older root remains a member.
+    issues[1].state = IssueState.RESOLVED
+    store.set_issues(issues)
+    engine.run(NOW + 300)
+    assert store.all_incidents()[0].last_seen_ts == T + 900
+
+
+def test_retained_incident_tracks_its_surviving_symptom(topo: TopologyBuilder) -> None:
+    ap = topo.add(1, "ap", name="AP-Garage-Mesh")
+    issues = [
+        make_issue(
+            10, "wifi.mesh_uplink", ap, first_seen_ts=T, last_seen_ts=T + 100, severity=Severity.P2
+        ),
+        make_issue(
+            11,
+            "net.coverage_hole",
+            ap,
+            first_seen_ts=T + 10,
+            last_seen_ts=T + 100,
+            severity=Severity.P2,
+        ),
+    ]
+    store = InMemoryCorrelationStore(issues, topo.build())
+    engine = CorrelationEngine(store)
+    engine.run(NOW)
+
+    # Root fixed; the symptom keeps firing.
+    issues[0].state = IssueState.RESOLVED
+    issues[1].last_seen_ts = NOW + 5000
+    store.set_issues(issues)
+    engine.run(NOW + 5000)
+    assert store.all_incidents()[0].last_seen_ts == NOW + 5000
+
+    # ... and then stops firing: the incident stays open, the timestamp stays put.
+    engine.run(NOW + 9000)
+    assert store.all_incidents()[0].last_seen_ts == NOW + 5000

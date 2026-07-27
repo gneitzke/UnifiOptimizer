@@ -347,6 +347,7 @@ Pure logic, no I/O beyond the repository. The heart of "relentless."
 - **Upsert**: finding arrives → open issue with that fingerprint exists? bump `last_seen_ts`, `occurrences`, refresh evidence, reset `clear_streak`. Else create in `pending`.
 - **pending → active**: condition holds M consecutive evaluations (per-detector M, default 3).
 - **active → resolving → resolved**: detector's clear condition (absence of the finding, or explicit clear signal) increments `clear_streak`; resolved at K clean evaluations (default 6). A fire during `resolving` snaps back to `active`. The *first* clean check writes a `resolving` `issue_events` row (`{clear_streak, k}`) — every later clean check while still resolving advances `clear_streak` on the issue row with no new event, so the issue detail's lifecycle trail pairs this one event with the issue's live `clear_streak` to show "N of K" clearing progress without a row per tick (Gitea #26).
+- **Departure**: a client that leaves the network is reported by nothing, so every client-scoped detector returns it as a per-entity UNKNOWN and its issue would freeze for ever. `DetectorEngine._collect_clears` reads that departure centrally from `entities.last_seen_ts` (CLIENT entities only — APs and switches have `infra.device_down` and its inhibition instead) and routes those issues to `process_cycle(absent=...)`, which runs the ordinary clear path and stamps `reason: entity_absent` on the `resolving` / `resolved` events. No new state: a departure is a resolution, not a way of being open. The threshold is `settings.thresholds["engine"]["client_absent_after_s"]`, default 1800 s, `0` to switch the check off. Inhibition still applies, so an AP or controller outage — every client vanishing at once — freezes instead of mass-resolving (Gitea #43).
 - **Reopen window**: same fingerprint fires within 24-48 h of `resolved` → reopen the old row (`reopened_from` links), not a fresh issue. Flap damping at the issue level.
 - **Inhibition**: `infra.controller_down` suppresses all issue creation and all clear-streak advancement (absence of evidence is not evidence of absence). `infra.device_down` for a switch suppresses that switch's port issues. Rules are data, not code: `(cause_key, suppressed_scope)` pairs.
 - **Snooze/ack** mute notifications, never evaluation.
@@ -611,6 +612,12 @@ Algorithm:
 6. Incident lifecycle: an incident resolves when all its members resolve; the LLM
    investigator (§10) can be pointed at an incident (not just an issue) to narrate
    the whole story on demand — but the clustering itself is never LLM-driven.
+   `first_seen_ts` marks when the grouping began; `last_seen_ts` is the newest
+   member `issue.last_seen_ts`, never the pass clock, so it goes static when the
+   evidence does instead of advertising a freshness the rollup invented by
+   running (Gitea #43). It is maxed with the stored value, so it stays monotonic
+   when membership shrinks and carries a resolved root's final sighting through
+   the retained-incident path.
 
 ### Two smaller additions shipped alongside
 

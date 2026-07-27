@@ -32,8 +32,9 @@ detectors use at this gateway-less site.
   * ``meta["is_wired"]`` — wired clients are out of scope for every wifi detector
   * state ``ap_mac`` — current attachment (``state_history`` = the roam trail)
   * state ``band`` — client's current band (``"ng"``/``"na"``), for band steering
-  * metrics ``rssi`` (dBm), ``tx_rate`` / ``rx_rate`` (Mbps), ``tx_retries`` /
-    ``wifi_tx_attempts`` (counters), ``roam_count``
+  * metrics ``rssi`` (dBm), ``tx_rate`` / ``rx_rate`` (**kbps** as the controller
+    reports them -- read through :func:`_rates_mbps`, never raw), ``tx_retries``
+    / ``wifi_tx_attempts`` (counters), ``roam_count``
   * events ``EVT_WU_Roam`` — client roam transitions
 ``WLAN`` entity (``native_id`` = the controller's wlanconf id, ``name`` = SSID):
   * ``meta["enabled"]`` — whether the SSID is on the air
@@ -108,6 +109,15 @@ _CANDIDATES_5 = (36, 44, 149, 157)
 # longer than a modern MCS frame).
 _B_RATES = frozenset({1.0, 2.0, 5.5, 11.0})
 
+# The controller reports PHY rates in kbps and ``netadmin.ingest.mapping.METRICS``
+# stores them that way (``tx_rate``/``rx_rate`` -> unit "kbps"). Every threshold,
+# evidence field and catalog label in this module is Mbps, so the conversion
+# happens exactly once, at the read boundary (:func:`_rates_mbps`). Reading the
+# raw samples against an Mbps threshold is how ``low_rate_corroborated`` silently
+# stayed false for every sticky client ever raised (Gitea #41): a real 1152.9
+# Mbps link arrives as 1152900 and no client is ever going to sit at 24 kbps.
+_KBPS_PER_MBPS = 1000.0
+
 _ROAM_EVENT_KEYS = frozenset({"EVT_WU_Roam", "EVT_WU_RoamRadio"})
 _RADAR_EVENT_KEY = "EVT_AP_RadarDetected"
 _LOST_CONTACT_SUFFIX = "_Lost_Contact"
@@ -126,6 +136,19 @@ def _values(window: Any) -> list[float]:
         if v is not None:
             out.append(float(v))
     return out
+
+
+def _kbps_to_mbps(values: list[float]) -> list[float]:
+    return [v / _KBPS_PER_MBPS for v in values]
+
+
+def _rates_mbps(window: Any) -> list[float]:
+    """A stored PHY-rate window (kbps) as Mbps -- the only way this module reads one.
+
+    Kept beside :func:`_values` rather than folded into it so the unit change is
+    visible at every call site: a rate window that is not converted here is a bug.
+    """
+    return _kbps_to_mbps(_values(window))
 
 
 def _fraction_below(values: list[float], threshold: float) -> float:
@@ -349,6 +372,31 @@ def _bssid_set(raw: Any) -> set[str]:
 # ====================================================================== #
 # wifi.sticky_client
 # ====================================================================== #
+#: Default ``low_rate_mbps`` threshold for the sticky-client rate confounder.
+#: Named because the demo seed has to agree with it: the demo's sticky client
+#: must corroborate for the same reason a real one does, not by assertion.
+STICKY_LOW_RATE_MBPS = 24.0
+
+
+def sticky_rate_evidence(
+    rates_kbps: list[float], low_rate_mbps: float, evidence: dict[str, Any]
+) -> None:
+    """Fold the median PHY rate into sticky-client evidence, in Mbps.
+
+    The one place the ``low_rate_corroborated`` verdict is decided, so the field
+    name (``median_tx_rate_mbps``), the catalog's "Mbps" label, the
+    ``low_rate_mbps`` threshold and the prose the user reads cannot drift apart
+    again. ``rates_kbps`` are the samples exactly as the store holds them; the
+    demo seed calls this with a fabricated series for the same reason the
+    detector does -- so a unit slip fails the demo instead of hiding in it.
+    """
+    med = _median(_kbps_to_mbps(rates_kbps))
+    if med is None:
+        return
+    evidence["median_tx_rate_mbps"] = round(med, 1)
+    evidence["low_rate_corroborated"] = med <= low_rate_mbps
+
+
 class StickyClientDetector:
     """``wifi.sticky_client`` — a client glued to a far AP while a better one exists.
 
@@ -374,7 +422,7 @@ class StickyClientDetector:
         min_samples = int(ctx.threshold(self.key, "min_samples", 4))
         better_margin = float(ctx.threshold(self.key, "better_ap_margin_db", 8))
         cluster_min = int(ctx.threshold(self.key, "cluster_min", 3))
-        low_rate_mbps = float(ctx.threshold(self.key, "low_rate_mbps", 24))
+        low_rate_mbps = float(ctx.threshold(self.key, "low_rate_mbps", STICKY_LOW_RATE_MBPS))
 
         raw: list[tuple[Entity, dict[str, Any], Optional[str]]] = []
         unknown: set[int] = set()
@@ -451,10 +499,7 @@ class StickyClientDetector:
         self, ctx: Any, client: Entity, window_s: int, low_rate_mbps: float, evidence: dict
     ) -> None:
         rates = _values(ctx.window(client.entity_id, "tx_rate", window_s))
-        med_rate = _median(rates)
-        if med_rate is not None:
-            evidence["median_tx_rate_mbps"] = med_rate
-            evidence["low_rate_corroborated"] = med_rate <= low_rate_mbps
+        sticky_rate_evidence(rates, low_rate_mbps, evidence)
 
     def _build(
         self, raw: list[tuple[Entity, dict[str, Any], Optional[str]]], cluster_min: int
@@ -1294,6 +1339,11 @@ class LegacyRatesDetector:
     the window occupies the medium far longer per frame than a modern client and
     slows everyone on that radio. Requires the low rate to be sustained (a single
     low sample during a lull is not an 11b client). Wired clients are excluded.
+
+    ``tx_rate`` is stored in kbps, so the window is read through
+    :func:`_rates_mbps` before it meets the Mbps threshold -- the same unit slip
+    that kept ``wifi.sticky_client``'s rate confounder dead (Gitea #41) kept this
+    detector from ever firing, since no client sits at 11 kbps.
     """
 
     key = KEY_LEGACY_RATES
@@ -1314,7 +1364,8 @@ class LegacyRatesDetector:
         for client in ctx.entities(EntityType.CLIENT):
             if client.entity_id is None or not _is_wireless_client(client):
                 continue
-            rates = [r for r in _values(ctx.window(client.entity_id, "tx_rate", window_s)) if r > 0]
+            window = ctx.window(client.entity_id, "tx_rate", window_s)
+            rates = [r for r in _rates_mbps(window) if r > 0]
             if len(rates) < min_samples:
                 # Too few positive tx_rate samples to judge the client's rate tier
                 # -> freeze its issue, do not clear it by absence.

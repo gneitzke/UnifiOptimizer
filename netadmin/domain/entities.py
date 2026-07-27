@@ -16,6 +16,38 @@ from netadmin.domain.types import EntityType, FixState, Severity
 # Epoch-second timestamps everywhere (UTC). Kept as int for SQLite affinity.
 Timestamp = int
 
+#: Entity types whose own name is only unique *within* their parent. Every AP
+#: names its radios ``wifi0``/``wifi1`` and every switch has a ``Port 2``, so the
+#: bare name identifies nothing on a site-wide surface.
+CHILD_ENTITY_TYPES = frozenset({EntityType.RADIO.value, EntityType.PORT.value})
+
+
+def entity_display_label(
+    name: str, entity_type: Optional[str], parent_name: Optional[str] = None
+) -> str:
+    """How an entity should be *named to a human*: ``"Loft / wifi0"`` for a child.
+
+    Four genuinely distinct saturated radios all render as ``wifi0``, and the
+    owner reads four separate faults as duplicate rows (Gitea #44). Qualifying a
+    radio or a port with the device it sits on is the whole disambiguation, and
+    it stays short enough for a width-constrained table column -- which is why
+    this is a prefix and not a parenthetical.
+
+    Top-level entities (AP, switch, gateway, client, WLAN) already have unique
+    names and come back untouched, as does a child whose parent is unresolved --
+    a stale ``parent_id`` must degrade to ``wifi0``, never to ``"None / wifi0"``.
+    A child an admin already named after its device ("Loft 5G" under "Loft") is
+    left alone too: the prefix exists to identify, and that name identifies.
+
+    The one rule, shared by the API serializer, the MCP tools, the report
+    assembler and the dossier; the web UI mirrors it in ``entityLabel``.
+    """
+    if entity_type not in CHILD_ENTITY_TYPES or not parent_name:
+        return name
+    if parent_name.casefold() in name.casefold():
+        return name
+    return f"{parent_name} / {name}"
+
 
 @dataclass
 class Entity:

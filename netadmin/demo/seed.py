@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from netadmin.detect.detectors.wifi import STICKY_LOW_RATE_MBPS, sticky_rate_evidence
 from netadmin.domain.entities import Entity
 from netadmin.domain.types import EntityType, FixState, IssueState, Severity
 from netadmin.issues.models import EventKind
@@ -258,6 +259,11 @@ class _Seeder:
         self.duplex_port_id: int = 0
         self.duplex_port_nid: str = ""
         self.sticky_client: dict[str, Any] = {}
+        # The sticky client's PHY-rate samples, in the kbps the store holds
+        # (``netadmin.ingest.mapping.METRICS``). Written in the series phase and
+        # read back in the issue phase, so the demo's evidence is *derived* from
+        # the series the UI charts rather than asserted alongside it.
+        self.sticky_rates_kbps: list[float] = []
         self.pingpong_client: dict[str, Any] = {}
         self.flaky_client: dict[str, Any] = {}
         self._series_units: dict[str, str] = {}
@@ -680,6 +686,19 @@ class _Seeder:
             poe.append((ts, 0.0 if k % 4 == 0 else 8.4 + self._jit(0.3)))
         self._write(self.flap_port_id, "poe_power", poe, "watts")
 
+        # Sticky client: the low negotiated PHY rate that corroborates the finding,
+        # written in kbps because that is what the controller reports and what the
+        # store holds. `_issue_sticky` runs these very samples through the
+        # detector's own conversion and threshold, so a kbps/Mbps slip surfaces in
+        # the demo instead of being papered over by a hardcoded verdict (Gitea #41).
+        self.sticky_rates_kbps = [_clamp(6000.0 + self._jit(900), 1000.0, 24000.0) for _ in tail]
+        self._write(
+            self.sticky_client["id"],
+            "tx_rate",
+            list(zip(tail, self.sticky_rates_kbps)),
+            "kbps",
+        )
+
         # DNS resolver recovery tail (issue is now RESOLVING).
         dtail = [
             ts for ts in range(self.now - 4 * HOUR, self.now, FINE_STEP) if not self._in_gap(ts)
@@ -1046,6 +1065,10 @@ class _Seeder:
         client = self.sticky_client
         living_mac = self.aps["Living Room"]["mac"]
         first = self.now - 2 * DAY
+        # Same call the detector makes, on the same samples the charts draw: the
+        # median and the verdict are computed here, never asserted.
+        evidence: dict[str, Any] = {"ap": living_mac, "rssi": -57, "clustered_on_ap": False}
+        sticky_rate_evidence(self.sticky_rates_kbps, STICKY_LOW_RATE_MBPS, evidence)
         iid = self._insert(
             detector_key="wifi.sticky_client",
             native_id=client["mac"],
@@ -1055,13 +1078,7 @@ class _Seeder:
             title=f"Sticky client {client['name']} on far AP",
             first_seen=first,
             last_seen=self.now - FINE_STEP,
-            evidence={
-                "ap": living_mac,
-                "rssi": -57,
-                "median_tx_rate_mbps": 6.0,
-                "low_rate_corroborated": True,
-                "clustered_on_ap": False,
-            },
+            evidence=evidence,
             confounders=["better_ap_exists", "sustained_not_transient", "low_rate_corroborated"],
             dims={"ap": living_mac},
             occurrences=22,

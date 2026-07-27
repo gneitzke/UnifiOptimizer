@@ -299,7 +299,11 @@ class FindingImpact:
 
 @dataclass
 class AffectedAsset:
-    """An entity a finding is about (the fix target or an affected device/radio)."""
+    """An entity a finding is about (the fix target or an affected AP/switch/radio).
+
+    ``name`` is the printed label, already qualified for a structural child --
+    ``"Loft / wifi0"``, never a bare ``wifi0`` that every AP also has.
+    """
 
     entity_id: int
     name: str

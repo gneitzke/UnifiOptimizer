@@ -25,6 +25,12 @@ problem is gone" (advance the clear streak); ``UNKNOWN`` says "I could not look"
 each detector and clears the ones the detector did not re-fire this cycle — and
 skips that derivation entirely for a detector that returned ``UNKNOWN``.
 
+The engine adds one verdict of its own that no detector can produce: a client
+that has **left the network** is reported by nothing, so every client-scoped
+detector calls it UNKNOWN and its issues would freeze for good. The engine reads
+that departure centrally from ``entities.last_seen_ts`` and routes those issues
+to ``process_cycle``'s ``absent=``, which clears them with a recorded reason.
+
 ``run`` takes an injected ``now`` (never the wall clock) so passes are
 deterministic and testable; the exported :func:`schedule_detection` wires the
 three tiers onto an APScheduler instance but is **not** started here — the
@@ -39,7 +45,7 @@ from typing import TYPE_CHECKING, Any, List, Optional, Union
 
 from netadmin.detect.context import DetectorContext
 from netadmin.domain.entities import Finding, Timestamp
-from netadmin.domain.types import Cadence, Severity
+from netadmin.domain.types import Cadence, EntityType, Severity
 from netadmin.issues.engine import IssueEngine, fingerprint
 from netadmin.issues.models import Transition
 from netadmin.logging import get_logger
@@ -55,6 +61,26 @@ _log = get_logger("detect.engine")
 # return :data:`UNKNOWN` instead of a verdict (sections 4 & 6). Exposed for
 # detectors to compare against so the 0.5 line lives in exactly one place.
 COVERAGE_MIN = 0.5
+
+# Pseudo detector key for pass-wide tunables read through
+# ``DetectorContext.threshold`` — one knob for the whole pass rather than the
+# same setting repeated under thirteen detector keys.
+ENGINE_THRESHOLD_KEY = "engine"
+
+# A CLIENT entity unseen by ``stat/sta`` for longer than this has left the
+# network, and its open issues clear instead of freezing forever.
+#
+# 1800 s = 30 missed 60 s ``fast_sta`` polls. Two anchors set it. The floor is
+# real poll jitter: measured on this project's own store, a client that is
+# present lands a sighting every 60 s with a tail to roughly four minutes, so no
+# run of missed polls comes near this line. The ceiling is the web UI, which
+# already stops counting a client as active at 900 s unseen — half of this — so
+# nothing resolves for a client the operator is still shown as here. What is
+# *not* pinned down is how long the controller keeps a disassociated client in
+# ``stat/sta``: that lag only delays noticing a departure, it cannot manufacture
+# one, so a generous margin costs latency and nothing else. Override with
+# ``settings.thresholds["engine"]["client_absent_after_s"]``.
+DEFAULT_CLIENT_ABSENT_AFTER_S = 1800
 
 
 class _Unknown:
@@ -138,6 +164,7 @@ class PassResult:
     transitions: list[Transition] = field(default_factory=list)
     cleared: list[str] = field(default_factory=list)
     frozen: list[str] = field(default_factory=list)
+    absent: list[str] = field(default_factory=list)
     unknown_detectors: list[str] = field(default_factory=list)
     failed_detectors: list[str] = field(default_factory=list)
     evaluated: int = 0
@@ -227,6 +254,7 @@ class DetectorEngine:
         findings: list[Finding] = []
         cleared: set[str] = set()
         frozen: set[str] = set()
+        absent: set[str] = set()
         unknown_detectors: list[str] = []
         failed_detectors: list[str] = []
         transitions: list[Transition] = []
@@ -235,6 +263,7 @@ class DetectorEngine:
             ctx = self.build_context(now)
             entries = self._catalog.by_cadence(cadence)
             open_by_key = self._open_issues_by_detector()
+            departed = self._departed_client_ids(open_by_key, ctx, now)
             for entry in entries:
                 verdict = self._evaluate(entry, ctx, cadence, failed_detectors)
                 if verdict is _SKIP:
@@ -246,10 +275,21 @@ class DetectorEngine:
                 result_findings, unknown_entities = _split_result(verdict)
                 fired = self._collect_findings(entry, result_findings, findings)
                 self._collect_clears(
-                    entry.key, fired, unknown_entities, open_by_key, cleared, frozen
+                    entry.key,
+                    fired,
+                    unknown_entities,
+                    open_by_key,
+                    cleared,
+                    frozen,
+                    departed=departed,
+                    absent=absent,
                 )
             transitions = self._issue_engine.process_cycle(
-                now, findings=findings, cleared=sorted(cleared), unknown=sorted(frozen)
+                now,
+                findings=findings,
+                cleared=sorted(cleared),
+                unknown=sorted(frozen),
+                absent=sorted(absent),
             )
         except Exception:  # noqa: BLE001 - a pass never crashes the caller
             ok = False
@@ -265,6 +305,7 @@ class DetectorEngine:
             transitions=transitions,
             cleared=sorted(cleared),
             frozen=sorted(frozen),
+            absent=sorted(absent),
             unknown_detectors=unknown_detectors,
             failed_detectors=failed_detectors,
             evaluated=evaluated,
@@ -344,13 +385,24 @@ class DetectorEngine:
         open_by_key: dict[str, list],
         cleared: set[str],
         frozen: set[str],
+        *,
+        departed: set[int],
+        absent: set[str],
     ) -> None:
         """Route each open issue this detector owns but did *not* re-fire.
 
-        An open issue whose entity the detector flagged UNKNOWN this cycle (too few
-        samples of its own to judge) is **frozen** — added to ``frozen`` so it
-        advances nothing — instead of cleared by absence. Everything else the
-        detector did not re-fire is a genuine clear.
+        Three destinations, in priority order:
+
+        * the issue's subject has **left** (``departed``) — routed to ``absent``,
+          which clears with a recorded reason. This outranks the detector's own
+          per-entity UNKNOWN on purpose: a departed client produces no samples, so
+          every client-scoped detector calls it unknown and the issue would freeze
+          for good. Absence is a measured fact about the entity, not an inference
+          from missing samples, so it is the better evidence of the two;
+        * the detector flagged the entity UNKNOWN this cycle (too few samples of
+          its own to judge) — **frozen**, advancing nothing, so a client that is
+          still here but quiet (power-save, a sparse poll) keeps its issue;
+        * everything else the detector did not re-fire — a genuine clear.
 
         Only issues of ``detector_key`` are considered, so a FAST pass never
         touches WINDOW/DAILY issues, and a detector that returned the whole-pass
@@ -359,10 +411,53 @@ class DetectorEngine:
         for issue in open_by_key.get(detector_key, ()):  # type: ignore[union-attr]
             if issue.fingerprint in fired:
                 continue
+            if issue.entity_id is not None and issue.entity_id in departed:
+                absent.add(issue.fingerprint)
+                continue
             if issue.entity_id is not None and issue.entity_id in unknown_entities:
                 frozen.add(issue.fingerprint)  # per-entity gap: freeze, do not clear
                 continue
             cleared.add(issue.fingerprint)
+
+    def _departed_client_ids(
+        self, open_by_key: dict[str, list], ctx: DetectorContext, now: Timestamp
+    ) -> set[int]:
+        """Entity ids of the open issues' subjects that have left the network.
+
+        CLIENT entities only. An AP or switch that stops answering has its own
+        down semantics (``infra.device_down`` plus the inhibition it triggers);
+        clearing its issues by absence would be exactly the false clear the freeze
+        exists to prevent — and a power cut that takes every AP down would
+        otherwise resolve the whole site's issues at once.
+
+        Staleness is read from ``entities.last_seen_ts``, which advances only when
+        the client is actually returned by a ``stat/sta`` poll (the 5-minute
+        report backfill writes samples, never inventory), so this is a measured
+        last sighting rather than an inference from a silent series. One batched
+        read per pass.
+        """
+        threshold = _positive_int(
+            ctx.threshold(ENGINE_THRESHOLD_KEY, "client_absent_after_s", None),
+            DEFAULT_CLIENT_ABSENT_AFTER_S,
+        )
+        if threshold is None:
+            return set()  # explicitly disabled
+        ids = {
+            issue.entity_id
+            for issues in open_by_key.values()
+            for issue in issues
+            if issue.entity_id is not None
+        }
+        if not ids:
+            return set()
+        departed: set[int] = set()
+        for entity_id, row in self._repo.entities_by_ids(ids).items():
+            if row["entity_type"] != EntityType.CLIENT.value:
+                continue
+            last_seen = row["last_seen_ts"]
+            if last_seen is not None and (now - int(last_seen)) > threshold:
+                departed.add(entity_id)
+        return departed
 
     def _open_issues_by_detector(self) -> dict[str, list]:
         grouped: dict[str, list] = {}
@@ -399,6 +494,22 @@ class _Skip:
 
 
 _SKIP = _Skip()
+
+
+def _positive_int(value: Any, default: int) -> Optional[int]:
+    """Coerce a configured second-count: unset/garbage -> ``default``, <= 0 -> off.
+
+    Zero or negative is the operator's off switch for the absence check, so a site
+    that would rather keep a departed client's issues open can say so in settings
+    without a code change.
+    """
+    if value is None:
+        return default
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return default
+    return seconds if seconds > 0 else None
 
 
 def _split_result(verdict: Any) -> tuple[List[Finding], set[int]]:
@@ -538,6 +649,8 @@ def _utcnow_ts() -> int:
 
 __all__ = [
     "COVERAGE_MIN",
+    "DEFAULT_CLIENT_ABSENT_AFTER_S",
+    "ENGINE_THRESHOLD_KEY",
     "UNKNOWN",
     "DetectorResult",
     "EvalResult",

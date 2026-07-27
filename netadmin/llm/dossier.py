@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional, Sequence
 
 from netadmin.detect.catalog import DEFAULT_CATALOG, Catalog, Playbook
+from netadmin.domain.entities import entity_display_label
 from netadmin.store.repository import Repository
 
 __all__ = ["build_dossier", "build_incident_dossier", "parse_answers"]
@@ -150,6 +151,24 @@ def _entity_label(row: Optional[sqlite3.Row]) -> str:
     return str(name) if name else str(row["native_id"])
 
 
+def _qualified(repo: Repository, row: Optional[sqlite3.Row]) -> str:
+    """:func:`_entity_label` with the parent resolved: ``"Loft / wifi0"``.
+
+    A dossier is read by a model that has to say *which* AP is at fault, and
+    every AP calls its radios ``wifi0``/``wifi1`` (Gitea #44). One indexed lookup
+    per dossier, on a document that is built on demand.
+    """
+    if row is None:
+        return "unknown"
+    parent_id = row["parent_id"]
+    parent = repo.get_entity(int(parent_id)) if parent_id is not None else None
+    return entity_display_label(
+        _entity_label(row),
+        str(row["entity_type"]),
+        _entity_label(parent) if parent is not None else None,
+    )
+
+
 def _humanize(token: str) -> str:
     return token.replace("_", " ").replace(".", " · ").strip().capitalize()
 
@@ -159,7 +178,9 @@ def _humanize(token: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def _section_header(issue: sqlite3.Row, entity: Optional[sqlite3.Row], now: int) -> str:
+def _section_header(
+    repo: Repository, issue: sqlite3.Row, entity: Optional[sqlite3.Row], now: int
+) -> str:
     open_ = issue["state"] != "resolved"
     if open_:
         span = _fmt_duration(now - int(issue["first_seen_ts"]))
@@ -172,7 +193,7 @@ def _section_header(issue: sqlite3.Row, entity: Optional[sqlite3.Row], now: int)
     entity_ref = (
         "network-wide"
         if entity is None
-        else f"{_entity_label(entity)} ({entity['entity_type']}, {entity['native_id']})"
+        else f"{_qualified(repo, entity)} ({entity['entity_type']}, {entity['native_id']})"
     )
 
     lines = [
@@ -275,7 +296,7 @@ def _section_related(repo: Repository, issue: sqlite3.Row, entity: Optional[sqli
 
     same = _issue_rows(repo.list_issues(entity_id=eid), int(issue["id"]))
     lines.append("")
-    lines.append(f"### On {_entity_label(entity)} (this entity)")
+    lines.append(f"### On {_qualified(repo, entity)} (this entity)")
     lines.append("")
     lines.append(_table(headers, same) if same else "_No other issues on this entity._")
     any_related = any_related or bool(same)
@@ -352,7 +373,7 @@ def _section_metric_windows(
 
     metrics = _select_metrics(repo, int(entity["entity_id"]), detector_key)
     if not metrics:
-        lines.append(f"_No metric series recorded for {_entity_label(entity)} ({span})._")
+        lines.append(f"_No metric series recorded for {_qualified(repo, entity)} ({span})._")
         return "\n".join(lines)
 
     lines.append(f"Bucketed hourly stats, {span} (windows, not raw samples).")
@@ -475,7 +496,7 @@ def build_dossier(
     playbook = _playbook_for(catalog, detector_key)
 
     sections = [
-        _section_header(issue, entity, now),
+        _section_header(repo, issue, entity, now),
         _section_lifecycle(events),
         _section_evidence(evidence if isinstance(evidence, dict) else {}),
         _section_confounders([str(c) for c in confounders], playbook),

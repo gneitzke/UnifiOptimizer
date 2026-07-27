@@ -7,7 +7,7 @@
 | Detector | `wired.bad_cable` |
 | Severity | P2 |
 | State | active |
-| Entity | Port 5 (port, aa:bb:cc:00:00:02:5) |
+| Entity | sw-core / Port 5 (port, aa:bb:cc:00:00:02:5) |
 | First seen | <TS> |
 | Last seen | <TS> |
 | Lifetime | ongoing 10m |
@@ -41,7 +41,7 @@ The detector tested and rejected these false-positive traps:
 
 ## Related issues
 
-### On Port 5 (this entity)
+### On sw-core / Port 5 (this entity)
 
 | Issue | Detector | Sev | State | First seen | Title |
 | --- | --- | --- | --- | --- | --- |
