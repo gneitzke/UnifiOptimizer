@@ -36,6 +36,7 @@ from netadmin.issues.engine import IssueEngine
 from netadmin.issues.store_repository import StoreIssueRepository
 from netadmin.logging import get_logger
 from netadmin.server.auth import ApiTokenAuthMiddleware
+from netadmin.server.mcp_mount import install_mcp_route, start_mcp, stop_mcp
 from netadmin.server.routers import changes as changes_router
 from netadmin.server.routers import events as events_router
 from netadmin.server.routers import fixes as fixes_router
@@ -258,6 +259,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.store = Repository.open(settings.db_path, site_id=settings.site_id)
     store: Repository = app.state.store
 
+    # Remote MCP mount (ARCHITECTURE.md 18.3; docs/MCP_SERVER.md section 8). Gated
+    # on NETADMIN_MCP_TOKEN and NOT on the API token; ``/mcp`` 404s when unset.
+    # Started here, after the store open above, because the mount opens its own
+    # ``mode=ro`` connection and a read-only open cannot create or migrate a file.
+    # It logs its own posture line, and every failure inside it is recorded and
+    # answered as a 503 rather than downing the daemon.
+    await start_mcp(app)
+
     if app.state.issue_engine is None:
         app.state.issue_engine = IssueEngine(StoreIssueRepository(store))
     engine: IssueEngine = app.state.issue_engine
@@ -347,7 +356,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         state.ready = False
-        # Auto-investigation stops first: it is the only consumer that can be
+        # The remote MCP mount stops first: it is a network-facing surface, and
+        # the sooner it stops accepting tool calls the fewer reads race teardown.
+        await stop_mcp(app)
+        # Auto-investigation stops next: it is the only consumer that can be
         # holding a long provider call, and nothing downstream depends on it.
         auto_investigator = getattr(app.state, "auto_investigator", None)
         if auto_investigator is not None:
@@ -477,6 +489,11 @@ def create_app(
     app.include_router(fixes_router.router)
     app.include_router(ondemand_router.router)
     app.add_api_websocket_route("/ws", websocket_endpoint)
+    # The remote MCP endpoint (ARCHITECTURE.md 18.3). Registered here, BEFORE the
+    # SPA catch-all below, so ``/mcp`` is never answered with index.html; the
+    # route itself decides the posture (404 with no NETADMIN_MCP_TOKEN, 401 on a
+    # bad one) and the lifespan starts its read-only store handle.
+    install_mcp_route(app)
     _mount_spa(app, settings)
     return app
 

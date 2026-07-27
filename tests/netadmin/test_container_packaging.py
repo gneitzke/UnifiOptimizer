@@ -26,6 +26,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_FILE = REPO_ROOT / "docker-compose.yml"
+DAEMON_DOCKERFILE = REPO_ROOT / "Dockerfile.netadmin"
 ADDON_DIR = REPO_ROOT / "addon"
 ADDON_CONFIG = ADDON_DIR / "config.yaml"
 ADDON_BUILD = ADDON_DIR / "build.yaml"
@@ -127,6 +128,30 @@ def test_compose_bakes_in_no_secrets(service):
         assert marker not in rendered, f"{marker} must not appear in a tracked compose file"
 
 
+def test_compose_has_a_commented_mcp_token_passthrough():
+    """NETADMIN_MCP_TOKEN is a separate credential from NETADMIN_API_TOKEN
+    (Gitea #29/#30) and needs the same opt-in passthrough the API token has,
+    or a Compose user has no way to configure the remote MCP mount."""
+    text = COMPOSE_FILE.read_text(encoding="utf-8")
+    assert "# NETADMIN_MCP_TOKEN: ${NETADMIN_MCP_TOKEN:-}" in text
+    assert (
+        "NETADMIN_API_TOKEN" in text
+    ), "the API token passthrough this mirrors must still be present"
+
+
+# --------------------------------------------------------------------------
+# Dockerfile.netadmin
+# --------------------------------------------------------------------------
+
+
+def test_daemon_dockerfile_installs_the_mcp_extra():
+    """Both container paths ship the optional MCP SDK (docs/MCP_SERVER.md) so
+    /mcp works without a rebuild once NETADMIN_MCP_TOKEN is set. It must stay
+    an extra, never inflate the pinned 11-dependency core list elsewhere."""
+    text = DAEMON_DOCKERFILE.read_text(encoding="utf-8")
+    assert '"mcp>=1.2"' in text
+
+
 # --------------------------------------------------------------------------
 # Home Assistant add-on
 # --------------------------------------------------------------------------
@@ -195,10 +220,26 @@ def test_addon_reads_every_option_behind_a_has_value_guard():
     assert guarded >= reads, "an option is read without a has_value guard"
 
 
+def test_addon_config_has_mcp_token_option(addon):
+    """mcp_token is a SEPARATE credential from api_token (Gitea #29/#30) --
+    without it the add-on has no way to configure the remote MCP mount."""
+    assert addon["options"]["mcp_token"] == ""
+    assert addon["schema"]["mcp_token"] == "password?"
+
+
+def test_addon_run_maps_mcp_token_behind_a_has_value_guard():
+    run = ADDON_RUN.read_text(encoding="utf-8")
+    assert "bashio::config.has_value 'mcp_token'" in run
+    assert "NETADMIN_MCP_TOKEN" in run
+    assert "export NETADMIN_MCP_TOKEN" in run
+
+
 def test_addon_dockerfile_installs_a_pinned_published_wheel():
     text = ADDON_DOCKERFILE.read_text(encoding="utf-8")
     assert "ARG BUILD_FROM" in text and "FROM ${BUILD_FROM}" in text
-    assert 'unifioptimizer==${NETADMIN_VERSION}"' in text
+    # [mcp] installs the optional MCP SDK too (docs/MCP_SERVER.md) so /mcp works
+    # out of the box; the version pin itself must still be exact.
+    assert 'unifioptimizer[mcp]==${NETADMIN_VERSION}"' in text
     # On musl a missing wheel would otherwise start a source build in an image
     # with no toolchain. Fail the build instead.
     assert "--only-binary=:all:" in text

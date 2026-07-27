@@ -116,9 +116,15 @@ async def test_a_tool_error_comes_back_as_a_readable_payload(demo_repo: Reposito
 
 
 async def test_registered_tools_match_the_registry(demo_repo: Repository) -> None:
-    """Guards against this file's server drifting from the shipped one."""
+    """Guards against this file's server drifting from the shipped one.
+
+    ``build_server`` is now the single registration point, and ``serve`` is one
+    of its two callers (the daemon's ``/mcp`` mount is the other), so the check
+    follows it there and pins the delegation.
+    """
     import inspect
 
-    source = inspect.getsource(server.serve)
+    source = inspect.getsource(server.build_server)
     assert "tools.TOOLS.values()" in source
     assert "tools.call_tool(repo, name, arguments)" in source
+    assert "build_server(repo)" in inspect.getsource(server.serve)

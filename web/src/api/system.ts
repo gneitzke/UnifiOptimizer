@@ -13,6 +13,10 @@
  * Both go through a reactive guard: fire, and on a 401 drop the stale token, prompt
  * for the access token over the live view, and retry. On loopback the reveal simply
  * succeeds with no token and no prompt.
+ *
+ * The remote-MCP-token pair below (§18.4) is the same shape for
+ * `NETADMIN_MCP_TOKEN` — gated by the same *access* token, never the MCP token
+ * being managed, since a credential must not authorize its own rotation.
  */
 
 import { authHeaders, clearToken, getToken, promptForToken } from './token';
@@ -78,3 +82,18 @@ export const revealSystemToken = () => guarded<SystemTokenInfo>('/api/system/tok
 /** Mint a new access token, returned once. The old token stops working. */
 export const regenerateSystemToken = () =>
   guarded<{ token: string }>('/api/system/token/regenerate', { method: 'POST' });
+
+export interface SystemMcpTokenInfo {
+  /** The current NETADMIN_MCP_TOKEN, or null when remote MCP is off. */
+  token: string | null;
+  configured: boolean;
+}
+
+/** Reveal the configured remote-MCP token (loopback-open; access-token-gated
+ *  from elsewhere — never the MCP token itself). */
+export const revealMcpToken = () => guarded<SystemMcpTokenInfo>('/api/system/mcp-token');
+
+/** Mint a new remote-MCP token, returned once. The old one stops working on
+ *  its very next `/mcp` request, with no daemon restart. */
+export const regenerateMcpToken = () =>
+  guarded<{ token: string }>('/api/system/mcp-token/regenerate', { method: 'POST' });

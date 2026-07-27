@@ -14,7 +14,10 @@ into tracked issues.
 
 The add-on ships with no port published. Reads on its API are unauthenticated,
 and Home Assistant publishes a mapped add-on port on every interface, so opening
-one is a decision you make rather than a default you inherit.
+one is a decision you make rather than a default you inherit. State-changing
+routes already refuse to work until you set `api_token` below, and the remote
+MCP server at `/mcp` is separately gated by `mcp_token` -- but neither of those
+makes the dashboard itself safe to publish to a network you do not trust.
 
 Open the Configuration tab, set the host port for `8765/tcp`, and save. Use
 `8765` unless something else on the host already has it. The dashboard is then
@@ -31,6 +34,7 @@ serve a blank page. It needs a runtime base path in the frontend first.
 | --- | --- | --- |
 | `log_level` | `info` | Daemon log verbosity. |
 | `api_token` | empty | Gates fix apply and revert over HTTP. Without it those endpoints are refused and reads still work. |
+| `mcp_token` | empty | Gates the remote MCP server at `/mcp`. A separate credential from `api_token`: without it `/mcp` answers 404 (the feature is absent), not just unauthenticated. |
 | `controller_host` | empty | Controller URL, for example `https://192.168.1.1`. Skips the web setup flow. |
 | `controller_api_key` | empty | Controller API key. Use with `controller_host`. |
 

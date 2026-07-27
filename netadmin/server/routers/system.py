@@ -18,6 +18,27 @@ prompt asks for. Their auth is enforced by the middleware, not here:
   once. A gated, rate-limited mutation (the middleware requires the *current*
   token before this runs).
 
+The two ``/system/mcp-token`` routes are the same pair for the remote-MCP
+credential (ARCHITECTURE.md 18.4 Settings addendum), so a Settings page can
+manage ``NETADMIN_MCP_TOKEN`` beside the access token instead of only through
+``netadmin mcp-token`` on the box. Gating is identical to their
+``/system/token`` counterparts -- bearer-or-loopback reveal, gated + rate
+limited regenerate -- except the credential that unlocks *both* is always the
+API token, never the MCP token being managed:
+
+* ``GET /system/mcp-token`` (reveal) returns the current ``NETADMIN_MCP_TOKEN``,
+  or ``null`` when remote MCP is off.
+* ``POST /system/mcp-token/regenerate`` mints a new MCP token, persists it, and
+  applies it to the live ``Settings`` in place -- so the mount's per-request
+  ``settings.mcp_token`` read (:class:`netadmin.server.mcp_mount.McpEndpoint`)
+  locks to it immediately and the old token is refused on its very next ``/mcp``
+  request, no daemon restart required. That immediacy only covers *rotating* an
+  already-running mount, though: if this daemon booted with no
+  ``NETADMIN_MCP_TOKEN`` at all, the mount's session manager was never built
+  (:func:`netadmin.server.mcp_mount.start_mcp` runs once, at lifespan startup),
+  so minting the *first* token here still needs a restart before ``/mcp``
+  answers anything but 503.
+
 The four ``/system/update*`` routes are the self-update banner's backend
 (ARCHITECTURE.md 23):
 
@@ -120,6 +141,45 @@ async def regenerate_token(request: Request) -> dict[str, Any]:
         path=getattr(app.state, "secrets_path", None) or SECRETS_ENV,
     )
     settings.netadmin_api_token = new_token
+    return {"token": new_token}
+
+
+@router.get("/system/mcp-token")
+async def reveal_mcp_token(request: Request) -> dict[str, Any]:
+    """Reveal the configured remote-MCP token (ARCHITECTURE.md 18.4).
+
+    Same shape as :func:`reveal_token`: the auth middleware has already enforced
+    access (the *API* bearer token, or a loopback peer) before this handler ever
+    runs; it only reads ``NETADMIN_MCP_TOKEN`` back so Settings can show it.
+    ``token`` is ``null`` when unset -- remote MCP is simply off, and ``/mcp``
+    answers 404.
+    """
+    token = request.app.state.settings.mcp_token
+    return {"token": token, "configured": token is not None}
+
+
+@router.post("/system/mcp-token/regenerate")
+async def regenerate_mcp_token(request: Request) -> dict[str, Any]:
+    """Mint a new remote-MCP token, persist it, and return it once (ARCHITECTURE.md 18.4).
+
+    Gated + rate limited by the middleware exactly like :func:`regenerate_token`,
+    using the *API* token as the credential -- rotating a read-only credential
+    must not be able to authorize its own rotation. Written to ``secrets.env``
+    (600, atomic, every other key preserved) and applied to the live ``Settings``
+    in place, so an already-running mount's per-request token read
+    (:class:`netadmin.server.mcp_mount.McpEndpoint`) locks to it immediately: the
+    old token is refused on its very next ``/mcp`` request, no restart. A mount
+    that was never started because no token existed at boot stays down until a
+    restart either way -- see the module docstring.
+    """
+    app = request.app
+    settings = app.state.settings
+    new_token = token_urlsafe(_TOKEN_BYTES)
+    write_secrets(
+        {"NETADMIN_MCP_TOKEN": new_token},
+        path=getattr(app.state, "secrets_path", None) or SECRETS_ENV,
+    )
+    settings.netadmin_mcp_token = new_token
     return {"token": new_token}
 
 

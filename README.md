@@ -101,6 +101,25 @@ For Claude Desktop, add this to `claude_desktop_config.json`:
 }
 ```
 
+If Claude is on a different machine from the daemon, the same 11 tools are also
+served over HTTP. Mint a token on the daemon host, restart it, then point any
+client at the URL:
+
+```bash
+netadmin mcp-token --regenerate      # writes NETADMIN_MCP_TOKEN to data/secrets.env
+claude mcp add --transport http unifioptimizer http://<daemon-host>:8765/mcp \
+  --header "Authorization: Bearer <token>"
+```
+
+That token is separate from the API token and can only read history, so a Claude
+config copied to a laptop never carries the authority to change your network.
+Without it, `/mcp` returns 404. Keep it on a network you trust: there is no TLS
+here, so use a reverse proxy if the link is not already private.
+
+Claude Code's `.mcp.json`, Claude Desktop's custom connector, and the
+`npx mcp-remote` fallback are all covered, with a table of what each error
+code means, in [`docs/MCP_REMOTE.md`](docs/MCP_REMOTE.md).
+
 It never writes to the store and never talks to your controller. Every tool, its
 parameters and when to reach for it are in
 [`docs/MCP_REFERENCE.md`](docs/MCP_REFERENCE.md); the design and safety model are in

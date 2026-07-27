@@ -7,11 +7,15 @@
 #
 # THREE THINGS THIS FILE GETS RIGHT ON PURPOSE, do not "simplify" them away:
 #
-# 1. The published port is `127.0.0.1:8765:8765`, not `8765:8765`. Reads on the
-#    API are unauthenticated by design (docs/ARCHITECTURE.md 18.1), so the bare
-#    form, which binds 0.0.0.0 on the host, would hand your whole network
-#    inventory to anyone on the LAN. Put a reverse proxy with auth in front if
-#    you want remote access.
+# 1. The published port is `127.0.0.1:8765:8765`, not `8765:8765`. GET reads on
+#    the API are open by design once configured (docs/ARCHITECTURE.md 18.1), so
+#    the bare form, which binds 0.0.0.0 on the host, would hand your whole
+#    network inventory to anyone on the LAN. State-changing routes already fail
+#    closed without `NETADMIN_API_TOKEN`, and `/mcp` (18.3) is separately gated
+#    by `NETADMIN_MCP_TOKEN` below — 404 when unset, 401 on a wrong or missing
+#    bearer — but neither of those makes a LAN publish free, since the read
+#    surface above is still exposed. Put a reverse proxy with auth in front, or
+#    widen the port deliberately, if you want LAN or remote access.
 #
 # 2. Storage is a named volume, not a `./data` bind mount. The image runs as a
 #    non-root user (uid 501 by default, see Dockerfile.netadmin) and Docker
@@ -48,6 +52,12 @@ services:
       # Uncomment to gate fix apply/revert over HTTP. Reads stay open; without a
       # token every mutating endpoint is refused, which is the safe default.
       # NETADMIN_API_TOKEN: ${NETADMIN_API_TOKEN:-}
+      # Uncomment to enable the remote MCP mount at /mcp (docs/MCP_SERVER.md).
+      # A SEPARATE credential from NETADMIN_API_TOKEN, with no fallback either
+      # direction: the API token authorizes controller mutations, this one only
+      # gates read-only MCP tool calls. Unset (the default) means /mcp answers
+      # 404 -- the feature is simply absent, not merely unauthenticated.
+      # NETADMIN_MCP_TOKEN: ${NETADMIN_MCP_TOKEN:-}
 
     volumes:
       - netadmin-data:/app/data

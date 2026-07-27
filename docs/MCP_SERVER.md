@@ -1,7 +1,9 @@
 # MCP Server (`netadmin/mcp/`)
 
 > Looking for what to call? [`MCP_REFERENCE.md`](MCP_REFERENCE.md) is the per-tool
-> reference. This page is the design and safety model.
+> reference. Looking for client setup instead? [`MCP_REMOTE.md`](MCP_REMOTE.md)
+> has the paste-in commands for Claude Code and Claude Desktop. This page is
+> the design and safety model.
 
 The authoritative design for the read-only MCP server that exposes the history
 store to the user's own Claude client. This document is the architecture as
@@ -151,3 +153,81 @@ against a `mode=ro` store, no write errors - this also catches read paths that
 lazily write); caps/truncation honored; a fresh EMPTY db answers honestly ("no
 data yet") on every tool; schema-version mismatch produces the guidance error;
 redaction masks every MAC and hostname field.
+
+## 8. Remote transport: the daemon's `/mcp` mount (Gitea #30)
+
+Shipped alongside stdio, not instead of it. `netadmin/server/mcp_mount.py` mounts
+the SDK's streamable-HTTP ASGI app at `/mcp` on the daemon, serving the same 11
+tools from `tools.py` with no change to that module. A Claude client on any
+machine on the LAN can read the history store without the package installed
+there.
+
+**Pick a transport by the question you are asking.** stdio opens the SQLite file
+itself, so it still answers "what happened last night" after the daemon crashed.
+The remote mount is part of the daemon, so it answers only while the daemon runs.
+That is the whole difference; the tools, the schemas and the output discipline
+are identical.
+
+### Enabling it
+
+```bash
+# on the daemon host
+netadmin mcp-token --regenerate     # writes NETADMIN_MCP_TOKEN to data/secrets.env
+# restart the daemon, then on any machine:
+claude mcp add --transport http unifioptimizer http://<daemon-host>:8765/mcp \
+  --header "Authorization: Bearer <token>"
+```
+
+Or from Settings in the web UI (Gitea #34): reveal or regenerate the token
+beside the access token, with a ready-to-copy Claude Code command for the
+token currently on screen. Reveal/regenerate there are gated exactly like the
+access token's own reveal/regenerate (bearer-or-loopback reveal, gated +
+rate-limited regenerate) -- using the *access* token, never the MCP token
+itself, since a credential must not authorize its own rotation. Rotating an
+**already-running** mount this way takes effect immediately, no restart:
+`GET /api/system/mcp-token` and `POST /api/system/mcp-token/regenerate` write
+to `secrets.env` exactly like the CLI, but also update the live `Settings`
+object the mount reads per request. Minting the *first* token for a mount that
+was never started still needs one restart either way, CLI or Settings --
+`start_mcp` only runs once, at daemon boot.
+
+Unset, `/mcp` answers 404 and the daemon logs that remote MCP is disabled.
+[`MCP_REMOTE.md`](MCP_REMOTE.md) covers every client this ships against
+(Claude Code, Claude Desktop, the `mcp-remote` fallback) with a failure table
+for exactly this kind of error.
+
+### Auth
+
+A dedicated `NETADMIN_MCP_TOKEN`, never `NETADMIN_API_TOKEN`, with no fallback
+either direction. The API token authorizes controller mutations, so reusing it
+would mean every laptop holding a Claude config also held network-change
+authority. The MCP token is read-only by construction and rotates on its own.
+
+| State | Answer |
+|---|---|
+| No token configured | `404`, the way an absent feature answers |
+| Wrong or missing token | `401` + `WWW-Authenticate: Bearer`, constant-time compared |
+| Over 10 failed attempts per client per 60 s | `429` + `Retry-After` |
+| Authenticated, SDK not installed | `503` naming `pip install "unifioptimizer[mcp]"` |
+
+The token is checked before anything reads the request body, so an
+unauthenticated caller never gets the daemon to parse a byte of JSON-RPC. The
+503 sits after the token check on purpose: only the operator can act on it.
+
+### Safety, unchanged
+
+Section 6 holds here too, through a connection this mount opens for itself rather
+than borrowing the daemon's writable one: `mode=ro`, `PRAGMA query_only=ON`, and
+no import path to the fix or ingest layers. The schema gate lives inside
+`tools.call_tool`, so it fires on this transport as well.
+
+`NETADMIN_MCP_REDACT` still defaults to off and is still read per call. Going
+remote changes which machine the client runs on, not what a model sees.
+
+### Not in v1
+
+Internet exposure, OAuth (static bearer only; a client that needs OAuth points
+`mcp-remote` at this URL), TLS or mTLS, per-tool scopes, multi-user, and the
+phone or claude.ai connectors. For TLS, terminate it at a reverse proxy in front
+of the daemon and forward to `/mcp`; the mount reads `X-Forwarded-For` for its
+rate-limit buckets, so per-client throttling survives the hop.

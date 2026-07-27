@@ -44,6 +44,23 @@ middleware never parses, so the route is left open here and
 itself once it has read the provider, reusing :func:`token_matches` and
 :func:`extract_bearer` so the check matches this middleware's own exactly.
 
+**The remote MCP mount (``/mcp``) is NOT gated here.** It sits outside
+``/api``, carries its own credential (``NETADMIN_MCP_TOKEN``, never
+``NETADMIN_API_TOKEN``), and is gated by :mod:`netadmin.server.mcp_mount`
+(ARCHITECTURE.md 18.3). That module reuses this one's :func:`token_matches`,
+:func:`extract_bearer`, :class:`FixedWindowRateLimiter` and :func:`client_key`,
+so both gates compare and throttle identically; only the secret and the
+"absent means 404" posture differ. Nothing in this middleware changes because of
+it, and nothing there can authorize an ``/api`` request.
+
+**Managing the MCP token IS gated here, though.** ``GET /api/system/mcp-token``
+(reveal) and ``POST /api/system/mcp-token/regenerate`` are the Settings surface
+for finding or rotating ``NETADMIN_MCP_TOKEN`` (ARCHITECTURE.md 18.4), and they
+follow their access-token counterparts' gating exactly, credential and all: the
+*API* bearer token (or a loopback peer, for reveal only) authorizes both, never
+the MCP token itself — rotating a read-only credential must not be able to
+authorize its own rotation.
+
 This is deliberately a single shared secret, not per-user auth: the daemon is a
 local-first single-operator tool (section 12), and a revocable static token keeps
 a browser and a curl call on the same simple contract without a login/session
@@ -54,6 +71,7 @@ surface. CORS wraps this middleware (added after it in ``create_app``), so a 401
 from __future__ import annotations
 
 import hmac
+import os
 import time
 from collections import deque
 from typing import Callable, Deque, Dict, Optional
@@ -68,15 +86,21 @@ __all__ = [
     "SETUP_STATUS_PATH",
     "SYSTEM_TOKEN_PATH",
     "SYSTEM_TOKEN_REGENERATE_PATH",
+    "SYSTEM_MCP_TOKEN_PATH",
+    "SYSTEM_MCP_TOKEN_REGENERATE_PATH",
     "SYSTEM_UPDATE_APPLY_PATH",
     "MUTATION_PATH_SUFFIXES",
     "WS_UNAUTHORIZED_CODE",
     "DEFAULT_WRITE_MAX",
     "DEFAULT_WRITE_WINDOW_S",
+    "FixedWindowRateLimiter",
     "token_matches",
     "extract_bearer",
+    "scope_header",
+    "client_key",
     "is_controller_mutation",
     "is_token_regenerate",
+    "is_mcp_token_regenerate",
     "is_investigate_route",
     "is_system_update_apply",
     "ApiTokenAuthMiddleware",
@@ -105,6 +129,14 @@ MUTATION_PATH_SUFFIXES = ("/fix/apply", "/fix/revert")
 # rate-limited mutation like the controller writes.
 SYSTEM_TOKEN_PATH = "/api/system/token"
 SYSTEM_TOKEN_REGENERATE_PATH = "/api/system/token/regenerate"
+
+# The remote-MCP-token surface (ARCHITECTURE.md 18.4 Settings addendum): reveal
+# and regenerate for NETADMIN_MCP_TOKEN, gated exactly like SYSTEM_TOKEN_PATH /
+# SYSTEM_TOKEN_REGENERATE_PATH above -- same bearer-or-loopback reveal, same
+# gated-and-rate-limited regenerate -- but the credential that unlocks them is
+# always the *API* token, never the MCP token being managed.
+SYSTEM_MCP_TOKEN_PATH = "/api/system/mcp-token"
+SYSTEM_MCP_TOKEN_REGENERATE_PATH = "/api/system/mcp-token/regenerate"
 
 # The pip self-upgrade apply route (ARCHITECTURE.md 23). Not a *controller*
 # mutation -- it upgrades the daemon's own code, never the live network -- but it
@@ -148,6 +180,19 @@ def is_token_regenerate(method: str, path: str) -> bool:
     return method == "POST" and path == SYSTEM_TOKEN_REGENERATE_PATH
 
 
+def is_mcp_token_regenerate(method: str, path: str) -> bool:
+    """Whether ``method``/``path`` is the MCP-token regenerate route.
+
+    Mints + persists a new ``NETADMIN_MCP_TOKEN``. Mirrors
+    :func:`is_token_regenerate` exactly -- token-gated and rate limited, never a
+    controller mutation -- but for the read-only remote-MCP credential
+    (ARCHITECTURE.md 18.4). Gated on the *API* token like its sibling: the MCP
+    token being rotated is never itself the credential that authorizes the
+    rotation.
+    """
+    return method == "POST" and path == SYSTEM_MCP_TOKEN_REGENERATE_PATH
+
+
 def is_system_update_apply(method: str, path: str) -> bool:
     """Whether ``method``/``path`` is ``POST /api/system/update/apply``.
 
@@ -182,8 +227,13 @@ def is_investigate_route(method: str, path: str) -> bool:
     return path.endswith("/investigate")
 
 
-class _WriteRateLimiter:
-    """A fixed-window per-client counter for controller-mutation requests.
+class FixedWindowRateLimiter:
+    """A fixed-window per-client attempt counter.
+
+    Used twice: for controller-mutation requests by the middleware below, and for
+    failed bearer-token attempts on the remote MCP mount
+    (:mod:`netadmin.server.mcp_mount`). Public rather than private precisely so
+    the second gate reuses this implementation instead of growing a near-copy.
 
     In-process and lock-free: the daemon runs a single uvicorn worker (section 2),
     so one limiter instance sees every request and no cross-process coordination is
@@ -202,6 +252,13 @@ class _WriteRateLimiter:
         """Record an attempt for ``key``; return False if it exceeds the window budget."""
         now = self._now()
         cutoff = now - self._window
+        # Drop every bucket that has fully aged out, not just this caller's. The
+        # dict is keyed by client address on a pre-auth path, so without this it
+        # only ever grows: one entry per address that ever probed, retained for
+        # the life of the process.
+        for stale in [k for k, b in self._hits.items() if not b or b[-1] <= cutoff]:
+            if stale != key:
+                del self._hits[stale]
         bucket = self._hits.setdefault(key, deque())
         while bucket and bucket[0] <= cutoff:
             bucket.popleft()
@@ -220,7 +277,12 @@ def token_matches(supplied: Optional[str], expected: Optional[str]) -> bool:
     """
     if not expected or not supplied:
         return False
-    return _compare(supplied, expected)
+    # Compare as bytes, not str. ``hmac.compare_digest`` rejects a str containing
+    # any codepoint above U+007F with TypeError, and Starlette decodes headers as
+    # latin-1, so a single high byte in the bearer raised out of this function and
+    # surfaced as an unauthenticated 500 -- one that never reached the rate
+    # limiter. Encoding first keeps the comparison constant-time and total.
+    return _compare(supplied.encode("utf-8", "surrogateescape"), expected.encode("utf-8"))
 
 
 def extract_bearer(header_value: Optional[str]) -> Optional[str]:
@@ -267,7 +329,7 @@ class ApiTokenAuthMiddleware:
         # construction path the unit tests use.
         self._token_provider = token_provider
         self._configured_provider = configured_provider
-        self._write_limiter = _WriteRateLimiter(write_max, write_window_s, now_fn=now_fn)
+        self._write_limiter = FixedWindowRateLimiter(write_max, write_window_s, now_fn=now_fn)
 
     @property
     def token(self) -> Optional[str]:
@@ -332,7 +394,7 @@ class ApiTokenAuthMiddleware:
                     code="mutation_locked",
                 )
                 return
-            if not self._write_limiter.allow(_client_key(scope)):
+            if not self._write_limiter.allow(client_key(scope)):
                 await self._refuse(
                     scope,
                     receive,
@@ -363,7 +425,7 @@ class ApiTokenAuthMiddleware:
                     code="mutation_locked",
                 )
                 return
-            if not self._write_limiter.allow(_client_key(scope)):
+            if not self._write_limiter.allow(client_key(scope)):
                 await self._refuse(
                     scope,
                     receive,
@@ -384,7 +446,7 @@ class ApiTokenAuthMiddleware:
         # unconfigured/open install still mints its first token through the open
         # shortcut below (there is nothing yet to protect).
         if self.token is not None and is_token_regenerate(method, path):
-            if not self._write_limiter.allow(_client_key(scope)):
+            if not self._write_limiter.allow(client_key(scope)):
                 await self._refuse(
                     scope,
                     receive,
@@ -394,6 +456,46 @@ class ApiTokenAuthMiddleware:
                     code="rate_limited",
                     headers={"Retry-After": str(int(DEFAULT_WRITE_WINDOW_S))},
                 )
+                return
+            await self._require_token(scope, receive, send)
+            return
+
+        # MCP-token regenerate (ARCHITECTURE.md 18.4). Deliberately NOT guarded on
+        # ``self.token is not None``, unlike the access-token regenerate above. The
+        # two credentials protect different things: the API token guards network
+        # mutations, the MCP token guards the whole history store. Gating this on
+        # the API token meant that on the documented setup path -- which mints only
+        # NETADMIN_MCP_TOKEN and never asks for an API token -- the open-reads
+        # shortcut below served this route to any LAN peer, who could then rotate
+        # the /mcp credential out from under every configured client. Handled here,
+        # above that shortcut, so posture is decided by THIS token's own rules.
+        if is_mcp_token_regenerate(method, path):
+            if not self._write_limiter.allow(client_key(scope)):
+                await self._refuse(
+                    scope,
+                    receive,
+                    send,
+                    status=429,
+                    detail="too many write requests; slow down",
+                    code="rate_limited",
+                    headers={"Retry-After": str(int(DEFAULT_WRITE_WINDOW_S))},
+                )
+                return
+            await self._require_token(scope, receive, send)
+            return
+
+        # The MCP-token reveal, for the same reason and with the same placement:
+        # it returns NETADMIN_MCP_TOKEN itself. Loopback is allowed unauthenticated
+        # -- the operator standing on the box, the same recovery path the access
+        # token gets, and the bootstrap that lets `netadmin mcp-token` and a local
+        # browser work on an install with no API token. A remote peer must present
+        # the API token; if none is configured, ``_require_token`` refuses every
+        # remote caller, which is the intended posture. Minting or reading the
+        # credential to the whole history store is not a thing the LAN may do
+        # anonymously just because network mutations happen to be unlocked.
+        if method == "GET" and path == SYSTEM_MCP_TOKEN_PATH:
+            if _is_loopback(scope):
+                await self.app(scope, receive, send)
                 return
             await self._require_token(scope, receive, send)
             return
@@ -453,7 +555,7 @@ class ApiTokenAuthMiddleware:
 
     async def _require_token(self, scope: Scope, receive: Receive, send: Send) -> None:
         """Pass through when the bearer token matches; otherwise 401."""
-        header_value = _header(scope, b"authorization")
+        header_value = scope_header(scope, b"authorization")
         if token_matches(extract_bearer(header_value), self.token):
             await self.app(scope, receive, send)
             return
@@ -484,7 +586,7 @@ class ApiTokenAuthMiddleware:
         await response(scope, receive, send)
 
 
-def _header(scope: Scope, name: bytes) -> Optional[str]:
+def scope_header(scope: Scope, name: bytes) -> Optional[str]:
     """Read one request header (case-insensitive) from a raw ASGI scope."""
     lname = name.lower()
     for key, value in scope.get("headers", []):
@@ -502,7 +604,7 @@ def _is_loopback(scope: Scope) -> bool:
     proxy the ASGI peer is the proxy, never the real client, so the bypass must not
     fire for a remote caller whose packets merely arrived via localhost.
     """
-    if _header(scope, b"x-forwarded-for"):
+    if scope_header(scope, b"x-forwarded-for"):
         return False
     client = scope.get("client")
     host = client[0] if client else None
@@ -511,18 +613,28 @@ def _is_loopback(scope: Scope) -> bool:
     return host == "::1" or host.startswith("127.")
 
 
-def _client_key(scope: Scope) -> str:
+def client_key(scope: Scope) -> str:
     """The rate-limit bucket key: the client host, or a stable fallback.
 
-    Prefers a forwarded client IP (when the daemon sits behind a trusted reverse
-    proxy) and otherwise the ASGI peer address. A missing client collapses to a
-    single shared bucket, so an unidentifiable flood is still throttled.
+    The ASGI peer address, which the kernel supplies and a caller cannot forge.
+
+    ``X-Forwarded-For`` is honoured ONLY when ``NETADMIN_TRUST_PROXY`` is set,
+    because this key is computed *before* authentication: if an unauthenticated
+    caller can choose their own bucket, they can rotate one header and never hit
+    the 429, which turns a rate-limited token into an unlimited guessing game.
+    Behind a real reverse proxy every peer address collapses to the proxy's, so
+    the header is the only way to tell clients apart -- hence the opt-in rather
+    than dropping it. Set it only when a proxy you control rewrites the header.
+
+    A missing client collapses to a single shared bucket, so an unidentifiable
+    flood is still throttled.
     """
-    forwarded = _header(scope, b"x-forwarded-for")
-    if forwarded:
-        first = forwarded.split(",")[0].strip()
-        if first:
-            return first
+    if os.environ.get("NETADMIN_TRUST_PROXY", "").strip().lower() in ("1", "true", "yes"):
+        forwarded = scope_header(scope, b"x-forwarded-for")
+        if forwarded:
+            first = forwarded.split(",")[0].strip()
+            if first:
+                return first
     client = scope.get("client")
     if client and client[0]:
         return str(client[0])

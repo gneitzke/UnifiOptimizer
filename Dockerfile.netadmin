@@ -54,9 +54,15 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Dependency closure == pyproject [project].dependencies (daemon runtime only).
-# The heavier legacy-CLI deps in requirements.txt (matplotlib, requests, jose,
-# urllib3<2) are intentionally excluded — the daemon imports none of them.
+# Dependency closure == pyproject [project].dependencies (daemon runtime only),
+# eleven packages, plus the optional `mcp` extra (docs/MCP_SERVER.md) installed
+# unconditionally here so the remote MCP mount at /mcp works out of the box in
+# every container deploy with no rebuild. It stays an extra, not a twelfth core
+# dep, in pyproject.toml/requirements — the daemon itself never imports it, and
+# the route is absent (404) until NETADMIN_MCP_TOKEN is configured regardless of
+# whether the package is present (netadmin/server/mcp_mount.py). The heavier
+# legacy-CLI deps in requirements.txt (matplotlib, requests, jose, urllib3<2)
+# are intentionally excluded — the daemon imports none of them.
 RUN pip install --no-cache-dir \
       "httpx>=0.27" \
       "pydantic>=2" \
@@ -68,7 +74,8 @@ RUN pip install --no-cache-dir \
       "fastapi>=0.104" \
       "uvicorn[standard]>=0.24" \
       "dnspython>=2" \
-      "aiomqtt>=2"
+      "aiomqtt>=2" \
+      "mcp>=1.2"
 
 # Application source (build context = git-archive tar + prebuilt web/dist; the tar
 # excludes every gitignored secret: data/secrets.env, data/*.db*, *.env).
@@ -85,9 +92,14 @@ USER netadmin
 
 # The daemon owns port 8765 (section 12). Bind 0.0.0.0 INSIDE the container's own
 # netns so the host port-publish can reach it; LAN exposure is controlled at run
-# time by the publish spec, which defaults to loopback-only (127.0.0.1:8765:8765)
-# because the API is unauthenticated — keep it bound to loopback, never LAN-exposed.
-# Controller access stays GET-only regardless.
+# time by the publish spec, which defaults to loopback-only (127.0.0.1:8765:8765).
+# That default is about READS, not mutations: GET /api/* is open by design once
+# configured (ARCHITECTURE.md 18.1), so publishing past loopback hands the network
+# inventory to the LAN. Mutations already fail closed without NETADMIN_API_TOKEN,
+# and /mcp (this image now ships the SDK) is separately gated by
+# NETADMIN_MCP_TOKEN — 404 when unset, 401 on a wrong/missing bearer — so widening
+# the publish spec is a considered call about read visibility, not a mutation or
+# MCP risk. Controller access stays GET-only regardless.
 EXPOSE 8765
 VOLUME ["/app/data"]
 

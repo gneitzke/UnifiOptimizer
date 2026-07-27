@@ -6,10 +6,20 @@ UnifiOptimizer's history store. For why it exists and how it is built, see
 
 Every tool is read-only. The server opens the SQLite file with `mode=ro` and
 `PRAGMA query_only`, imports nothing from the fix, ingest or config layers, and
-holds no controller credentials. It cannot change your network or your database,
-and it answers even when the daemon is stopped.
+holds no controller credentials. It cannot change your network or your database.
 
-## Install
+There are two ways to reach it, with the same 11 tools behind both.
+
+| | `netadmin-mcp` (stdio) | `/mcp` on the daemon (HTTP) |
+|---|---|---|
+| Runs where | the machine your Claude client is on | the machine the daemon is on |
+| Needs the daemon running | no, it reads the file directly | yes |
+| Setup | install the package and point it at the database | one token, one URL, nothing installed locally |
+
+Use stdio when you want an answer after a crash. Use the HTTP mount when Claude
+is on a different machine from the daemon.
+
+## Install: stdio
 
 ```bash
 pip install "unifioptimizer[mcp]"
@@ -35,6 +45,40 @@ The database path resolves from `--db`, then `NETADMIN_DB_PATH`, then
 `NETADMIN_DATA_DIR/netadmin.db`, then `./data/netadmin.db`. Claude Desktop launches
 processes with `/` as the working directory, so pass `--db` or set the environment
 variable rather than relying on the relative default.
+
+## Install: the daemon's `/mcp` endpoint
+
+On the machine running the daemon, mint a token and restart:
+
+```bash
+pip install "unifioptimizer[mcp]"    # the daemon needs the extra too
+netadmin mcp-token --regenerate      # writes NETADMIN_MCP_TOKEN to data/secrets.env
+```
+
+Then, on any machine that can reach it:
+
+```bash
+claude mcp add --transport http unifioptimizer http://<daemon-host>:8765/mcp \
+  --header "Authorization: Bearer <token>"
+```
+
+`NETADMIN_MCP_TOKEN` is a separate credential from `NETADMIN_API_TOKEN` and there
+is no fallback between them. The API token can apply fixes to your network; this
+one can only read history, and you can rotate it without touching anything else.
+Keep it off the public internet: there is no TLS here, so put a reverse proxy in
+front of the daemon if the link is not one you already trust.
+
+Without a token configured, `/mcp` returns 404. A wrong token returns 401, and
+repeated failures from one client are rate limited.
+
+Minting and reading that token is a local operation. The routes behind the CLI
+and the Settings buttons serve the daemon's own host unauthenticated and ask
+every other machine for the API token, so a device on the LAN cannot read the
+credential or rotate it out from under your clients.
+
+For the `.mcp.json` form that keeps the token out of the file, the Claude
+Desktop setup, and a full table of what each of those error codes means, see
+[`MCP_REMOTE.md`](MCP_REMOTE.md).
 
 ## Shared parameters
 

@@ -843,6 +843,146 @@ just load. Revised model:
   protected). Anyone who wants viewing gated too runs it behind a reverse proxy or
   the loopback-only bind. This is the right default for a trusted home LAN.
 
+### 18.2 Remote MCP token (`NETADMIN_MCP_TOKEN`) — settings only (Gitea #29)
+
+Groundwork for the remote MCP mount described in `docs/MCP_SERVER.md`: a future
+streamable-HTTP ASGI app at `/mcp`, serving the existing 11 read-only tools
+(`netadmin/mcp/tools.py`) to a Claude client over the network instead of stdio.
+This step adds only the credential surface, no route:
+
+- `Settings.netadmin_mcp_token`, read from `NETADMIN_MCP_TOKEN` in
+  `data/secrets.env` / the environment — **never** yaml, mirroring
+  `netadmin_api_token`. Exposed through `Settings.mcp_token` (whitespace-only
+  treated as unset).
+- **Deliberately a separate credential from `NETADMIN_API_TOKEN`, with no
+  fallback either direction.** The API token authorizes controller *mutations*;
+  the MCP token is read-only by construction and independently rotatable. Since
+  `GET /api/*` reads are open on a configured, LAN-published install (§18.1),
+  reusing the API token for MCP would turn a config leaked from one laptop into
+  network control, not just a privacy leak.
+- `netadmin mcp-token` (CLI): prints the configured token, or errors to stderr
+  (exit 1) when unset. `--regenerate` mints `token_urlsafe(32)` and persists it
+  via `write_secrets` (atomic, chmod 600, every other key preserved) — the same
+  pattern as `POST /api/system/token/regenerate`
+  (`netadmin/server/routers/system.py`).
+- A startup log line states whether remote MCP is configured
+  (`NETADMIN_MCP_TOKEN` set) or disabled (unset).
+- **No server behaviour changed in this step.** The route that consumes the token
+  arrived in §18.3 below.
+
+### 18.3 Remote MCP mount (`/mcp`): the gated route (Gitea #30)
+
+`netadmin/server/mcp_mount.py` mounts the MCP SDK's streamable-HTTP ASGI app at
+`/mcp` on the existing daemon, serving the same 11 read-only tools
+(`netadmin/mcp/tools.py`, unchanged: it was written transport-agnostic for
+exactly this). A Claude client on any machine on the LAN can now read the history
+store without the package being installed there.
+
+**Posture ladder, evaluated in this order.**
+
+| State | Answer |
+|---|---|
+| No `NETADMIN_MCP_TOKEN` | `404` + `code: mcp_disabled`. The feature is absent, and a 401 would advertise a surface that serves nothing. |
+| Wrong or missing bearer token | `401` + `WWW-Authenticate: Bearer`, constant-time compared via `auth.token_matches` |
+| More than 10 *failed* attempts per client per 60 s | `429` + `Retry-After`, via `auth.FixedWindowRateLimiter` |
+| Authenticated, SDK absent | `503` naming `pip install "unifioptimizer[mcp]"` |
+| Authenticated, mount live | the MCP session |
+
+Two ordering decisions matter. The token is checked **before anything reads the
+request body**: nothing calls ASGI `receive` until the compare has passed, so an
+unauthenticated caller cannot make the daemon buffer or parse a byte of JSON-RPC.
+And the 503 is checked **after** the token, one step stricter than the sketch in
+§18.2: it is deployment state, only the operator can act on it, and an
+unauthenticated caller learns nothing about how the box is provisioned.
+
+**Why the gate exists at all.** `GET /api/*` reads are open on the LAN once
+configured (§18.1) and the mini is LAN-published, so an ungated mount would hand
+any guest device the whole history store in one tool call. The credential is
+`NETADMIN_MCP_TOKEN` and never `NETADMIN_API_TOKEN`, with no fallback either
+direction: the API token authorizes controller mutations, so pasting it into a
+Claude config on every laptop would turn one leaked file from a privacy problem
+into network control.
+
+**Read-only, three ways.** The mount opens its **own**
+`Repository.open(..., read_only=True)` handle in the lifespan, never the daemon's
+read-write one: SQLite `mode=ro` at the VFS layer, `PRAGMA query_only=ON` on the
+connection, and a tool layer that imports nothing from `netadmin/fixes/` or
+`netadmin/ingest/`. `tools.call_tool` carries the schema gate, so a store this
+build does not understand answers with the same guidance sentence here as over
+stdio.
+
+**Transport.** Stateless, JSON-response streamable HTTP: a fresh transport per
+request, no session table, no long-lived SSE stream beside the daemon's own
+`/ws`. `serverInfo.version` is `netadmin.__version__`. The SDK's DNS-rebinding
+protection is left off on purpose; a bearer token is the stronger guard and a
+Host allow-list would break the LAN-by-IP access the feature exists for.
+
+**What remote does not inherit.** The stdio server (`netadmin-mcp`) answers when
+the daemon is down, because it opens the file itself. This one is part of the
+daemon, so it answers only while the daemon runs. Both ship; they are not
+interchangeable.
+
+**Not in v1:** internet exposure, OAuth (static bearer only; a client that needs
+OAuth uses the `mcp-remote` wrapper), TLS or mTLS (run a reverse proxy),
+per-tool scopes, multi-user, phone or claude.ai connectors.
+`NETADMIN_MCP_REDACT` still defaults to off and is still read per call, so it
+governs this surface unchanged: going remote changes which machine the client
+runs on, not what a model sees.
+
+**Shared primitives.** `token_matches`, `extract_bearer`, `client_key`,
+`scope_header` and `FixedWindowRateLimiter` are now public in
+`netadmin/server/auth.py` and used by both gates, so the two cannot drift into
+subtly different comparison or throttling rules. `ApiTokenAuthMiddleware` is
+untouched: `/mcp` sits outside `/api`, so it never reaches that middleware's
+rules, and nothing about the MCP token can authorize an `/api` request.
+
+### 18.4 Remote MCP token reveal/regenerate in Settings (Gitea #34)
+
+Managing `NETADMIN_MCP_TOKEN` was CLI-only (`netadmin mcp-token`) or a hand
+edit of `secrets.env`. This adds a Settings surface beside the existing access
+token section: `GET /api/system/mcp-token` (reveal) and `POST
+/api/system/mcp-token/regenerate`, backing a `McpTokenSection` component next
+to `AccessTokenSection`.
+
+**Gating deliberately mirrors `/system/token` exactly, credential included.**
+Reveal is open to a loopback peer or the *API* bearer token; regenerate is
+gated + rate limited on that same API token, sharing the controller-writes
+budget. The MCP token being managed is **never** the credential that unlocks
+either route — a read-only, rotatable secret must not be able to authorize its
+own rotation, the same reasoning that keeps it separate from the API token in
+the first place (§18.2). `netadmin/server/auth.py` adds `SYSTEM_MCP_TOKEN_PATH`
+/ `SYSTEM_MCP_TOKEN_REGENERATE_PATH` and `is_mcp_token_regenerate`, wired into
+`ApiTokenAuthMiddleware` right beside their access-token equivalents, and an
+unconfigured/open install (no API token at all) can still mint a *first* MCP
+token through the same open-shortcut bootstrap the access-token regenerate
+already gets.
+
+**Rotation takes effect immediately, no restart — with one honest caveat.**
+`regenerate_mcp_token` writes the new value to `secrets.env` (atomic, chmod
+600, every other key preserved, same as the access-token path) and mutates the
+live `Settings` object in place. `McpEndpoint.token` (the `/mcp` gate) reads
+`settings.mcp_token` fresh on every request, so an **already-running** mount
+refuses the old token and accepts the new one on its very next call, in the
+same process, no restart. That immediacy is specific to *rotating* a mount
+that is already up: `netadmin/server/mcp_mount.py`'s session manager is built
+exactly once, in the daemon lifespan, and only when `settings.mcp_token` was
+already set at boot. So minting the **first** token for a daemon that started
+with none configured still leaves `/mcp` answering 503 (`mcp_unavailable`)
+until the daemon restarts and `start_mcp` runs again — this step does not
+change that; the UI copy says so rather than promising something the mount
+does not yet do.
+
+**The Claude Code snippet is copy-paste, never a placeholder.** The Settings
+card renders `claude mcp add --transport http unifioptimizer <origin>/mcp
+--header "Authorization: Bearer <token>"` only once the real token is on
+screen (after Reveal or Regenerate), with its own copy button — there is
+nothing here to paste and have silently fail against a token that was never
+actually issued.
+
+**Not changed:** `netadmin mcp-token` (CLI), the `/mcp` mount itself, or
+`NETADMIN_MCP_REDACT`. This step is the Settings-side counterpart to the CLI
+path added in §18.2, nothing more.
+
 ## 19. Report export (feature)
 
 An in-app **Export report** action produces a professional network assessment
@@ -1007,11 +1147,15 @@ These are not stylistic. Each one, dropped, is a user-visible failure, and
 `tests/netadmin/test_container_packaging.py` asserts each against the shipped
 files.
 
-- **Loopback by default.** Reads on the API are unauthenticated (section 18.1),
-  so Compose publishes `127.0.0.1:8765:8765` and the add-on declares
-  `8765/tcp: null`. Home Assistant publishes a mapped port on every interface
-  with no loopback option, which is exactly why the add-on default is unmapped
-  and opting in is the user's decision.
+- **Loopback by default.** GET reads on the API are open by design once
+  configured (section 18.1), so Compose publishes `127.0.0.1:8765:8765` and the
+  add-on declares `8765/tcp: null`. Home Assistant publishes a mapped port on
+  every interface with no loopback option, which is exactly why the add-on
+  default is unmapped and opting in is the user's decision. State-changing
+  routes already fail closed without `NETADMIN_API_TOKEN` / `api_token`, and
+  `/mcp` (section 18.3) is separately gated by `NETADMIN_MCP_TOKEN` /
+  `mcp_token`, but neither of those makes the read surface above safe to
+  publish by default: see "MCP in the container paths" below.
 - **Mutable state on a mount.** `secrets.env`, `config.yaml`, `netadmin.db`, and
   the logs live on the volume, so an image rebuild or an add-on update keeps the
   history the product exists to accumulate.
@@ -1043,6 +1187,37 @@ Turning it on is a frontend change: a runtime base path in the SPA, a matching
 `base` in `vite.config.ts`, and that prefix applied in the API client and the
 WebSocket URL builder. `ingress: false` is a recorded finding, not an untouched
 default, and a test pins it so it cannot be flipped without the frontend work.
+
+### MCP in the container paths (Gitea #32, #33)
+
+Both `Dockerfile.netadmin` and `addon/Dockerfile` install the optional `mcp`
+extra (`mcp>=1.2`, `pyproject.toml`'s `[project.optional-dependencies]`)
+unconditionally, so the remote MCP mount at `/mcp` (section 18.3) works with no
+rebuild the moment an operator sets a token; the daemon still answers 404
+until then, since the route's presence depends on `NETADMIN_MCP_TOKEN` /
+`mcp_token`, never on whether the package happens to be installed. It stays an
+extra, not a twelfth core runtime dependency: the daemon itself never imports
+it outside `netadmin/server/mcp_mount.py`, and the SDK is a pure-Python
+(`py3-none-any`) wheel, so it does not weaken the add-on's
+`--only-binary=:all:` musllinux guard.
+
+- `docker-compose.yml` gets a commented `NETADMIN_MCP_TOKEN` passthrough
+  beside the existing `NETADMIN_API_TOKEN` one: same opt-in shape, separate
+  credential, no fallback either direction (section 18.2).
+- `addon/config.yaml` adds `mcp_token` as a `password?` option next to
+  `api_token`; `addon/run.sh` maps it to `NETADMIN_MCP_TOKEN` behind the same
+  `bashio::config.has_value` guard every other option uses. The port itself
+  stays unpublished by default in both paths; the MCP gate does not change
+  that call, since `GET /api/*` is still the wider read surface being
+  protected against.
+- `deploy/update-macmini.sh`'s post-deploy probe now checks `/mcp` on every
+  deploy: an unauthenticated request must answer `401` or `404` while
+  `/api/health` stays `200`. Anything else, `200` above all, fails the
+  deploy loudly with the same automatic rollback a failed health check gets,
+  rather than silently shipping a generation whose MCP gate does not work.
+  The script and `deploy/macmini.md` are gitignored local deploy docs, not
+  tracked files, but their header comments were rewritten off the same stale
+  "the API has NO authentication" framing this section corrects.
 
 ### Version coupling
 

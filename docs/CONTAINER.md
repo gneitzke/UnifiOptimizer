@@ -26,9 +26,13 @@ writes your controller credentials into the data volume.
 Three of its choices matter:
 
 **The port is published to loopback only.** `127.0.0.1:8765:8765`, not
-`8765:8765`. Reads on the API are unauthenticated by design, so the short form
-would publish your full network inventory to everyone on the LAN. For remote
-access, put a reverse proxy that authenticates in front of it.
+`8765:8765`. GET reads on the API are open by design once configured, so the
+short form would publish your full network inventory to everyone on the LAN.
+State-changing routes already refuse to work without `NETADMIN_API_TOKEN`, and
+the remote MCP server at `/mcp` is separately gated by `NETADMIN_MCP_TOKEN`
+(see "Enabling the remote MCP server" below), but neither of those makes the
+read surface above safe to publish. For remote access, put a reverse proxy
+that authenticates in front of it.
 
 **Storage is a named volume.** The image runs as a non-root user, uid 501 by
 default. Docker seeds a new named volume from the image with that ownership
@@ -67,6 +71,23 @@ which is the safe default. To enable them, uncomment `NETADMIN_API_TOKEN` in
 echo "NETADMIN_API_TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')" >> .env
 docker compose up -d
 ```
+
+### Enabling the remote MCP server
+
+The image ships the optional `mcp` extra already, so a Claude client on the LAN
+can read the history store over `/mcp` once you set a token. `NETADMIN_MCP_TOKEN`
+is a **separate** credential from `NETADMIN_API_TOKEN`, and never falls back to
+it in either direction, since it authorizes read-only MCP tool calls, not
+controller mutations. Uncomment `NETADMIN_MCP_TOKEN` in `docker-compose.yml` the
+same way:
+
+```bash
+echo "NETADMIN_MCP_TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')" >> .env
+docker compose up -d
+```
+
+Unset, `/mcp` answers `404`: the feature is simply absent, not merely
+unauthenticated. See `docs/MCP_SERVER.md` for the client-side setup.
 
 ### If you want the data on the host instead
 
@@ -146,8 +167,11 @@ default instead of killing the add-on at startup.
 ### Why no port by default
 
 Home Assistant publishes a mapped add-on port on every interface and offers no
-loopback-only option. Since reads are unauthenticated, `config.yaml` declares
-`8765/tcp: null`, so nothing is reachable until you choose a port.
+loopback-only option. Since GET reads are open by design once configured,
+`config.yaml` declares `8765/tcp: null`, so nothing is reachable until you
+choose a port. Setting `api_token` and `mcp_token` in the Configuration tab
+gates mutations and `/mcp` respectively, but neither changes this default:
+opening the port is still the decision that exposes reads.
 
 ### Why no ingress
 

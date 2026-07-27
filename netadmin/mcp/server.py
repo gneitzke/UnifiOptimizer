@@ -1,10 +1,15 @@
-"""The stdio binding: ``netadmin-mcp``.
+"""The stdio binding: ``netadmin-mcp``, plus the shared server builder.
 
-The only module that touches the MCP SDK, and it imports it *inside*
-:func:`main` rather than at module scope. That is deliberate: the SDK is an
-optional extra, `netadmin.mcp.tools` must stay importable (and testable) without
-it, and a user who runs ``netadmin-mcp`` without the extra deserves the one-line
-``pip install "unifioptimizer[mcp]"`` instruction rather than a traceback.
+Every SDK import here is *inside* a function rather than at module scope. That is
+deliberate: the SDK is an optional extra, `netadmin.mcp.tools` must stay
+importable (and testable) without it, and a user who runs ``netadmin-mcp``
+without the extra deserves the one-line ``pip install "unifioptimizer[mcp]"``
+instruction rather than a traceback.
+
+:func:`build_server` is the single place the 11 tools get registered on an MCP
+server object. The daemon's remote streamable-HTTP mount
+(:mod:`netadmin.server.mcp_mount`) calls it too, so the two transports cannot
+drift apart in what they expose.
 
 Everything else here is startup hygiene for a process the user never sees the
 console of. A stdio MCP server's stdout *is* the protocol channel, so every
@@ -31,7 +36,7 @@ from netadmin import __version__
 from netadmin.mcp import SERVER_NAME, paths, tools
 from netadmin.store.repository import Repository
 
-__all__ = ["build_parser", "main", "serve"]
+__all__ = ["build_parser", "build_server", "main", "serve"]
 
 _SDK_MISSING = (
     'The MCP SDK is not installed. Run: pip install "unifioptimizer[mcp]"\n'
@@ -88,12 +93,21 @@ def open_store(db_path: Path) -> Repository:
     return Repository.open(db_path, read_only=True)
 
 
-def serve(repo: Repository) -> int:
-    """Run the stdio server against an already-open store until the client exits."""
-    import anyio
+def build_server(repo: Repository) -> Any:
+    """Build the low-level MCP ``Server`` with all 11 tools bound to ``repo``.
+
+    Transport-free on purpose. Two bindings need exactly these registrations --
+    :func:`serve` over stdio, and the daemon's streamable-HTTP mount
+    (:mod:`netadmin.server.mcp_mount`) -- and a second hand-written copy of the
+    ``list_tools`` / ``call_tool`` pair is precisely how a tool ends up exposed on
+    one transport and not the other. Anything transport-specific (streams, session
+    management, auth) stays with its caller.
+
+    Imports the SDK inside the function, like every other entry point here, so
+    ``netadmin.mcp`` stays importable without the ``[mcp]`` extra.
+    """
     import mcp.types as types
     from mcp.server.lowlevel import Server
-    from mcp.server.stdio import stdio_server
 
     # Our version, not the SDK's: the client shows serverInfo.version in its
     # server list, and "1.28.1" there would name the wrong piece of software.
@@ -114,9 +128,20 @@ def serve(repo: Repository) -> int:
     async def _call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
         # tools.call_tool never raises: an expected failure comes back as a
         # payload whose summary tells the model what to do next, which is worth
-        # far more to it than an MCP error code.
+        # far more to it than an MCP error code. The schema gate is inside it, so
+        # it fires on every transport rather than only at stdio startup.
         payload = tools.call_tool(repo, name, arguments)
         return [types.TextContent(type="text", text=json.dumps(payload, indent=2, default=str))]
+
+    return server
+
+
+def serve(repo: Repository) -> int:
+    """Run the stdio server against an already-open store until the client exits."""
+    import anyio
+    from mcp.server.stdio import stdio_server
+
+    server = build_server(repo)
 
     async def _run() -> None:
         async with stdio_server() as (read_stream, write_stream):

@@ -195,10 +195,13 @@ async def test_options_preflight_not_gated(token_app: object) -> None:
 async def test_constant_time_comparator_is_used(
     token_app: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    calls: list[tuple[str, str]] = []
+    # Bytes, not str: token_matches encodes before comparing, because
+    # hmac.compare_digest raises TypeError on a non-ASCII str and Starlette
+    # decodes headers as latin-1.
+    calls: list[tuple[bytes, bytes]] = []
     real = auth_mod._compare
 
-    def spy(a: str, b: str) -> bool:
+    def spy(a: bytes, b: bytes) -> bool:
         calls.append((a, b))
         return real(a, b)
 
@@ -208,7 +211,7 @@ async def test_constant_time_comparator_is_used(
     async with await _client(token_app) as c:
         await c.post(_APPLY_PATH, json={}, headers={"Authorization": f"Bearer {TOKEN}"})
     assert calls, "auth did not go through the constant-time comparator"
-    assert calls[-1] == (TOKEN, TOKEN)
+    assert calls[-1] == (TOKEN.encode(), TOKEN.encode())
 
 
 def test_unauthenticated_startup_logs_warning(settings: Settings, seeded_store: Repository) -> None:

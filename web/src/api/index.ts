@@ -22,9 +22,11 @@ export {
 export {
   revealSystemToken,
   regenerateSystemToken,
+  revealMcpToken,
+  regenerateMcpToken,
   SystemTokenError,
 } from './system';
-export type { SystemTokenInfo } from './system';
+export type { SystemTokenInfo, SystemMcpTokenInfo } from './system';
 export {
   getUpdateStatus,
   dismissUpdate,

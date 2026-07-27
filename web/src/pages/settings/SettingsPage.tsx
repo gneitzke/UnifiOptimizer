@@ -4,6 +4,7 @@ import { Button, Card, EmptyState, Skeleton } from '../../components/ui';
 import { useHealth, type Health, type JobHealth } from '../../api';
 import { startTour } from '../onboarding';
 import { AccessTokenSection } from './AccessTokenSection';
+import { McpTokenSection } from './McpTokenSection';
 
 /**
  * /settings — read-only view of the daemon's live configuration and health. No
@@ -315,6 +316,13 @@ export default function SettingsPage() {
             description="Viewing is open on your LAN; applying a fix asks for this token. Reveal it to copy, or regenerate to rotate it (ARCHITECTURE §18.1)."
           >
             <AccessTokenSection />
+          </Section>
+
+          <Section
+            title="Remote MCP token"
+            description="Lets a Claude client on another machine read this daemon's history over the network at /mcp, read-only. Off until a token is set (ARCHITECTURE §18.4)."
+          >
+            <McpTokenSection />
           </Section>
 
           <Section

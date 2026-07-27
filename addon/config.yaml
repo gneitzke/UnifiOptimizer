@@ -40,16 +40,19 @@ boot: auto
 ingress: false
 panel_icon: mdi:wifi-cog
 
-# Declared but UNPUBLISHED by default (null). Reads on the API are
-# unauthenticated (docs/ARCHITECTURE.md 18.1) and Home Assistant publishes a
-# mapped add-on port on every interface, with no loopback-only option, so
-# defaulting to a live port would put the whole inventory on the LAN. Set a host
-# port in the add-on Configuration tab when you have decided that is what you
-# want.
+# Declared but UNPUBLISHED by default (null). GET reads on the API are open by
+# design once configured (docs/ARCHITECTURE.md 18.1) and Home Assistant
+# publishes a mapped add-on port on every interface, with no loopback-only
+# option, so defaulting to a live port would put the whole inventory on the
+# LAN. State-changing routes already fail closed without `api_token`, and
+# `/mcp` (18.3) is separately gated by `mcp_token` below -- 404 when unset, 401
+# on a wrong or missing bearer -- but neither of those makes the read surface
+# above safe to publish by default. Set a host port in the add-on
+# Configuration tab when you have decided that is what you want.
 ports:
   8765/tcp: null
 ports_description:
-  8765/tcp: Dashboard and read-only API. Unauthenticated for reads, so only map this on a network you trust.
+  8765/tcp: Dashboard and read-only API. Reads are unauthenticated; /mcp is separately token-gated (401/404). Only map this on a network you trust.
 
 # /data is the add-on's own persistent directory, provided by the Supervisor and
 # preserved across add-on updates. run.sh points NETADMIN_DATA_DIR at it, so
@@ -64,10 +67,12 @@ map: []
 options:
   log_level: info
   api_token: ""
+  mcp_token: ""
   controller_host: ""
   controller_api_key: ""
 schema:
   log_level: list(debug|info|warning|error)
   api_token: password?
+  mcp_token: password?
   controller_host: str?
   controller_api_key: password?

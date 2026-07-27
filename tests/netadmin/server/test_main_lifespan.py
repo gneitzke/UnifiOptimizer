@@ -3,15 +3,32 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 
+from netadmin.server import mcp_mount
 from netadmin.server.main import DaemonComponents, build_default_components, create_app
 from netadmin.server.runtime import DaemonState
 
 from .conftest import FakeScheduler, FakeSupervisor
 
 pytestmark = pytest.mark.asyncio
+
+
+class _LogCapture(logging.Handler):
+    """Attach directly to ``netadmin.server.main``.
+
+    That logger sets ``propagate=False`` (see ``test_auth.py``), so caplog
+    (root-attached) never sees it; this mirrors the existing workaround.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
 
 
 async def test_lifespan_starts_and_stops_all_components(settings, seeded_store) -> None:
@@ -108,6 +125,46 @@ async def test_version_checker_disabled_by_config_still_boots_cleanly(
         checker = app.state.version_checker
         assert checker is not None
         assert checker.running is False  # disabled: start() was a no-op
+
+
+async def test_lifespan_logs_remote_mcp_disabled_by_default(settings, seeded_store) -> None:
+    """No NETADMIN_MCP_TOKEN configured -> an honest 'disabled' line (Gitea #29).
+
+    The mount itself is covered in ``test_mcp_mount.py``; this pins that the
+    daemon lifespan is what drives it, and says so on the way up.
+    """
+    assert settings.mcp_token is None
+    logger = logging.getLogger("netadmin.server.mcp")
+    handler = _LogCapture()
+    logger.addHandler(handler)
+    app = create_app(settings=settings, store=seeded_store, components=DaemonComponents())
+    try:
+        async with app.router.lifespan_context(app):
+            assert app.state.mcp.manager is None
+    finally:
+        logger.removeHandler(handler)
+    assert any("remote MCP" in m and "disabled" in m for m in handler.messages)
+
+
+@pytest.mark.skipif(
+    not mcp_mount.sdk_available(), reason="the optional [mcp] extra is not installed"
+)
+async def test_lifespan_starts_and_stops_the_remote_mcp_mount(settings, seeded_store) -> None:
+    mcp_settings = settings.model_copy(update={"netadmin_mcp_token": "s3cr3t-mcp-token"})
+    logger = logging.getLogger("netadmin.server.mcp")
+    handler = _LogCapture()
+    logger.addHandler(handler)
+    app = create_app(settings=mcp_settings, store=seeded_store, components=DaemonComponents())
+    try:
+        async with app.router.lifespan_context(app):
+            assert app.state.mcp.manager is not None
+            assert app.state.mcp.repo is not None
+    finally:
+        logger.removeHandler(handler)
+    # Torn down with the daemon: the mount is not a process that outlives it.
+    assert app.state.mcp.manager is None
+    assert app.state.mcp.repo is None
+    assert any("/mcp mounted" in m for m in handler.messages)
 
 
 async def test_build_default_components_tolerates_absent_peers(settings, seeded_store) -> None:

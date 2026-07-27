@@ -19,9 +19,13 @@ existing API:
   redaction) that :mod:`netadmin.mcp.tools` applies centrally.
 * :mod:`netadmin.mcp.tools` is transport-agnostic: plain
   ``(Repository, params) -> dict`` functions, unit-testable with no SDK present.
-* :mod:`netadmin.mcp.server` is the only module that imports the MCP SDK, and it
-  imports it lazily so ``pip install unifioptimizer`` without the ``[mcp]`` extra
-  still imports cleanly.
+* :mod:`netadmin.mcp.server` owns the stdio binding and
+  :func:`netadmin.mcp.server.build_server`, the one place the 11 tools are
+  registered on an SDK server object.
+* The SDK is imported lazily, inside functions, by the only two modules that
+  need it -- :mod:`netadmin.mcp.server` and the daemon's remote mount
+  :mod:`netadmin.server.mcp_mount` -- so ``pip install unifioptimizer`` without
+  the ``[mcp]`` extra still imports cleanly and the daemon still boots.
 
 Nothing here imports :mod:`netadmin.fixes` or :mod:`netadmin.ingest`. That is
 the third read-only guarantee, after SQLite's ``mode=ro`` and ``PRAGMA

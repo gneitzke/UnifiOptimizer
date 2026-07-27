@@ -41,6 +41,16 @@ if bashio::config.has_value 'api_token'; then
   export NETADMIN_API_TOKEN
 fi
 
+# Gates the remote MCP mount at /mcp (docs/MCP_SERVER.md). A SEPARATE
+# credential from api_token, with no fallback either direction: api_token
+# authorizes controller mutations, this one only gates read-only MCP tool
+# calls. Absent, /mcp answers 404 -- the feature is simply not there, not
+# merely unauthenticated.
+if bashio::config.has_value 'mcp_token'; then
+  NETADMIN_MCP_TOKEN="$(bashio::config 'mcp_token')"
+  export NETADMIN_MCP_TOKEN
+fi
+
 # Optional shortcut past the web setup flow for people who would rather keep
 # credentials in the add-on configuration.
 if bashio::config.has_value 'controller_host'; then

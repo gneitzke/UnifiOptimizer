@@ -492,6 +492,17 @@ class Settings(BaseSettings):
     # the env var like the other secrets (``unifi_host`` -> ``UNIFI_HOST``); read
     # through the :attr:`api_token` property so callers never touch the raw field.
     netadmin_api_token: str | None = None
+    # Optional remote-MCP bearer token (Gitea #29; docs/MCP_SERVER.md's remote
+    # streamable-HTTP mount design). Deliberately a SEPARATE credential from
+    # ``netadmin_api_token``: the API token authorizes controller *mutations*, so
+    # reusing it for a read-only MCP mount would turn a config leaked from one
+    # laptop into network control, not just a privacy leak. Read only from
+    # ``NETADMIN_MCP_TOKEN`` in ``data/secrets.env`` / the environment -- never
+    # yaml, never code, no fallback to ``netadmin_api_token`` -- through the
+    # :attr:`mcp_token` property. Consumed by
+    # :mod:`netadmin.server.mcp_mount`: unset means ``/mcp`` answers 404 and the
+    # feature is simply absent.
+    netadmin_mcp_token: str | None = None
     # Pinned CORS origins (section 12); ``*`` is stripped by the server, never
     # allowed. Empty -> the server's localhost dev defaults.
     cors_origins: list[str] = Field(default_factory=list)
@@ -546,6 +557,17 @@ class Settings(BaseSettings):
         does not silently lock the API behind an unusable token.
         """
         token = self.netadmin_api_token
+        token = token.strip() if token else None
+        return token or None
+
+    @property
+    def mcp_token(self) -> str | None:
+        """The remote-MCP bearer token, or ``None`` (the feature stays absent).
+
+        Whitespace-only is treated as unset, mirroring :attr:`api_token`, so a
+        blank line in ``secrets.env`` never silently arms an unusable token.
+        """
+        token = self.netadmin_mcp_token
         token = token.strip() if token else None
         return token or None
 

@@ -11,6 +11,11 @@ Subcommands:
                     (the explicit, service-manager form: no browser is opened).
 * ``status``      - hit a running daemon's ``/api/health`` and report it.
 * ``token``       - print the configured access token (or error if none is set).
+* ``mcp-token``   - print the configured NETADMIN_MCP_TOKEN (or error if unset);
+                    ``--regenerate`` mints and persists a new one. This is the
+                    bearer token for the daemon's ``/mcp`` endpoint, which any
+                    machine on the network can point a Claude client at
+                    (docs/MCP_REMOTE.md).
 * ``visit``       - on-demand "tech visit": backfill, detect, report, exit.
 * ``detect``      - identify a UniFi console (read-only) and print its API-key /
                     local-admin setup steps plus the exact ``data/secrets.env`` lines.
@@ -39,10 +44,11 @@ import threading
 import time
 import webbrowser
 from pathlib import Path
+from secrets import token_urlsafe
 from typing import Optional, Sequence
 
 from netadmin import __version__
-from netadmin.config import get_settings
+from netadmin.config import get_settings, write_secrets
 from netadmin.llm.provider import PROVIDER_NAMES
 from netadmin.logging import configure_logging, get_logger
 
@@ -219,6 +225,51 @@ def _cmd_token(args: argparse.Namespace) -> int:
     if token is None:
         print(
             "no access token configured; set NETADMIN_API_TOKEN in data/secrets.env",
+            file=sys.stderr,
+        )
+        return 1
+    print(token)
+    return 0
+
+
+# CSPRNG entropy for `netadmin mcp-token --regenerate`; matches the API-token
+# regenerate path (netadmin/server/routers/system.py) and first-run mint
+# (netadmin/server/routers/setup.py) so all three produce the same token shape.
+_MCP_TOKEN_BYTES = 32
+
+
+def _cmd_mcp_token(args: argparse.Namespace) -> int:
+    """Print the configured NETADMIN_MCP_TOKEN, or mint a new one with --regenerate.
+
+    The read/regenerate counterpart of ``_cmd_token`` (``NETADMIN_API_TOKEN``) and
+    the reveal/regenerate pair in ``routers/system.py``, but for the dedicated,
+    read-only, independently-rotatable remote-MCP credential (docs/MCP_SERVER.md):
+    there is deliberately NO fallback to ``NETADMIN_API_TOKEN`` -- pasting the
+    mutation-authorizing API token into a laptop's MCP config would turn a leak
+    from a privacy problem into network control. No running daemon is required;
+    like ``netadmin token``, this reads/writes ``data/secrets.env`` directly.
+
+    This step is settings-only: no ``/mcp`` endpoint reads this token yet, so
+    minting one here does not change what the daemon serves.
+
+    ``--regenerate`` mints a fresh ``token_urlsafe(32)``, persists it to
+    ``data/secrets.env`` via :func:`write_secrets` (atomic, chmod 600, every other
+    key preserved), and prints it once; minting always succeeds (exit 0). Without
+    ``--regenerate``, exit codes: 0 with the token printed on stdout, 1 (a message
+    on stderr) when no token is configured yet.
+    """
+    if args.regenerate:
+        new_token = token_urlsafe(_MCP_TOKEN_BYTES)
+        write_secrets({"NETADMIN_MCP_TOKEN": new_token})
+        print(new_token)
+        return 0
+
+    settings = get_settings()
+    token = settings.mcp_token
+    if token is None:
+        print(
+            "no MCP token configured; set NETADMIN_MCP_TOKEN in data/secrets.env "
+            "or run `netadmin mcp-token --regenerate`",
             file=sys.stderr,
         )
         return 1
@@ -719,6 +770,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="print the configured access token (or error if none is set)",
     )
     p_token.set_defaults(func=_cmd_token)
+
+    p_mcp_token = sub.add_parser(
+        "mcp-token",
+        help="print the configured NETADMIN_MCP_TOKEN, or mint one with --regenerate",
+    )
+    p_mcp_token.add_argument(
+        "--regenerate",
+        action="store_true",
+        help="mint a new token_urlsafe(32) token and persist it to data/secrets.env",
+    )
+    p_mcp_token.set_defaults(func=_cmd_mcp_token)
 
     p_visit = sub.add_parser("visit", help="run an on-demand tech visit")
     p_visit.add_argument("--host", default=None, help="controller host (overrides the profile)")
