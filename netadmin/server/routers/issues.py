@@ -37,15 +37,20 @@ from netadmin.llm.provider import ProviderError, ProviderUnavailableError, avail
 from netadmin.logging import get_logger
 from netadmin.server.auth import extract_bearer, token_matches
 from netadmin.server.serialize import decode_json, entity_ref_map, get_store
-from netadmin.store.repository import SLE_ATTRIBUTED_ENTITY_TYPES, Repository
+from netadmin.store.repository import (
+    SLE_ATTRIBUTED_ENTITY_TYPES,
+    SLE_DEVICE_AXIS_ENTITY_TYPES,
+    IssueImpactMinutes,
+    Repository,
+)
 
 router = APIRouter(prefix="/api", tags=["issues"])
 _log = get_logger("server.routers.issues")
 
 # How far back an issue's impact figure looks. Matches the offenders leaderboard
-# window (``netadmin.analytics.offenders``) so the two surfaces can never quote
-# different fail-minute totals for the same recent grief, and bounds the
-# ``sle_minutes`` scan to a day of buckets however old the issue itself is.
+# window (``netadmin.analytics.offenders``) so the two surfaces read the same
+# recent grief, and bounds the ``sle_minutes`` scan to a day of buckets however
+# old the issue itself is.
 IMPACT_WINDOW_S = 86_400
 
 
@@ -99,48 +104,98 @@ def _impact_basis(ref: Optional[dict[str, Any]]) -> Optional[str]:
     return "own" if etype == "client" else "attributed"
 
 
+def _overlaps(span: Optional[tuple[int, int]], start: int, end: int) -> bool:
+    """Whether the SLE engine judged this axis anywhere in ``[start, end)``."""
+    if span is None:
+        return False
+    lo, hi = span
+    return not (start > hi or end <= lo)
+
+
+def _unmeasured_impact(basis: Optional[str], window_s: int) -> dict[str, Any]:
+    """The impact block with nothing on either axis — every figure explicitly null."""
+    return {
+        "window_s": window_s,
+        "basis": basis,
+        "measured": False,
+        "client": {
+            "measured": False,
+            "clients": None,
+            "fail_minutes": None,
+            "clients_in_window": None,
+        },
+        "infra": {"measured": False, "down_minutes": None, "entity_type": None},
+    }
+
+
 def _impact(
     row: sqlite3.Row,
     ref: Optional[dict[str, Any]],
-    fail_minutes: dict[int, float],
-    span: Optional[tuple[int, int]],
+    impacts: dict[int, IssueImpactMinutes],
+    spans: dict[str, Optional[tuple[int, int]]],
+    clients_in_window: int,
     window_start: int,
     window_end: int,
 ) -> dict[str, Any]:
-    """One issue's impact block: what it has cost, or why that is unknown.
+    """One issue's impact block: what it has cost, on two axes that never merge.
 
-    ``measured`` is the whole point. An issue can carry no number for three
-    honest reasons -- its entity is one the SLE engine never scores
-    (:func:`_impact_basis`), its open window does not reach into the impact
-    window at all (resolved before it opened), or the engine produced no
-    judgement in the overlap (fresh install, daemon was down, backfill still
-    running). In every one of those cases ``fail_minutes`` is **null**, never
-    ``0.0``: a zero here means "the window was judged and nothing failed", and a
-    UI that cannot tell the two apart will report an unmeasured outage as
-    harmless.
+    **Two quantities, never added** (Gitea #36). ``client`` is what real clients
+    lived through — how many of them, and for how many minutes, out of the
+    clients the SLE engine judged in the window. ``infra`` is how long the AP,
+    switch or gateway itself was down, which is device-time and was nobody's
+    client minute. Summing the two produced minutes no client ever experienced;
+    the shape here makes that sum impossible to write by accident, because
+    there is no combined field to reach for.
+
+    ``measured`` is the other half of the point, and it is per axis. An axis can
+    carry no number for three honest reasons -- the issue's entity is one the
+    engine never records that axis against (:func:`_impact_basis` for the client
+    axis, :data:`SLE_DEVICE_AXIS_ENTITY_TYPES` for infra), the issue's open
+    window does not reach into the impact window at all (resolved before it
+    opened), or the engine produced no judgement on that axis in the overlap
+    (fresh install, daemon was down, backfill still running). In every one of
+    those cases the figures are **null**, never ``0.0``: a zero means "the
+    window was judged and nothing failed", and a UI that cannot tell the two
+    apart will report an unmeasured outage as harmless.
     """
     basis = _impact_basis(ref)
-    unmeasured: dict[str, Any] = {
-        "window_s": window_end - window_start,
-        "basis": basis,
-        "measured": False,
-        "fail_minutes": None,
-    }
-    if basis is None or span is None:
-        return unmeasured
+    window_s = window_end - window_start
+    if basis is None:
+        return _unmeasured_impact(basis, window_s)
     # The issue's own life, clipped to the impact window — the same clipping
-    # Repository.issue_fail_minutes applies to the buckets it sums.
+    # Repository.issue_impact_minutes applies to the buckets it sums.
     start = max(int(row["first_seen_ts"]), window_start)
     resolved = row["resolved_ts"]
     end = min(int(resolved), window_end) if resolved is not None else window_end
-    lo, hi = span
-    if start >= end or start > hi or end <= lo:
-        return unmeasured
+    if start >= end:
+        return _unmeasured_impact(basis, window_s)
+
+    etype = ref.get("type") if ref else None
+    client_measured = _overlaps(spans.get("client"), start, end)
+    # A radio can be *attributed* client minutes but the infra SLE never walks a
+    # radio's state timeline, so "down 0 min" would be a claim we never measured.
+    infra_measured = etype in SLE_DEVICE_AXIS_ENTITY_TYPES and _overlaps(
+        spans.get("infra"), start, end
+    )
+    if not (client_measured or infra_measured):
+        return _unmeasured_impact(basis, window_s)
+
+    cost = impacts.get(int(row["id"]), IssueImpactMinutes())
     return {
-        "window_s": window_end - window_start,
+        "window_s": window_s,
         "basis": basis,
         "measured": True,
-        "fail_minutes": round(fail_minutes.get(int(row["id"]), 0.0), 1),
+        "client": {
+            "measured": client_measured,
+            "clients": cost.clients if client_measured else None,
+            "fail_minutes": round(cost.client_fail_minutes, 1) if client_measured else None,
+            "clients_in_window": clients_in_window if client_measured else None,
+        },
+        "infra": {
+            "measured": infra_measured,
+            "down_minutes": round(cost.infra_down_minutes, 1) if infra_measured else None,
+            "entity_type": etype if infra_measured else None,
+        },
     }
 
 
@@ -240,10 +295,11 @@ async def list_issues(
     ``state`` / ``severity`` are enum-validated by FastAPI (bad value -> 422).
     Each issue's owning entity is resolved to a ``{entity_id, name, type, ...}``
     ref so the list can show names, not numeric ids, and each carries an
-    ``impact`` block — the failed SLE client-minutes it accounts for over the
-    last :data:`IMPACT_WINDOW_S`, or an explicit "not measured" (see
-    :func:`_impact`). That figure is the column the list is read by, so it is
-    computed here rather than left to the client to guess at.
+    ``impact`` block — how many clients lost how many minutes, and separately
+    how long the device itself was down, over the last :data:`IMPACT_WINDOW_S`,
+    or an explicit "not measured" (see :func:`_impact`). That block is the
+    column the list is read by, so it is computed here rather than left to the
+    client to guess at.
     """
     store = get_store(request)
     rows = store.list_issues(
@@ -257,16 +313,19 @@ async def list_issues(
     incidents = store.incident_brief_for_issues([r["id"] for r in rows])
     window_end = int(time.time())
     window_start = window_end - IMPACT_WINDOW_S
-    fail_minutes = store.issue_fail_minutes(
+    impacts = store.issue_impact_minutes(
         [r["id"] for r in rows], start_ts=window_start, end_ts=window_end
     )
-    span = store.sle_minutes_span(window_start, window_end)
+    spans = store.sle_minutes_axis_spans(window_start, window_end)
+    clients_in_window = store.sle_measured_client_count(window_start, window_end)
     issues = []
     for r in rows:
         item = _issue_dict(r)
         eid = r["entity_id"]
         item["entity"] = refs.get(int(eid)) if eid is not None else None
-        item["impact"] = _impact(r, item["entity"], fail_minutes, span, window_start, window_end)
+        item["impact"] = _impact(
+            r, item["entity"], impacts, spans, clients_in_window, window_start, window_end
+        )
         inc = incidents.get(int(r["id"]))
         item["incident_id"] = int(inc["incident_id"]) if inc is not None else None
         item["incident_role"] = inc["incident_role"] if inc is not None else None
@@ -334,8 +393,9 @@ async def get_issue(request: Request, issue_id: int) -> dict[str, Any]:
     issue["impact"] = _impact(
         row,
         entity,
-        store.issue_fail_minutes([issue_id], start_ts=window_start, end_ts=window_end),
-        store.sle_minutes_span(window_start, window_end),
+        store.issue_impact_minutes([issue_id], start_ts=window_start, end_ts=window_end),
+        store.sle_minutes_axis_spans(window_start, window_end),
+        store.sle_measured_client_count(window_start, window_end),
         window_start,
         window_end,
     )

@@ -1,8 +1,17 @@
-"""The issues list's impact figure: what an issue cost, or why that is unknown.
+"""The issues list's impact block: what an issue cost, on two axes that never merge.
 
-Every case here exists to defend one distinction: a **null** ``fail_minutes``
-("not measured") is not a **zero** one ("measured, nothing failed"). The issue
-list column reads directly off this block, so collapsing the two would let an
+Two distinctions are defended here, and every case exists to protect one of them.
+
+**Axis** (Gitea #36). ``sle_minutes`` holds two different units: coverage,
+roaming, capacity, connect and wan rows are minutes a real *client* spent
+degraded, while ``infra`` rows are minutes a *device* was down. Summing them
+produced a figure that credited a switch outage with client-minutes nobody
+experienced. The payload keeps them in separate blocks with no combined field,
+so the sum cannot be written back in by accident.
+
+**Measured** — a **null** figure ("not measured") is not a **zero** one
+("measured, nothing failed"), and that holds per axis. The list column reads
+directly off this block, so collapsing either distinction would let an
 unmeasured outage render as harmless.
 """
 
@@ -39,7 +48,7 @@ def now() -> int:
 
 @pytest.fixture
 def impact_store(tmp_db_path: Path, now: int) -> Iterator[Repository]:
-    """An AP with a radio, a switch with a port, a client — and one issue each.
+    """An AP with a radio, a switch with a port, two clients — and one issue each.
 
     Recent enough to sit inside the impact window: the store is seeded relative
     to ``now`` rather than a fixed epoch, because the whole point of the figure
@@ -64,6 +73,10 @@ def impact_store(tmp_db_path: Path, now: int) -> Iterator[Repository]:
         Entity(entity_type=EntityType.CLIENT, native_id="11:22:33:44:55:01", name="iPhone"),
         ts=started,
     )
+    laptop = store.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="11:22:33:44:55:02", name="laptop"),
+        ts=started,
+    )
 
     def issue(fp: str, entity_id: int | None, **kw: Any) -> int:
         return store.insert_issue(
@@ -79,6 +92,7 @@ def impact_store(tmp_db_path: Path, now: int) -> Iterator[Repository]:
         )
 
     issue("fp-ap", ap)
+    issue("fp-switch", sw)
     issue("fp-port", port)
     issue("fp-client", client)
     issue("fp-sitewide", None)
@@ -95,12 +109,12 @@ def impact_store(tmp_db_path: Path, now: int) -> Iterator[Repository]:
     # clipping case: it must not inherit the AP's earlier grief.
     issue("fp-fresh", ap, first_seen_ts=now - BUCKET_S)
 
-    # Failed minutes: two buckets blamed on the AP (one inside the fresh issue's
-    # life, one two hours before it opened), and one the client owns itself.
+    # Client-axis minutes: two buckets blamed on the AP (one inside the fresh
+    # issue's life, one two hours before it opened), across two clients.
     store.upsert_sle_minute(
         bucket_ts=now - 2 * 3600,
         sle="coverage",
-        classifier="weak_rssi",
+        classifier="weak_signal",
         entity_id=client,
         minutes=4.0,
         attributed_entity_id=ap,
@@ -108,8 +122,8 @@ def impact_store(tmp_db_path: Path, now: int) -> Iterator[Repository]:
     store.upsert_sle_minute(
         bucket_ts=now - BUCKET_S,
         sle="capacity",
-        classifier="airtime",
-        entity_id=client,
+        classifier="wifi_interference",
+        entity_id=laptop,
         minutes=2.5,
         attributed_entity_id=ap,
     )
@@ -120,6 +134,26 @@ def impact_store(tmp_db_path: Path, now: int) -> Iterator[Repository]:
         classifier="ok",
         entity_id=client,
         minutes=5.0,
+        attributed_entity_id=ap,
+    )
+    # Device-axis minutes: the switch was down. These are the minutes that used
+    # to be added into the client total. Nobody lived through them as a client.
+    store.upsert_sle_minute(
+        bucket_ts=now - 2 * 3600,
+        sle="infra",
+        classifier="switch_down",
+        entity_id=sw,
+        minutes=42.0,
+        attributed_entity_id=sw,
+    )
+    # The AP stayed up the whole window: an ok infra row, so the infra axis is
+    # measured for the AP and honestly reports zero downtime.
+    store.upsert_sle_minute(
+        bucket_ts=now - 2 * 3600,
+        sle="infra",
+        classifier="ok",
+        entity_id=ap,
+        minutes=300.0,
         attributed_entity_id=ap,
     )
     yield store
@@ -138,14 +172,59 @@ async def _by_fingerprint(app: object) -> dict[str, dict[str, Any]]:
     return {i["fingerprint"]: i for i in body["issues"]}
 
 
-async def test_infrastructure_issue_reports_attributed_minutes(impact_app: object) -> None:
+# --------------------------------------------------------------------------- #
+# The axis split (Gitea #36)
+# --------------------------------------------------------------------------- #
+
+
+async def test_device_downtime_is_never_added_to_client_minutes(impact_app: object) -> None:
+    """The bug itself: a switch down 42 minutes is not 42 client-minutes.
+
+    The switch owns 42 infra down-minutes and no client has any minutes pinned
+    on it, so the client axis reports a measured zero across zero clients while
+    the infra axis reports the downtime. There is no field that adds them.
+    """
+    impact = (await _by_fingerprint(impact_app))["fp-switch"]["impact"]
+    assert impact["measured"] is True
+    assert impact["infra"] == {"measured": True, "down_minutes": 42.0, "entity_type": "switch"}
+    assert impact["client"]["measured"] is True
+    assert impact["client"]["clients"] == 0
+    assert impact["client"]["fail_minutes"] == 0.0
+    assert "fail_minutes" not in impact  # no combined total to reach for
+
+
+async def test_infrastructure_issue_reports_attributed_client_minutes(impact_app: object) -> None:
     issues = await _by_fingerprint(impact_app)
     impact = issues["fp-ap"]["impact"]
     assert impact["measured"] is True
     assert impact["basis"] == "attributed"
-    # 4.0 + 2.5 failed; the 5.0 ok minutes are not grief.
-    assert impact["fail_minutes"] == 6.5
+    # 4.0 + 2.5 failed across two clients; the 5.0 ok minutes are not grief.
+    assert impact["client"]["fail_minutes"] == 6.5
+    assert impact["client"]["clients"] == 2
     assert impact["window_s"] == 86_400
+
+
+async def test_client_count_is_the_headline_not_the_minute_total(impact_app: object) -> None:
+    """Harm is "how many clients, for how long" — the count must be published."""
+    client = (await _by_fingerprint(impact_app))["fp-ap"]["impact"]["client"]
+    # Two clients had failed minutes; both are among the clients the engine
+    # judged in the window, which is the denominator the figure is quoted against.
+    assert client["clients"] == 2
+    assert client["clients_in_window"] == 2
+
+
+async def test_ap_that_stayed_up_reports_a_measured_zero_downtime(impact_app: object) -> None:
+    """A real zero on the infra axis is a zero, not a dash — it was judged."""
+    impact = (await _by_fingerprint(impact_app))["fp-ap"]["impact"]
+    assert impact["infra"] == {"measured": True, "down_minutes": 0.0, "entity_type": "ap"}
+
+
+async def test_client_issue_has_no_infra_axis_at_all(impact_app: object) -> None:
+    """The infra SLE never walks a client's state timeline, so there is nothing
+    to report — and "down 0 min" would be a claim nobody measured."""
+    impact = (await _by_fingerprint(impact_app))["fp-client"]["impact"]
+    assert impact["basis"] == "own"
+    assert impact["infra"] == {"measured": False, "down_minutes": None, "entity_type": None}
 
 
 async def test_client_issue_reports_its_own_failed_minutes(impact_app: object) -> None:
@@ -153,14 +232,23 @@ async def test_client_issue_reports_its_own_failed_minutes(impact_app: object) -
     impact = issues["fp-client"]["impact"]
     assert impact["basis"] == "own"
     assert impact["measured"] is True
-    assert impact["fail_minutes"] == 6.5
+    # Only this client's own rows — the laptop's 2.5 belong to the laptop.
+    assert impact["client"]["fail_minutes"] == 4.0
+    assert impact["client"]["clients"] == 1
 
 
 async def test_impact_is_clipped_to_the_issues_own_life(impact_app: object) -> None:
     issues = await _by_fingerprint(impact_app)
-    # The AP failed 6.5 minutes today, but only 2.5 of them after this issue
-    # opened. An issue is charged with what happened while it was open.
-    assert issues["fp-fresh"]["impact"]["fail_minutes"] == 2.5
+    # The AP cost clients 6.5 minutes today, but only 2.5 of them after this
+    # issue opened. An issue is charged with what happened while it was open.
+    client = issues["fp-fresh"]["impact"]["client"]
+    assert client["fail_minutes"] == 2.5
+    assert client["clients"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# Measured vs. not measured, on both axes
+# --------------------------------------------------------------------------- #
 
 
 async def test_port_issue_is_not_measured_rather_than_zero(impact_app: object) -> None:
@@ -168,24 +256,31 @@ async def test_port_issue_is_not_measured_rather_than_zero(impact_app: object) -
     impact = issues["fp-port"]["impact"]
     assert impact["basis"] is None
     assert impact["measured"] is False
-    assert impact["fail_minutes"] is None
+    assert impact["client"]["fail_minutes"] is None
+    assert impact["client"]["clients"] is None
+    assert impact["infra"]["down_minutes"] is None
 
 
 async def test_sitewide_issue_has_no_entity_to_charge(impact_app: object) -> None:
     issues = await _by_fingerprint(impact_app)
     impact = issues["fp-sitewide"]["impact"]
     assert impact["basis"] is None
-    assert impact["fail_minutes"] is None
+    assert impact["measured"] is False
+    assert impact["client"]["fail_minutes"] is None
 
 
 async def test_issue_resolved_before_the_window_is_not_measured(impact_app: object) -> None:
     issues = await _by_fingerprint(impact_app)
     impact = issues["fp-old"]["impact"]
     # Its entity is scoreable, so the basis stands — but none of its life is in
-    # the window, so there is nothing to report and it must not read as zero.
+    # the window, so there is nothing to report on either axis and neither must
+    # read as zero.
     assert impact["basis"] == "attributed"
     assert impact["measured"] is False
-    assert impact["fail_minutes"] is None
+    assert impact["client"]["measured"] is False
+    assert impact["client"]["fail_minutes"] is None
+    assert impact["infra"]["measured"] is False
+    assert impact["infra"]["down_minutes"] is None
 
 
 async def test_no_sle_minutes_at_all_is_not_measured(app: object) -> None:
@@ -193,8 +288,11 @@ async def test_no_sle_minutes_at_all_is_not_measured(app: object) -> None:
     async with await _client(app) as c:
         body = (await c.get("/api/issues")).json()
     for issue in body["issues"]:
-        assert issue["impact"]["measured"] is False
-        assert issue["impact"]["fail_minutes"] is None
+        impact = issue["impact"]
+        assert impact["measured"] is False
+        assert impact["client"]["fail_minutes"] is None
+        assert impact["client"]["clients"] is None
+        assert impact["infra"]["down_minutes"] is None
 
 
 async def test_detail_carries_the_same_impact_block(impact_app: object) -> None:
@@ -233,7 +331,7 @@ async def test_measured_zero_is_distinct_from_unmeasured(tmp_db_path: Path, now:
     store.upsert_sle_minute(
         bucket_ts=now - BUCKET_S,
         sle="coverage",
-        classifier="weak_rssi",
+        classifier="weak_signal",
         entity_id=client,
         minutes=3.0,
         attributed_entity_id=ap,
@@ -247,4 +345,12 @@ async def test_measured_zero_is_distinct_from_unmeasured(tmp_db_path: Path, now:
         store.close()
     impact = body["issues"][0]["impact"]
     assert impact["measured"] is True
-    assert impact["fail_minutes"] == 0.0
+    assert impact["client"]["measured"] is True
+    assert impact["client"]["fail_minutes"] == 0.0
+    assert impact["client"]["clients"] == 0
+    # One client was judged in the window, so the zero is quoted out of one.
+    assert impact["client"]["clients_in_window"] == 1
+    # The engine wrote no infra rows at all, so that axis is unmeasured — a dash,
+    # not a zero, even though the AP was never observed down.
+    assert impact["infra"]["measured"] is False
+    assert impact["infra"]["down_minutes"] is None

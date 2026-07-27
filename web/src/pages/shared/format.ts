@@ -66,14 +66,17 @@ export function ongoingLabel(issue: IssueRow, nowSec: number): string {
   return issue.state === 'resolved' ? `lasted ${dur}` : `ongoing ${dur}`;
 }
 
-/* ---- Issue impact (the Issues list's Impact column, Gitea #24) ----------- */
+/* ---- Issue impact (the Issues list's Impact column, Gitea #24, #36) ------ */
 
 /** What the Impact column measures, as a sentence — the column header's hover
- *  text. The window is left to each figure's own tooltip (it comes from the
- *  payload, so the header cannot state it without going stale); what the header
- *  owes the reader is the unit and the dash rule. */
+ *  text. Two quantities, and the header's job is to say they are two: client
+ *  minutes and device down-minutes are different units over different
+ *  populations, and the figure that summed them credited a switch outage with
+ *  minutes no client experienced (Gitea #36). Each figure's own tooltip carries
+ *  the denominator and the window, which come from the payload and so cannot be
+ *  stated here without going stale. */
 export const ISSUE_IMPACT_DEFINITION =
-  'Failed SLE client-minutes this issue accounts for — real minutes real clients spent degraded while it was open. A dash means nothing was measured, which is not the same as zero.';
+  'Two separate quantities, never added. Clients: how many clients lost SLE minutes while this issue was open, and how many minutes they lost, out of the clients the engine judged in the window. Down: how long the AP, switch or gateway itself was offline — device time, which nobody spent as a client. A dash means nothing was measured, which is not the same as zero.';
 
 /** The impact window as prose. Hours, not `formatDurationLong`'s "1 day": the
  *  sentences read "within the last 24 hours", which is how an operator thinks
@@ -83,38 +86,82 @@ function impactWindowLabel(seconds: number): string {
   return hours === 1 ? '1 hour' : `${hours} hours`;
 }
 
-/** Fail-minutes as display text. Precision follows what the number can carry: a
+/** Minutes as display text. Precision follows what the number can carry: a
  *  large total rounds to whole minutes (a tenth of a minute is noise against
  *  it), a small one keeps its decimal so a real-but-small cost does not round
  *  away to a zero it would then be mistaken for. */
-export function formatFailMinutes(minutes: number): string {
+export function formatImpactMinutes(minutes: number): string {
   if (minutes <= 0) return '0';
   if (minutes < 0.05) return '<0.1';
   if (minutes < 10) return String(Math.round(minutes * 10) / 10);
   return Math.round(minutes).toLocaleString();
 }
 
-export interface ImpactDisplay {
-  /** The figure as text, or null when nothing was measured — in which case the
-   *  caller renders a dash. Never a stand-in zero. */
-  text: string | null;
+/** "clients", never "devices" (an AP or switch, to a UniFi admin) and never
+ *  "users" (an administrator, in UniFi's Alarm Manager). */
+function clientCount(n: number): string {
+  return n === 1 ? '1 client' : `${n} clients`;
+}
+
+/** Entity types the infra SLE walks a state timeline for — the ones that have a
+ *  downtime axis at all. Mirrors `SLE_DEVICE_AXIS_ENTITY_TYPES` in
+ *  `netadmin/store/repository.py`; a radio is absent from both. */
+const INFRA_ENTITY_TYPES: readonly (string | null)[] = ['ap', 'switch', 'gateway'];
+
+/** The piece of infrastructure, in the reader's own vocabulary. `ap` is an
+ *  initialism and stays capitalised; the rest are ordinary nouns. Naming the
+ *  specific kind beats the generic "device", which a UniFi admin reads as
+ *  "some AP or switch" and which is never allowed to stand in for "client". */
+function deviceWord(entityType: string | null | undefined): string {
+  if (entityType === 'ap') return 'AP';
+  if (entityType === 'switch') return 'switch';
+  if (entityType === 'gateway') return 'gateway';
+  if (entityType === 'radio') return 'radio';
+  return 'device';
+}
+
+export interface ImpactLine {
+  /** The figure as text, e.g. "3 clients" or "AP down 42 min". */
+  text: string;
   /** True only for a real, measured zero, so it can read quieter than a cost. */
   zero: boolean;
-  /** The sentence that qualifies the figure, or explains its absence. */
+}
+
+export interface ImpactDisplay {
+  /** The headline figure, or null when neither axis was measured — in which
+   *  case the caller renders a dash. Never a stand-in zero. */
+  primary: ImpactLine | null;
+  /** The qualifying second line, or null when there is nothing more to add.
+   *  Always the *other* axis or the primary's own multiplier — never a total,
+   *  because the two axes have no meaningful sum. */
+  secondary: ImpactLine | null;
+  /** Everything the figures say, with denominators and window. Hover text on
+   *  every surface, and the screen-reader text behind the dash. */
   note: string;
 }
 
 /** An issue's impact as the list column and the detail page both show it.
  *
  *  One function so the two surfaces cannot drift, and so every "no figure"
- *  branch is forced to say *why*. "Nothing was measured" and "it was measured
- *  and cost nobody anything" are different facts; presenting the first as the
- *  second would let an unwatched outage read as harmless. */
+ *  branch is forced to say *why*. Two rules it exists to enforce:
+ *
+ *  1. **The axes never merge.** A client-experience finding leads with the
+ *     client count and carries the minutes as its multiplier; an infrastructure
+ *     finding leads with the device's own downtime. Whichever leads, the other
+ *     appears beside it as a separate figure, never summed into it.
+ *  2. **"Not measured" is not "zero".** Nothing measured renders a dash with
+ *     its reason; a real measured zero renders as a zero, quietly. Presenting
+ *     the first as the second would let an unwatched outage read as harmless. */
 export function impactDisplay(issue: IssueRow, nowSec: number): ImpactDisplay {
   const impact: IssueImpact | null | undefined = issue.impact;
-  const absent = (note: string): ImpactDisplay => ({ text: null, zero: false, note });
+  const absent = (note: string): ImpactDisplay => ({ primary: null, secondary: null, note });
 
-  if (!impact) return absent('This daemon did not report an impact figure for this issue.');
+  // `client`/`infra` are guarded as well as `impact` itself: a UI running ahead
+  // of its daemon degrades to "not measured" rather than throwing on the older
+  // single-figure payload.
+  if (!impact || !impact.client || !impact.infra) {
+    return absent('This daemon did not report an impact figure for this issue.');
+  }
   if (!issue.entity) {
     return absent('Network-wide: there is no entity to attribute failed client-minutes to.');
   }
@@ -129,7 +176,7 @@ export function impactDisplay(issue: IssueRow, nowSec: number): ImpactDisplay {
       `Failed client-minutes are never recorded against ${what}, so this issue has no figure of its own.`,
     );
   }
-  if (!impact.measured || impact.fail_minutes == null) {
+  if (!impact.measured) {
     if (issue.resolved_ts != null && issue.resolved_ts <= nowSec - impact.window_s) {
       return absent(
         `This issue closed before the last ${impactWindowLabel(impact.window_s)} began, so none of its life falls in the measured window.`,
@@ -138,16 +185,56 @@ export function impactDisplay(issue: IssueRow, nowSec: number): ImpactDisplay {
     return absent('No SLE measurements cover the hours this issue was open.');
   }
 
-  const zero = impact.fail_minutes === 0;
-  return {
-    text: formatFailMinutes(impact.fail_minutes),
-    zero,
-    note: zero
-      ? 'Measured over the window: no failed client-minutes are attributed to this issue.'
-      : impact.basis === 'own'
-        ? `This client's own failed SLE minutes over the hours this issue was open, within the last ${impactWindowLabel(impact.window_s)}.`
-        : `Failed SLE client-minutes attributed to this entity over the hours this issue was open, within the last ${impactWindowLabel(impact.window_s)}.`,
-  };
+  const window = impactWindowLabel(impact.window_s);
+  const c = impact.client;
+  const i = impact.infra;
+
+  // ---- client axis -------------------------------------------------------
+  let clientLine: ImpactLine | null = null;
+  let clientNote: string | null = null;
+  if (c.measured && c.clients != null && c.fail_minutes != null) {
+    const denom = c.clients_in_window ?? 0;
+    if (c.fail_minutes > 0) {
+      clientLine = {
+        text: `${clientCount(c.clients)} · ${formatImpactMinutes(c.fail_minutes)} min`,
+        zero: false,
+      };
+      clientNote =
+        impact.basis === 'own'
+          ? `This client lost ${formatImpactMinutes(c.fail_minutes)} SLE minutes while this issue was open — one of the ${clientCount(denom)} the engine judged in the last ${window}.`
+          : `${c.clients} of the ${clientCount(denom)} the engine judged in the last ${window} lost SLE minutes pinned on this ${deviceWord(issue.entity.type)} while this issue was open: ${formatImpactMinutes(c.fail_minutes)} minutes in total.`;
+    } else {
+      clientLine = { text: clientCount(0), zero: true };
+      clientNote = `Measured: none of the ${clientCount(denom)} the engine judged in the last ${window} lost a minute to this issue.`;
+    }
+  } else if (i.measured) {
+    clientNote = 'No client-minute measurements cover the hours this issue was open.';
+  }
+
+  // ---- device axis -------------------------------------------------------
+  let infraLine: ImpactLine | null = null;
+  let infraNote: string | null = null;
+  if (i.measured && i.down_minutes != null) {
+    const word = deviceWord(i.entity_type);
+    if (i.down_minutes > 0) {
+      infraLine = { text: `${word} down ${formatImpactMinutes(i.down_minutes)} min`, zero: false };
+      infraNote = `The ${word} itself was down ${formatImpactMinutes(i.down_minutes)} minutes while this issue was open, from its own state timeline. Device time is not client time, so the two figures are never added.`;
+    } else {
+      infraNote = `Measured: the ${word} itself never went down while this issue was open.`;
+    }
+  } else if (INFRA_ENTITY_TYPES.includes(issue.entity.type)) {
+    // The entity has a downtime axis but nothing judged it here. Saying so
+    // beats silence, which a reader would take as "it stayed up".
+    infraNote = `Downtime for this ${deviceWord(issue.entity.type)} was not measured over these hours.`;
+  }
+
+  // Downtime leads when there is any: an offline AP or switch is the fact the
+  // row is about, and its client cost (often none) reads as the qualifier. The
+  // sentences follow the same order, so the tooltip explains the top line first.
+  const primary = infraLine ?? clientLine;
+  const secondary = infraLine ? clientLine : null;
+  const ordered = infraLine ? [infraNote, clientNote] : [clientNote, infraNote];
+  return { primary, secondary, note: ordered.filter(Boolean).join(' ') };
 }
 
 /** Sort key: most severe first (p1 < p2 < p3). */

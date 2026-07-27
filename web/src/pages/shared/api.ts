@@ -71,19 +71,47 @@ export type IncidentRole = 'root' | 'symptom';
  * is no figure to quote. */
 export type ImpactBasis = 'attributed' | 'own';
 
+/** The client-experience axis: what real clients lived through.
+ *
+ * `measured: false` always comes with null figures, never `0` — a zero here
+ * means "the window was judged and nothing failed", and an unmeasured outage
+ * rendered as a zero would read as harmless. */
+export interface IssueImpactClientAxis {
+  measured: boolean;
+  /** Distinct clients that had failed SLE minutes while the issue was open. */
+  clients: number | null;
+  /** Those clients' failed minutes, summed. Never added to `infra.down_minutes`. */
+  fail_minutes: number | null;
+  /** The denominator: clients the SLE engine judged anywhere in the window. */
+  clients_in_window: number | null;
+}
+
+/** The device axis: how long the AP, switch or gateway itself was down.
+ *
+ * Device-minutes, integrated from the device's own state timeline. Nobody
+ * experienced them as a client, which is why they live in their own block. */
+export interface IssueImpactInfraAxis {
+  measured: boolean;
+  down_minutes: number | null;
+  /** `ap` / `switch` / `gateway` — what was down, for the label. */
+  entity_type: string | null;
+}
+
 /** What an issue has cost, or an explicit statement that nobody knows.
  *
- * `measured: false` always comes with `fail_minutes: null`, never `0` — a zero
- * here means "the window was judged and nothing failed", and an unmeasured
- * outage rendered as a zero would read as harmless. Source of truth:
+ * **Two quantities, never added** (Gitea #36). Client-minutes and device
+ * down-minutes are different units over different populations; there is
+ * deliberately no combined field, because summing them credited a switch
+ * outage with minutes no client experienced. Source of truth:
  * `netadmin/server/routers/issues.py::_impact`. */
 export interface IssueImpact {
-  /** How far back the figure looks, in seconds (the API uses 24 h). */
+  /** How far back the figures look, in seconds (the API uses 24 h). */
   window_s: number;
   basis: ImpactBasis | null;
+  /** True when at least one axis carries a figure. */
   measured: boolean;
-  /** Failed SLE client-minutes, counted only while the issue was open. */
-  fail_minutes: number | null;
+  client: IssueImpactClientAxis;
+  infra: IssueImpactInfraAxis;
 }
 
 export interface IssueRow {

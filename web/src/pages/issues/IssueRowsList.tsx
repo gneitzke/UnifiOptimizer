@@ -53,8 +53,11 @@ export type DisplayRow = { kind: 'issue'; issue: IssueRow } | { kind: 'group'; g
 
 // Sev / State / Issue / Entity / Impact / Duration / Last seen / expander.
 // Sev is 72px because the widest pill ("Critical") is 68px and was spilling
-// under the State pill next to it.
-const COLS = '72px 100px minmax(280px,3fr) minmax(130px,1.15fr) 104px 140px 84px 96px';
+// under the State pill next to it. Impact is 144px because it now carries a
+// count and its multiplier on one line ("12 clients · 1,204 min") rather than a
+// bare number; the width came off Duration, which never needed 140px for
+// "ongoing 12d 3h", so the table's minimum is unchanged.
+const COLS = '72px 100px minmax(272px,3fr) minmax(122px,1.15fr) 144px 116px 84px 96px';
 /** Below this the columns would start crushing each other, so the list scrolls
  *  inside its own container rather than pushing the page sideways. Kept under
  *  1012px, which is what the page's own max-width leaves at a 1280px viewport:
@@ -144,20 +147,25 @@ function EntityCell({ entity }: { entity: IssueRow['entity'] }) {
 }
 
 /**
- * The Impact figure, or a dash that says why there isn't one.
+ * The Impact figures, or a dash that says why there aren't any.
+ *
+ * Up to two lines, and they are never added together (Gitea #36): client
+ * minutes are what real clients lived through, device down-minutes are what an
+ * AP or switch spent offline. A row about a downed device leads with the
+ * downtime and carries its client cost — often none — underneath.
  *
  * The dash is load-bearing: the unmeasured case never renders a number, and its
  * reason rides along as hover text *and* as screen-reader text rather than
  * being left for the reader to infer from an em dash.
  */
 function ImpactCell({ issue, now }: { issue: IssueRow; now: number }) {
-  const { text, zero, note } = impactDisplay(issue, now);
+  const { primary, secondary, note } = impactDisplay(issue, now);
 
-  if (text === null) {
-    // `relative` is load-bearing: sr-only is absolutely positioned, and without a
-    // positioned ancestor it resolves against the page rather than this cell —
-    // escaping the table's own horizontal scroller and dragging the page's
-    // scroll width out with it.
+  // `relative` is load-bearing on both branches: sr-only is absolutely
+  // positioned, and without a positioned ancestor it resolves against the page
+  // rather than this cell — escaping the table's own horizontal scroller and
+  // dragging the page's scroll width out with it.
+  if (primary === null) {
     return (
       <span
         className="t-body text-right relative"
@@ -171,13 +179,20 @@ function ImpactCell({ issue, now }: { issue: IssueRow; now: number }) {
   }
 
   return (
-    <span className="text-right whitespace-nowrap" title={note}>
-      <span className="t-body tnum" style={{ color: zero ? 'var(--fg-muted)' : 'var(--fg)' }}>
-        {text}
+    <span className="relative flex flex-col items-end justify-center" title={note}>
+      <span
+        aria-hidden
+        className="t-caption tnum whitespace-nowrap"
+        style={{ color: primary.zero ? 'var(--fg-muted)' : 'var(--fg)' }}
+      >
+        {primary.text}
       </span>
-      <span className="t-micro" style={{ color: 'var(--fg-subtle)' }}>
-        {' fail-min'}
-      </span>
+      {secondary && (
+        <span aria-hidden className="t-micro whitespace-nowrap" style={{ color: 'var(--fg-subtle)' }}>
+          {secondary.text}
+        </span>
+      )}
+      <span className="sr-only">{note}</span>
     </span>
   );
 }

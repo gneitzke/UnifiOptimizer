@@ -46,10 +46,14 @@ from netadmin.store.metrics import MetricKind, metric_kind
 __all__ = [
     "SampleReading",
     "WindowResult",
+    "IssueImpactMinutes",
     "Repository",
     "HOUR_SECONDS",
     "DAY_SECONDS",
     "SLE_ATTRIBUTED_ENTITY_TYPES",
+    "SLE_CLIENT_AXIS_SLES",
+    "SLE_DEVICE_AXIS_SLES",
+    "SLE_DEVICE_AXIS_ENTITY_TYPES",
 ]
 
 HOUR_SECONDS = 3600
@@ -61,14 +65,44 @@ DAY_SECONDS = 86400
 # (``sle_minutes.attributed_entity_id``). Nothing is ever recorded against a
 # port or a WLAN, so an issue on one of those has no fail-minute figure -- which
 # is a different statement from "it cost nothing", and callers must keep the two
-# apart. Used by :meth:`Repository.issue_fail_minutes` and by the issues router,
-# which reads the same tuple rather than repeating the list.
+# apart. Used by :meth:`Repository.issue_impact_minutes` and by the issues
+# router, which reads the same tuple rather than repeating the list.
 SLE_ATTRIBUTED_ENTITY_TYPES = (
     EntityType.CLIENT.value,
     EntityType.AP.value,
     EntityType.SWITCH.value,
     EntityType.GATEWAY.value,
     EntityType.RADIO.value,
+)
+
+# The two axes an ``sle_minutes`` row can sit on. They are DIFFERENT UNITS and
+# must never be summed into one figure (Gitea #36).
+#
+# * **Client axis** -- coverage, roaming, capacity, connect and wan rows are
+#   keyed on a client (``entity_id`` is the client) and count minutes a real
+#   client spent below a service level. ``wan`` belongs here even though it is
+#   judged once per bucket against the gateway: the row is still written per
+#   active client, so a degraded uplink has a knowable set of clients behind it.
+# * **Device axis** -- ``infra`` rows are keyed on the AP/switch/gateway itself
+#   and count minutes the *device* was down, integrated from its state
+#   timeline. Nobody experienced those minutes as a client; adding them to the
+#   client axis invents client-minutes that never happened.
+#
+# ``netadmin.sle.classifiers`` owns the SLE names; they are mirrored here rather
+# than imported so the store layer keeps no dependency on the SLE engine above
+# it. ``tests/netadmin/store/test_repository.py`` asserts the two tuples
+# partition ``ALL_SLES`` exactly, so a new SLE cannot land on neither axis.
+SLE_CLIENT_AXIS_SLES = ("coverage", "roaming", "capacity", "connect", "wan")
+SLE_DEVICE_AXIS_SLES = ("infra",)
+
+# Entity types the infra SLE actually writes down-minutes for
+# (``SleMinutesJob._infra`` iterates exactly these). A radio is absent on
+# purpose: it can be *attributed* client minutes but it has no state timeline of
+# its own, so "down 0 min" would be a claim we never measured.
+SLE_DEVICE_AXIS_ENTITY_TYPES = (
+    EntityType.AP.value,
+    EntityType.SWITCH.value,
+    EntityType.GATEWAY.value,
 )
 
 
@@ -150,6 +184,30 @@ class WindowResult:
                     out.append({"ts": ts, "rate": delta / elapsed})
             prev_ts = ts
         return out
+
+
+@dataclass(frozen=True)
+class IssueImpactMinutes:
+    """What one issue cost, kept on its two axes and never collapsed to one.
+
+    The two figures are different units and are deliberately not summable
+    (Gitea #36):
+
+    * ``client_fail_minutes`` / ``clients`` -- the client-experience axis.
+      Minutes real clients spent below a service level, plus how many distinct
+      clients those minutes belong to. The count leads: harm is "how many
+      clients, for how long", and a bare minute total hides whether it was one
+      client for an hour or sixty clients for a minute.
+    * ``infra_down_minutes`` -- the device axis. Minutes the AP, switch or
+      gateway itself was down. Nobody lived through these as a client.
+
+    A caller that wants "total impact" does not get one. There is no such
+    number: the two axes measure different populations over the same window.
+    """
+
+    client_fail_minutes: float = 0.0
+    clients: int = 0
+    infra_down_minutes: float = 0.0
 
 
 class Repository:
@@ -1481,8 +1539,10 @@ class Repository:
             bucket["total"] += count
         return out
 
-    def sle_fail_minutes_by_attributed(self, start_ts: int, end_ts: int) -> dict[int, float]:
-        """Failed SLE client-minutes attributed to each infrastructure entity.
+    def sle_fail_minutes_by_attributed(
+        self, start_ts: int, end_ts: int, *, sles: Optional[Sequence[str]] = None
+    ) -> dict[int, float]:
+        """Failed SLE minutes attributed to each infrastructure entity.
 
         One ``GROUP BY attributed_entity_id`` over ``sle_minutes`` in
         ``[start_ts, end_ts)``, excluding the ``ok`` classifier (only *failed*
@@ -1492,54 +1552,105 @@ class Repository:
         offender ranking must avoid). Returns ``{entity_id: failed_minutes}`` for
         every entity the failed minutes pin on; entities with none are absent.
 
-        This is the impact-weighted term of the offender score
-        (``netadmin.analytics.offenders``): a failed client-minute is a real
-        minute a real client had a degraded experience because of this entity.
+        ``sles`` picks the axis (:data:`SLE_CLIENT_AXIS_SLES` /
+        :data:`SLE_DEVICE_AXIS_SLES`). The default of ``None`` sums **both**,
+        which mixes client-minutes with device down-minutes and is therefore
+        only sound as a relative *ranking* input, never as a figure shown to a
+        reader as "minutes clients lost" (Gitea #36). Pass the axis you mean
+        whenever the number reaches a surface.
         """
+        clause = ""
+        params: list[Any] = [start_ts, end_ts]
+        if sles is not None:
+            names = list(sles)
+            if not names:
+                return {}
+            clause = f"AND sle IN ({','.join('?' for _ in names)}) "
+            params.extend(names)
         rows = self._conn.execute(
             "SELECT attributed_entity_id AS eid, SUM(minutes) AS m FROM sle_minutes "
             "WHERE bucket_ts>=? AND bucket_ts<? "
+            f"{clause}"
             "AND classifier != 'ok' AND attributed_entity_id IS NOT NULL "
             "GROUP BY attributed_entity_id",
-            (start_ts, end_ts),
+            params,
         ).fetchall()
         return {int(r["eid"]): float(r["m"] or 0.0) for r in rows}
 
-    def sle_minutes_span(self, start_ts: int, end_ts: int) -> Optional[tuple[int, int]]:
-        """First and last ``sle_minutes`` bucket inside ``[start_ts, end_ts)``, or None.
+    def sle_minutes_axis_spans(
+        self, start_ts: int, end_ts: int
+    ) -> dict[str, Optional[tuple[int, int]]]:
+        """First/last judged bucket per axis inside ``[start_ts, end_ts)``.
 
-        The exposure probe behind every "not measured" answer: a caller asking
-        what a window cost cannot tell an honest zero (the SLE engine judged the
-        window and found nothing wrong) from a measurement gap (the engine never
-        judged it at all -- fresh install, stopped daemon, backfill still
-        running) without knowing whether the window holds any judgement at all.
-        Two index seeks on the ``bucket_ts``-leading primary key, so it stays
-        cheap on a table with a month of buckets in it.
+        Returns ``{"client": (lo, hi) | None, "infra": (lo, hi) | None}`` — the
+        exposure probe behind every "not measured" answer, kept per axis because
+        the two are judged by different code paths and can be present
+        independently (a fresh install can have infra state history but no
+        client-minute judgement yet, and vice versa on a site whose SLE job has
+        only just started).
+
+        A caller asking what a window cost cannot tell an honest zero (the
+        engine judged the window and found nothing wrong) from a measurement gap
+        (it never judged it at all) without this. ``None`` for an axis means the
+        engine wrote nothing on that axis in the window, so any figure on it
+        must render as "not measured", never as ``0``.
         """
-        row = self._conn.execute(
-            "SELECT MIN(bucket_ts) AS lo, MAX(bucket_ts) AS hi FROM sle_minutes "
-            "WHERE bucket_ts>=? AND bucket_ts<?",
-            (start_ts, end_ts),
-        ).fetchone()
-        if row is None or row["lo"] is None:
-            return None
-        return int(row["lo"]), int(row["hi"])
+        client_places = ",".join("?" for _ in SLE_CLIENT_AXIS_SLES)
+        rows = self._conn.execute(
+            f"SELECT CASE WHEN sle IN ({client_places}) THEN 'client' ELSE 'infra' END AS axis, "
+            "MIN(bucket_ts) AS lo, MAX(bucket_ts) AS hi FROM sle_minutes "
+            "WHERE bucket_ts>=? AND bucket_ts<? GROUP BY axis",
+            (*SLE_CLIENT_AXIS_SLES, start_ts, end_ts),
+        ).fetchall()
+        spans: dict[str, Optional[tuple[int, int]]] = {"client": None, "infra": None}
+        for r in rows:
+            if r["lo"] is not None:
+                spans[str(r["axis"])] = (int(r["lo"]), int(r["hi"]))
+        return spans
 
-    def issue_fail_minutes(
+    def sle_measured_client_count(self, start_ts: int, end_ts: int) -> int:
+        """How many distinct clients the SLE engine judged in ``[start_ts, end_ts)``.
+
+        The **denominator** every client-axis figure is quoted against: "3
+        clients" means nothing until the reader knows whether 4 or 400 were
+        being watched. Counts client-axis rows only (``entity_id`` there is
+        always the client), pass and fail alike — being judged and coming out
+        clean still counts as measured.
+        """
+        places = ",".join("?" for _ in SLE_CLIENT_AXIS_SLES)
+        row = self._conn.execute(
+            "SELECT COUNT(DISTINCT entity_id) AS n FROM sle_minutes "
+            f"WHERE bucket_ts>=? AND bucket_ts<? AND sle IN ({places})",
+            (start_ts, end_ts, *SLE_CLIENT_AXIS_SLES),
+        ).fetchone()
+        return int(row["n"] or 0) if row is not None else 0
+
+    def issue_impact_minutes(
         self, issue_ids: Iterable[int], *, start_ts: int, end_ts: int
-    ) -> dict[int, float]:
-        """Failed SLE client-minutes each issue accounts for in ``[start_ts, end_ts)``.
+    ) -> dict[int, IssueImpactMinutes]:
+        """What each issue cost in ``[start_ts, end_ts)``, split by axis.
 
         The per-issue form of :meth:`sle_fail_minutes_by_attributed`, and the
-        number the issue list is ranked and read by. Two things make it an
-        *issue's* impact rather than its entity's:
+        figure the issue list is read by. Returns an
+        :class:`IssueImpactMinutes` per issue that has any judged minutes;
+        issues with none are **absent** from the result rather than mapped to
+        zero, so the caller keeps "not measured" and "measured, cost nothing"
+        apart. Four things make it an *issue's* impact rather than its entity's:
 
+        * **Two axes, never one total.** Client-axis minutes (coverage, roaming,
+          capacity, connect, wan — rows a real client owns) and infra
+          down-minutes (the device's own state timeline) are summed separately
+          and returned separately. Adding them would invent client-minutes
+          nobody experienced, which is exactly the bug this shape prevents
+          (Gitea #36).
+        * **The client axis carries its own count.** ``clients`` is the number
+          of distinct clients those failed minutes belong to, so the figure can
+          be read as "N clients for M minutes" instead of a bare total that
+          cannot distinguish one client for an hour from sixty for a minute.
         * **Clipped to the issue's own life.** Only buckets in
           ``[first_seen_ts, resolved_ts or end_ts)`` count, so an issue opened an
           hour ago is never charged with a day of its AP's grief, and one
-          resolved before the window opened returns nothing at all (absent from
-          the result -- never a zero, which would read as "cost nobody
-          anything").
+          resolved before the window opened returns nothing at all.
         * **Blame follows what the SLE engine can actually pin.** For an issue
           on infrastructure the minutes are the ones *attributed* to it
           (``attributed_entity_id``); for an issue on a client they are that
@@ -1557,8 +1668,13 @@ class Repository:
             return {}
         id_places = ",".join("?" for _ in ids)
         type_places = ",".join("?" for _ in SLE_ATTRIBUTED_ENTITY_TYPES)
+        client_places = ",".join("?" for _ in SLE_CLIENT_AXIS_SLES)
+        device_places = ",".join("?" for _ in SLE_DEVICE_AXIS_SLES)
         rows = self._conn.execute(
-            "SELECT i.id AS issue_id, SUM(m.minutes) AS m "
+            "SELECT i.id AS issue_id, "
+            f" SUM(CASE WHEN m.sle IN ({client_places}) THEN m.minutes ELSE 0 END) AS client_m, "
+            f" COUNT(DISTINCT CASE WHEN m.sle IN ({client_places}) THEN m.entity_id END) AS n_cl, "
+            f" SUM(CASE WHEN m.sle IN ({device_places}) THEN m.minutes ELSE 0 END) AS infra_m "
             "FROM issues i "
             "JOIN entities e ON e.entity_id = i.entity_id "
             "JOIN sle_minutes m "
@@ -1572,6 +1688,9 @@ class Repository:
             "  AND m.bucket_ts >= ? AND m.bucket_ts < ? "
             "GROUP BY i.id",
             (
+                *SLE_CLIENT_AXIS_SLES,
+                *SLE_CLIENT_AXIS_SLES,
+                *SLE_DEVICE_AXIS_SLES,
                 end_ts,
                 EntityType.CLIENT.value,
                 EntityType.CLIENT.value,
@@ -1581,7 +1700,14 @@ class Repository:
                 end_ts,
             ),
         ).fetchall()
-        return {int(r["issue_id"]): float(r["m"] or 0.0) for r in rows}
+        return {
+            int(r["issue_id"]): IssueImpactMinutes(
+                client_fail_minutes=float(r["client_m"] or 0.0),
+                clients=int(r["n_cl"] or 0),
+                infra_down_minutes=float(r["infra_m"] or 0.0),
+            )
+            for r in rows
+        }
 
     def event_counts_by_entity(
         self, start_ts: int, end_ts: int, keys: Sequence[str]

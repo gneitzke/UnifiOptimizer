@@ -9,8 +9,16 @@ import pytest
 
 from netadmin.domain.entities import Entity
 from netadmin.domain.types import EntityType
+from netadmin.sle.classifiers import ALL_SLES
 from netadmin.store.metrics import MetricKind
-from netadmin.store.repository import DAY_SECONDS, HOUR_SECONDS, Repository, SampleReading
+from netadmin.store.repository import (
+    DAY_SECONDS,
+    HOUR_SECONDS,
+    SLE_CLIENT_AXIS_SLES,
+    SLE_DEVICE_AXIS_SLES,
+    Repository,
+    SampleReading,
+)
 
 # ---------------------------------------------------------------------------
 # Entities + discrete state history
@@ -630,6 +638,88 @@ def test_delete_sle_minutes_clears_only_its_bucket(repo: Repository, switch_enti
 
 def test_delete_sle_minutes_empty_bucket_is_a_noop(repo: Repository) -> None:
     assert repo.delete_sle_minutes(12345) == 0
+
+
+# ---------------------------------------------------------------------------
+# SLE axes (Gitea #36): client-minutes and device down-minutes never merge
+# ---------------------------------------------------------------------------
+
+
+def test_the_two_sle_axes_partition_every_sle() -> None:
+    """A new SLE cannot quietly land on neither axis, or on both.
+
+    The store mirrors the SLE names rather than importing them (it is the layer
+    below the engine), so this is the guard against the two lists drifting.
+    """
+    client_axis = set(SLE_CLIENT_AXIS_SLES)
+    device_axis = set(SLE_DEVICE_AXIS_SLES)
+    assert client_axis | device_axis == set(ALL_SLES)
+    assert client_axis & device_axis == set()
+
+
+def _seed_two_axes(repo: Repository) -> tuple[int, int]:
+    """One AP down 10 minutes, with one client losing 4 minutes pinned on it."""
+    ap = repo.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="aa:bb:cc:00:00:0a", name="ap"), ts=0
+    )
+    client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="11:22:33:44:55:0a", name="phone"), ts=0
+    )
+    repo.upsert_sle_minute(
+        bucket_ts=0,
+        sle="coverage",
+        classifier="weak_signal",
+        entity_id=client,
+        minutes=4.0,
+        attributed_entity_id=ap,
+    )
+    repo.upsert_sle_minute(
+        bucket_ts=0,
+        sle="infra",
+        classifier="ap_down",
+        entity_id=ap,
+        minutes=10.0,
+        attributed_entity_id=ap,
+    )
+    return ap, client
+
+
+def test_fail_minutes_by_attributed_can_be_read_per_axis(repo: Repository) -> None:
+    ap, _ = _seed_two_axes(repo)
+    client_axis = repo.sle_fail_minutes_by_attributed(0, 300, sles=SLE_CLIENT_AXIS_SLES)
+    device_axis = repo.sle_fail_minutes_by_attributed(0, 300, sles=SLE_DEVICE_AXIS_SLES)
+    assert client_axis[ap] == 4.0
+    assert device_axis[ap] == 10.0
+    # The default still sums both — the legacy ranking input, documented as
+    # unsafe to show as "minutes clients lost".
+    assert repo.sle_fail_minutes_by_attributed(0, 300)[ap] == 14.0
+    # An empty axis means no axis, never "everything".
+    assert repo.sle_fail_minutes_by_attributed(0, 300, sles=()) == {}
+
+
+def test_axis_spans_report_the_two_axes_independently(repo: Repository) -> None:
+    _seed_two_axes(repo)
+    assert repo.sle_minutes_axis_spans(0, 300) == {"client": (0, 0), "infra": (0, 0)}
+    # A window the engine never judged has no span on either axis, which is how
+    # "not measured" stays distinct from "measured, nothing failed".
+    assert repo.sle_minutes_axis_spans(600, 900) == {"client": None, "infra": None}
+
+
+def test_axis_span_is_absent_for_an_axis_with_no_rows(repo: Repository) -> None:
+    ap = repo.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="aa:bb:cc:00:00:0b", name="ap"), ts=0
+    )
+    repo.upsert_sle_minute(
+        bucket_ts=0, sle="infra", classifier="ap_down", entity_id=ap, minutes=5.0
+    )
+    assert repo.sle_minutes_axis_spans(0, 300) == {"client": None, "infra": (0, 0)}
+
+
+def test_measured_client_count_is_the_denominator(repo: Repository) -> None:
+    """Counts clients the engine judged, pass or fail — never the devices."""
+    _seed_two_axes(repo)
+    assert repo.sle_measured_client_count(0, 300) == 1
+    assert repo.sle_measured_client_count(600, 900) == 0
 
 
 def test_investigations_crud(repo: Repository) -> None:

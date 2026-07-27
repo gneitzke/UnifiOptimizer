@@ -268,21 +268,32 @@ export function IssueDetailPage() {
           <MetaItem label="Entity">
             {entity ? <EntityLink entity={entity} /> : <span style={{ color: 'var(--fg-subtle)' }}>network-wide</span>}
           </MetaItem>
-          {/* The figure the Issues list is read by, repeated here with the
-              sentence that qualifies it — otherwise the column is a number the
-              reader can click on and learn nothing more about. */}
+          {/* The figures the Issues list is read by, repeated here with the
+              sentences that qualify them — otherwise the column is a number the
+              reader can click on and learn nothing more about. Same
+              `impactDisplay` the list uses, so the two can never drift, and the
+              two axes stay two figures here as well (Gitea #36). */}
           <MetaItem label="Impact">
-            {impact.text === null ? (
-              <span style={{ color: 'var(--fg-subtle)' }} title={impact.note}>
+            {impact.primary === null ? (
+              <span className="relative" style={{ color: 'var(--fg-subtle)' }} title={impact.note}>
                 <span aria-hidden>—</span>
                 <span className="sr-only">{impact.note}</span>
               </span>
             ) : (
-              <span className="tnum" title={impact.note} style={{ color: impact.zero ? 'var(--fg-muted)' : 'var(--fg)' }}>
-                {impact.text}
-                <span className="t-micro" style={{ color: 'var(--fg-subtle)' }}>
-                  {' fail-min'}
+              <span className="relative flex flex-col gap-0.5" title={impact.note}>
+                <span
+                  aria-hidden
+                  className="tnum"
+                  style={{ color: impact.primary.zero ? 'var(--fg-muted)' : 'var(--fg)' }}
+                >
+                  {impact.primary.text}
                 </span>
+                {impact.secondary && (
+                  <span aria-hidden className="t-caption" style={{ color: 'var(--fg-subtle)' }}>
+                    {impact.secondary.text}
+                  </span>
+                )}
+                <span className="sr-only">{impact.note}</span>
               </span>
             )}
           </MetaItem>
