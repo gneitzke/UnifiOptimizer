@@ -57,7 +57,9 @@ UnifiOptimizer is the fourth shape: it keeps the history *and* attaches meaning 
 - **Root cause, not a wall of alarms.** Correlation groups a cause with its symptoms, so a
   failing mesh uplink reads as one incident instead of six unrelated complaints.
 - **Health you can argue with.** Every score traces to failed client-minutes attributed to
-  exactly one cause on one device, so "84/100" always has a receipt.
+  exactly one cause on one device, so "84/100" always has a receipt. A device's own downtime
+  is tracked separately and never added to that total, because minutes a box spent dark are
+  not minutes a person spent waiting.
 - **Fixes you approve.** Dry-run by default, before/after snapshots, one-click revert.
 - **Bring your own model.** The investigator compiles a dossier you can hand to any LLM, or
   run through the Copilot CLI or the Anthropic API. No API key required to use the tool.
