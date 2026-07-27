@@ -31,8 +31,9 @@ import httpx
 import pytest
 
 from netadmin import __version__
-from netadmin.config import Settings
+from netadmin.config import Settings, write_secrets
 from netadmin.mcp import tools as mcp_tools
+from netadmin.server import main as server_main
 from netadmin.server import mcp_mount
 from netadmin.server.main import DaemonComponents, create_app
 from netadmin.store.repository import Repository
@@ -750,3 +751,393 @@ async def test_rate_limit_is_not_escapable_with_a_forwarded_header(mcp_app: Any)
             for i in range(40)
         ]
     assert 429 in codes, "rotating X-Forwarded-For bought unlimited token guesses"
+
+
+# --------------------------------------------------------------------------- #
+# Rotation performed from OUTSIDE this process (Gitea #35)
+# --------------------------------------------------------------------------- #
+# ``netadmin mcp-token --regenerate`` runs in a second process and rewrites
+# ``data/secrets.env``. ``Settings`` is a startup snapshot, so the daemon went on
+# accepting the token that had just been rotated away -- confirmed on a live
+# deployment, where the superseded token still answered 200 while a garbage one
+# answered 401. Rotation exists precisely to stop the old value working, so these
+# pin the whole rule: the gate enforces what the file says NOW, an exported
+# environment variable still outranks the file, and an unreadable file never
+# becomes an outage.
+#
+# Values below are obviously-fake placeholders; nothing here ever touches the
+# real ``data/secrets.env``.
+BOOT_MCP_TOKEN = "boot-mcp-token-placeholder"
+ROTATED_MCP_TOKEN = "rotated-mcp-token-placeholder"
+EXPORTED_MCP_TOKEN = "exported-mcp-token-placeholder"
+
+# What a request that PASSED the gate looks like when the mount itself is not
+# running: the SDK is never reached, so these tests hold on a core install.
+_PASSED_THE_GATE = 503
+
+
+@pytest.fixture
+def secrets_file(tmp_path: Path) -> Path:
+    """A TEMP ``secrets.env`` holding the boot token. Never the real one."""
+    path = tmp_path / "secrets.env"
+    path.write_text(f"NETADMIN_MCP_TOKEN={BOOT_MCP_TOKEN}\n", encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def rotating_app(
+    secrets_file: Path,
+    tmp_db_path: Path,
+    seeded_store: Repository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Any:
+    """A daemon whose MCP token came from ``secrets.env``, as a real install's does.
+
+    ``main.SECRETS_ENV`` is pointed at the temp file *before* ``create_app`` so the
+    daemon watches it from construction, exactly the way it watches the real one --
+    rather than repointing the seam afterwards, which would test a code path no
+    deployment runs.
+    """
+    monkeypatch.delenv("NETADMIN_MCP_TOKEN", raising=False)
+    monkeypatch.setattr(server_main, "SECRETS_ENV", secrets_file)
+    settings = Settings(_env_file=str(secrets_file), db_path=tmp_db_path, site_id="default")
+    assert settings.mcp_token == BOOT_MCP_TOKEN  # the token really did come from the file
+    return create_app(settings=settings, store=seeded_store, components=DaemonComponents())
+
+
+def _rotate_secrets_file(path: Path, token: str) -> None:
+    """Rotate the token the way the CLI does: the real writer, atomic replace."""
+    write_secrets({"NETADMIN_MCP_TOKEN": token}, path=path)
+
+
+def _gate(app: Any) -> tuple[Any, httpx.AsyncClient]:
+    """A client wired straight to the gate, with no lifespan and so no SDK."""
+    endpoint = mcp_mount.McpEndpoint(app)
+    transport = httpx.ASGITransport(app=endpoint)
+    return endpoint, httpx.AsyncClient(transport=transport, base_url="http://test")
+
+
+async def test_a_rotation_by_another_process_disarms_the_old_token(
+    rotating_app: Any, secrets_file: Path
+) -> None:
+    """The bug: a CLI rotation left the superseded token authenticating.
+
+    Driven at the gate rather than through a live session, so the regression is
+    pinned on a core install too -- 503 here means "the token was accepted and
+    the mount, which this harness never started, is what is missing".
+    """
+    _endpoint, client = _gate(rotating_app)
+    async with client:
+        accepted = await client.post("/mcp", headers=_headers(BOOT_MCP_TOKEN))
+        assert accepted.status_code == _PASSED_THE_GATE
+
+        _rotate_secrets_file(secrets_file, ROTATED_MCP_TOKEN)
+
+        stale = await client.post("/mcp", headers=_headers(BOOT_MCP_TOKEN))
+        assert stale.status_code == 401, "the rotated-away token still authenticates"
+        rotated = await client.post("/mcp", headers=_headers(ROTATED_MCP_TOKEN))
+        assert rotated.status_code == _PASSED_THE_GATE
+
+
+@requires_sdk
+async def test_a_rotation_by_another_process_takes_effect_on_a_running_daemon(
+    rotating_app: Any, secrets_file: Path
+) -> None:
+    """The same rotation end to end, as the live deployment reproduced it.
+
+    Same process, same app, no restart and no rebuilt ``Settings``: a real MCP
+    session on the old token, a rotation written by "another process", then 401
+    for that session's token and a working one for the new value.
+    """
+    async with rotating_app.router.lifespan_context(rotating_app), _client(rotating_app) as client:
+        opened = await client.post("/mcp", headers=_headers(BOOT_MCP_TOKEN), json=_INITIALIZE)
+        assert opened.status_code == 200
+
+        _rotate_secrets_file(secrets_file, ROTATED_MCP_TOKEN)
+
+        stale = await client.post("/mcp", headers=_headers(BOOT_MCP_TOKEN), json=_TOOLS_LIST)
+        assert stale.status_code == 401
+        reopened = await client.post("/mcp", headers=_headers(ROTATED_MCP_TOKEN), json=_INITIALIZE)
+        assert reopened.status_code == 200
+
+
+async def test_the_daemons_own_settings_are_not_rebuilt_to_do_it(
+    rotating_app: Any, secrets_file: Path
+) -> None:
+    """Only the token is refreshed -- never the whole configuration.
+
+    Re-running the settings loader would swap live controller credentials, the
+    database path and the log destination mid-flight to fix an auth bug. The
+    ``Settings`` object the daemon runs on must be the same object, untouched,
+    with only the enforced token having moved.
+    """
+    settings = rotating_app.state.settings
+    endpoint, client = _gate(rotating_app)
+    async with client:
+        _rotate_secrets_file(secrets_file, ROTATED_MCP_TOKEN)
+        assert endpoint.token == ROTATED_MCP_TOKEN
+
+    assert rotating_app.state.settings is settings
+    assert settings.netadmin_mcp_token == BOOT_MCP_TOKEN  # the snapshot is left alone
+    assert settings.db_path == rotating_app.state.settings.db_path
+
+
+# --- precedence: a real environment variable is not editable from disk ------- #
+@pytest.fixture
+def exported_token_app(
+    secrets_file: Path,
+    tmp_db_path: Path,
+    seeded_store: Repository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Any:
+    """A container-shaped deploy: the token is exported, and ``secrets.env`` disagrees."""
+    monkeypatch.setenv("NETADMIN_MCP_TOKEN", EXPORTED_MCP_TOKEN)
+    monkeypatch.setattr(server_main, "SECRETS_ENV", secrets_file)
+    settings = Settings(_env_file=str(secrets_file), db_path=tmp_db_path, site_id="default")
+    # This is pydantic-settings' own precedence, asserted so the fixture cannot
+    # silently stop describing the case it is named for.
+    assert settings.mcp_token == EXPORTED_MCP_TOKEN
+    return create_app(settings=settings, store=seeded_store, components=DaemonComponents())
+
+
+async def test_an_exported_token_outranks_the_file_before_and_after_an_edit(
+    exported_token_app: Any, secrets_file: Path
+) -> None:
+    """A deployment's own ``NETADMIN_MCP_TOKEN`` cannot be rewritten from disk.
+
+    Containers and systemd units set this in the environment, where it beats
+    ``env_file`` in the loader. Refreshing from the file must not quietly invert
+    that: an editor (or a stray CLI regenerate) on the daemon host would otherwise
+    take over the credential the deployment believes it configured.
+    """
+    endpoint, client = _gate(exported_token_app)
+    async with client:
+        assert endpoint.token == EXPORTED_MCP_TOKEN
+
+        _rotate_secrets_file(secrets_file, ROTATED_MCP_TOKEN)
+        assert endpoint.token == EXPORTED_MCP_TOKEN
+
+        exported = await client.post("/mcp", headers=_headers(EXPORTED_MCP_TOKEN))
+        assert exported.status_code == _PASSED_THE_GATE
+        for ignored in (BOOT_MCP_TOKEN, ROTATED_MCP_TOKEN):
+            refused = await client.post("/mcp", headers=_headers(ignored))
+            assert refused.status_code == 401, ignored
+
+        # Nor can deleting the file disarm what the environment configured.
+        secrets_file.unlink()
+        assert endpoint.token == EXPORTED_MCP_TOKEN
+
+
+async def test_an_in_process_rotation_still_wins_over_the_environment(
+    exported_token_app: Any,
+) -> None:
+    """Settings-UI rotation keeps applying immediately, exported var or not.
+
+    The refresher returns the live settings object rather than the raw variable
+    for exactly this reason: init kwargs and an in-process rotation outrank the
+    environment in the loader too, and that path must not regress.
+    """
+    endpoint, client = _gate(exported_token_app)
+    async with client:
+        exported_token_app.state.settings.netadmin_mcp_token = ROTATED_MCP_TOKEN
+        assert endpoint.token == ROTATED_MCP_TOKEN
+        stale = await client.post("/mcp", headers=_headers(EXPORTED_MCP_TOKEN))
+        assert stale.status_code == 401
+
+
+# --- the feature can be turned back off, not just rotated -------------------- #
+async def test_removing_the_token_from_the_file_returns_the_mount_to_404(
+    rotating_app: Any, secrets_file: Path
+) -> None:
+    """Deleting the key is a decision, and it must take effect like any other."""
+    endpoint, client = _gate(rotating_app)
+    async with client:
+        assert endpoint.token == BOOT_MCP_TOKEN
+        secrets_file.write_text("# the token line is gone\n", encoding="utf-8")
+
+        assert endpoint.token is None
+        refused = await client.post("/mcp", headers=_headers(BOOT_MCP_TOKEN))
+        assert refused.status_code == 404
+        assert refused.json()["code"] == "mcp_disabled"
+
+
+async def test_deleting_the_secrets_file_returns_the_mount_to_404(
+    rotating_app: Any, secrets_file: Path
+) -> None:
+    """A file that is gone is an unambiguous answer: the feature is off."""
+    endpoint, client = _gate(rotating_app)
+    async with client:
+        assert endpoint.token == BOOT_MCP_TOKEN
+        secrets_file.unlink()
+
+        assert endpoint.token is None
+        refused = await client.post("/mcp", headers=_headers(BOOT_MCP_TOKEN))
+        assert refused.status_code == 404
+
+
+async def test_a_delete_racing_the_read_is_the_same_as_a_delete(
+    rotating_app: Any, secrets_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vanishing between the stat and the read is still absence, not a failure."""
+
+    def _vanished(name: str, *, path: Path) -> Optional[str]:
+        raise FileNotFoundError(path)
+
+    endpoint, _client_unused = _gate(rotating_app)
+    monkeypatch.setattr(mcp_mount, "read_env_file_secret", _vanished)
+    _rotate_secrets_file(secrets_file, ROTATED_MCP_TOKEN)
+    assert endpoint.token is None
+
+
+# --- an unreadable file is a malfunction, not a decision --------------------- #
+async def test_an_unreadable_secrets_file_keeps_the_last_known_good_token(
+    rotating_app: Any, secrets_file: Path
+) -> None:
+    """Documented behaviour: hold the last value, never 500, never flap.
+
+    Rotation publishes through ``os.replace``, so a torn read should be
+    impossible -- but correctness here must not depend on that. Dropping the
+    token on a bad read would 401 every correctly-configured client at once,
+    while holding it loosens nothing: that value authenticated a moment ago.
+    """
+    endpoint, client = _gate(rotating_app)
+    async with client:
+        _rotate_secrets_file(secrets_file, ROTATED_MCP_TOKEN)
+        assert endpoint.token == ROTATED_MCP_TOKEN
+
+        # Not valid UTF-8: the read raises where a half-written file would.
+        secrets_file.write_bytes(b"NETADMIN_MCP_TOKEN=\xff\xfe\xff-broken\n")
+
+        assert endpoint.token == ROTATED_MCP_TOKEN
+        held = await client.post("/mcp", headers=_headers(ROTATED_MCP_TOKEN))
+        assert held.status_code == _PASSED_THE_GATE  # a 500 here would be the failure
+        assert (await client.post("/mcp", headers=_headers("wrong"))).status_code == 401
+
+        # ...and it heals as soon as the file is readable again.
+        secrets_file.write_text(f"NETADMIN_MCP_TOKEN={BOOT_MCP_TOKEN}\n", encoding="utf-8")
+        assert endpoint.token == BOOT_MCP_TOKEN
+
+
+async def test_a_secrets_file_that_cannot_be_stat_ed_holds_the_token_too(
+    rotating_app: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same rule one step earlier: a permission failure is not "unset".
+
+    Including at construction, which is what ``create_app`` runs: a baseline that
+    cannot be taken must degrade, never raise a daemon's startup.
+    """
+    endpoint, client = _gate(rotating_app)
+
+    def _denied(path: Path) -> None:
+        raise PermissionError(path)
+
+    async with client:
+        monkeypatch.setattr(mcp_mount, "_stat_signature", _denied)
+        assert endpoint.token == BOOT_MCP_TOKEN
+        held = await client.post("/mcp", headers=_headers(BOOT_MCP_TOKEN))
+        assert held.status_code == _PASSED_THE_GATE
+        assert mcp_mount.LiveMcpToken(rotating_app).read() == BOOT_MCP_TOKEN
+
+
+async def test_an_unreadable_file_is_logged_once_not_per_request(
+    rotating_app: Any, secrets_file: Path
+) -> None:
+    """This is on a request path a client hits every few seconds."""
+    logger = logging.getLogger("netadmin.server.mcp")
+    handler = _LogCapture()
+    logger.addHandler(handler)
+    try:
+        endpoint, _client_unused = _gate(rotating_app)
+        secrets_file.write_bytes(b"\xff\xfe-broken\n")
+        for _ in range(5):
+            assert endpoint.token == BOOT_MCP_TOKEN
+    finally:
+        logger.removeHandler(handler)
+
+    complaints = [m for m in handler.messages if "cannot re-read" in m]
+    assert len(complaints) == 1
+
+
+# --- the check itself has to be cheap --------------------------------------- #
+async def test_the_file_is_only_parsed_when_it_actually_changed(
+    rotating_app: Any, secrets_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One ``os.stat`` per request is the budget; parsing is gated on it.
+
+    Counted rather than timed: the point is that an unchanged file is never
+    opened at all, and a changed one is opened exactly once however many requests
+    follow.
+    """
+    parsed: list[Path] = []
+    real_read = mcp_mount.read_env_file_secret
+
+    def _counting(name: str, *, path: Path) -> Optional[str]:
+        parsed.append(path)
+        return real_read(name, path=path)
+
+    monkeypatch.setattr(mcp_mount, "read_env_file_secret", _counting)
+    endpoint, _client_unused = _gate(rotating_app)
+
+    for _ in range(5):
+        assert endpoint.token == BOOT_MCP_TOKEN
+    assert parsed == [], "an untouched secrets.env was parsed anyway"
+
+    _rotate_secrets_file(secrets_file, ROTATED_MCP_TOKEN)
+    for _ in range(5):
+        assert endpoint.token == ROTATED_MCP_TOKEN
+    assert parsed == [secrets_file], "the file was re-parsed on requests that saw no change"
+
+
+async def test_re_pointing_the_watched_file_starts_a_fresh_baseline(
+    rotating_app: Any, tmp_path: Path
+) -> None:
+    """Moving the seam asks a different question; it is not a rotation.
+
+    Nothing in production repoints ``app.state.secrets_path``, but tests and
+    embedders do, and reading a newly-pointed file as if it were a change would
+    silently disarm a token that came from init kwargs.
+    """
+    endpoint, _client_unused = _gate(rotating_app)
+    assert endpoint.token == BOOT_MCP_TOKEN
+
+    elsewhere = tmp_path / "other" / "secrets.env"
+    rotating_app.state.secrets_path = elsewhere
+    assert endpoint.token == BOOT_MCP_TOKEN  # the settings snapshot, not "no file -> None"
+
+    elsewhere.parent.mkdir()
+    _rotate_secrets_file(elsewhere, ROTATED_MCP_TOKEN)
+    assert endpoint.token == ROTATED_MCP_TOKEN
+
+
+# --- what rotation still cannot do: mount a feature that never started ------- #
+async def test_a_token_added_after_boot_authenticates_but_asks_for_a_restart(
+    tmp_path: Path,
+    tmp_db_path: Path,
+    seeded_store: Repository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Enabling remote MCP is still a restart, and the 503 now says so.
+
+    The gate tracks the file, but the mount -- its read-only store handle and
+    session manager -- is started once, in the lifespan. An operator who enables
+    the feature on a running daemon now gets a sentence naming the remedy instead
+    of the generic "not running", which reads like a missing SDK.
+    """
+    secrets = tmp_path / "secrets.env"
+    secrets.write_text("# no MCP token yet\n", encoding="utf-8")
+    monkeypatch.delenv("NETADMIN_MCP_TOKEN", raising=False)
+    monkeypatch.setattr(server_main, "SECRETS_ENV", secrets)
+    settings = Settings(_env_file=str(secrets), db_path=tmp_db_path, site_id="default")
+    assert settings.mcp_token is None
+    app = create_app(settings=settings, store=seeded_store, components=DaemonComponents())
+
+    async with app.router.lifespan_context(app), _client(app) as client:
+        assert (await client.post("/mcp", headers=_headers(ROTATED_MCP_TOKEN))).status_code == 404
+
+        _rotate_secrets_file(secrets, ROTATED_MCP_TOKEN)
+
+        enabled = await client.post("/mcp", headers=_headers(ROTATED_MCP_TOKEN))
+        assert enabled.status_code == 503
+        assert "restart" in enabled.json()["detail"]
+        # The remedy is deployment state, so it stays behind the gate.
+        assert (await client.post("/mcp", headers=_headers("wrong"))).status_code == 401

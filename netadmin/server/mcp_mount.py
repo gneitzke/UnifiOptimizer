@@ -33,6 +33,14 @@ pasting it into a Claude config on every laptop would turn one leaked config fil
 from a privacy problem into network control. The MCP token is read-only by
 construction and rotates on its own.
 
+**Rotation disarms the old value on the next request, whoever performed it.** The
+gate does not enforce the startup snapshot of ``Settings``; it enforces what
+``data/secrets.env`` says now, so ``netadmin mcp-token --regenerate`` in another
+shell -- or an operator with an editor -- takes effect against a running daemon
+without a restart, and deleting the token turns ``/mcp`` back to 404. An exported
+``NETADMIN_MCP_TOKEN`` still outranks the file, and only this one key is
+re-read. :class:`LiveMcpToken` is where that lives and why.
+
 **Read-only, three ways, none of them by convention.** The mount opens its *own*
 :meth:`netadmin.store.repository.Repository.open` connection with
 ``read_only=True``: SQLite ``mode=ro`` at the VFS layer, ``PRAGMA
@@ -62,14 +70,17 @@ for.
 from __future__ import annotations
 
 import importlib.util
+import threading
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
+from netadmin.config import SECRETS_ENV, env_var_is_set, read_env_file_secret
 from netadmin.logging import get_logger
 from netadmin.server.auth import (
     FixedWindowRateLimiter,
@@ -81,11 +92,14 @@ from netadmin.server.auth import (
 
 __all__ = [
     "MCP_PATH",
+    "MCP_TOKEN_ENV",
     "DEFAULT_MCP_AUTH_MAX",
     "DEFAULT_MCP_AUTH_WINDOW_S",
     "SDK_MISSING_DETAIL",
     "NOT_RUNNING_DETAIL",
+    "NOT_ENABLED_AT_BOOT_DETAIL",
     "McpMountState",
+    "LiveMcpToken",
     "McpEndpoint",
     "sdk_available",
     "install_mcp_route",
@@ -99,6 +113,11 @@ _log = get_logger("server.mcp")
 # ``http://<host>:<port>/mcp``.
 MCP_PATH = "/mcp"
 
+# The one credential this feature reads, in ``data/secrets.env`` or the real
+# environment. Named here rather than spelled inline so the gate, the refresher
+# and the log lines can never drift apart.
+MCP_TOKEN_ENV = "NETADMIN_MCP_TOKEN"
+
 # Failed-token budget per client per rolling window. Mirrors the write-op limit in
 # auth.py: generous for a human fixing a typo in a Claude config, low enough that
 # a token guess is throttled rather than unbounded.
@@ -110,6 +129,16 @@ SDK_MISSING_DETAIL = (
     'pip install "unifioptimizer[mcp]", then restart the daemon'
 )
 NOT_RUNNING_DETAIL = "the remote MCP endpoint is not running"
+# Said only to a caller who already authenticated with a token this daemon now
+# accepts but did not have when it booted. Rotation applies to the next request
+# (see :class:`LiveMcpToken`); *enabling* the feature does not, because the mount
+# itself -- its read-only store handle and session manager -- is started once, in
+# the lifespan. Naming that distinction here keeps the operator from reading the
+# generic 503 as "install the extra".
+NOT_ENABLED_AT_BOOT_DETAIL = (
+    f"{MCP_TOKEN_ENV} was not configured when the daemon started, so the remote "
+    "MCP endpoint was never mounted; restart the daemon to serve it"
+)
 
 
 def sdk_available() -> bool:
@@ -137,13 +166,183 @@ class McpMountState:
     unavailable: Optional[str] = None
 
 
+# The stat fields a change is judged by, and the "no file there" answer.
+_Signature = Tuple[int, int, int, int]
+# Distinguishable from ``None``, which is a perfectly good parsed value ("the key
+# is not in the file"). Means "this refresher has never parsed the file at all".
+_NEVER_PARSED = object()
+
+
+def _stat_signature(path: Path) -> Optional[_Signature]:
+    """``(mtime_ns, size, inode, device)``, or ``None`` when the file is absent.
+
+    All four fields, because no smaller set is honest. mtime alone has coarse
+    granularity on some filesystems; size does not move at all when a token is
+    replaced by another of the same length (every minted token is
+    ``token_urlsafe(32)``, always 43 characters); and
+    :func:`netadmin.config.write_secrets` publishes through ``os.replace``, which
+    always lands the new content on a *different inode*. Together they cannot miss
+    a rotation, and they cost one ``os.stat`` on the request path.
+
+    Only "not there" is answered as ``None``. Every other ``OSError`` propagates:
+    a file we are not allowed to stat is a malfunction, not a deliberate absence,
+    and the two must not be collapsed into the same answer.
+    """
+    try:
+        st = path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    return (st.st_mtime_ns, st.st_size, st.st_ino, st.st_dev)
+
+
+def _baseline_signature(path: Path) -> Optional[_Signature]:
+    """:func:`_stat_signature`, with an unreadable path treated as absent.
+
+    Used only when establishing a baseline, where there is nothing yet to protect
+    and the next request re-derives the answer anyway. Separate from the reading
+    path on purpose: taking a baseline must never be able to raise into
+    ``create_app``.
+    """
+    try:
+        return _stat_signature(path)
+    except OSError:
+        return None
+
+
+class LiveMcpToken:
+    """The token ``/mcp`` enforces right now, tracked against ``secrets.env``.
+
+    ``app.state.settings`` is a snapshot taken once at startup, so a rotation
+    performed by *another process* (``netadmin mcp-token --regenerate``, an
+    operator with an editor) was invisible to a running daemon: the superseded
+    token kept authenticating until the next restart, which is the one outcome
+    rotation exists to prevent (Gitea #35). This refresher closes that gap for the
+    MCP token **only** -- deliberately not by rebuilding ``Settings``, which would
+    swap live controller credentials, the database path and the log destination
+    out from under a running daemon to fix an auth bug.
+
+    The rule, in precedence order, evaluated per request:
+
+    1. **A real environment variable wins, always.** If ``NETADMIN_MCP_TOKEN`` is
+       exported into the process (containers, systemd units), the file is not even
+       consulted, and an edit to ``secrets.env`` cannot override the deployment.
+       What is returned in that case is the settings object's own value rather
+       than the raw variable, because init kwargs outrank the environment in turn
+       and because the Settings-UI rotation mutates that object in place -- both
+       must keep working.
+    2. **Otherwise, "has the file moved since we started watching it?"** While the
+       signature matches the one taken at construction, whatever the loader
+       resolved at boot still stands -- which is what keeps a token that came from
+       somewhere *other* than the file (init kwargs in tests, a rotation applied
+       in-process) authoritative. That framing, rather than "the file is the
+       authority", is what makes this safe to layer under the existing precedence
+       chain instead of replacing it.
+    3. **Once it has moved, the file is the answer** -- including when the answer
+       is "the key is gone" or "the file is gone", which turns the mount back off
+       and returns ``/mcp`` to 404 rather than leaving it stuck armed.
+
+    Re-parsing is gated on that signature, so the steady state costs one
+    ``os.stat`` per request and no parse at all. An unreadable file (permissions,
+    a bad decode, anything short of honest absence) keeps the **last known-good**
+    value and logs once: rotation publishes atomically via ``os.replace``, so a
+    torn read should be impossible, but if one ever happens the gate must not flap
+    -- losing the token would 401 every correctly-configured client, and the value
+    being held was already valid a moment ago, so nothing loosens by holding it.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self._app = app
+        # The endpoint is driven from one event loop, so ``read`` is already
+        # atomic against other coroutines; the lock is for the threadpool and for
+        # anything that later reads this from another thread, and it costs an
+        # uncontended acquire on a path that is about to touch the filesystem.
+        self._lock = threading.Lock()
+        self._path = self._secrets_path()
+        self._baseline = _baseline_signature(self._path)
+        self._parsed_sig: Any = _NEVER_PARSED
+        self._parsed: Optional[str] = None
+        self._read_failed = False
+
+    def _secrets_path(self) -> Path:
+        """The file to watch: the app's settable seam, else the real one."""
+        return Path(getattr(self._app.state, "secrets_path", None) or SECRETS_ENV)
+
+    def _snapshot(self) -> Optional[str]:
+        """What the live ``Settings`` object says, normalised (blank -> ``None``)."""
+        settings = getattr(self._app.state, "settings", None)
+        return getattr(settings, "mcp_token", None) if settings is not None else None
+
+    def read(self) -> Optional[str]:
+        """The token to enforce for this request, or ``None`` when there is none."""
+        snapshot = self._snapshot()
+        if env_var_is_set(MCP_TOKEN_ENV):
+            return snapshot
+
+        path = self._secrets_path()
+        with self._lock:
+            if path != self._path:
+                # The watched file was re-pointed after construction (tests, and
+                # any embedder that moves the seam). Re-baseline on the new file
+                # rather than reading it as a change: nothing has been rotated,
+                # the question being asked has simply changed.
+                self._path = path
+                self._baseline = _baseline_signature(path)
+                self._parsed_sig = _NEVER_PARSED
+                self._parsed = None
+                return snapshot
+
+            try:
+                sig = _stat_signature(path)
+            except OSError:
+                return self._hold_last_known_good(path, snapshot)
+
+            if sig == self._baseline:
+                return snapshot
+            if sig == self._parsed_sig:
+                return self._parsed
+
+            if sig is None:
+                value: Optional[str] = None  # deleted: the feature is off, honestly
+            else:
+                try:
+                    value = read_env_file_secret(MCP_TOKEN_ENV, path=path)
+                except FileNotFoundError:
+                    value = None  # raced with a delete; absence is unambiguous
+                except Exception:  # noqa: BLE001 - a bad secrets file must never 500 /mcp
+                    return self._hold_last_known_good(path, snapshot)
+
+            self._read_failed = False
+            self._parsed_sig, self._parsed = sig, value
+            return value
+
+    def _hold_last_known_good(self, path: Path, snapshot: Optional[str]) -> Optional[str]:
+        """Answer an unreadable file with the last value we trusted. Lock held.
+
+        Neither the cache nor the signature is updated, so the next request tries
+        again and a transient failure heals itself. Logged once per failure run,
+        because this is on a request path a client may hit every few seconds.
+        """
+        if not self._read_failed:
+            self._read_failed = True
+            _log.warning(
+                "remote MCP: cannot re-read %s; keeping the last known-good %s "
+                "until it is readable again",
+                path,
+                MCP_TOKEN_ENV,
+                exc_info=True,
+            )
+        return self._parsed if self._parsed_sig is not _NEVER_PARSED else snapshot
+
+
 class McpEndpoint:
     """The ASGI app behind ``/mcp``: the gate, then the SDK's transport.
 
     Holds the app rather than a snapshot of its settings so the token is read
-    **live** off ``app.state.settings`` on every request, matching how
+    **live** on every request, matching how
     :class:`netadmin.server.auth.ApiTokenAuthMiddleware` reads the API token: a
-    rotated token takes effect without a restart, and so does removing one.
+    rotated token takes effect without a restart, and so does removing one. Live
+    means live for an *external* rotation too, not just one performed in this
+    process -- see :class:`LiveMcpToken`.
     """
 
     def __init__(
@@ -157,12 +356,12 @@ class McpEndpoint:
         self._app = app
         self._auth_window_s = auth_window_s
         self._failures = FixedWindowRateLimiter(auth_max, auth_window_s, now_fn=now_fn)
+        self._live_token = LiveMcpToken(app)
 
     @property
     def token(self) -> Optional[str]:
-        """The configured MCP token, or ``None`` when the feature is off."""
-        settings = getattr(self._app.state, "settings", None)
-        return getattr(settings, "mcp_token", None) if settings is not None else None
+        """The MCP token to enforce, or ``None`` when the feature is off."""
+        return self._live_token.read()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":  # pragma: no cover - Route only dispatches http
@@ -243,10 +442,11 @@ def install_mcp_route(app: Any) -> None:
     """Register ``/mcp`` on ``app``. Always registered; the endpoint decides.
 
     Registered unconditionally rather than only when a token is set, for two
-    reasons. The posture is read live, so a token added to ``data/secrets.env``
-    and picked up by a settings reload must not need a different route table. And
-    an unregistered path would fall through to the SPA catch-all, which answers
-    ``GET /mcp`` with ``index.html`` and a 200 -- a far worse answer than 404.
+    reasons. The posture is read live (:class:`LiveMcpToken`), so a token added
+    to or rotated in ``data/secrets.env`` after boot must not need a different
+    route table. And an unregistered path would fall through to the SPA
+    catch-all, which answers ``GET /mcp`` with ``index.html`` and a 200 -- a far
+    worse answer than 404.
 
     Must be called before :func:`netadmin.server.main._mount_spa`, which appends
     that catch-all: Starlette matches routes in registration order.
@@ -274,8 +474,13 @@ async def start_mcp(app: Any) -> None:
     settings = app.state.settings
 
     if settings.mcp_token is None:
+        # Recorded, not just logged: the gate reads its token live, so a token
+        # written to secrets.env after boot starts authenticating immediately --
+        # and would otherwise land on the generic "not running" 503, which reads
+        # like the SDK is missing. This one says the actual remedy.
+        state.unavailable = NOT_ENABLED_AT_BOOT_DETAIL
         _log.info(
-            "remote MCP: disabled (no NETADMIN_MCP_TOKEN configured); %s returns 404", MCP_PATH
+            "remote MCP: disabled (no %s configured); %s returns 404", MCP_TOKEN_ENV, MCP_PATH
         )
         return
 

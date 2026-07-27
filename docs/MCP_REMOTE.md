@@ -19,10 +19,19 @@ pip install "unifioptimizer[mcp]"    # the daemon needs the extra too, not just 
 netadmin mcp-token --regenerate      # mints a token, writes NETADMIN_MCP_TOKEN to data/secrets.env
 ```
 
-Restart the daemon so it picks up the new token, then note its URL:
+Restart the daemon so it mounts the endpoint, then note its URL:
 `http://<daemon-host>:8765/mcp` (8765 is the default port; adjust if you run
 the daemon on a different one). Everything below plugs a client into that URL
 with the token in an `Authorization: Bearer` header.
+
+That restart is only for the first token. Once the endpoint is mounted, a
+later `netadmin mcp-token --regenerate` applies on the daemon's next `/mcp`
+request: the old token starts getting 401s immediately, without a restart and
+without the daemon rereading anything else it was configured with. Deleting the
+`NETADMIN_MCP_TOKEN` line takes effect the same way, and turns `/mcp` back into
+a 404. The one exception is a `NETADMIN_MCP_TOKEN` exported into the daemon's
+environment (containers, systemd units): that wins over `data/secrets.env`, as
+it does at startup, so rotate it wherever the deployment sets it.
 
 `netadmin mcp-token` with no flag prints the current token without minting a
 new one, if you need it again later.
@@ -38,11 +47,10 @@ device rotating it would silently break every client you have set up.
 Or skip the CLI: the web UI's Settings page has a "Remote MCP token" section
 beside the access token, with Reveal and Regenerate buttons and a ready-to-copy
 `claude mcp add` command for whatever token is currently on screen. Rotating
-there takes effect immediately if remote MCP is already running, no restart --
-only turning it on for the first time (going from no token at boot to one)
-still needs a restart, the same as the CLI path above. The same rule applies
-there: a browser on the daemon host can reveal and rotate freely, and one on
-another machine is asked for the API token first.
+there behaves exactly like the CLI: immediate if remote MCP is already running,
+and only turning it on for the first time needs the restart. The same access
+rule applies there too: a browser on the daemon host can reveal and rotate
+freely, and one on another machine is asked for the API token first.
 
 If you put the daemon behind a reverse proxy, set `NETADMIN_TRUST_PROXY=1` so
 the rate limiter reads `X-Forwarded-For` instead of bucketing every client
@@ -149,10 +157,10 @@ speaks streamable HTTP, not SSE. Restart Claude Desktop after saving.
 | Symptom | Cause | Fix |
 |---|---|---|
 | Connection refused | The daemon is not listening there: either it is stopped, or its port is bound to loopback only (the Docker Compose default). | Check `netadmin status` or `docker compose logs` on the daemon host. If the port is loopback-bound, tunnel it: `ssh -L 8765:localhost:8765 <daemon-host>`, then point the client at `http://localhost:8765/mcp`. If the daemon really is down, only the stdio server still answers, because it opens the database file directly and does not need the daemon process running at all. |
-| `401 Unauthorized` | The bearer token does not match `NETADMIN_MCP_TOKEN`, or no `Authorization` header was sent. | Run `netadmin mcp-token` on the daemon host to confirm the current value, and check the header for a stray space or an old token still cached in a client config. |
+| `401 Unauthorized` | The bearer token does not match `NETADMIN_MCP_TOKEN`, or no `Authorization` header was sent. A token that worked until a moment ago means someone rotated it; the daemon stops accepting the old one on the next request, restart or no restart. | Run `netadmin mcp-token` on the daemon host to confirm the current value, and check the header for a stray space or an old token still cached in a client config. |
 | `404 Not Found` | No `NETADMIN_MCP_TOKEN` is configured, so `/mcp` is not mounted at all. | Run `netadmin mcp-token --regenerate` on the daemon host and restart it. |
 | `429 Too Many Requests` | More than 10 failed auth attempts from this client in 60 seconds. | Wait out the `Retry-After` window, then fix the token before retrying. |
-| `503 Service Unavailable` | The token is right, but the daemon host does not have the `mcp` extra installed. | `pip install "unifioptimizer[mcp]"` on the daemon host, then restart it. |
+| `503 Service Unavailable` | The token is right, but the mount is not serving: either the daemon host does not have the `mcp` extra installed, or the token was added after the daemon started, so the endpoint was never mounted. The response body says which. | `pip install "unifioptimizer[mcp]"` on the daemon host if that is what it names, then restart it. Either way this one needs the restart. |
 
 ## Not supported: phones and claude.ai
 

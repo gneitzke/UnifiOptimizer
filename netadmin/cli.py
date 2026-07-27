@@ -249,14 +249,22 @@ def _cmd_mcp_token(args: argparse.Namespace) -> int:
     from a privacy problem into network control. No running daemon is required;
     like ``netadmin token``, this reads/writes ``data/secrets.env`` directly.
 
-    This step is settings-only: no ``/mcp`` endpoint reads this token yet, so
-    minting one here does not change what the daemon serves.
-
     ``--regenerate`` mints a fresh ``token_urlsafe(32)``, persists it to
     ``data/secrets.env`` via :func:`write_secrets` (atomic, chmod 600, every other
     key preserved), and prints it once; minting always succeeds (exit 0). Without
     ``--regenerate``, exit codes: 0 with the token printed on stdout, 1 (a message
     on stderr) when no token is configured yet.
+
+    A rotation performed here reaches a **running** daemon: its ``/mcp`` gate
+    reads the token out of ``data/secrets.env`` per request rather than from its
+    startup snapshot, so the superseded token is refused on its next use with no
+    restart (:class:`netadmin.server.mcp_mount.LiveMcpToken`, Gitea #35). Two
+    caveats worth knowing before relying on that. Minting the *first* token for a
+    daemon that booted without one still needs a restart -- the mount itself is
+    what has to start, and until it does an authenticated caller gets a 503 saying
+    so. And an exported ``NETADMIN_MCP_TOKEN`` outranks the file everywhere,
+    including here: writing ``data/secrets.env`` will not change what such a
+    daemon enforces.
     """
     if args.regenerate:
         new_token = token_urlsafe(_MCP_TOKEN_BYTES)

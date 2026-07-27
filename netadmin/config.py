@@ -14,6 +14,7 @@ is instantiated at import time; call :func:`get_settings`.
 
 from __future__ import annotations
 
+import io
 import os
 import tempfile
 from functools import lru_cache
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Any, Literal, Mapping
 
 import yaml
+from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
@@ -756,6 +758,76 @@ def write_secrets(updates: Mapping[str, str], *, path: Path = SECRETS_ENV) -> Pa
     return path
 
 
+# --------------------------------------------------------------------------- #
+# secrets.env reader — the writer's counterpart, for ONE key (Gitea #35)
+# --------------------------------------------------------------------------- #
+# A :class:`Settings` instance is a *snapshot*: pydantic-settings reads
+# ``env_file`` once, at construction. A long-running daemon therefore keeps
+# enforcing whatever ``secrets.env`` said at boot, even after another process
+# rewrites it — ``netadmin mcp-token --regenerate``, an operator with an editor,
+# a config-management tool. For a credential that is *rotated*, that is a
+# security defect and not a papercut: the previous value goes on working until
+# the next restart, which is the one thing rotation exists to prevent.
+#
+# These two helpers are what lets a running process re-evaluate ONE key without
+# rebuilding Settings (which would swap live controller credentials, the database
+# path and the log destination mid-flight). They deliberately reproduce the
+# loader's own rules rather than inventing parallel ones:
+#
+#   * ``model_config`` sets ``case_sensitive=False``, so both the environment
+#     source and the dotenv source lowercase keys before matching a field. Both
+#     lookups below are case-insensitive for exactly that reason.
+#   * The environment source outranks the dotenv source, and ``env_ignore_empty``
+#     is off, so a variable exported as the empty string still beats the file.
+#     :func:`env_var_is_set` therefore tests *presence*, never truthiness:
+#     whoever exports the variable — a container, a systemd unit — owns that
+#     value, and an edit to ``secrets.env`` must not silently override the
+#     deployment's own configuration.
+#   * The file is parsed with python-dotenv, the very parser
+#     ``DotEnvSettingsSource`` uses (and a hard dependency of pydantic-settings,
+#     so this adds nothing to the install), so quoting, escaping and ``export``
+#     prefixes round-trip exactly the way :func:`write_secrets` intends.
+
+
+def env_var_is_set(name: str) -> bool:
+    """Whether the real process environment defines ``name`` (case-insensitively).
+
+    "Set to the empty string" counts as set, matching the loader: an exported
+    variable outranks ``secrets.env`` whatever its value.
+    """
+    if name in os.environ:
+        return True
+    wanted = name.lower()
+    return any(key.lower() == wanted for key in os.environ)
+
+
+def read_env_file_secret(name: str, *, path: Path = SECRETS_ENV) -> str | None:
+    """Read ONE key back out of a ``secrets.env``-style file, as the loader would.
+
+    Returns the value, or ``None`` when the file does not define the key (or
+    defines it blank — whitespace-only is treated as unset, mirroring
+    :attr:`Settings.api_token` / :attr:`Settings.mcp_token`, so a stray blank line
+    never arms an unusable credential).
+
+    Raises whatever the filesystem raises: ``FileNotFoundError`` when the file is
+    gone, ``OSError``/``UnicodeDecodeError`` when it cannot be read or decoded.
+    Absence and unreadability are genuinely different answers — one is a
+    deliberate state, the other is a malfunction — so this function never
+    collapses them into ``None``; the caller decides what each one means.
+    """
+    text = Path(path).read_text(encoding="utf-8")
+    # Parsed from the text we read ourselves rather than by path, so the IO error
+    # surfaces here instead of being swallowed by dotenv's own missing-file
+    # handling, and so a caller can tell "no such file" from "cannot read it".
+    values = dotenv_values(stream=io.StringIO(text))
+    wanted = name.lower()
+    for key, value in values.items():
+        if key is not None and key.lower() == wanted:
+            value = value.strip() if value else None
+            return value or None
+    return None
+
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     """Return the process-wide Settings singleton (cached)."""
@@ -789,5 +861,7 @@ __all__ = [
     "Settings",
     "get_settings",
     "write_secrets",
+    "read_env_file_secret",
+    "env_var_is_set",
     "SecretValueError",
 ]

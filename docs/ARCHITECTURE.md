@@ -960,10 +960,13 @@ already gets.
 **Rotation takes effect immediately, no restart — with one honest caveat.**
 `regenerate_mcp_token` writes the new value to `secrets.env` (atomic, chmod
 600, every other key preserved, same as the access-token path) and mutates the
-live `Settings` object in place. `McpEndpoint.token` (the `/mcp` gate) reads
-`settings.mcp_token` fresh on every request, so an **already-running** mount
-refuses the old token and accepts the new one on its very next call, in the
-same process, no restart. That immediacy is specific to *rotating* a mount
+live `Settings` object in place. `McpEndpoint.token` (the `/mcp` gate) resolves
+the token fresh on every request — from the live `Settings` object *and*, when
+the environment does not own the variable, from `secrets.env` itself, so a
+rotation performed by another process lands too (`LiveMcpToken`, Gitea #35;
+see §18.5) — so an **already-running** mount refuses the old token and accepts
+the new one on its very next call, in the same process, no restart. That
+immediacy is specific to *rotating* a mount
 that is already up: `netadmin/server/mcp_mount.py`'s session manager is built
 exactly once, in the daemon lifespan, and only when `settings.mcp_token` was
 already set at boot. So minting the **first** token for a daemon that started
@@ -982,6 +985,55 @@ actually issued.
 **Not changed:** `netadmin mcp-token` (CLI), the `/mcp` mount itself, or
 `NETADMIN_MCP_REDACT`. This step is the Settings-side counterpart to the CLI
 path added in §18.2, nothing more.
+
+### 18.5 Rotation from outside the process (Gitea #35)
+
+§18.4's immediacy was real but narrow: it worked because the Settings route
+mutates the live `Settings` object *in this process*. `netadmin mcp-token
+--regenerate` runs in a **second** process, and `Settings` is a snapshot taken
+once at startup, so a running daemon kept accepting the token that had just
+been rotated away — reproduced on the live deployment, where the old token
+still answered 200 while a garbage one answered 401. Rotation exists to stop
+the previous value working, so that is a security defect, not a papercut.
+
+`LiveMcpToken` (`netadmin/server/mcp_mount.py`) is the fix: the gate resolves
+its token per request instead of enforcing the boot snapshot. Four decisions
+carry it.
+
+**Precedence is preserved, not replaced.** A `NETADMIN_MCP_TOKEN` exported into
+the real environment still wins and the file is not consulted at all — that is
+how containers and systemd units configure this, and an edit to `secrets.env`
+must not silently take over a credential the deployment believes it owns. When
+the environment does not own it, the question asked is *"has `secrets.env`
+moved since this process started watching it?"*, never *"what does the file
+say?"*. While it has not moved, whatever the loader resolved at boot stands,
+which is what keeps init kwargs and an in-process rotation authoritative.
+Once it has moved, the file is the answer — including "the key is gone" and
+"the file is gone", which return `/mcp` to 404 rather than leaving it armed.
+
+**Only this one key is re-read.** Rebuilding `Settings` would swap live
+controller credentials, the database path and the log destination out from
+under a running daemon to fix an auth bug. `read_env_file_secret` (in
+`config.py`, beside `write_secrets`) reads one key with python-dotenv, the same
+parser the settings loader uses, so quoting and `export` prefixes round-trip
+identically.
+
+**The check is one `os.stat`.** Re-parsing is gated on `(mtime_ns, size, inode,
+device)` — all four, because a rotated token is always the same length and
+`write_secrets` publishes through `os.replace`, which always lands on a new
+inode. The steady state parses nothing.
+
+**An unreadable file holds the last known-good value** and logs once, rather
+than treating a malfunction as "unset": dropping the token would 401 every
+correctly-configured client at once, while holding a value that authenticated a
+moment ago loosens nothing. A file that is *absent* is different — that is an
+unambiguous decision, and it disarms the mount.
+
+**Still a restart:** enabling the feature. `start_mcp` builds the read-only
+store handle and session manager once, in the lifespan, so a token added after
+boot now authenticates and then gets a 503 that names the restart
+(`NOT_ENABLED_AT_BOOT_DETAIL`) instead of the generic "not running", which read
+like a missing SDK.
 
 ## 19. Report export (feature)
 

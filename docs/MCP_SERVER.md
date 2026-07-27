@@ -184,12 +184,12 @@ token currently on screen. Reveal/regenerate there are gated exactly like the
 access token's own reveal/regenerate (bearer-or-loopback reveal, gated +
 rate-limited regenerate) -- using the *access* token, never the MCP token
 itself, since a credential must not authorize its own rotation. Rotating an
-**already-running** mount this way takes effect immediately, no restart:
-`GET /api/system/mcp-token` and `POST /api/system/mcp-token/regenerate` write
-to `secrets.env` exactly like the CLI, but also update the live `Settings`
-object the mount reads per request. Minting the *first* token for a mount that
-was never started still needs one restart either way, CLI or Settings --
-`start_mcp` only runs once, at daemon boot.
+**already-running** mount takes effect immediately from either path, no
+restart: both write `secrets.env`, and the gate reads the token from that file
+per request rather than from the daemon's startup snapshot, so the superseded
+value is refused on its next use (Gitea #35). Minting the *first* token for a
+mount that was never started still needs one restart either way, CLI or
+Settings -- `start_mcp` only runs once, at daemon boot.
 
 Unset, `/mcp` answers 404 and the daemon logs that remote MCP is disabled.
 [`MCP_REMOTE.md`](MCP_REMOTE.md) covers every client this ships against
