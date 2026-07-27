@@ -106,7 +106,7 @@ export function ScopeSection({
           )}
         </Block>
 
-        <Block title="Limitations">
+        <Block title="Limitations" keep>
           {scope.limitations.length === 0 ? (
             <NoData label="No limitations recorded." reason="Absence here is unusual. Treat scope as complete only if the collection window covered normal use." />
           ) : (
@@ -118,9 +118,21 @@ export function ScopeSection({
   );
 }
 
-function Block({ title, children }: { title: string; children: React.ReactNode }) {
+function Block({
+  title,
+  children,
+  keep,
+}: {
+  title: string;
+  children: React.ReactNode;
+  /** Print-only: keep this block whole rather than letting it split mid-list and
+   *  strand its tail on an otherwise-empty page (Gitea #27) — only for a block
+   *  short enough to always move as one unit, unlike the longer data tables in
+   *  this section, which are fine to flow with their own per-row atomicity. */
+  keep?: boolean;
+}) {
   return (
-    <div>
+    <div className={keep ? 'report-keep' : undefined}>
       <h3 className="t-label mb-2" style={{ color: 'var(--fg-muted)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
         {title}
       </h3>

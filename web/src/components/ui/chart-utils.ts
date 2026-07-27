@@ -247,6 +247,19 @@ export function clockLabelSec(ts: number): string {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
+/** Full local date + time + zone for an "as of" stamp on a PRINTED artefact — a
+ *  time with no date or zone is unusable once it's on paper, where "today" and
+ *  "here" can no longer be inferred from the screen it's read on (store is UTC;
+ *  display local, per file convention). */
+export function clockLabelFull(ts: number): string {
+  const d = new Date(ts * 1000);
+  const date = d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+  const zone = new Intl.DateTimeFormat(undefined, { timeZoneName: 'short' })
+    .formatToParts(d)
+    .find((p) => p.type === 'timeZoneName')?.value;
+  return zone ? `${date}, ${clockLabelSec(ts)} ${zone}` : `${date}, ${clockLabelSec(ts)}`;
+}
+
 /** Nearest point index to a pixel x, for scrub selection. */
 export function nearestIndex(points: ChartPoint[], x: Scale, px: number): number {
   let best = 0;

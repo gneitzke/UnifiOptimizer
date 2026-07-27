@@ -23,12 +23,15 @@ const NODE_W = 128; // preferred (max) box width — unchanged from the original
 const NODE_H = 46;
 const MIN_NODE_W = 84; // floor before a row wraps rather than shrinking further
 const GAP_MIN = 14; // minimum horizontal gap between boxes, and their side margin
-// Gap sized so the full internet→gateway→switch→AP→mesh→client stack (now six
-// rows, with a dedicated mesh layer) still fits on one printed page under its
-// section header, rather than the diagram spilling to a fresh page and stranding
-// the header on an otherwise empty one.
-const LAYER_GAP = 60;
-const ROW_GAP = 16; // vertical gap between a layer's own wrapped rows
+// Gap sized so the full internet→gateway→switch→AP→mesh→client stack (six
+// layers, with a dedicated mesh layer, PLUS a wrapped second AP row on a
+// crowded site) still fits on one printed page under its section header
+// (Section's `keepHeadingWithContent`), rather than the diagram spilling to a
+// fresh page and stranding the header on an otherwise empty one (Gitea #27). A
+// fleet large enough to need a THIRD wrapped row will still outgrow one page —
+// an honest overflow onto its own page beats a cramped, illegible diagram.
+const LAYER_GAP = 40;
+const ROW_GAP = 12; // vertical gap between a layer's own wrapped rows
 // Real sites run well past 8 APs; wrapping (not truncation) is now how a crowded
 // layer stays legible, so this is a safety valve for pathological input, not the
 // everyday ceiling it used to be.
@@ -110,6 +113,10 @@ export function TopologyDiagram({ topology, className }: Props) {
     });
   });
   const height = Math.max(120, cursorY + NODE_H / 2 + 24);
+  const hasMesh =
+    topology.links.some((l) => l.kind === 'mesh') ||
+    topology.layers.some((l) => l.nodes.some((n) => n.mesh_uplink));
+  const hasBadges = topology.layers.some((l) => l.nodes.some((n) => n.badge));
 
   return (
     <div ref={ref} className={className}>
@@ -130,8 +137,12 @@ export function TopologyDiagram({ topology, className }: Props) {
           const color = mesh ? BAND_COLOR[link.health ?? 'none'] : 'var(--hairline)';
           const mx = (a.x + b.x) / 2;
           const my = (a.y + b.y) / 2;
+          // The legend promises every mesh link is "coloured by health, labelled
+          // with RSSI" (Gitea #27) — an honest "RSSI n/a" keeps that true even
+          // when the controller didn't report a reading, instead of silently
+          // dropping the label and breaking the promise for that one edge.
           const label =
-            link.label ?? (link.rssi != null ? `${link.rssi} dBm` : null);
+            link.label ?? (link.rssi != null ? `${link.rssi} dBm` : 'RSSI n/a');
           return (
             <Fragment key={i}>
               <line
@@ -143,7 +154,7 @@ export function TopologyDiagram({ topology, className }: Props) {
                 strokeWidth={mesh ? 1.5 : 1}
                 strokeDasharray={mesh ? '5 3' : undefined}
               />
-              {mesh && label && (
+              {mesh && (
                 <text
                   x={mx + 6}
                   y={my}
@@ -178,18 +189,16 @@ export function TopologyDiagram({ topology, className }: Props) {
                 strokeDasharray="5 3"
               />
               <circle cx={x} cy={top - MESH_STUB} r={2.5} fill={color} />
-              {node.mesh_uplink.rssi != null && (
-                <text
-                  x={x + 6}
-                  y={top - MESH_STUB / 2}
-                  dominantBaseline="middle"
-                  className="tnum"
-                  fontSize={10}
-                  fill={color}
-                >
-                  {node.mesh_uplink.rssi} dBm
-                </text>
-              )}
+              <text
+                x={x + 6}
+                y={top - MESH_STUB / 2}
+                dominantBaseline="middle"
+                className="tnum"
+                fontSize={10}
+                fill={color}
+              >
+                {node.mesh_uplink.rssi != null ? `${node.mesh_uplink.rssi} dBm` : 'RSSI n/a'}
+              </text>
             </g>
           );
         })}
@@ -227,17 +236,24 @@ export function TopologyDiagram({ topology, className }: Props) {
         ))}
       </svg>
 
-      {(topology.links.some((l) => l.kind === 'mesh') ||
-        topology.layers.some((l) => l.nodes.some((n) => n.mesh_uplink))) && (
+      {(hasMesh || hasBadges) && (
         <div className="flex flex-wrap items-center gap-4 mt-2 t-caption" style={{ color: 'var(--fg-muted)' }}>
-          <span className="inline-flex items-center gap-1.5">
-            <span aria-hidden className="inline-block w-5 border-t" style={{ borderColor: 'var(--hairline)' }} />
-            Wired
-          </span>
-          <span className="inline-flex items-center gap-1.5">
-            <span aria-hidden className="inline-block w-5 border-t border-dashed" style={{ borderColor: BAND_COLOR.good }} />
-            Wireless mesh backhaul (coloured by health, labelled with RSSI; parent AP not always reported)
-          </span>
+          {hasMesh && (
+            <>
+              <span className="inline-flex items-center gap-1.5">
+                <span aria-hidden className="inline-block w-5 border-t" style={{ borderColor: 'var(--hairline)' }} />
+                Wired
+              </span>
+              <span className="inline-flex items-center gap-1.5">
+                <span aria-hidden className="inline-block w-5 border-t border-dashed" style={{ borderColor: BAND_COLOR.good }} />
+                Wireless mesh backhaul (coloured by health, labelled with RSSI; parent AP not always reported)
+              </span>
+            </>
+          )}
+          {/* The per-AP number is otherwise a bare digit with nothing saying what
+              it counts (Gitea #27) — one legend line covers every node at once
+              rather than repeating a unit on each small badge. */}
+          {hasBadges && <span className="inline-flex items-center gap-1.5">Number = connected clients</span>}
         </div>
       )}
     </div>

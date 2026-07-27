@@ -60,6 +60,17 @@
 }
 
 @media print {
+  /* `body` sits OUTSIDE `.report-root` and keeps its normal (possibly dark-theme)
+     `--canvas` background (src/index.css); on screen that's invisible because
+     `.report-root`'s own background covers the full viewport, but the printed
+     page box can run slightly past where `.report-root`'s content actually ends,
+     letting that unstyled background show through as a stray grey block on the
+     last page. Force it white here too so nothing outside the report's own
+     scope can leak a non-paper colour onto a printed page. */
+  body {
+    background: #ffffff;
+  }
+
   /* Force an exact-colour light "paper" theme, independent of the reader's screen
      theme, so severity chips, chart fills and band dots print as designed. */
   .report-root {

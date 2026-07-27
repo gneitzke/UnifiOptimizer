@@ -9,6 +9,7 @@ import {
   areaPaths,
   bandPaths,
   clockLabel,
+  clockLabelFull,
   clockLabelSec,
   dayLabel,
   dayTimeLabel,
@@ -81,6 +82,10 @@ interface Props {
    *  against the SERVER's fetch clock — kept out of render to stay pure/skew-free).
    *  Adds a "· stale" marker to the "as of" stamp. */
   stale?: boolean;
+  /** "time" (default, HH:MM:SS) suits an on-screen live view where "today" is
+   *  implicit. "full" adds the date and timezone — required once the chart can be
+   *  printed or saved (a bare time is unusable off-screen), e.g. the report. */
+  asOfFormat?: 'time' | 'full';
   takeaway?: string;
   /** Severity band — ONLY when the data itself is severity (threshold/anomaly). */
   band?: { from: number; to: number; color?: string; label?: string };
@@ -118,6 +123,7 @@ export function TimeSeriesChart({
   summaryStat,
   asOf,
   stale = false,
+  asOfFormat = 'time',
   takeaway,
   band,
   className,
@@ -193,7 +199,8 @@ export function TimeSeriesChart({
   // by the caller from the server's fetch clock) marks a line that just ends
   // because ingestion stalled, so it is never read as live (never-do rule 8).
   const isStale = stale && asOf != null;
-  const asOfLabel = asOf != null ? `as of ${clockLabelSec(asOf)}` : null;
+  const asOfLabel =
+    asOf != null ? `as of ${asOfFormat === 'full' ? clockLabelFull(asOf) : clockLabelSec(asOf)}` : null;
 
   // Fill and spread band only make sense against a real, meaningful baseline. A
   // dBm/level axis (no zero baseline, no fixed domain floor of meaning) must not

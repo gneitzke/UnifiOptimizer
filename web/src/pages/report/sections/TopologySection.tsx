@@ -21,6 +21,7 @@ export function TopologySection({
       title="Topology"
       site={site}
       lead="How traffic reaches clients, from the WAN through the gateway and switches to the access points and their mesh backhaul."
+      keepHeadingWithContent
     >
       {!hasNodes ? (
         <NoData label="Topology could not be reconstructed." reason="No uplink relationships were resolved for this site's devices." />

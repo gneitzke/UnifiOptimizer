@@ -377,6 +377,27 @@ def _impact_index(store: Repository, start: int, end: int) -> dict[int, dict[str
     return idx
 
 
+def _display_hours(hours: float) -> str:
+    """Client-hours rounded to a precision the window's minute-granularity data can
+    actually support: whole hours once a tenth of an hour (6 minutes) is noise
+    against an aggregate this size, one decimal place below that so a small-but-
+    real impact does not round away to zero."""
+    return str(round(hours)) if hours >= 10 else str(round(hours, 1))
+
+
+def _impact_prose(affected: int, fail_client_hours: float) -> str:
+    """The shared "N clients affected, about H client-hours degraded" sentence --
+    one source for both a finding's own Impact field and the executive summary's
+    plain-language recap, so the two can never drift into different roundings or
+    different units (Gitea #27: one used to say "client-hours of failed SLE
+    minutes", mashing two units in one phrase)."""
+    hours_text = _display_hours(fail_client_hours)
+    return (
+        f"{_plural(affected, 'client')} affected, about {hours_text} "
+        "client-hours degraded over the window."
+    )
+
+
 def _finding_impact(
     entity_ids: list[int], impact_index: dict[int, dict[str, Any]]
 ) -> FindingImpact:
@@ -392,10 +413,7 @@ def _finding_impact(
     fail_client_hours = round(minutes / 60.0, 1)
     affected = len(clients)
     if minutes > 0:
-        summary = (
-            f"{_plural(affected, 'client')} affected, {fail_client_hours} client-hours of "
-            "failed SLE minutes over the window."
-        )
+        summary = _impact_prose(affected, fail_client_hours)
     else:
         summary = "No failed SLE client-minutes are attributed to this finding over the window."
     return FindingImpact(
@@ -950,10 +968,7 @@ def _posture(health_score: Optional[int], counts: dict[str, int], total: int) ->
 
 def _top_plain(f: Finding) -> str:
     if f.impact.fail_minutes > 0 or f.impact.affected_clients > 0:
-        return (
-            f"{_plural(f.impact.affected_clients, 'client')} affected, about "
-            f"{f.impact.fail_client_hours} client-hours degraded over the window."
-        )
+        return _impact_prose(f.impact.affected_clients, f.impact.fail_client_hours)
     return "Confirmed issue with no measured client-minute impact over the window."
 
 

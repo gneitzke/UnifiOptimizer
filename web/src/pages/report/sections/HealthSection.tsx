@@ -19,14 +19,21 @@ export function HealthSection({
 }) {
   const trendPoints = health.trend.points;
   const hasTrend = trendPoints.some((p) => p.value != null && Number.isFinite(p.value));
+  // No area fill: the score sits in a narrow band well above zero, so filling all
+  // the way to the axis floor paints a large block of ink over an area with no
+  // data in it (docs/REPORT_SPEC.md data-ink rule; Gitea #27). The line alone
+  // carries the trend.
   const series: Series[] = [
-    { name: 'Network health', points: trendPoints, kind: 'line', fill: true },
+    { name: 'Network health', points: trendPoints, kind: 'line' },
   ];
 
+  // Bars stay the neutral accent colour, same restraint as the app's SLE blocks
+  // (SleHealthBlock): the band lives in the tile's coloured dot + word below, not
+  // painted onto identical data twice (Gitea #27 — report and app used to
+  // disagree here for the same scores).
   const sleBars: CategoryBar[] = health.sles.map((s) => ({
     label: s.label,
     value: s.score,
-    color: BAND_COLOR[s.band],
   }));
 
   return (
@@ -49,6 +56,7 @@ export function HealthSection({
               contextLabel="Overall network health"
               summaryStat={health.trend.summary_stat ?? undefined}
               asOf={health.trend.as_of}
+              asOfFormat="full"
               takeaway="0–100 score across the window; dips mark windows where service levels missed target."
             />
           ) : (
