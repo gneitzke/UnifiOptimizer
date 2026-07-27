@@ -440,8 +440,11 @@ _PLAYBOOKS: dict[str, Playbook] = {
         "client; corroborated by low rates and high retries.",
         confounders="No better AP in the client's history, so that is a coverage hole, a different "
         "issue, not a sticky client.",
-        fix_guidance="Tune min-RSSI or band steering to nudge the client off; review AP placement "
-        "if it clusters on one AP.",
+        fix_guidance="Enable 802.11k/v (UniFi calls it Roaming Assistant) so the client is handed "
+        "a neighbour list and asked to move; lower the far AP's TX power so it has a reason to. "
+        "Review AP placement if it clusters on one AP. Do NOT reach for min-RSSI: it "
+        "deauthenticates rather than steering, so the client drops and re-scans instead of "
+        "transitioning, which is worse for anything on a call.",
         evidence_fields=(
             EvidenceField("median_rssi", "RSSI (median)", "dBm"),
             EvidenceField("rssi", "RSSI", "dBm"),
@@ -482,8 +485,10 @@ _PLAYBOOKS: dict[str, Playbook] = {
         signature="Two APs, ≥ 4 roams ≤ 10 s apart (Meraki definition); stationary devices flagged "
         "at > 4-6/h (suspicious) and > 10-15/h (definite).",
         confounders="A genuinely mobile device walking a boundary between cells.",
-        fix_guidance="Add min-RSSI hysteresis, reduce overlapping-cell tx-power, and enable "
-        "sticky-client / roaming assistance.",
+        fix_guidance="Reduce overlapping-cell tx-power so the two cells stop trading places within "
+        "a few dB, and enable 802.11k/v (Roaming Assistant) so the transition is negotiated rather "
+        "than guessed. Min-RSSI is the wrong lever here: it has no hysteresis, it deauthenticates, "
+        "and a client that is already bouncing bounces harder when it is thrown off entirely.",
         evidence_fields=(
             EvidenceField("roams", "Roams in window"),
             EvidenceField("roams_per_hour", "Roam rate", "/h"),
