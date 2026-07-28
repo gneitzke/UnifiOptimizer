@@ -25,7 +25,7 @@ ENV NETADMIN_DATA_DIR=/data \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-ARG NETADMIN_VERSION=0.6.1
+ARG NETADMIN_VERSION=0.7.0
 
 # --no-cache keeps the wheel cache out of the layer. --only-binary=:all: is the
 # guard that matters on musl: it fails loudly if any dependency lacks a
