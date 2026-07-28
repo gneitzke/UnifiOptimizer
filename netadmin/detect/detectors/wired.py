@@ -850,6 +850,24 @@ class BroadcastStormDetector:
                     continue
                 baseline = max(band.p50, min_baseline)
                 if current > multiplier * baseline:
+                    # A port that is DOWN cannot storm: on combo uplinks (USW
+                    # Flex 2.5G port 9 RJ45 / port 10 SFP+) the controller
+                    # mirrors one uplink's counters onto both entries while only
+                    # one can link, so the dead half double-counts the live one
+                    # and a single chatty uplink reads as the "multiple ports
+                    # simultaneously" this detector requires. Only an explicit
+                    # down excludes -- unrecorded state is not evidence -- and
+                    # the skip is logged, because a P1 that stops firing with no
+                    # trace is the silence that hid the unshipped device KB.
+                    if _as_bool(ctx.repo.current_state(port.entity_id, "up")) is False:
+                        _log.info(
+                            "broadcast_storm: %s reads %.1fx its broadcast baseline "
+                            "but the link is down -- mirrored combo-uplink counters, "
+                            "not counted as a storming port",
+                            port.native_id,
+                            current / baseline,
+                        )
+                        continue
                     storming.append(
                         {
                             "port": port.native_id,
@@ -872,7 +890,12 @@ class BroadcastStormDetector:
                         "ports_storming": len(storming),
                         "detail": storming,
                     },
-                    ["coverage_gated", "baseline_relative", "multi_port_simultaneous"],
+                    [
+                        "coverage_gated",
+                        "baseline_relative",
+                        "multi_port_simultaneous",
+                        "link_up_checked",
+                    ],
                 )
             )
         return findings

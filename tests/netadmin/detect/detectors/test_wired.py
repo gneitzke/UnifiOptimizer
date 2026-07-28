@@ -1050,3 +1050,116 @@ def test_a_pattern_cannot_straddle_the_name_and_oui(repo: Repository) -> None:
     seed_counter(repo, pid, "rx_errors", step=0)
 
     assert len(BadCableDetector().evaluate(_ctx(repo))) == 1
+
+
+def test_broadcast_storm_ignores_a_down_ports_mirrored_counters(repo: Repository) -> None:
+    """A port that is DOWN cannot storm; its counters are somebody else's.
+
+    On the USW Flex 2.5G the 10GE RJ45 uplink (port 9) and the SFP+ cage
+    (port 10) are one combo uplink: the controller reports the SAME counters on
+    both entries while only one can link. Verified on a live site — 94% of
+    rx_broadcast samples byte-identical across the pair, port 10 ``up=False``
+    the whole time. Counting the mirror as a second storming port converts one
+    chatty uplink into a "multi-port simultaneous" P1, which is exactly the
+    single-host case the detector's own docstring promises to exclude.
+    """
+    full_coverage(repo)
+    sw = make_switch(repo)
+    baselines = StubBaselines()
+    up_port = make_port(repo, sw_id=sw, idx=9, up=True)
+    down_port = make_port(repo, sw_id=sw, idx=10, up=False)
+    for pid in (up_port, down_port):
+        sid = seed_counter(repo, pid, "rx_broadcast", step=1000)  # identical mirror
+        baselines.register(sid, band(p50=10.0))
+
+    assert BroadcastStormDetector().evaluate(_ctx(repo, baselines=baselines)) == []
+
+
+def test_broadcast_storm_still_fires_when_both_ports_are_up(repo: Repository) -> None:
+    """The companion guard: excluding down ports must not eat real storms."""
+    full_coverage(repo)
+    sw = make_switch(repo)
+    baselines = StubBaselines()
+    for idx in (1, 2):
+        pid = make_port(repo, sw_id=sw, idx=idx, up=True)
+        sid = seed_counter(repo, pid, "rx_broadcast", step=1000)
+        baselines.register(sid, band(p50=10.0))
+
+    findings = BroadcastStormDetector().evaluate(_ctx(repo, baselines=baselines))
+    assert len(findings) == 1
+    assert findings[0].evidence["ports_storming"] == 2
+
+
+def test_broadcast_storm_with_unknown_up_state_still_counts(repo: Repository) -> None:
+    """No recorded ``up`` state is not evidence of a down port; count it.
+
+    Only an explicit ``up=False`` excludes — a port polled before state tracking
+    began must not silently weaken the multi-port gate.
+    """
+    full_coverage(repo)
+    sw = make_switch(repo)
+    baselines = StubBaselines()
+    for idx in (1, 2):
+        pid = make_port(repo, sw_id=sw, idx=idx, up=None)  # nothing recorded
+        sid = seed_counter(repo, pid, "rx_broadcast", step=1000)
+        baselines.register(sid, band(p50=10.0))
+
+    findings = BroadcastStormDetector().evaluate(_ctx(repo, baselines=baselines))
+    assert len(findings) == 1
+
+
+def test_broadcast_storm_fires_on_remaining_up_ports_when_one_is_down(repo: Repository) -> None:
+    """Excluding a down port is per-port, not per-switch: the live ports still storm.
+
+    The down port comes FIRST in iteration order on purpose — an exclusion that
+    bailed out of the whole switch instead of skipping one port passes every
+    other test in this file, because their down port is last or alone.
+    """
+    full_coverage(repo)
+    sw = make_switch(repo)
+    baselines = StubBaselines()
+    for idx, up in ((1, False), (2, True), (3, True)):
+        pid = make_port(repo, sw_id=sw, idx=idx, up=up)
+        sid = seed_counter(repo, pid, "rx_broadcast", step=1000)
+        baselines.register(sid, band(p50=10.0))
+
+    findings = BroadcastStormDetector().evaluate(_ctx(repo, baselines=baselines))
+    assert len(findings) == 1
+    assert findings[0].evidence["ports_storming"] == 2
+    assert "link_up_checked" in findings[0].confounders_checked
+
+
+def test_broadcast_storm_says_why_a_down_port_was_not_counted(repo: Repository) -> None:
+    """The skip is logged, or a vanished P1 is undebuggable six months on.
+
+    The ``netadmin`` root logger sets propagate=False, so caplog (root-attached)
+    misses it; attach a handler to the module logger directly, the same
+    workaround as test_unauthenticated_startup_logs_warning.
+    """
+    import logging
+
+    messages: list[str] = []
+
+    class _Cap(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            messages.append(record.getMessage())
+
+    logger = logging.getLogger("netadmin.detect.wired")
+    handler = _Cap()
+    logger.addHandler(handler)
+    try:
+        full_coverage(repo)
+        sw = make_switch(repo)
+        baselines = StubBaselines()
+        up_port = make_port(repo, sw_id=sw, idx=9, up=True)
+        down_port = make_port(repo, sw_id=sw, idx=10, up=False)
+        for pid in (up_port, down_port):
+            sid = seed_counter(repo, pid, "rx_broadcast", step=1000)
+            baselines.register(sid, band(p50=10.0))
+        BroadcastStormDetector().evaluate(_ctx(repo, baselines=baselines))
+    finally:
+        logger.removeHandler(handler)
+
+    skips = [m for m in messages if "mirrored combo-uplink" in m]
+    assert len(skips) == 1, messages
+    assert "sw:1:10" in skips[0]
