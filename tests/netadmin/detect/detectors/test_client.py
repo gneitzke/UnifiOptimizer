@@ -314,27 +314,47 @@ def test_known_pathology_kb_path_override_is_honoured(repo: Repository, tmp_path
 
 
 def test_known_pathology_degrades_quietly_when_the_kb_is_missing(
-    repo: Repository, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    repo: Repository, tmp_path: Path
 ) -> None:
     """KB-empty must return no findings rather than raise -- but must SAY so.
 
     The iot_pmf_11r branch is driven entirely by the KB's known_2.4ghz_only list,
     so with no KB it goes quiet. That silence is the whole bug this commit fixes,
     so the warning is the early-warning system and is asserted, not assumed.
+
+    Captured with a handler attached to the module logger rather than ``caplog``:
+    ``netadmin/logging.py`` sets ``propagate = False`` on the ``netadmin`` root so
+    the package does not double-log, and ``caplog`` attaches to the *root* logger,
+    so it sees nothing once logging has been configured. Configuration happens on
+    first ``get_logger`` call, which makes a caplog-based assertion here pass or
+    fail on test ordering. Same workaround as
+    ``tests/netadmin/server/test_auth.py::test_unauthenticated_startup_logs_warning``.
     """
     _iot_client_with_disconnects(repo, mac="io:6", name="ESP32-sensor")
     missing = tmp_path / "absent.json"
 
-    settings = SimpleNamespace(
-        thresholds={KEY_KNOWN_PATHOLOGY: {"kb_path": str(missing)}}, poll=None
-    )
-    with caplog.at_level(logging.WARNING):
-        assert KnownPathologyDetector().evaluate(_ctx(repo, settings=settings)) == []
+    messages: list[str] = []
 
-    assert str(missing) in caplog.text
+    class _Cap(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            messages.append(record.getMessage())
+
+    logger = logging.getLogger("netadmin.detect.device_kb")
+    handler = _Cap()
+    logger.addHandler(handler)
+    try:
+        settings = SimpleNamespace(
+            thresholds={KEY_KNOWN_PATHOLOGY: {"kb_path": str(missing)}}, poll=None
+        )
+        assert KnownPathologyDetector().evaluate(_ctx(repo, settings=settings)) == []
+    finally:
+        logger.removeHandler(handler)
+
+    text = "\n".join(messages)
+    assert str(missing) in text
     # The remediation matters: a typo'd kb_path otherwise leaves no way to know
     # a working baseline exists.
-    assert "packaged baseline" in caplog.text
+    assert "packaged baseline" in text
 
 
 def test_known_pathology_retries_a_failed_kb_instead_of_caching_it(

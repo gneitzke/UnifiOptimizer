@@ -92,7 +92,24 @@ def load_kb(path: Optional[Union[str, Path]] = None) -> Optional[dict[str, Any]]
     try:
         with open(target, "r", encoding="utf-8") as fh:
             loaded = json.load(fh)
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
+        # Say so, once per path. Returning None silently is how a typo'd kb_path
+        # turns into a detector that quietly finds nothing forever: the
+        # known-pathology branch is driven entirely by this file, so an unreadable
+        # KB is indistinguishable from a healthy network. Name the packaged
+        # baseline in the same breath, because "there is a working default you are
+        # not using" is the actionable half.
+        key = f"failed:{target}"
+        if key not in _announced_paths:
+            _announced_paths.add(key)
+            _log.warning(
+                "device KB: cannot read %s (%s); known-pathology detection is "
+                "inert until this is fixed. Remove the kb_path override to fall "
+                "back to the packaged baseline at %s",
+                target,
+                exc,
+                PACKAGED_KB_PATH,
+            )
         return None
     if not isinstance(loaded, dict):
         return None
