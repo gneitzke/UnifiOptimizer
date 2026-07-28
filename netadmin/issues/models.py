@@ -42,6 +42,16 @@ class EventKind:
     INVESTIGATED = "investigated"
 
 
+# ``issue_events.detail["reason"]`` on the ``escalated`` row the engine writes
+# when a fire during RESOLVING snaps the issue back to ACTIVE and zeroes the
+# clear streak. It lives here, not as a literal in the engine, because a reader
+# matches on it: :meth:`netadmin.store.repository.Repository.
+# issue_streak_reset_counts` counts these rows (plus ``reopened``) to derive how
+# often an issue has come back. Two copies of the string would let a rename
+# silently turn every recurring issue into an ordinary one.
+REASON_REFIRE_DURING_RESOLVING = "refire_during_resolving"
+
+
 @dataclass
 class Issue:
     """One tracked issue. Mirrors a row of the ``issues`` table.
@@ -212,6 +222,7 @@ class IssueRepository(Protocol):
 
 __all__ = [
     "EventKind",
+    "REASON_REFIRE_DURING_RESOLVING",
     "Issue",
     "IssueEvent",
     "Transition",

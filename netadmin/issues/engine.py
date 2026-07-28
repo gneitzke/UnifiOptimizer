@@ -39,6 +39,7 @@ from netadmin.issues.inhibition import (
     InhibitionScope,
 )
 from netadmin.issues.models import (
+    REASON_REFIRE_DURING_RESOLVING,
     EngineConfig,
     EventKind,
     Issue,
@@ -334,10 +335,10 @@ class IssueEngine:
             now,
             IssueState.RESOLVING,
             IssueState.ACTIVE,
-            {"reason": "refire_during_resolving"},
+            {"reason": REASON_REFIRE_DURING_RESOLVING},
         )
         if armed:
-            self._mark_fix_failed(issue, now, transitions, reason="refire_during_resolving")
+            self._mark_fix_failed(issue, now, transitions, reason=REASON_REFIRE_DURING_RESOLVING)
 
     def _reopen(
         self,

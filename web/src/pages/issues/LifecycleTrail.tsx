@@ -98,6 +98,11 @@ function eventSummary(kind: string, detail: Record<string, unknown>): ReactNode 
       return 'Escalated.';
     }
     case 'resolving': {
+      // A departed client is not a clean check. Nothing was observed at all, so
+      // saying "clean" here would describe evidence that does not exist.
+      if (detail.reason === 'entity_absent') {
+        return 'The client left the network; clearing.';
+      }
       const k = typeof detail.k === 'number' ? detail.k : null;
       return k != null
         ? `Clean on the first check since it fired. Resolves once it stays clear through ${plural(k, 'consecutive check')}.`
@@ -140,6 +145,9 @@ function eventSummary(kind: string, detail: Record<string, unknown>): ReactNode 
       return reason ? `Fix failed: ${reason}.` : 'Fix failed.';
     }
     case 'resolved': {
+      if (detail.reason === 'entity_absent') {
+        return 'Resolved: the client left the network.';
+      }
       const n = typeof detail.clear_streak === 'number' ? detail.clear_streak : null;
       return n != null ? `Resolved after ${plural(n, 'clean check')}.` : 'Resolved.';
     }

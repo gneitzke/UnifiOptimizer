@@ -124,6 +124,58 @@ export function ongoingLabel(issue: IssueRow, nowSec: number): string {
   return issue.state === 'resolved' ? `lasted ${dur}` : `ongoing ${dur}`;
 }
 
+/* ---- Lifecycle legibility (Gitea #39) ------------------------------------
+ *
+ * "Resolving" on its own is a spinner with no end in sight, and an issue on its
+ * ninety-eighth bounce used to render exactly like one clearing for the first
+ * time. Both facts were already in the payload — `clear_streak` against the
+ * engine's `clear_k`, and a count of the trail rows that record every killed
+ * streak — so these two helpers turn them into the strings the list and the
+ * detail page share. One source, so the two surfaces cannot drift.
+ */
+
+/** "3 of 6 clean checks" while an issue is resolving, else null.
+ *
+ * Only for the resolving state: a `clear_streak` of 0 on an active issue is not
+ * progress towards anything, and a resolved one has already arrived. */
+export function clearProgressLabel(issue: IssueRow): string | null {
+  const k = issue.lifecycle?.clear_k;
+  if (issue.state !== 'resolving' || k == null || k <= 0) return null;
+  return `${issue.clear_streak} of ${k} clean checks`;
+}
+
+/** The full sentence behind that fraction — hover and screen-reader text. */
+export function clearProgressNote(issue: IssueRow): string | null {
+  const k = issue.lifecycle?.clear_k;
+  if (issue.state !== 'resolving' || k == null || k <= 0) return null;
+  const done = issue.clear_streak;
+  return `Clean on ${done} ${done === 1 ? 'check' : 'checks'} in a row since it last fired. It resolves at ${k} in a row; one more occurrence puts the count back to zero.`;
+}
+
+/** "12×" for a recurring issue, else null — the compact badge in the list. */
+export function recurrenceBadgeLabel(issue: IssueRow): string | null {
+  const lc = issue.lifecycle;
+  if (!lc?.recurring) return null;
+  return `${lc.streak_resets_7d}×`;
+}
+
+/** "came back 12 times this week" — the phrase the detail header appends. */
+export function recurrencePhrase(issue: IssueRow): string | null {
+  const lc = issue.lifecycle;
+  if (!lc?.recurring) return null;
+  const n = lc.streak_resets_7d;
+  return `came back ${n} ${n === 1 ? 'time' : 'times'} this week`;
+}
+
+/** Hover and screen-reader text for the recurrence badge: what was counted, and
+ *  why it is not the occurrence count sitting next to it. */
+export function recurrenceNote(issue: IssueRow): string | null {
+  const lc = issue.lifecycle;
+  if (!lc?.recurring) return null;
+  const n = lc.streak_resets_7d;
+  return `Recurring: it came back ${n} ${n === 1 ? 'time' : 'times'} in the last 7 days, each time resetting the count of clean checks. That is how often it returned, not how often it fired.`;
+}
+
 /* ---- Issue impact (the Issues list's Impact column, Gitea #24, #36) ------ */
 
 /** What the Impact column measures, as a sentence — the column header's hover

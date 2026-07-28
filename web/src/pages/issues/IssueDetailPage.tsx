@@ -11,10 +11,13 @@ import { RelativeTime } from '../../components/ui/RelativeTime';
 import { useWsFrames } from '../../api/WsProvider';
 import { EntityLink } from '../shared/EntityLink';
 import {
+  clearProgressLabel,
+  clearProgressNote,
   formatDurationLong,
   humanizeKey,
   impactDisplay,
   issueDurationSeconds,
+  recurrencePhrase,
 } from '../shared/format';
 import { ackIssue, getIssue, snoozeIssue } from '../shared/api';
 import { usePageAsync, useNowSeconds } from '../shared/hooks';
@@ -136,6 +139,7 @@ export function IssueDetailPage() {
   const snoozed = issue.snooze_until_ts != null && issue.snooze_until_ts > now;
   const hints = metricHintsForIssue(issue);
   const isOpen = issue.state !== 'resolved';
+  const recurrence = recurrencePhrase(issue);
 
   return (
     <div className="px-6 py-6 mx-auto flex flex-col gap-4" style={{ maxWidth: 1100 }}>
@@ -147,7 +151,14 @@ export function IssueDetailPage() {
           <div className="flex flex-col gap-2 min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
               <SeverityPill severity={issue.severity} />
-              <StatePill state={issue.state} severity={issue.severity} />
+              {/* Width is free here, so the pill carries the streak itself
+                  rather than a caption under it (Gitea #39). */}
+              <StatePill
+                state={issue.state}
+                severity={issue.severity}
+                progress={clearProgressLabel(issue)}
+                title={clearProgressNote(issue) ?? undefined}
+              />
               {issue.fix_state && (
                 <span
                   className="inline-flex items-center h-[20px] px-1.5 rounded-full text-[12px] font-medium"
@@ -166,6 +177,10 @@ export function IssueDetailPage() {
             >
               {issue.state === 'resolved' ? 'Lasted' : 'Ongoing'} {formatDurationLong(durSecs)}
               {issue.occurrences > 1 ? ` · ${issue.occurrences} occurrences` : ''}
+              {/* Two different numbers, and the difference is the point:
+                  occurrences counts every cycle this fired, recurrence counts
+                  the times it came back after starting to clear (Gitea #39). */}
+              {recurrence ? ` · ${recurrence}` : ''}
             </span>
             {/* Rendered only for a genuine incident (2+ members, Gitea #21) —
                 an incident-of-one has symptom_count 0, and showing a line

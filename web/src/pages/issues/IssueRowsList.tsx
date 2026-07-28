@@ -1,6 +1,6 @@
 import { useState, type RefCallback } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { ChevronDown, ChevronRight } from 'lucide-react';
+import { ChevronDown, ChevronRight, RotateCcw } from 'lucide-react';
 import { SeverityPill, SeverityGlyph } from '../../components/ui/SeverityPill';
 import { StatePill } from '../../components/ui/StatePill';
 import { RelativeTime } from '../../components/ui/RelativeTime';
@@ -9,9 +9,13 @@ import { EntityLink } from '../shared/EntityLink';
 import type { IssueRow } from '../shared/api';
 import {
   ISSUE_IMPACT_DEFINITION,
+  clearProgressLabel,
+  clearProgressNote,
   formatDuration,
   impactDisplay,
   ongoingLabel,
+  recurrenceBadgeLabel,
+  recurrenceNote,
 } from '../shared/format';
 import type { Severity } from '../../api/types';
 
@@ -57,7 +61,12 @@ export type DisplayRow = { kind: 'issue'; issue: IssueRow } | { kind: 'group'; g
 // count and its multiplier on one line ("12 clients · 1,204 min") rather than a
 // bare number; the width came off Duration, which never needed 140px for
 // "ongoing 12d 3h", so the table's minimum is unchanged.
-const COLS = '72px 100px minmax(272px,3fr) minmax(122px,1.15fr) 144px 116px 84px 96px';
+//
+// State is 116px so a resolving row can print its streak under the pill ("3 of
+// 6 clean checks", Gitea #39) on one line instead of wrapping. Those 16px came
+// off Entity's minimum, which only binds at the table's own minimum width where
+// that column truncates anyway — so MIN_TABLE_WIDTH is unchanged.
+const COLS = '72px 116px minmax(272px,3fr) minmax(106px,1.15fr) 144px 116px 84px 96px';
 /** Below this the columns would start crushing each other, so the list scrolls
  *  inside its own container rather than pushing the page sideways. Kept under
  *  1012px, which is what the page's own max-width leaves at a 1280px viewport:
@@ -197,6 +206,58 @@ function ImpactCell({ issue, now }: { issue: IssueRow; now: number }) {
   );
 }
 
+/**
+ * The state pill, plus how far a clearing issue has actually got (Gitea #39).
+ *
+ * "Resolving" on its own is a spinner: on a site where half the open rows sit
+ * there, it reads as stuck rather than as progress. The streak and its threshold
+ * were already in the payload, so the row prints them. The fraction sits under
+ * the pill rather than inside it because the pill has to stay narrow enough for
+ * the State column at the table's minimum width.
+ */
+function StateCell({ issue, severity }: { issue: IssueRow; severity?: Severity }) {
+  const tint = severity ?? issue.severity;
+  const progress = clearProgressLabel(issue);
+  const note = clearProgressNote(issue);
+  if (!progress) return <StatePill state={issue.state} severity={tint} />;
+  return (
+    <span className="relative flex flex-col items-start gap-0.5" title={note ?? undefined}>
+      <StatePill state={issue.state} severity={tint} />
+      <span aria-hidden className="t-micro whitespace-nowrap" style={{ color: 'var(--fg-subtle)' }}>
+        {progress}
+      </span>
+      <span className="sr-only">{note}</span>
+    </span>
+  );
+}
+
+/**
+ * The quiet marker that separates an issue clearing for the first time from one
+ * that has been round this loop all week (Gitea #39).
+ *
+ * The count is clear-streak resets — every time the condition came back and put
+ * the clean-check count to zero — not occurrences, which also climbs while an
+ * issue simply burns. Neutral fill, not a severity tint: how often something
+ * returns is not how bad it is, and the Sev pill two columns left already
+ * answers that.
+ */
+function RecurrenceBadge({ issue }: { issue: IssueRow }) {
+  const label = recurrenceBadgeLabel(issue);
+  const note = recurrenceNote(issue);
+  if (!label) return null;
+  return (
+    <span
+      className="relative inline-flex items-center gap-0.5 shrink-0 h-[18px] px-1.5 rounded-full t-micro"
+      style={{ background: 'var(--sev-neutral-fill)', color: 'var(--fg-muted)' }}
+      title={note ?? undefined}
+    >
+      <RotateCcw size={10} strokeWidth={2.5} aria-hidden />
+      <span aria-hidden>Recurring {label}</span>
+      <span className="sr-only">{note}</span>
+    </span>
+  );
+}
+
 interface RowActivationProps {
   rowRef: RefCallback<HTMLElement>;
   isActive: boolean;
@@ -228,9 +289,12 @@ function SoloIssueRow({
       }}
     >
       <SeverityPill severity={issue.severity} />
-      <StatePill state={issue.state} severity={issue.severity} />
-      <span className="t-body truncate pr-2" style={{ color: 'var(--fg)' }}>
-        {issue.title}
+      <StateCell issue={issue} />
+      <span className="flex items-center gap-2 min-w-0 pr-2">
+        <span className="t-body truncate" style={{ color: 'var(--fg)' }}>
+          {issue.title}
+        </span>
+        <RecurrenceBadge issue={issue} />
       </span>
       <EntityCell entity={issue.entity} />
       <ImpactCell issue={issue} now={now} />
@@ -274,10 +338,16 @@ function GroupRow({
         }}
       >
         <SeverityPill severity={group.severity} />
-        <StatePill state={group.root.state} severity={group.severity} />
+        {/* The group row speaks for its root everywhere else — state, entity,
+            age, impact — so its lifecycle line is the root's too. The pill keeps
+            the incident's severity tint, which is what it showed before. */}
+        <StateCell issue={group.root} severity={group.severity} />
         <div className="flex flex-col min-w-0 pr-2 gap-0.5">
-          <span className="t-body truncate font-medium" style={{ color: 'var(--fg)' }}>
-            {group.title}
+          <span className="flex items-center gap-2 min-w-0">
+            <span className="t-body truncate font-medium" style={{ color: 'var(--fg)' }}>
+              {group.title}
+            </span>
+            <RecurrenceBadge issue={group.root} />
           </span>
           <span className="t-caption truncate" style={{ color: 'var(--fg-muted)' }}>
             {group.summary}

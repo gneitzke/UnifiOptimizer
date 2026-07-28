@@ -38,6 +38,25 @@ export interface EntityRef {
 
 /* ---- Issues ------------------------------------------------------------- */
 
+/** What an issue's lifecycle position means, derived server-side (Gitea #39).
+ *
+ * Source of truth: `netadmin/server/routers/issues.py::_lifecycle`. Nothing here
+ * is stored on the issue row — `clear_k` comes from the live engine config and
+ * the reset count from the `issue_events` trail — so none of it is a lifecycle
+ * state, and no state machine change stands behind it. */
+export interface IssueLifecycle {
+  /** Consecutive clean checks that resolve this issue: the denominator for
+   * `clear_streak`. Without it "Resolving" is a spinner with no end in sight. */
+  clear_k: number;
+  /** Times the clear streak was killed in the last 7 days — a refire while
+   * resolving, or a reopen after resolving. Counted from event rows, never from
+   * `occurrences`, which also climbs while an issue burns steadily. */
+  streak_resets_7d: number;
+  /** `streak_resets_7d >= 2`. One bounce is the debounce working; two means the
+   * condition is genuinely oscillating. */
+  recurring: boolean;
+}
+
 export interface Issue {
   id: number;
   fingerprint: string;
@@ -59,6 +78,9 @@ export interface Issue {
   evidence: Record<string, unknown>;
   fix_state: FixState | null;
   reopened_from: number | null;
+  /** Optional so a UI ahead of its daemon degrades to a bare state pill rather
+   * than crashing on an older `/api/issues` payload. */
+  lifecycle?: IssueLifecycle | null;
 }
 
 export interface IssueEvent {

@@ -493,6 +493,103 @@ def test_delete_issue_removes_row_and_trail(repo: Repository, switch_entity_id: 
     assert repo.list_issue_events(iid) == []
 
 
+# ---------------------------------------------------------------------------
+# Clear-streak resets — the count behind the "Recurring" label (Gitea #39)
+# ---------------------------------------------------------------------------
+
+
+def _issue(repo: Repository, fingerprint: str, entity_id: int) -> int:
+    return repo.insert_issue(
+        fingerprint=fingerprint,
+        detector_key="wifi.sticky_client",
+        severity="p2",
+        state="active",
+        first_seen_ts=1_000,
+        last_seen_ts=2_000,
+        title="sticky client",
+        entity_id=entity_id,
+    )
+
+
+def test_streak_resets_count_only_refires_and_reopens(
+    repo: Repository, switch_entity_id: int
+) -> None:
+    iid = _issue(repo, "fp-flap", switch_entity_id)
+    # Counted: a refire that killed the clear streak, and a reopen.
+    repo.record_issue_event(
+        iid, "escalated", ts=1_100, detail={"reason": "refire_during_resolving"}
+    )
+    repo.record_issue_event(iid, "reopened", ts=1_200, detail={"reopened_from": iid})
+    # Not counted: the confirm escalation, the streak's own events, everything else.
+    repo.record_issue_event(iid, "escalated", ts=1_050, detail={"reason": "m_reached", "m": 3})
+    repo.record_issue_event(iid, "detected", ts=1_000, detail={"severity": "p2"})
+    repo.record_issue_event(iid, "resolving", ts=1_150, detail={"clear_streak": 1, "k": 6})
+    repo.record_issue_event(iid, "resolved", ts=1_180, detail={"clear_streak": 6})
+    repo.record_issue_event(
+        iid, "fix_failed", ts=1_190, detail={"reason": "refire_during_resolving"}
+    )
+
+    assert repo.issue_streak_reset_counts([iid], since_ts=0) == {iid: 2}
+
+
+def test_streak_resets_respect_the_window(repo: Repository, switch_entity_id: int) -> None:
+    iid = _issue(repo, "fp-old", switch_entity_id)
+    repo.record_issue_event(
+        iid, "escalated", ts=1_000, detail={"reason": "refire_during_resolving"}
+    )
+    repo.record_issue_event(
+        iid, "escalated", ts=5_000, detail={"reason": "refire_during_resolving"}
+    )
+
+    assert repo.issue_streak_reset_counts([iid], since_ts=0) == {iid: 2}
+    # Inclusive floor: an event exactly on the boundary is inside the window.
+    assert repo.issue_streak_reset_counts([iid], since_ts=5_000) == {iid: 1}
+    assert repo.issue_streak_reset_counts([iid], since_ts=5_001) == {}
+
+
+def test_streak_resets_batch_and_default_to_absent(repo: Repository, switch_entity_id: int) -> None:
+    flapping = _issue(repo, "fp-a", switch_entity_id)
+    steady = _issue(repo, "fp-b", switch_entity_id)
+    repo.record_issue_event(
+        flapping, "escalated", ts=1_100, detail={"reason": "refire_during_resolving"}
+    )
+    repo.record_issue_event(steady, "escalated", ts=1_100, detail={"reason": "m_reached"})
+
+    counts = repo.issue_streak_reset_counts([flapping, steady], since_ts=0)
+    # An issue with no resets is ABSENT, not zero -- callers default it.
+    assert counts == {flapping: 1}
+    assert repo.issue_streak_reset_counts([], since_ts=0) == {}
+
+
+def test_streak_resets_survive_a_malformed_detail_blob(
+    repo: Repository, switch_entity_id: int
+) -> None:
+    """One unreadable detail costs its own row, never the whole issues list."""
+    iid = _issue(repo, "fp-junk", switch_entity_id)
+    repo.record_issue_event(
+        iid, "escalated", ts=1_100, detail={"reason": "refire_during_resolving"}
+    )
+    with repo._write() as conn:  # noqa: SLF001 - forcing a shape no writer produces
+        conn.execute(
+            "INSERT INTO issue_events (issue_id, ts, kind, detail) VALUES (?,?,?,?)",
+            (iid, 1_200, "escalated", "not json at all"),
+        )
+
+    assert repo.issue_streak_reset_counts([iid], since_ts=0) == {iid: 1}
+
+
+def test_streak_resets_ignore_occurrences(repo: Repository, switch_entity_id: int) -> None:
+    """The signal is event rows, not the fire counter (Gitea #39).
+
+    A steadily-burning issue racks up occurrences without ever flapping; the
+    reset count is what says "this keeps coming back".
+    """
+    burning = _issue(repo, "fp-burning", switch_entity_id)
+    repo.update_issue(burning, occurrences=98)
+
+    assert repo.issue_streak_reset_counts([burning], since_ts=0) == {}
+
+
 def test_update_issue_rejects_unknown_column(repo: Repository) -> None:
     iid = repo.insert_issue(
         fingerprint="fp",

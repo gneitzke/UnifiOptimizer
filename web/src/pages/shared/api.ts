@@ -19,6 +19,7 @@ import { authHeaders, clearToken, getToken, promptForToken } from '../../api/tok
 import type {
   EntityType,
   FixState,
+  IssueLifecycle,
   IssueState,
   Severity,
 } from '../../api/types';
@@ -156,6 +157,10 @@ export interface IssueRow {
   /** Optional so a UI ahead of its daemon degrades to "not measured" rather
    * than crashing on an older `/api/issues` payload. */
   impact?: IssueImpact | null;
+  /** Clear threshold + recurrence, derived server-side (Gitea #39). Optional for
+   * the same reason `impact` is: an older daemon just omits it, and the list
+   * falls back to a bare state pill. */
+  lifecycle?: IssueLifecycle | null;
   /** Incident membership (section 17) — a join on the read model, so an issue's
    * own lifecycle is untouched. Null when the issue is in no open incident. */
   incident_id?: number | null;

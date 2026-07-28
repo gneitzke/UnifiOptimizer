@@ -53,6 +53,19 @@ _log = get_logger("server.routers.issues")
 # old the issue itself is.
 IMPACT_WINDOW_S = 86_400
 
+# How far back the recurrence count looks (Gitea #39). A week covers a site's
+# whole rhythm -- weekday and weekend, the evening peak, the one day someone
+# works from the far bedroom -- so a condition that only bites under one of those
+# still reads as recurring, while last month's flapping does not colour a row
+# that has been steady since.
+STREAK_RESET_WINDOW_S = 7 * 86_400
+
+# Clear-streak resets before an issue is called recurring. Two, not one: a single
+# bounce is the K-streak debounce doing its job, and calling that recurring would
+# put the label on almost every open row. Two means the streak has been killed
+# twice and the condition is genuinely oscillating.
+RECURRING_MIN_RESETS = 2
+
 
 def _engine(request: Request, store: Repository) -> IssueEngine:
     """The shared issue engine, or an ephemeral one bound to this store.
@@ -63,6 +76,11 @@ def _engine(request: Request, store: Repository) -> IssueEngine:
     the lifespan the engine is absent, so we bind a throwaway one to the same
     store — the mutation still writes ``issue_events`` correctly, just without a
     live socket to notify.
+
+    The read paths use it too, for one thing only: ``cfg.k_for`` — the clear
+    threshold an issue's ``clear_streak`` is counting towards. Reading it off the
+    live engine is what keeps the number the UI shows equal to the number the
+    state machine will actually act on, including any per-detector override.
     """
     engine = request.app.state.issue_engine
     if engine is not None:
@@ -84,6 +102,36 @@ def _event_dict(row: sqlite3.Row) -> dict[str, Any]:
     data = dict(row)
     data["detail"] = decode_json(data.get("detail"), {})
     return data
+
+
+def _lifecycle(row: sqlite3.Row, engine: IssueEngine, resets: dict[int, int]) -> dict[str, Any]:
+    """What the row's lifecycle position actually means, for the UI (Gitea #39).
+
+    Two facts the issues list could not previously show, both derived, neither
+    stored:
+
+    * ``clear_k`` — how many consecutive clean checks resolve this issue. The row
+      already carries ``clear_streak``; without its denominator "Resolving" is a
+      spinner with no end in sight, and half a list of them reads as stuck. Taken
+      from the live engine's config, so a per-detector ``detector_k`` override is
+      respected here for free rather than hard-coded to the default 6.
+    * ``streak_resets_7d`` / ``recurring`` — how many times the clear streak has
+      been killed in the last week, and whether that is enough to say so. This is
+      the fact that separates an issue clearing for the first time from one on
+      its ninety-eighth bounce, which until now rendered identically.
+
+    Deliberately **not** a lifecycle state: recurrence is an adjective on being
+    open, not a different place in the state machine, and every reset is already
+    written down in ``issue_events``. A state would duplicate that record and
+    could drift from it; a derived label also labels historical rows correctly
+    the moment it ships, with no backfill.
+    """
+    n = int(resets.get(int(row["id"]), 0))
+    return {
+        "clear_k": engine.cfg.k_for(row["detector_key"]),
+        "streak_resets_7d": n,
+        "recurring": n >= RECURRING_MIN_RESETS,
+    }
 
 
 def _impact_basis(ref: Optional[dict[str, Any]]) -> Optional[str]:
@@ -300,6 +348,10 @@ async def list_issues(
     or an explicit "not measured" (see :func:`_impact`). That block is the
     column the list is read by, so it is computed here rather than left to the
     client to guess at.
+
+    Each also carries a ``lifecycle`` block (see :func:`_lifecycle`): the clear
+    threshold its ``clear_streak`` is counting towards, and how often it has come
+    back this week.
     """
     store = get_store(request)
     rows = store.list_issues(
@@ -318,6 +370,10 @@ async def list_issues(
     )
     spans = store.sle_minutes_axis_spans(window_start, window_end)
     clients_in_window = store.sle_measured_client_count(window_start, window_end)
+    engine = _engine(request, store)
+    resets = store.issue_streak_reset_counts(
+        [r["id"] for r in rows], since_ts=window_end - STREAK_RESET_WINDOW_S
+    )
     issues = []
     for r in rows:
         item = _issue_dict(r)
@@ -326,6 +382,7 @@ async def list_issues(
         item["impact"] = _impact(
             r, item["entity"], impacts, spans, clients_in_window, window_start, window_end
         )
+        item["lifecycle"] = _lifecycle(r, engine, resets)
         inc = incidents.get(int(r["id"]))
         item["incident_id"] = int(inc["incident_id"]) if inc is not None else None
         item["incident_role"] = inc["incident_role"] if inc is not None else None
@@ -398,6 +455,11 @@ async def get_issue(request: Request, issue_id: int) -> dict[str, Any]:
         store.sle_measured_client_count(window_start, window_end),
         window_start,
         window_end,
+    )
+    issue["lifecycle"] = _lifecycle(
+        row,
+        _engine(request, store),
+        store.issue_streak_reset_counts([issue_id], since_ts=window_end - STREAK_RESET_WINDOW_S),
     )
     evidence_layout, confounder_notes = _presentation(issue["detector_key"], evidence, confounders)
     return {

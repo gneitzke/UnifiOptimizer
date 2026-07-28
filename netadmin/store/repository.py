@@ -40,6 +40,7 @@ from typing import Any, Iterable, Iterator, Optional, Sequence, Union
 
 from netadmin.domain.entities import Entity
 from netadmin.domain.types import EntityType
+from netadmin.issues.models import REASON_REFIRE_DURING_RESOLVING, EventKind
 from netadmin.store import db as _db
 from netadmin.store.metrics import MetricKind, metric_kind
 
@@ -1382,6 +1383,56 @@ class Repository:
         return self._conn.execute(
             "SELECT * FROM issue_events WHERE issue_id=? ORDER BY ts, id", (issue_id,)
         ).fetchall()
+
+    def issue_streak_reset_counts(
+        self, issue_ids: Iterable[int], *, since_ts: int
+    ) -> dict[int, int]:
+        """How many times each issue's clear streak was killed since ``since_ts``.
+
+        The number behind the "Recurring" label (Gitea #39). A clear streak dies
+        exactly two ways, and the engine writes both down as they happen:
+
+        * ``escalated`` with ``reason: refire_during_resolving`` — the issue was
+          clearing and fired again, so the streak went back to zero.
+        * ``reopened`` — it had already resolved and came back inside the reopen
+          window, onto the same row.
+
+        Counting those rows is the only honest measure of "this keeps coming
+        back". ``issues.occurrences`` is not: it increments on every fire cycle,
+        so an issue that burns steadily for a week racks up hundreds without ever
+        flapping, while a genuinely intermittent one can oscillate all week on a
+        modest count. The distinction is the whole point of the label, so the
+        query reads the event trail rather than the counter.
+
+        Returns ``{issue_id: count}`` for the issues that have any; ones with
+        none are absent, so callers default to 0. Issues are batched into one
+        grouped query — the issues list asks about every row it renders.
+
+        ``json_valid`` guards the extract: ``json_extract`` raises on malformed
+        JSON, and one bad ``detail`` blob (a hand-edited row, a future writer)
+        would otherwise take out the whole issues list rather than costing one
+        uncounted reset.
+        """
+        ids = [int(i) for i in dict.fromkeys(issue_ids)]
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            "SELECT issue_id, COUNT(*) AS n FROM issue_events "
+            f"WHERE issue_id IN ({placeholders}) AND ts >= ? "
+            "  AND (kind = ? "
+            "       OR (kind = ? AND json_valid(detail) "
+            "           AND json_extract(detail, '$.reason') = ?)) "
+            "GROUP BY issue_id",
+            (
+                *ids,
+                int(since_ts),
+                EventKind.REOPENED,
+                EventKind.ESCALATED,
+                REASON_REFIRE_DURING_RESOLVING,
+            ),
+        ).fetchall()
+        return {int(r["issue_id"]): int(r["n"]) for r in rows}
 
     # ------------------------------------------------------------------ #
     # Server-surface read helpers (name resolution, inventory rollups, events)
