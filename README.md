@@ -249,7 +249,7 @@ fabricated MACs, documentation-range IPs, so nothing below is a real network.
 The issues view is the triage surface: every open finding with its severity, the
 detector that raised it, the affected device, and how long it has been going.
 
-![The issues list: fourteen findings ranked by severity, each with its state (active or resolving), the detector that raised it (port flapping, weak mesh backhaul, DNS slow, rogue AP, sticky client), the affected entity, and its duration.](docs/img/screenshots/issues-light.png)
+![The issues list: fifteen findings ranked by severity, each with its state (active or resolving), the detector that raised it (port flapping, weak mesh backhaul, DNS slow, sticky client, legacy-rate client), the affected entity, and its duration.](docs/img/screenshots/issues-light.png)
 
 Open one and it carries its whole lifecycle: the evidence, the false alarms ruled
 out, and a proposed fix you approve before anything touches the controller.

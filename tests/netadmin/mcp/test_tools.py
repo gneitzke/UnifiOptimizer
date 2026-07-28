@@ -143,10 +143,10 @@ def test_a_top_level_entity_ref_is_not_prefixed(demo_repo: Repository) -> None:
 def test_issue_briefs_place_every_port_on_its_switch(demo_repo: Repository) -> None:
     """Two switches, both with a "Port 2": the briefs must not be interchangeable.
 
-    (The demo's radios are named after their AP already -- "Living Room 2.4G" --
-    so they are deliberately left unprefixed; a real controller's ``wifi0`` is
-    covered by :func:`test_a_port_ref_names_the_switch_it_is_on` and the domain
-    rule's own tests.)
+    (The demo's radios are now named ``wifi0``/``wifi1`` like a real controller,
+    so the same disambiguation applies to them; the radio path is covered by the
+    demo seed's own #44 test and the domain rule's tests, while this one pins the
+    two-"Port 2" switch case.)
     """
     result = _call(demo_repo, "netadmin_overview", window="24h")
     named = [

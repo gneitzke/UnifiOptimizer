@@ -112,11 +112,12 @@ def test_entity_counts(demo_db) -> None:
 
 def test_issue_counts_by_state_and_severity(demo_db) -> None:
     _path, stats = demo_db
-    # 11 baseline + the Back Porch mesh cluster (mesh_uplink root + coverage_hole
-    # + airtime + client.flaky) + a standalone neighbor_density = 16.
-    assert stats.issues_total == 16
-    assert stats.issues_by_state == {"active": 13, "resolving": 1, "resolved": 2}
-    assert stats.issues_by_severity == {"p1": 1, "p2": 9, "p3": 6}
+    # 11 curated + the Back Porch mesh cluster (mesh_uplink root + coverage_hole
+    # + airtime + client.flaky) + a standalone neighbor_density + a standalone
+    # legacy_rates (802.11b) client = 17.
+    assert stats.issues_total == 17
+    assert stats.issues_by_state == {"active": 14, "resolving": 1, "resolved": 2}
+    assert stats.issues_by_severity == {"p1": 1, "p2": 9, "p3": 7}
 
 
 def test_supporting_data_populated(demo_db) -> None:
@@ -218,6 +219,8 @@ def test_issue_spread_and_lifecycle(demo_db) -> None:
             "net.coverage_hole",
             "client.flaky",
             "wifi.neighbor_density",
+            # The legacy 802.11b client that finally makes wifi.legacy_rates fire.
+            "wifi.legacy_rates",
         ):
             assert key in by_key, f"missing seeded issue {key}"
 
@@ -317,6 +320,110 @@ def test_sle_offenders_point_at_fictional_infra(demo_db) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# faithful-to-controller vocabulary + derived (not asserted) evidence
+# --------------------------------------------------------------------------- #
+def test_radios_use_controller_vocabulary_and_render_under_parent(demo_db) -> None:
+    """Radios are named ``wifi0``/``wifi1`` like a real UniFi controller, so the
+    demo exercises the parent-label rendering (Gitea #44): four genuinely
+    distinct ``wifi0`` radios are indistinguishable until qualified by their AP."""
+    from collections import Counter
+
+    from netadmin.domain.entities import entity_display_label
+
+    path, _stats = demo_db
+    repo = Repository.open(path)
+    try:
+        radios = repo.list_entities("radio")
+        assert {r["name"] for r in radios} == {"wifi0", "wifi1"}
+        names = Counter(r["name"] for r in radios)
+        # Exactly one wifi0 and one wifi1 per AP -> the bare name is ambiguous.
+        assert names["wifi0"] == names["wifi1"] == len(repo.list_entities("ap"))
+        wifi0 = next(r for r in radios if r["name"] == "wifi0")
+        parent = repo.get_entity(wifi0["parent_id"])
+        label = entity_display_label(wifi0["name"], "radio", parent["name"])
+        assert label == f"{parent['name']} / wifi0"
+    finally:
+        repo.close()
+
+
+def test_sticky_evidence_is_derived_from_the_store_not_asserted(demo_db) -> None:
+    """The sticky finding's better-AP attribution, candidate-health screen pass
+    and low-rate corroboration are recomputed here straight from the seeded
+    store, through the detector's own code. A revert to hardcoded literals (e.g.
+    the old ``better_ap_samples`` of 286, or a bare ``low_rate_corroborated``)
+    would not match (Gitea #41/#42/#45)."""
+    import json
+
+    from netadmin.detect.context import DetectorContext
+    from netadmin.detect.detectors._rssi import _attachment_intervals, sticky_per_ap_rssi
+    from netadmin.detect.detectors.wifi import (
+        STICKY_HISTORY_WINDOW_S,
+        STICKY_LOW_RATE_MBPS,
+        _CandidateApScreen,
+        _kbps_to_mbps,
+        _median,
+    )
+
+    path, _stats = demo_db
+    repo = Repository.open(path)
+    try:
+        issue = next(r for r in repo.list_issues() if r["detector_key"] == "wifi.sticky_client")
+        ev = json.loads(repo.get_issue(issue["id"])["evidence"])
+        client_id = int(issue["entity_id"])
+        ctx = DetectorContext.for_repository(repo, DEFAULT_NOW, site_id="default")
+
+        # (1) better_ap_samples equals the store-derived per-AP attribution over
+        # the detector's own 7-day window: the #45 trail<->evidence agreement.
+        intervals = _attachment_intervals(
+            ctx, client_id, DEFAULT_NOW - STICKY_HISTORY_WINDOW_S, DEFAULT_NOW
+        )
+        rssi_sid = repo.get_series(client_id, "rssi")
+        rssi = [(int(r["ts"]), float(r["value"])) for r in repo.read_raw(rssi_sid, 0, DEFAULT_NOW)]
+        per_ap = sticky_per_ap_rssi(intervals, rssi)
+        assert ev["better_ap_samples"] == len(per_ap[ev["better_ap"]])
+        assert ev["better_ap_samples"] != 286  # the old hand-built interval count
+
+        # (2) the recommended AP genuinely survives the real health screen.
+        screen = _CandidateApScreen(ctx)
+        assert screen.healthy(ev["better_ap"]) is True
+        assert "candidate_ap_health_screened" in ev["confounders_checked"]
+
+        # (3) low_rate_corroborated is the detector's verdict over the stored kbps
+        # tx_rate series, not a literal, and its confounder tracks that verdict.
+        rate_sid = repo.get_series(client_id, "tx_rate")
+        rates = [r["value"] for r in repo.read_raw(rate_sid, 0, DEFAULT_NOW)]
+        med = round(_median(_kbps_to_mbps(rates)), 1)
+        assert ev["median_tx_rate_mbps"] == med
+        assert ev["low_rate_corroborated"] == (med <= STICKY_LOW_RATE_MBPS)
+        assert "low_rate_corroborated" in ev["confounders_checked"]
+    finally:
+        repo.close()
+
+
+def test_legacy_rates_client_derives_its_11b_verdict(demo_db) -> None:
+    """The demo now produces an 802.11b client so wifi.legacy_rates fires, and
+    its ``matches_11b_rate`` verdict is derived from the stored kbps PHY-rate
+    series through the detector's own kbps->Mbps conversion (Gitea #41)."""
+    import json
+
+    from netadmin.detect.detectors.wifi import _B_RATES, _kbps_to_mbps, _median
+
+    path, _stats = demo_db
+    repo = Repository.open(path)
+    try:
+        issue = next(r for r in repo.list_issues() if r["detector_key"] == "wifi.legacy_rates")
+        ev = json.loads(repo.get_issue(issue["id"])["evidence"])
+        rate_sid = repo.get_series(int(issue["entity_id"]), "tx_rate")
+        assert rate_sid is not None, "the legacy client must carry a tx_rate series"
+        rates = [r["value"] for r in repo.read_raw(rate_sid, 0, DEFAULT_NOW)]
+        med = _median(_kbps_to_mbps(rates))
+        assert ev["median_tx_rate_mbps"] == med
+        assert ev["matches_11b_rate"] is (med in _B_RATES) is True
+    finally:
+        repo.close()
+
+
+# --------------------------------------------------------------------------- #
 # the repository can open it and the API can serve it
 # --------------------------------------------------------------------------- #
 def test_api_serves_demo_db(demo_db) -> None:
@@ -340,7 +447,7 @@ def test_api_serves_demo_db(demo_db) -> None:
 
         issues = client.get("/api/issues", headers=auth)
         assert issues.status_code == 200
-        assert issues.json()["count"] == 16
+        assert issues.json()["count"] == 17
 
         # The correlation surface serves the grouped Back Porch incident.
         incidents = client.get("/api/incidents", headers=auth)

@@ -33,10 +33,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from netadmin.detect.context import DetectorContext
+from netadmin.detect.detectors._rssi import _attachment_intervals
 from netadmin.detect.detectors.wifi import (
+    _B_RATES,
     STICKY_BETTER_AP_MARGIN_DB,
+    STICKY_HISTORY_WINDOW_S,
     STICKY_LOW_RATE_MBPS,
+    STICKY_MIN_AP_SAMPLES,
     STICKY_RSSI_FLOOR_DBM,
+    _CandidateApScreen,
+    _kbps_to_mbps,
+    _median,
     sticky_better_ap_evidence,
     sticky_per_ap_rssi,
     sticky_rate_evidence,
@@ -286,10 +294,20 @@ class _Seeder:
         # recommendation the demo shows is measured on the AP it names.
         self.sticky_rssi: list[tuple[int, float]] = []
         self.sticky_prior_ap = "Office"
-        self.sticky_prior_since = now - 5 * DAY
+        # The prior attachment opens at the start of history, not 5 days in: the
+        # client sat comfortably on Office for the whole pre-roam span (its RSSI
+        # regime is the prior signal for every ts before the roam), and anchoring
+        # here keeps the store trail and the derived evidence one and the same
+        # -- the #45 bug was a prior_since that disagreed with the round-robin
+        # ap_mac already written at `start`, which deduped and split the trail.
+        self.sticky_prior_since = self.start
         self.sticky_roam_ts = now - 2 * DAY
         self.pingpong_client: dict[str, Any] = {}
         self.flaky_client: dict[str, Any] = {}
+        # The legacy-rate (802.11b) client and its PHY-rate series (kbps), so
+        # wifi.legacy_rates actually fires in the demo.
+        self.legacy_client: dict[str, Any] = {}
+        self.legacy_rates_kbps: list[float] = []
         self._series_units: dict[str, str] = {}
 
     # -- time helpers -------------------------------------------------------- #
@@ -426,10 +444,15 @@ class _Seeder:
             for band, chan in (("ng", spec["ng"]), ("na", spec["na"])):
                 rnid = f"{mac}:{band}"
                 ht = 20 if band == "ng" else 80
+                # A real UniFi controller names its radios `wifi0` (2.4 GHz) and
+                # `wifi1` (5 GHz) -- indistinguishable across APs until rendered
+                # under their parent ("Living Room / wifi0", Gitea #44). The demo
+                # uses those names so the parent-label rendering is exercised here
+                # instead of only on the owner's own network.
                 rid = self._entity(
                     EntityType.RADIO,
                     rnid,
-                    name=f"{spec['name']} {'2.4G' if band == 'ng' else '5G'}",
+                    name="wifi0" if band == "ng" else "wifi1",
                     parent_id=aid,
                     meta={"band": band, "ht": ht},
                 )
@@ -739,6 +762,37 @@ class _Seeder:
             "kbps",
         )
 
+        # Legacy 802.11b client: discrete 11b-set PHY rates (11 / 5.5 Mbps) in
+        # kbps, exactly as a real controller reports them. `_issue_legacy_rates`
+        # runs these through the detector's own kbps->Mbps conversion, so the
+        # unit slip that kept wifi.legacy_rates dead (the #41 family) would fail
+        # the demo here instead of leaving it silently unfired.
+        ltail = [
+            ts for ts in range(self.now - 4 * HOUR, self.now, FINE_STEP) if not self._in_gap(ts)
+        ]
+        self.legacy_rates_kbps = [5500.0 if k % 4 == 0 else 11000.0 for k in range(len(ltail))]
+        self._write(
+            self.legacy_client["id"],
+            "tx_rate",
+            list(zip(ltail, self.legacy_rates_kbps)),
+            "kbps",
+        )
+
+        # Dense recent cu_total tail for the sticky client's candidate AP so the
+        # real `_CandidateApScreen` (run in `_issue_sticky`) has enough samples in
+        # its window to *judge* the AP -- an AP it cannot judge is never
+        # recommended, so without this the health screen would silently drop the
+        # better AP and the sticky finding would collapse. Deterministic (no rng
+        # draw) so the rest of the seed's random stream is unperturbed.
+        cu_tail = [ts for ts in range(self.now - HOUR, self.now, 150) if not self._in_gap(ts)]
+        for radio in self.aps[self.sticky_prior_ap]["radios"].values():
+            self._write(
+                radio["id"],
+                "cu_total",
+                [(ts, _clamp(self._diurnal(ts, 12, 22, 21), 1, 95)) for ts in cu_tail],
+                "percent",
+            )
+
         # DNS resolver recovery tail (issue is now RESOLVING).
         dtail = [
             ts for ts in range(self.now - 4 * HOUR, self.now, FINE_STEP) if not self._in_gap(ts)
@@ -939,6 +993,10 @@ class _Seeder:
             # shows crowded air the way the report does -- as context, never as
             # one alarm per neighbour BSS.
             self._issue_neighbor_density()
+            # A legacy 802.11b client dragging its cell. Appended last so the
+            # curated issue ids above (e.g. the channel-plan fix at id 11 the
+            # screenshots deep-link to) stay stable.
+            self._issue_legacy_rates()
 
     def _insert(
         self,
@@ -1106,24 +1164,26 @@ class _Seeder:
         prior = self.aps[self.sticky_prior_ap]
         basement_mac = self.aps["Basement"]["mac"]
         first = self.now - 2 * DAY
-        # The roam trail: comfortable near Office, then stuck on Basement.
+        # The roam trail, written to the store exactly as ingest would: the
+        # client sat on the prior AP from the start of history, then roamed to
+        # Basement two days ago. `sticky_prior_since` is `self.start`, so this
+        # write agrees with the round-robin ap_mac already recorded at `start`
+        # (and if they ever disagreed, this later write wins by row id) -- the
+        # trail has one unambiguous prior AP.
         self._state(client["id"], "ap_mac", prior["mac"], self.sticky_prior_since)
         self._state(client["id"], "ap_mac", basement_mac, self.sticky_roam_ts)
 
-        # Every number below is the detector's own code run over the samples the
-        # charts draw, never asserted alongside them. In particular the better-AP
-        # claim goes through the same attribution the detector uses, so the demo
-        # can only say "Office measured -57 dBm" if the readings taken while the
-        # client was actually on Office say so (Gitea #42).
-        # The intervals are the trail written just above, so every reading
-        # credited to Office was taken while the store says the client was there.
-        per_ap = sticky_per_ap_rssi(
-            [
-                (self.sticky_prior_since, self.sticky_roam_ts, prior["mac"]),
-                (self.sticky_roam_ts, self.now, basement_mac),
-            ],
-            self.sticky_rssi,
+        # Derive attribution from the SAME store trail the detector reads, over
+        # the detector's own 7-day history window, so the evidence and the trail
+        # can never disagree the way they did when the intervals were hand-built
+        # (the #45 bug: the hand-built list claimed the prior AP served ~286
+        # samples while the stored trail implied ~574). One source of truth: the
+        # store, read back through the detector's own `_attachment_intervals`.
+        dctx = DetectorContext.for_repository(self.repo, self.now, site_id=SITE_ID)
+        intervals = _attachment_intervals(
+            dctx, client["id"], self.now - STICKY_HISTORY_WINDOW_S, self.now
         )
+        per_ap = sticky_per_ap_rssi(intervals, self.sticky_rssi)
         stuck = sorted(per_ap.get(basement_mac, []))
         median_rssi = round(_percentile(stuck, 0.5), 1)
         evidence: dict[str, Any] = {
@@ -1135,20 +1195,44 @@ class _Seeder:
             "rssi_floor_dbm": STICKY_RSSI_FLOOR_DBM,
             "clustered_on_ap": False,
         }
+        # Screen candidate APs through the detector's own health screen over the
+        # seeded cu series -- `candidate_ap_health_screened` is then an earned
+        # pass, not a bare literal. A saturated or bad-backhaul prior AP would be
+        # dropped here and the finding would (correctly) collapse to a coverage
+        # hole. This mirrors StickyClientDetector._better_ap_evidence exactly.
+        screen = _CandidateApScreen(dctx)
+        candidates = {
+            mac: vals
+            for mac, vals in per_ap.items()
+            if mac != basement_mac and len(vals) >= STICKY_MIN_AP_SAMPLES and screen.healthy(mac)
+        }
         better = sticky_better_ap_evidence(
-            {mac: vals for mac, vals in per_ap.items() if mac != basement_mac},
+            candidates,
             median_rssi,
             rssi_floor=STICKY_RSSI_FLOOR_DBM,
             margin=STICKY_BETTER_AP_MARGIN_DB,
-            names={prior["mac"]: self.sticky_prior_ap},
+            min_samples=STICKY_MIN_AP_SAMPLES,
+            names=screen.names(),
         )
         if better is None:  # pragma: no cover - the seeded samples cannot fail this
             raise RuntimeError(
-                "demo sticky client has no better AP: the seeded RSSI no longer "
-                "supports the finding it is used to show"
+                "demo sticky client has no better AP: the seeded RSSI/screen no "
+                "longer supports the finding it is used to show"
             )
         evidence.update(better)
         sticky_rate_evidence(self.sticky_rates_kbps, STICKY_LOW_RATE_MBPS, evidence)
+        # Build the confounder list the way the detector's `_build` does: the base
+        # four are always checked; `low_rate_corroborated` is only claimed when
+        # the rate series actually produced a verdict, so a broken kbps/Mbps
+        # conversion drops the claim from the demo too rather than asserting it.
+        confounders = [
+            "better_ap_exists",
+            "per_ap_rssi_attributed",
+            "candidate_ap_health_screened",
+            "sustained_not_transient",
+        ]
+        if "low_rate_corroborated" in evidence:
+            confounders.append("low_rate_corroborated")
         iid = self._insert(
             detector_key="wifi.sticky_client",
             native_id=client["mac"],
@@ -1159,13 +1243,7 @@ class _Seeder:
             first_seen=first,
             last_seen=self.now - FINE_STEP,
             evidence=evidence,
-            confounders=[
-                "better_ap_exists",
-                "per_ap_rssi_attributed",
-                "candidate_ap_health_screened",
-                "sustained_not_transient",
-                "low_rate_corroborated",
-            ],
+            confounders=confounders,
             # One sticky issue per client, whichever AP it is glued to (#40).
             dims={},
             occurrences=22,
@@ -1283,7 +1361,7 @@ class _Seeder:
             evidence={
                 "min_rssi_dbm": -75,
                 "reason": "stricter_than_floor",
-                "ap_count": 8,
+                "ap_count": len(self.aps),
                 "on_mesh_ap": False,
                 "strict_floor_dbm": -70,
             },
@@ -1530,6 +1608,13 @@ class _Seeder:
             {"bssid": "02:00:5e:99:14:47", "essid": "NEIGHBOR-C", "channel": 6, "rssi_dbm": -73},
             {"bssid": "02:00:5e:99:14:52", "essid": "NEIGHBOR-D", "channel": 1, "rssi_dbm": -74},
         ]
+        # The band-share aggregates the detector computes from its scan list:
+        # derive them from the offenders here instead of asserting a count that
+        # could drift out of step with the list it summarizes.
+        per_channel: dict[str, int] = {}
+        for o in offenders:
+            key = str(o["channel"])
+            per_channel[key] = per_channel.get(key, 0) + 1
         iid = self._insert(
             detector_key="wifi.neighbor_density",
             native_id="rf:2.4",
@@ -1541,9 +1626,9 @@ class _Seeder:
             last_seen=self.now - HOUR,
             evidence={
                 "band": "2.4",
-                "qualifying_count": 4,
+                "qualifying_count": len(offenders),
                 "total_seen": 9,
-                "per_channel": {"1": 1, "6": 1, "11": 2},
+                "per_channel": per_channel,
                 "top_offenders": [
                     dict(o, seen_by_ap=radio["nid"], scan_count=4) for o in offenders
                 ],
@@ -1564,6 +1649,42 @@ class _Seeder:
         )
         self._detected(iid, first, Severity.P3)
         self._escalated(iid, first + 3 * 900, 3)
+
+    def _issue_legacy_rates(self) -> None:
+        """An 802.11b-rate client dragging the cell -- so ``wifi.legacy_rates``
+        actually fires in the demo.
+
+        The evidence is derived from the same kbps PHY-rate series the chart
+        draws, through the detector's own kbps->Mbps conversion, so the unit slip
+        that kept this detector dead on real data (the #41 family) would fail the
+        demo here instead of leaving it silently unfired.
+        """
+        client = self.legacy_client
+        first = self.now - 3 * DAY
+        rates_mbps = _kbps_to_mbps(self.legacy_rates_kbps)
+        med = _median(rates_mbps)
+        evidence = {
+            "median_tx_rate_mbps": med,
+            "max_b_rate_mbps": 11.0,
+            "matches_11b_rate": med in _B_RATES,
+        }
+        ssid = SSID_IOT if client["iot"] else SSID_MAIN
+        iid = self._insert(
+            detector_key="wifi.legacy_rates",
+            native_id=client["mac"],
+            entity_id=client["id"],
+            severity=Severity.P3,
+            state=IssueState.ACTIVE,
+            title=f"Legacy-rate client {client['name']}",
+            first_seen=first,
+            last_seen=self.now - FINE_STEP,
+            evidence=evidence,
+            confounders=["rate_sustained_not_momentary", "wired_client_excluded"],
+            dims={"ssid": ssid},
+            occurrences=3,
+        )
+        self._detected(iid, first, Severity.P3)
+        self._escalated(iid, first + 2 * DAY, 3)
 
     # -- SLE minutes --------------------------------------------------------- #
     def _pick_special_clients(self) -> None:
@@ -1595,6 +1716,12 @@ class _Seeder:
                     parent_id=backporch,
                     meta={"oui": "DemoIoT", "is_wired": False, "essid": SSID_IOT},
                 )
+        # The legacy-rate client: the Weather Station, an old outdoor 2.4 GHz
+        # sensor that still associates at an 802.11b PHY rate (11 Mbps). No
+        # reparenting or RSSI change -- only its tx_rate series marks it legacy.
+        for c in self.clients:
+            if not c["wired"] and c["name"] == "Weather Station":
+                self.legacy_client = c
         # Fallbacks (roster is fixed, but stay safe).
         if not self.sticky_client:
             self.sticky_client = next(c for c in self.clients if not c["wired"])
@@ -1602,6 +1729,10 @@ class _Seeder:
             self.pingpong_client = next(c for c in self.clients if not c["wired"])
         if not self.flaky_client:
             self.flaky_client = next(
+                c for c in self.clients if not c["wired"] and c["id"] != self.sticky_client["id"]
+            )
+        if not self.legacy_client:
+            self.legacy_client = next(
                 c for c in self.clients if not c["wired"] and c["id"] != self.sticky_client["id"]
             )
 
