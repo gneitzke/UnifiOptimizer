@@ -274,17 +274,85 @@ export function nearestIndex(points: ChartPoint[], x: Scale, px: number): number
   return best;
 }
 
-/** How many characters of `fontSize` text fit in `width` px (never below 3). */
-export function maxCharsForWidth(width: number, fontSize: number, reserve = 0): number {
-  return Math.max(3, Math.floor((width - reserve) / (fontSize * 0.58)));
+/**
+ * Width of `text` in px at `font`, measured rather than estimated.
+ *
+ * SVG offers no layout pass to consult before painting, so a chart that must fit
+ * a label into a known box has to know the width up front. A per-character
+ * average is the obvious shortcut and it fails in the dangerous direction: when
+ * it under-reads, the text is judged to fit, no ellipsis is added, and the
+ * viewBox clips the overflow silently — the exact bug the shortening exists to
+ * prevent, minus the ellipsis that would have signalled it.
+ *
+ * One reused canvas context measures real glyphs. Where canvas is unavailable it
+ * falls back to a deliberately generous average, so the failure mode stays "a
+ * slightly short label" rather than "silently clipped text".
+ */
+let _measureCtx: CanvasRenderingContext2D | null | undefined;
+
+export function measureTextWidth(text: string, font: string): number {
+  if (_measureCtx === undefined) {
+    try {
+      _measureCtx = document.createElement('canvas').getContext('2d');
+    } catch {
+      _measureCtx = null;
+    }
+  }
+  if (_measureCtx) {
+    _measureCtx.font = font;
+    return _measureCtx.measureText(text).width;
+  }
+  const px = parseFloat(font) || 11;
+  return Array.from(text).length * px * 0.68; // generous: over-shorten, never clip
 }
 
-/** `text` shortened to `maxChars` with an ellipsis, or unchanged if it fits. */
-export function truncateChars(text: string, maxChars: number): string {
-  return text.length > maxChars ? `${text.slice(0, Math.max(1, maxChars - 1))}…` : text;
+/**
+ * How far a measurement may under-read the real glyphs before it clips.
+ *
+ * The canvas resolves `font` against the *canvas* font stack, which is not always
+ * the stack the SVG paints with — a webfont still loading, or absent in a
+ * headless render, resolves to a different fallback with different metrics. That
+ * gap measured ~5% on a real label (drawn 159px into a 152px gutter). Budgeting
+ * for it means the failure mode is a slightly-too-short label carrying a visible
+ * ellipsis, never text painted outside its box.
+ */
+const FIT_SAFETY = 1.15;
+
+/**
+ * `text` shortened with an ellipsis in the MIDDLE so both ends survive.
+ *
+ * Both ends carry identity: charts label bars "<AP name> · ch <n>", where the
+ * head names the device and the tail disambiguates two radios of the SAME
+ * device. Dropping either end makes distinct bars render identically — worse
+ * than the clipping this replaced, because the reader cannot tell it happened.
+ * `Array.from` so an astral character is never sliced mid-surrogate.
+ */
+export function truncateMiddle(text: string, width: number, font: string): string {
+  const budget = width / FIT_SAFETY;
+  if (measureTextWidth(text, font) <= budget) return text;
+  const chars = Array.from(text);
+  let head = Math.ceil(chars.length / 2);
+  let tail = chars.length - head;
+  while (head + tail > 1) {
+    if (head > tail) head--;
+    else tail--;
+    const candidate = `${chars.slice(0, head).join('')}…${chars.slice(chars.length - tail).join('')}`;
+    if (measureTextWidth(candidate, font) <= budget) return candidate;
+  }
+  return '…';
 }
 
-/** `text` shortened to fit `width` px at `fontSize`. */
-export function truncateToWidth(text: string, width: number, fontSize: number): string {
-  return truncateChars(text, maxCharsForWidth(width, fontSize));
+/**
+ * Show every Nth categorical label so neighbours never collide.
+ *
+ * A categorical axis gets one slot per bar, and nothing upstream caps how many
+ * bars there are — a full-band neighbour scan (2.4 GHz + DFS 5 GHz + 6 GHz PSC)
+ * is comfortably 40 channels, leaving ~15px a slot. Shortening cannot rescue
+ * that: three characters of "2.4·11" identify nothing. Thinning keeps whole,
+ * readable labels and drops the ones there is no room for, which is honest about
+ * the axis being sampled rather than pretending to label every bar.
+ */
+export function labelStride(count: number, slotWidth: number, widestLabelPx: number): number {
+  if (count <= 1 || slotWidth <= 0) return 1;
+  return Math.max(1, Math.ceil((widestLabelPx + 6) / slotWidth));
 }

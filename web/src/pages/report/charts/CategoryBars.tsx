@@ -1,4 +1,11 @@
-import { fmt, linScale, niceYScale, truncateToWidth } from '../../../components/ui/chart-utils';
+import {
+  fmt,
+  labelStride,
+  linScale,
+  measureTextWidth,
+  niceYScale,
+  truncateMiddle,
+} from '../../../components/ui/chart-utils';
 import { cn } from '../../../components/ui/cn';
 import { useMeasuredWidth } from './useMeasuredWidth';
 
@@ -148,6 +155,8 @@ function VerticalBars({
   const base = y(0);
   const slot = plotW / data.length;
   const bw = Math.max(2, Math.min(slot * 0.62, 40));
+  const widest = Math.max(...data.map((d) => measureTextWidth(d.label, LABEL_FONT)), 0);
+  const stride = labelStride(data.length, slot, widest);
 
   return (
     <svg
@@ -256,22 +265,32 @@ function VerticalBars({
         );
       })}
 
-      {data.map((d, i) => (
-        <text
-          key={`lbl-${i}`}
-          x={M.left + slot * (i + 0.5)}
-          y={height - 8}
-          textAnchor="middle"
-          className="tnum"
-          fontSize={11}
-          fill="var(--fg-subtle)"
-        >
-          {d.label}
-        </text>
-      ))}
+      {/* One slot per bar and no cap on bar count, so a dense axis paints every
+          label over its neighbours into an unreadable band. Show every Nth label
+          instead: whole and legible, and honest that the axis is sampled. */}
+      {data.map((d, i) =>
+        i % stride !== 0 ? null : (
+          <text
+            key={`lbl-${i}`}
+            x={M.left + slot * (i + 0.5)}
+            y={height - 8}
+            textAnchor="middle"
+            className="tnum"
+            fontSize={11}
+            fill="var(--fg-subtle)"
+          >
+            {d.label}
+          </text>
+        ),
+      )}
     </svg>
   );
 }
+
+// The label font, as the canvas measurer needs it. Mirrors the fontSize={11} and
+// the `tnum` class below, whose tabular figures are wider than proportional ones —
+// a per-character average silently under-measures them and lets text clip.
+const LABEL_FONT = '11px InterVariable, -apple-system, "Segoe UI", sans-serif';
 
 function HorizontalBars({
   data,
@@ -333,8 +352,11 @@ function HorizontalBars({
             {/* Anchored at the gutter's right edge and growing leftwards, so a label
                 wider than the gutter runs past x=0 and the viewBox clips its first
                 characters — "U7 Pro - Kitchen · ch 6" arrives as "ro - Kitchen · ch 6".
-                Truncating keeps the identifying head of the name and loses the tail,
-                which is the readable half. */}
+                Shortened from the MIDDLE, because these labels are "<AP> · ch <n>"
+                and both ends identify: drop the head and the device is anonymous,
+                drop the tail and two radios of one AP render identically — which is
+                the ambiguity the label was built to remove (see RfSection). The full
+                text stays in a <title> so nothing is ever unrecoverable. */}
             <text
               x={M.left - 8}
               y={cy}
@@ -344,7 +366,8 @@ function HorizontalBars({
               fontSize={11}
               fill="var(--fg-muted)"
             >
-              {truncateToWidth(d.label, labelW - 8, 11)}
+              <title>{d.label}</title>
+              {truncateMiddle(d.label, labelW - 8, LABEL_FONT)}
             </text>
             <line
               x1={M.left}

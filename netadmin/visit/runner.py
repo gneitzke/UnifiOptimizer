@@ -127,11 +127,28 @@ class VisitReport:
 
     @property
     def window_was_capped(self) -> bool:
-        """True when less was analysed than the caller asked for."""
-        return self.window_days < self.lookback_days
+        """True when less was analysed than the caller asked for.
+
+        Compared in seconds, not in :attr:`window_days`: that value is floored for
+        display, so a 6.5-day window against a 7-day request would compare equal
+        once rounded and silently suppress the very disclosure this exists to
+        make.
+        """
+        return (self.window_end_ts - self.window_start_ts) < self.lookback_days * 86_400
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        """Serialised form, including the derived window facts.
+
+        ``asdict`` copies fields only, so the properties would be invisible to
+        ``render_json``, the on-demand API and the web UI -- every machine
+        consumer would keep seeing only the *requested* lookback, which is the
+        bug this pair of properties exists to fix. They are injected explicitly.
+        """
+        return {
+            **asdict(self),
+            "window_days": self.window_days,
+            "window_was_capped": self.window_was_capped,
+        }
 
 
 class _StepTracker:

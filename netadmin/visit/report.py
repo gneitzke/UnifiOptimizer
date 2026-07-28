@@ -118,13 +118,14 @@ def _window_phrase(report: VisitReport, unit: str = "d") -> str:
     at -- two reports of the same network then differ by tens of points with
     nothing on either to explain it. When the two agree this reads exactly as
     before; when they differ, both numbers are shown and neither is a claim
-    about the other.
+    about the other. Carries no brackets of its own -- the console wraps it in
+    one pair, and a nested set read as a typo.
     """
     suffix = "-day" if unit == "day" else "d"
     analysed = f"{report.window_days}{suffix}"
     if not report.window_was_capped:
         return f"{analysed} lookback"
-    return f"{analysed} window ({report.lookback_days}{suffix} lookback requested)"
+    return f"{analysed} window, {report.lookback_days}{suffix} lookback requested"
 
 
 def console_summary(report: VisitReport) -> str:

@@ -1,5 +1,4 @@
 import { Fragment } from 'react';
-import { maxCharsForWidth as fitChars, truncateChars } from '../../../components/ui/chart-utils';
 import type { TopologyModel, TopoNode } from '../model';
 import { BAND_COLOR } from '../severity';
 import { useMeasuredWidth } from './useMeasuredWidth';
@@ -274,10 +273,9 @@ const KIND_TAG: Record<TopoNode['kind'], string> = {
  *  always fits the box it's drawn in rather than a fixed guess. `reserveRight`
  *  carves out room for a badge sharing the same text line. */
 function maxCharsForWidth(w: number, fontSize: number, reserveRight = 0): number {
-  // 10px inner padding on each side, plus whatever a badge on the same line takes.
-  // The advance estimate itself is shared with the bar charts, which face the same
-  // "fit this label in a known box or it gets clipped" problem.
-  return fitChars(w, fontSize, 20 + reserveRight);
+  const avgAdvance = fontSize * 0.58; // Inter's roughly average glyph advance at this size
+  const usable = w - 20 - reserveRight; // 10px inner padding on each side
+  return Math.max(3, Math.floor(usable / avgAdvance));
 }
 
 function Node({ node, x, y, w }: { node: TopoNode; x: number; y: number; w: number }) {
@@ -310,6 +308,7 @@ function Node({ node, x, y, w }: { node: TopoNode; x: number; y: number; w: numb
         fill="var(--fg-subtle)"
         style={{ letterSpacing: '0.03em', textTransform: 'uppercase' }}
       >
+        <title>{KIND_TAG[node.kind]}</title>
         {truncate(KIND_TAG[node.kind], maxCharsForWidth(w, 9))}
       </text>
       <text
@@ -319,10 +318,16 @@ function Node({ node, x, y, w }: { node: TopoNode; x: number; y: number; w: numb
         fontWeight={500}
         fill="var(--fg)"
       >
+        {/* The box is fixed-width, so a long device name is shortened to fit. The
+            full name stays here: a truncated label is the only thing identifying
+            the node, and two devices sharing a prefix would otherwise be
+            indistinguishable with no way to recover either. */}
+        <title>{node.label}</title>
         {truncate(node.label, maxCharsForWidth(w, 12, badgeReserve))}
       </text>
       {node.sublabel && (
         <text x={left + 10} y={top + 41} fontSize={9.5} fill="var(--fg-subtle)">
+          <title>{node.sublabel}</title>
           {truncate(node.sublabel, maxCharsForWidth(w, 9.5))}
         </text>
       )}
@@ -342,4 +347,6 @@ function Node({ node, x, y, w }: { node: TopoNode; x: number; y: number; w: numb
   );
 }
 
-const truncate = truncateChars;
+function truncate(s: string, maxChars: number): string {
+  return s.length > maxChars ? `${s.slice(0, Math.max(1, maxChars - 1))}…` : s;
+}
