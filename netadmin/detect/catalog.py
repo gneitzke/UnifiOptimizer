@@ -317,8 +317,9 @@ _PLAYBOOKS: dict[str, Playbook] = {
                 else None
             ),
             "known_100mbps_device_class": lambda ev: (
-                "Peer device class checked: the wired devices on this switch were checked "
-                "against a known 10/100-by-design list before the downshift was called a fault."
+                "Peer device class checked: the wired peer on this port was checked against "
+                "a known 10/100-by-design list, and is not one — a device that only has a "
+                "100 Mbps port would explain the speed, and this one does not."
             ),
             "port_gigabit_capable": lambda ev: (
                 f"Port confirmed gigabit-capable: negotiated at {_n(ev.get('negotiated_speed'), 0)} "

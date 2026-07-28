@@ -145,7 +145,9 @@ def make_port(
     return pid
 
 
-def make_client(repo: Repository, *, sw_id: int, name: str, oui: str = "") -> int:
+def make_client(
+    repo: Repository, *, sw_id: int, name: str, oui: str = "", sw_port: Optional[int] = None
+) -> int:
     return repo.upsert_entity(
         Entity(
             entity_type=EntityType.CLIENT,
@@ -153,7 +155,7 @@ def make_client(repo: Repository, *, sw_id: int, name: str, oui: str = "") -> in
             site_id="default",
             name=name,
             parent_id=sw_id,
-            meta={"oui": oui, "is_wired": True},
+            meta={"oui": oui, "is_wired": True, "sw_port": sw_port},
         ),
         ts=NOW,
     )
@@ -911,21 +913,23 @@ _TEN_100_CAMERAS = [
     "G6 Turret",
     "g6-turret---driveway",  # as an operator actually renamed it
     "G5 Turret Ultra",
+    "g5-turret-ultra-porch",
     "G5 Flex",
+    "g5_flex_side",
     "G5 Bullet",
+    "g5-bullet-01",
 ]
 _GIGABIT_CAMERAS = [
     "G6 Pro Turret",
     "AI LPR",
     "lpr---driveway",
-    "G6 Edge Turret",  # not verified as 10/100; must not be silently assumed
+    "G6 Edge Turret",  # verified GbE, like every Pro/Edge tier so far
 ]
 
 
 @pytest.mark.parametrize("name", _TEN_100_CAMERAS)
 def test_ten_100_cameras_suppress_the_downshift(repo: Repository, name: str) -> None:
     """A gigabit port at 100 Mbps to a 10/100-by-design camera is not a fault."""
-    _known_100mbps_patterns.cache_clear()
     full_coverage(repo)
     sw = make_switch(repo)
     pid = make_port(repo, sw_id=sw, idx=1, meta={"max_speed": 1000}, speed=100)
@@ -942,7 +946,6 @@ def test_gigabit_cameras_do_not_suppress_the_downshift(repo: Repository, name: s
     detector goes quiet for the whole switch and a genuine broken pair on any
     port stops being reported.
     """
-    _known_100mbps_patterns.cache_clear()
     full_coverage(repo)
     sw = make_switch(repo)
     pid = make_port(repo, sw_id=sw, idx=1, meta={"max_speed": 1000}, speed=100)
@@ -951,3 +954,99 @@ def test_gigabit_cameras_do_not_suppress_the_downshift(repo: Repository, name: s
     findings = BadCableDetector().evaluate(_ctx(repo))
     assert len(findings) == 1
     assert "speed_downshift" in findings[0].evidence["signals"]
+
+
+def test_a_camera_does_not_silence_the_downshift_on_another_port(repo: Repository) -> None:
+    """The blast radius. This is the test whose absence made the list dangerous.
+
+    Suppression used to consider every wired client under the switch, so one
+    10/100 camera anywhere on it explained away a genuine broken pair on every
+    other port. The controller reports each client's ``sw_port``; with that
+    persisted, only the peer on THIS port can speak for it.
+    """
+    full_coverage(repo)
+    sw = make_switch(repo)
+    cam_port = make_port(repo, sw_id=sw, idx=1, meta={"max_speed": 1000}, speed=100)
+    nas_port = make_port(repo, sw_id=sw, idx=2, meta={"max_speed": 1000}, speed=100)
+    make_client(repo, sw_id=sw, name="G6 Turret - Driveway", sw_port=1)
+    make_client(repo, sw_id=sw, name="Synology-NAS", sw_port=2)
+    seed_counter(repo, cam_port, "rx_errors", step=0)
+    seed_counter(repo, nas_port, "rx_errors", step=0)
+
+    findings = BadCableDetector().evaluate(_ctx(repo))
+    owners = {f.entity.name for f in findings}
+    assert owners == {"port2"}, "the NAS's downshift must survive the camera on port 1"
+
+
+def test_a_camera_on_another_switch_does_not_suppress(repo: Repository) -> None:
+    """Scope is per switch as well as per port; nothing pinned the switch half."""
+    full_coverage(repo)
+    sw_a = make_switch(repo, native_id="sw:1")
+    sw_b = make_switch(repo, native_id="sw:2")
+    pid = make_port(repo, sw_id=sw_a, idx=1, meta={"max_speed": 1000}, speed=100)
+    make_client(repo, sw_id=sw_b, name="G6 Turret - Garage", sw_port=1)
+    make_client(repo, sw_id=sw_a, name="Dell-Workstation", sw_port=1)
+    seed_counter(repo, pid, "rx_errors", step=0)
+
+    assert len(BadCableDetector().evaluate(_ctx(repo))) == 1
+
+
+def test_ten_megabit_is_never_explained_away_by_device_class(repo: Repository) -> None:
+    """A 10/100 device at 10 Mbps is 100BASE-TX falling back, i.e. the fault.
+
+    The spec that justifies these patterns says "10/100": it establishes 100 as
+    the by-design speed, not "anything under a gigabit is fine".
+    """
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, meta={"max_speed": 1000}, speed=10)
+    make_client(repo, sw_id=sw, name="G6 Turret - Driveway", sw_port=1)
+    seed_counter(repo, pid, "rx_errors", step=0)
+
+    findings = BadCableDetector().evaluate(_ctx(repo))
+    assert len(findings) == 1
+    assert findings[0].evidence["negotiated_speed"] == 10
+
+
+def test_camera_patterns_live_in_the_builtin_tuple_not_the_device_kb(repo: Repository) -> None:
+    """Provenance. The suite otherwise cannot tell the two sources apart.
+
+    ``_known_100mbps_patterns`` merges the built-ins with the runtime device KB,
+    so moving these entries into the KB would keep every other test green — and
+    then a stale, absent or unreadable KB would silently undo the fix, which is
+    precisely the failure this project has already shipped once.
+    """
+    for pattern in ("g6 turret", "g5 turret ultra", "g5 flex", "g5 bullet"):
+        assert pattern in _KNOWN_100MBPS_HINTS
+
+
+def test_a_renamed_camera_is_not_recognised(repo: Repository) -> None:
+    """A known and deliberate limit: matching is on the name the operator chose.
+
+    A camera renamed purely for its location carries nothing to match, so it is
+    still reported. Recorded so the next bug report is met with a documented
+    limitation rather than a surprise.
+    """
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, meta={"max_speed": 1000}, speed=100)
+    make_client(repo, sw_id=sw, name="Driveway", oui="Ubiquiti Inc", sw_port=1)
+    seed_counter(repo, pid, "rx_errors", step=0)
+
+    assert len(BadCableDetector().evaluate(_ctx(repo))) == 1
+
+
+def test_a_pattern_cannot_straddle_the_name_and_oui(repo: Repository) -> None:
+    """Name and OUI are matched separately, never concatenated.
+
+    Joining them lets a pattern span the seam: a client called "Cam-G5" from OUI
+    "Flextronics" reads as "cam g5 flextronics", which contains "g5 flex" and
+    would silence a real downshift on hardware that is nothing of the sort.
+    """
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, meta={"max_speed": 1000}, speed=100)
+    make_client(repo, sw_id=sw, name="Cam-G5", oui="Flextronics", sw_port=1)
+    seed_counter(repo, pid, "rx_errors", step=0)
+
+    assert len(BadCableDetector().evaluate(_ctx(repo))) == 1

@@ -61,6 +61,15 @@ The `known_2.4ghz_only` list drives two detectors:
   finding: a gigabit port sitting at 100 Mbps to one of these devices is the
   device's design, not a broken pair.
 
+> **The KB is not the only source for the wired detector.** `wired.bad_cable` also
+> carries a built-in list of device classes that ship a 10/100 port by design
+> (`_KNOWN_100MBPS_HINTS` in `netadmin/detect/detectors/wired.py`) — smart plugs,
+> print servers, and the UniFi Protect cameras whose published spec is
+> "10/100 MbE RJ45 port". You do not need to add those to this file. Suppression
+> applies only to the peer on the affected port and only at 100 Mbps: a 10/100
+> device negotiating 10 Mbps is still reported, because that is a fallback, not a
+> design limit.
+
 The device classes:
 - **WiFi 7 (802.11be)** devices: 6GHz capable with 320MHz channels and MLO *(reserved)*
 - **WiFi 6E (802.11ax-6e)** devices: 6GHz capable with 160MHz channels *(reserved)*

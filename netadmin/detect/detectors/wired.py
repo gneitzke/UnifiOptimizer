@@ -105,17 +105,13 @@ _KNOWN_100MBPS_HINTS: tuple[str, ...] = (
     # Listed PER MODEL, never by form factor: "turret" would also match the G6
     # Pro Turret and "lpr" the AI LPR, and BOTH of those are "GbE RJ45 port" —
     # matching them would suppress a genuine downshift. Verify the spec page
-    # before adding a model here. Space and hyphen spellings both appear because
-    # the match is a plain substring and operators rename freely
-    # ("g6-turret---driveway").
+    # before adding a model here. One spelling each: _normalise_for_match folds
+    # hyphens and underscores to spaces, so "g6 turret" matches the real-world
+    # "g6-turret---driveway".
     "g6 turret",
-    "g6-turret",
     "g5 turret ultra",
-    "g5-turret-ultra",
     "g5 flex",
-    "g5-flex",
     "g5 bullet",
-    "g5-bullet",
 )
 
 
@@ -256,9 +252,55 @@ def _wired_clients_under(ctx: Any, switch_id: int) -> list[Entity]:
     ]
 
 
+def _normalise_for_match(text: str) -> str:
+    """Lowercase, and collapse every run of non-alphanumerics to one space.
+
+    Operators name devices "G6-Turret---Driveway" or "Kitchen_Smart_Plug", so a
+    raw substring test against a multi-word pattern never fires: "smart plug"
+    does not appear in "Kitchen-Smart-Plug". Normalising once here is what lets a
+    pattern be written the way the product is spelled, and is why this list needs
+    only one spelling per model.
+    """
+    return " ".join("".join(c if c.isalnum() else " " for c in text.lower()).split())
+
+
+def _port_index(port: Entity) -> Optional[int]:
+    """The switch port number from a port entity's ``<sw_mac>:<idx>`` native id."""
+    return _as_int(str(port.native_id).rsplit(":", 1)[-1])
+
+
+def _peers_on_port(ctx: Any, switch_id: int, port: Entity) -> list[Entity]:
+    """The wired clients to weigh against THIS port, narrowest scope available.
+
+    The controller reports each wired client's ``sw_port``, so when that is known
+    the only relevant peer is the one actually on this port. Falling back to every
+    client on the switch -- which is all this could do before ``sw_port`` was
+    persisted -- means one 10/100 camera suppresses the downshift arm for every
+    other port on that switch, hiding a genuine broken pair on an unrelated run.
+
+    The fallback survives only for clients polled before ``sw_port`` was stored:
+    if ANY client under the switch reports a port, the port map is trusted and an
+    empty result means "no wired peer here", not "check them all".
+    """
+    peers = _wired_clients_under(ctx, switch_id)
+    if not any(c.meta.get("sw_port") is not None for c in peers):
+        return peers  # no port map available; legacy switch-wide behaviour
+    idx = _port_index(port)
+    if idx is None:
+        return []
+    return [c for c in peers if _as_int(c.meta.get("sw_port")) == idx]
+
+
 def _matches_known_100mbps(entity: Entity) -> bool:
-    hay = " ".join(str(x).lower() for x in (entity.name, entity.meta.get("oui")) if x)
-    return any(pat in hay for pat in _known_100mbps_patterns())
+    """True when the device's own name or OUI names a 10/100-by-design class.
+
+    Fields are tested SEPARATELY, never joined: concatenating them lets a pattern
+    straddle the boundary, so a client called "Cam-G5" from OUI "Flextronics"
+    would match "g5 flex" and silence a real downshift.
+    """
+    fields = [_normalise_for_match(str(x)) for x in (entity.name, entity.meta.get("oui")) if x]
+    pats = _known_100mbps_patterns()
+    return any(pat in field for field in fields for pat in pats)
 
 
 def _finding(
@@ -384,16 +426,30 @@ class BadCableDetector:
         neg = _as_int(ctx.repo.current_state(port.entity_id, "speed"))
         if neg is None or neg >= 1000 or neg <= 0:
             return None
-        # Confounder: a peer that is 10/100 by design is not a bad cable. We can
-        # only inspect wired clients under the parent switch (the store has no
-        # port-level peer map); when there are candidates, we check them honestly.
+        # Confounder: a peer that is 10/100 by design is not a bad cable. Only a
+        # 100 Mbps link can be explained that way -- a 10/100 device sitting at
+        # *10* is 100BASE-TX falling back, which is the broken-pair signature this
+        # arm exists to catch, so it is never explained away by device class.
         switch = switches.get(port.parent_id) if port.parent_id is not None else None
-        if switch is not None:
-            candidates = _wired_clients_under(ctx, switch.entity_id)
+        if switch is not None and neg == 100:
+            candidates = _peers_on_port(ctx, switch.entity_id, port)
             if candidates:
                 confounders.append("known_100mbps_device_class")
-                if any(_matches_known_100mbps(c) for c in candidates):
-                    return None  # suppressed: a by-design fast-ethernet peer
+                match = next((c for c in candidates if _matches_known_100mbps(c)), None)
+                if match is not None:
+                    # Say so. A suppressed finding is never constructed, so the
+                    # confounder list dies with it and the operator is left with
+                    # an absence they cannot explain -- exactly the silence that
+                    # made the un-shipped device KB invisible for so long.
+                    _log.info(
+                        "bad_cable: %s negotiated %s of %s Mbps, downshift not reported "
+                        "-- peer %r is a known 10/100-by-design class",
+                        port.native_id,
+                        neg,
+                        cap,
+                        match.name,
+                    )
+                    return None
         confounders.append("port_gigabit_capable")
         return {"negotiated_speed": neg, "port_capable_speed": cap}
 
