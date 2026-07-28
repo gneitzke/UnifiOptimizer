@@ -101,6 +101,20 @@ class IssueNotFound(FixError):
     """The issue id does not exist (surfaces as a 404 / CLI error)."""
 
 
+class IssueNotActionable(FixError):
+    """The issue is no longer live, so applying its fix would act on stale state.
+
+    An issue's evidence is refreshed only while its detector FIRES; once the
+    condition stops, evidence freezes at its last-firing value while the network
+    keeps moving. Nothing else in the gate chain notices for an auto-channel
+    radio: config stays "auto", so the precondition passes and the confirm token
+    stays valid indefinitely. Refusing resolved/resolving issues bounds the apply
+    window to the life of the problem itself — a saved token for a self-resolved
+    issue must not pin a radio weeks later on evidence about a channel it left.
+    Dry-run stays open: previewing a stale plan is harmless and useful.
+    """
+
+
 @dataclass
 class FixSeams:
     """The injected controller seams a :class:`FixService` needs.
@@ -187,6 +201,17 @@ class FixService:
         min-RSSI rail before a single call is sent. Only an applied change records
         the ``fix_applied`` event that starts the section-7 verification window.
         """
+        row = self._store.get_issue(issue_id)
+        if row is None:
+            raise IssueNotFound(f"issue {issue_id} not found")
+        state = str(row["state"])
+        if state in ("resolving", "resolved"):
+            raise IssueNotActionable(
+                f"issue {issue_id} is {state}: its evidence is no longer live, so the "
+                "fix would apply against the network as it was, not as it is. If the "
+                "problem returns, the next detection pass re-raises it with fresh "
+                "evidence and a fresh plan."
+            )
         plan = await self.build_plan(issue_id)
         current_state = await self._read_current_state(plan)
         result = await self._applier.apply(

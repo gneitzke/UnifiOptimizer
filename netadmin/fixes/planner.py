@@ -264,7 +264,9 @@ def _plan_band_channel_spread(
     Every step is an ordinary, individually revertible ``rest/device`` PUT that
     preserves the rest of its device's ``radio_table``; the plan carries no new
     gate and no new capability. A radio whose live channel no longer matches the
-    evidence is dropped from the plan rather than moved on a stale assumption.
+    evidence is dropped from the plan rather than moved on a stale assumption --
+    a pinned radio by its configured channel, an auto radio by the operating
+    channel its device's stats report.
     """
     band = str(finding.evidence.get("band") or "")
     subtype = str(finding.evidence.get("subtype") or finding.dims.get("subtype") or "")
@@ -361,6 +363,12 @@ def _channel_step(
     dev_id, radio_table, radio = _locate_radio(device, band_code)
     if dev_id is None or radio is None:
         return None
+    if radio.get("channel") is None:
+        # No configured channel to assert means no precondition worth the name:
+        # {"channel": None} is the one expected value a VANISHED radio's empty
+        # live extract would satisfy, quietly defeating the missing-target drift
+        # guard on a device-mutating PUT. Refuse to plan instead.
+        return None
     live = _as_int(radio.get("channel"))
     if expect_channel is not None and live is not None and live != expect_channel:
         return None
@@ -385,10 +393,17 @@ def _channel_step(
         method="PUT",
         endpoint=endpoint,
         payload=payload,
+        # The precondition asserts the CONFIGURED channel -- the same
+        # ``radio_table`` field the applier's live read extracts -- not the
+        # operating channel the detector observed. On an auto-channel radio
+        # (UniFi's factory default) the two speak different languages: config
+        # says "auto" while the evidence says the int the radio happens to be
+        # on, and asserting the int against "auto" is a precondition no live
+        # read can satisfy. The plan then renders forever and applies never.
         precondition=Precondition(
             target_native_id=native_id,
-            expected={"channel": current},
-            description=f"Radio must still be on channel {current}.",
+            expected={"channel": radio.get("channel")},
+            description=(f"Radio channel must still be set to {radio.get('channel')}."),
         ),
         before={"method": "PUT", "endpoint": endpoint, "body": {"radio_table": list(radio_table)}},
         after={"method": "PUT", "endpoint": endpoint, "body": payload},
@@ -618,8 +633,14 @@ def _drifted_radios(
     """Conflicted radios whose live channel no longer matches the evidence.
 
     Only radios we actually hold a live device read for can be checked; one we
-    were not handed is left alone, because "unknown" is not "drifted". Returns
-    readable native ids so the advisory can name them.
+    were not handed is left alone, because "unknown" is not "drifted". A pinned
+    radio is compared on its configured channel; an auto radio has no configured
+    int to compare, so it is compared on the OPERATING channel the device's
+    ``radio_table_stats`` reports -- an auto radio that has hopped since
+    detection has invalidated the load vector exactly as a re-pinned one has,
+    and skipping it (the old behaviour) let a hopped auto radio sail into a
+    joint solve built on a band layout it already left. Returns readable native
+    ids so the advisory can name them.
     """
     out: list[str] = []
     for channel, natives in conflicted.items():
@@ -632,9 +653,24 @@ def _drifted_radios(
             if radio is None:
                 continue
             live = _as_int(radio.get("channel"))
+            if live is None:
+                live = _operating_channel(device, band_code)
             if live is not None and live != channel:
                 out.append(native_id)
     return sorted(out)
+
+
+def _operating_channel(device: Mapping[str, Any], band_code: Optional[str]) -> Optional[int]:
+    """The channel a radio is transmitting on, from ``radio_table_stats``.
+
+    The configured channel lives in ``radio_table`` and can be the string
+    "auto"; the stats table carries the int the auto planner actually chose.
+    ``None`` when the device does not report stats for the radio.
+    """
+    for entry in device.get("radio_table_stats") or []:
+        if isinstance(entry, Mapping) and entry.get("radio") == band_code:
+            return _as_int(entry.get("channel"))
+    return None
 
 
 def _channel_loads(evidence: Mapping[str, Any], candidates: tuple[int, ...]) -> dict[int, int]:

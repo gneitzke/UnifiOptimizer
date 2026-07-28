@@ -504,3 +504,101 @@ async def test_apply_of_advisory_plan_is_noop(store):
     assert result.aborted_reason == "manual_action_required"
     assert writer.call_count == 0
     assert store.list_changes() == []
+
+
+# --------------------------------------------------------------------------- #
+# auto-channel radios go through the REAL gate
+# --------------------------------------------------------------------------- #
+def _auto_channel_plan(issue_id=None):
+    device = make_ap_device(radios=[{"radio": "ng", "channel": "auto", "ht": 20}])
+    finding = make_finding(
+        "wifi.channel_plan",
+        radio_entity("ng"),
+        dims={"subtype": "channel_off_grid", "band": "2.4"},
+        evidence={"subtype": "channel_off_grid", "band": "2.4", "channel": 3},
+    )
+    return plan_fix(finding, device=device, issue_id=issue_id), device
+
+
+async def test_auto_channel_plan_applies_through_the_real_gate(store):
+    """The shipped regression, end to end: an unchanged auto radio must APPLY.
+
+    Before the fix this exact call aborted with PreconditionDrift on every auto
+    radio (UniFi's factory default): the precondition asserted the operating
+    int from evidence against a live config that says "auto", forever.
+    """
+    from netadmin.fixes.service import _extract_target_attrs
+
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+    plan, device = _auto_channel_plan()
+    step = plan.steps[0]
+    live = _extract_target_attrs(
+        device, step.precondition.target_native_id, step.precondition.expected
+    )
+    result = await applier.apply(
+        plan,
+        dry_run=False,
+        confirm_token=plan_confirm_token(plan),
+        current_state={step.precondition.target_native_id: live},
+    )
+    assert result.applied is True
+    assert writer.call_count == 1
+
+
+async def test_auto_channel_plan_pinned_meanwhile_still_aborts(store):
+    """The guard keeps guarding: pin the radio between render and apply."""
+    from netadmin.fixes.service import _extract_target_attrs
+
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+    plan, _device = _auto_channel_plan()
+    step = plan.steps[0]
+    pinned = make_ap_device(radios=[{"radio": "ng", "channel": 6, "ht": 20}])
+    live = _extract_target_attrs(
+        pinned, step.precondition.target_native_id, step.precondition.expected
+    )
+    with pytest.raises(PreconditionDrift):
+        await applier.apply(
+            plan,
+            dry_run=False,
+            confirm_token=plan_confirm_token(plan),
+            current_state={step.precondition.target_native_id: live},
+        )
+    assert writer.call_count == 0
+
+
+async def test_vanished_radio_is_drift_even_when_expected_would_be_none(store):
+    """The empty extract of a gone radio must never satisfy any precondition.
+
+    Belt-and-braces with the planner's refusal to build a {"channel": None}
+    precondition: even a hand-forged plan carrying one aborts, because a key
+    the live read could not produce is drift, not a None == None match.
+    """
+    from netadmin.fixes.service import _extract_target_attrs
+
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+    plan, _device = _auto_channel_plan()
+    step = plan.steps[0]
+    step.precondition.expected = {"channel": None}  # forge the hole
+    vanished = make_ap_device(radios=[{"radio": "na", "channel": 36, "ht": 40}])
+    live = _extract_target_attrs(
+        vanished, step.precondition.target_native_id, step.precondition.expected
+    )
+    with pytest.raises(PreconditionDrift):
+        await applier.apply(
+            plan,
+            dry_run=False,
+            confirm_token=plan_confirm_token(plan),
+            current_state={step.precondition.target_native_id: live},
+        )
+    assert writer.call_count == 0
+
+
+async def test_auto_channel_revert_body_still_says_auto(store):
+    """What makes the fix revertible: the before-state carries "auto" verbatim."""
+    plan, _device = _auto_channel_plan()
+    step = plan.steps[0]
+    radios = {r["radio"]: r for r in step.before["body"]["radio_table"]}
+    assert radios["ng"]["channel"] == "auto"
