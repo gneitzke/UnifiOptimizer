@@ -896,3 +896,58 @@ def test_bad_cable_suppression_can_come_from_the_kb_alone(
     make_client(repo, sw_id=sw, name="Widgetron-9000")
     seed_counter(repo, pid, "rx_errors", step=0)
     assert BadCableDetector().evaluate(_ctx(repo)) == []
+
+
+# ====================================================================== #
+# UniFi Protect cameras: 10/100 by model, gigabit by model
+# ====================================================================== #
+# Ubiquiti publishes the port speed per camera model, and it is NOT consistent
+# within a form factor: the G6 Turret is "10/100 MbE RJ45 port" while the G6 Pro
+# Turret is "GbE RJ45 port". Matching on "turret" would therefore silence a real
+# downshift on the Pro. These two tests are a matched pair — the negative one is
+# the load-bearing half, because a wrong entry here suppresses bad_cable for
+# EVERY port on the switch (_downshift suppresses on `any` peer match).
+_TEN_100_CAMERAS = [
+    "G6 Turret",
+    "g6-turret---driveway",  # as an operator actually renamed it
+    "G5 Turret Ultra",
+    "G5 Flex",
+    "G5 Bullet",
+]
+_GIGABIT_CAMERAS = [
+    "G6 Pro Turret",
+    "AI LPR",
+    "lpr---driveway",
+    "G6 Edge Turret",  # not verified as 10/100; must not be silently assumed
+]
+
+
+@pytest.mark.parametrize("name", _TEN_100_CAMERAS)
+def test_ten_100_cameras_suppress_the_downshift(repo: Repository, name: str) -> None:
+    """A gigabit port at 100 Mbps to a 10/100-by-design camera is not a fault."""
+    _known_100mbps_patterns.cache_clear()
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, meta={"max_speed": 1000}, speed=100)
+    make_client(repo, sw_id=sw, name=name)
+    seed_counter(repo, pid, "rx_errors", step=0)
+    assert BadCableDetector().evaluate(_ctx(repo)) == []
+
+
+@pytest.mark.parametrize("name", _GIGABIT_CAMERAS)
+def test_gigabit_cameras_do_not_suppress_the_downshift(repo: Repository, name: str) -> None:
+    """The other half: a GbE camera at 100 Mbps IS a real downshift.
+
+    If a pattern added for a 10/100 sibling also matches one of these, this
+    detector goes quiet for the whole switch and a genuine broken pair on any
+    port stops being reported.
+    """
+    _known_100mbps_patterns.cache_clear()
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, meta={"max_speed": 1000}, speed=100)
+    make_client(repo, sw_id=sw, name=name)
+    seed_counter(repo, pid, "rx_errors", step=0)
+    findings = BadCableDetector().evaluate(_ctx(repo))
+    assert len(findings) == 1
+    assert "speed_downshift" in findings[0].evidence["signals"]

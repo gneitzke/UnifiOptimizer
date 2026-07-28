@@ -95,6 +95,27 @@ _KNOWN_100MBPS_HINTS: tuple[str, ...] = (
     "harmony hub",
     "lutron",
     "envisalink",
+    # UniFi Protect cameras that ship a 10/100 port BY MODEL, per Ubiquiti's own
+    # tech specs ("10/100 MbE RJ45 port"). A PoE switch port sitting at 100 Mbps
+    # to one of these is the camera, not a broken pair — confirmed on a real site
+    # where both G6 Turrets negotiated 100 with zero rx/tx errors and zero drops
+    # across 5,518 samples. Without this a UniFi tool reports UniFi hardware as
+    # cable faults, which is how this list acquired its first entries too.
+    #
+    # Listed PER MODEL, never by form factor: "turret" would also match the G6
+    # Pro Turret and "lpr" the AI LPR, and BOTH of those are "GbE RJ45 port" —
+    # matching them would suppress a genuine downshift. Verify the spec page
+    # before adding a model here. Space and hyphen spellings both appear because
+    # the match is a plain substring and operators rename freely
+    # ("g6-turret---driveway").
+    "g6 turret",
+    "g6-turret",
+    "g5 turret ultra",
+    "g5-turret-ultra",
+    "g5 flex",
+    "g5-flex",
+    "g5 bullet",
+    "g5-bullet",
 )
 
 
