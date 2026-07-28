@@ -50,7 +50,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     DB_PATH=/app/data/netadmin.db \
     NETADMIN_INSTALL_METHOD=container \
-    NETADMIN_VERSION=0.7.1
+    NETADMIN_VERSION=0.7.2
 
 WORKDIR /app
 
