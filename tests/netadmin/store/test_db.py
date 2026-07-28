@@ -31,8 +31,8 @@ def test_migration_sets_user_version(tmp_db_path: Path) -> None:
     conn = db.connect(tmp_db_path)
     assert db.schema_version(conn) == 0
     applied = db.apply_migrations(conn)
-    assert applied == [1, 2, 3, 4, 5, 6, 7]
-    assert db.schema_version(conn) == 7
+    assert applied == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert db.schema_version(conn) == 8
     conn.close()
 
 
@@ -104,10 +104,10 @@ def test_migration_idempotent(tmp_db_path: Path) -> None:
     first = db.apply_migrations(conn)
     second = db.apply_migrations(conn)
     third = db.apply_migrations(conn)
-    assert first == [1, 2, 3, 4, 5, 6, 7]
+    assert first == [1, 2, 3, 4, 5, 6, 7, 8]
     assert second == []  # nothing re-applied
     assert third == []
-    assert db.schema_version(conn) == 7
+    assert db.schema_version(conn) == 8
     conn.close()
 
 
@@ -141,8 +141,9 @@ def test_migration_0005_retires_legacy_rogue_ap_issues(tmp_db_path: Path) -> Non
 
     # 0006 rides along on the same rewind; it retires a different taxonomy and
     # leaves the channel_plan survivor below untouched. 0007 (app_meta) rides
-    # along too -- it is schema-only and touches none of the rows asserted here.
-    assert db.apply_migrations(conn) == [5, 6, 7]
+    # along too -- it is schema-only and touches none of the rows asserted here,
+    # as does 0008 (sticky_client, a third taxonomy this fixture never seeds).
+    assert db.apply_migrations(conn) == [5, 6, 7, 8]
 
     rows = conn.execute(
         "SELECT state, resolved_ts FROM issues WHERE detector_key = 'wifi.rogue_ap'"
@@ -218,8 +219,8 @@ def test_migration_0006_retires_plan_level_channel_plan_issues(tmp_db_path: Path
     _seed_per_radio_channel_plan(conn)
 
     # 0007 (app_meta) rides along too -- schema-only, touches none of the rows
-    # asserted below.
-    assert db.apply_migrations(conn) == [6, 7]
+    # asserted below -- and so does 0008, which retires a different detector.
+    assert db.apply_migrations(conn) == [6, 7, 8]
 
     states = dict(
         conn.execute(
@@ -256,6 +257,77 @@ def test_migration_0006_retires_plan_level_channel_plan_issues(tmp_db_path: Path
     assert all("superseded" in e[1] and "migration 0006" in e[1] for e in events)
 
     # The incident rooted on a retired issue is closed.
+    assert conn.execute("SELECT state FROM incidents").fetchone()[0] == "resolved"
+    conn.close()
+
+
+def _seed_per_ap_sticky_clients(conn: sqlite3.Connection) -> None:
+    """Pre-0008 state: one client holding two sticky rows, one per AP it bounces to.
+
+    Plus a second client with a single row, the theoretical dims={} legacy row
+    (current AP unknown at detection), an already-resolved row that must not get
+    a second audit event, and a neighbouring detector's issue that must survive.
+    """
+    rows = [
+        ("fp-sticky-a1", "active", "aa:bb:cc:00:00:01"),
+        ("fp-sticky-a2", "resolving", "aa:bb:cc:00:00:02"),  # same client, other AP
+        ("fp-sticky-b1", "pending", "aa:bb:cc:00:00:01"),
+        ("fp-sticky-c1", "active", None),  # legacy row: no AP dim in the hash
+        ("fp-sticky-d1", "resolved", "aa:bb:cc:00:00:01"),
+    ]
+    with db.begin_immediate(conn):
+        for fp, state, ap in rows:
+            evidence = json.dumps({"current_ap": ap} if ap else {})
+            conn.execute(
+                "INSERT INTO issues (fingerprint, detector_key, severity, state, "
+                "first_seen_ts, last_seen_ts, title, evidence, clear_streak) "
+                "VALUES (?, 'wifi.sticky_client', 'p3', ?, 1, 1, 'Sticky', ?, 3)",
+                (fp, state, evidence),
+            )
+        conn.execute(
+            "INSERT INTO issues (fingerprint, detector_key, severity, state, "
+            "first_seen_ts, last_seen_ts, title) "
+            "VALUES ('fp-pingpong','wifi.pingpong_roamer','p3','active',1,1,'Ping-pong')"
+        )
+        conn.execute(
+            "INSERT INTO incidents (fingerprint, root_issue_id, severity, state, "
+            "first_seen_ts, last_seen_ts, title) "
+            "VALUES ('inc-sticky',1,'p3','open',1,1,'Sticky client')"
+        )
+
+
+def test_migration_0008_retires_per_ap_sticky_client_issues(tmp_db_path: Path) -> None:
+    conn = db.connect(tmp_db_path)
+    db.apply_migrations(conn)
+    conn.execute("PRAGMA user_version=7")  # rewind to the pre-rescope schema
+    _seed_per_ap_sticky_clients(conn)
+
+    assert db.apply_migrations(conn) == [8]
+
+    # Every sticky fingerprint is retired: the ap dim lives only inside the hash,
+    # so SQL cannot tell the two-AP rows from the legacy dims={} one, and
+    # retiring that one is harmless (its hash is what the new scheme produces).
+    rows = conn.execute(
+        "SELECT state, resolved_ts FROM issues WHERE detector_key = 'wifi.sticky_client'"
+    ).fetchall()
+    assert len(rows) == 5
+    assert {r[0] for r in rows} == {"resolved"}
+    assert sum(1 for r in rows if r[1] is not None) == 4  # the pre-resolved one kept its NULL
+
+    # Another detector's issue is untouched: this retires an identity, not a table.
+    survivor = conn.execute(
+        "SELECT state FROM issues WHERE detector_key = 'wifi.pingpong_roamer'"
+    ).fetchone()
+    assert survivor[0] == "active"
+
+    # One honest audit row per retired issue, none for the already-resolved one.
+    events = conn.execute("SELECT kind, detail FROM issue_events").fetchall()
+    assert len(events) == 4
+    assert {e[0] for e in events} == {"resolved"}
+    assert all("superseded" in e[1] and "migration 0008" in e[1] for e in events)
+
+    # The incident rooted on a retired issue is closed, not left advertising a
+    # resolved root.
     assert conn.execute("SELECT state FROM incidents").fetchone()[0] == "resolved"
     conn.close()
 

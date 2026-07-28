@@ -179,6 +179,48 @@ def roam(repo: Repository, client_id: int, ts: int, from_ap_id: Optional[int]) -
 # ====================================================================== #
 # wifi.sticky_client
 # ====================================================================== #
+#: When the sticky client roams off its old AP onto the far one it is stuck to.
+STICKY_ROAM_TS = NOW - 1800
+
+
+def mk_recommendable_ap(
+    repo: Repository,
+    native_id: str,
+    *,
+    name: Optional[str] = None,
+    cu_total: float = 12.0,
+    now: int = NOW,
+) -> int:
+    """An AP with a quiet radio: judged, and judged fit to be recommended.
+
+    The candidate screen refuses to recommend an AP it cannot judge, so a
+    candidate needs a radio reporting real airtime before it can be anything but
+    excluded.
+    """
+    ap = mk_ap(repo, native_id, name=name, now=now)
+    radio = mk_radio(repo, f"{native_id}:na", ap, band="na", now=now)
+    gauge(repo, radio, "cu_total", [cu_total] * 8, now=now)
+    return ap
+
+
+def _prior_attachment(
+    repo: Repository,
+    client_id: int,
+    ap_mac: str,
+    *,
+    rssi: float,
+    samples: int = 6,
+    since: int = NOW - 6 * 3600,
+    until: int = STICKY_ROAM_TS,
+) -> None:
+    """Attach ``client_id`` to ``ap_mac`` for a stretch, with RSSI measured there."""
+    repo.record_state_change(client_id, "ap_mac", ap_mac, ts=since)
+    step = (until - since) // (samples + 1)
+    repo.record_samples(
+        SampleReading(client_id, "rssi", since + step * (i + 1), rssi) for i in range(samples)
+    )
+
+
 def _sticky_client(
     repo: Repository,
     native_id: str,
@@ -186,13 +228,18 @@ def _sticky_client(
     *,
     better: bool,
     tx_rate_kbps: float = 12_000.0,
+    prior_rssi: float = -58.0,
 ) -> int:
-    cid = mk_client(repo, native_id, ap_mac=ap_mac)
+    """A client sustained-weak on ``ap_mac``, with or without a real prior AP.
+
+    ``better=True`` gives it a recorded attachment to ``ap-good`` whose RSSI
+    samples were taken *during* that attachment: the only thing that can prove
+    another AP served this client better.
+    """
+    cid = mk_client(repo, native_id)
     if better:
-        # A prior attachment to a different AP where the client saw a strong signal.
-        repo.record_state_change(cid, "ap_mac", "ap-far", ts=NOW - 5000)
-        repo.record_state_change(cid, "ap_mac", ap_mac, ts=NOW - 3000)
-        repo.record_samples([SampleReading(cid, "rssi", NOW - 4800, -58.0)])
+        _prior_attachment(repo, cid, "ap-good", rssi=prior_rssi)
+    repo.record_state_change(cid, "ap_mac", ap_mac, ts=STICKY_ROAM_TS)
     gauge(repo, cid, "rssi", [-82.0] * 8)
     # tx_rate is stored in kbps (netadmin.ingest.mapping.METRICS), never Mbps.
     gauge(repo, cid, "tx_rate", [tx_rate_kbps] * 8)
@@ -201,7 +248,8 @@ def _sticky_client(
 
 def test_sticky_client_fires_with_better_ap(repo: Repository) -> None:
     seed_cov(repo)
-    _sticky_client(repo, "cli-1", "ap-near", better=True)
+    mk_recommendable_ap(repo, "ap-good", name="Hallway")
+    _sticky_client(repo, "cli-1", "ap-far", better=True)
 
     findings = StickyClientDetector().evaluate(_ctx(repo))
     assert len(findings) == 1
@@ -209,20 +257,208 @@ def test_sticky_client_fires_with_better_ap(repo: Repository) -> None:
     assert f.detector_key == KEY_STICKY_CLIENT
     assert f.severity is Severity.P3
     assert "better_ap_exists" in f.confounders_checked
-    assert f.evidence["better_ap"] == "ap-far"
+    assert f.evidence["better_ap"] == "ap-good"
+    assert f.evidence["better_ap_name"] == "Hallway"
+    assert f.evidence["better_ap_median_rssi"] == -58.0
+    # Only the six readings taken while the client was on ap-good count: the
+    # eight weak ones after the roam belong to the AP it is stuck on.
+    assert f.evidence["better_ap_samples"] == 6
+
+
+def test_sticky_client_names_the_ap_its_reported_rssi_was_measured_on(repo: Repository) -> None:
+    """The recommended AP and the dBm figure beside it must be one fact (Gitea #42).
+
+    The old code paired the *alphabetically first* AP in the roam trail with the
+    client's best RSSI *anywhere* in the window, so it recommended ap-aaa at a
+    -40 dBm reading the client took while sitting on the AP it is stuck to.
+    """
+    seed_cov(repo)
+    mk_recommendable_ap(repo, "ap-aaa")
+    mk_recommendable_ap(repo, "ap-good")
+    cid = mk_client(repo, "cli-1")
+    # Two prior attachments. ap-aaa sorts first and is genuinely better than the
+    # current -82 dBm, but ap-good is better still.
+    _prior_attachment(repo, cid, "ap-aaa", rssi=-70.0, since=NOW - 6 * 3600, until=NOW - 4 * 3600)
+    _prior_attachment(repo, cid, "ap-good", rssi=-58.0, since=NOW - 4 * 3600)
+    repo.record_state_change(cid, "ap_mac", "ap-far", ts=STICKY_ROAM_TS)
+    gauge(repo, cid, "rssi", [-82.0] * 8)
+    # A one-sample transient the client took *on the AP it is stuck to*, outside
+    # the analysis window. It is the best reading in the history window and says
+    # nothing about any other AP.
+    repo.record_samples([SampleReading(cid, "rssi", NOW - 1200, -40.0)])
+
+    (f,) = StickyClientDetector().evaluate(_ctx(repo))
+    assert f.evidence["better_ap"] == "ap-good"
+    assert f.evidence["better_ap_median_rssi"] == -58.0
+
+
+def test_sticky_client_never_recommends_a_congested_ap(repo: Repository) -> None:
+    """A stronger radio in a full cell is not somewhere better to be."""
+    seed_cov(repo)
+    mk_recommendable_ap(repo, "ap-busy", cu_total=70.0)  # over the 50% degraded line
+    mk_recommendable_ap(repo, "ap-good")
+    cid = mk_client(repo, "cli-1")
+    _prior_attachment(repo, cid, "ap-busy", rssi=-50.0, since=NOW - 6 * 3600, until=NOW - 4 * 3600)
+    _prior_attachment(repo, cid, "ap-good", rssi=-58.0, since=NOW - 4 * 3600)
+    repo.record_state_change(cid, "ap_mac", "ap-far", ts=STICKY_ROAM_TS)
+    gauge(repo, cid, "rssi", [-82.0] * 8)
+
+    (f,) = StickyClientDetector().evaluate(_ctx(repo))
+    assert f.evidence["better_ap"] == "ap-good"  # not the stronger, saturated one
+    assert "candidate_ap_health_screened" in f.confounders_checked
+
+
+def test_sticky_client_suppressed_when_the_only_candidate_is_congested(repo: Repository) -> None:
+    seed_cov(repo)
+    mk_recommendable_ap(repo, "ap-good", cu_total=70.0)
+    _sticky_client(repo, "cli-1", "ap-far", better=True)
+    assert StickyClientDetector().evaluate(_ctx(repo)) == []
+
+
+def test_sticky_client_never_recommends_a_weak_mesh_uplink(repo: Repository) -> None:
+    """A better radio behind a marginal backhaul is not better."""
+    seed_cov(repo)
+    meshed = mk_recommendable_ap(repo, "ap-good")
+    repo.record_state_change(meshed, "uplink_type", "wireless", ts=NOW)
+    gauge(repo, meshed, "uplink_rssi", [-72.0] * 8)  # under the -65 dBm warn line
+    _sticky_client(repo, "cli-1", "ap-far", better=True)
+    assert StickyClientDetector().evaluate(_ctx(repo)) == []
+
+
+def test_sticky_client_never_recommends_an_ap_it_cannot_judge(repo: Repository) -> None:
+    """No airtime data for a candidate is not a clean bill of health.
+
+    ``fast_device`` can be gapped while ``fast_sta`` (which gates this detector)
+    is healthy, and an empty airtime window reads as "not congested" to anything
+    that only looks at the median. Silence about a candidate costs a suppressed
+    finding; guessing about it costs a client steered into a full cell.
+    """
+    seed_cov(repo)
+    ap = mk_ap(repo, "ap-good")
+    mk_radio(repo, "ap-good:na", ap, band="na")  # a radio, but no cu_total samples
+    _sticky_client(repo, "cli-1", "ap-far", better=True)
+    assert StickyClientDetector().evaluate(_ctx(repo)) == []
+
+
+def test_sticky_client_never_recommends_an_unjudgeable_mesh_backhaul(repo: Repository) -> None:
+    """Same rule on the other disqualifier: meshed, with no uplink readings."""
+    seed_cov(repo)
+    meshed = mk_recommendable_ap(repo, "ap-good")
+    repo.record_state_change(meshed, "uplink_type", "wireless", ts=NOW)
+    _sticky_client(repo, "cli-1", "ap-far", better=True)
+    assert StickyClientDetector().evaluate(_ctx(repo)) == []
+
+
+def test_sticky_client_recommends_a_wired_ap_with_meshing_enabled(repo: Repository) -> None:
+    """``wired_with_mesh_enabled`` is a latent-failover note, not a bad backhaul."""
+    seed_cov(repo)
+    ap = mk_recommendable_ap(repo, "ap-good")
+    repo.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="ap-good", meta={"mesh_enabled": True}),
+        ts=NOW,
+    )
+    repo.record_state_change(ap, "uplink_type", "wire", ts=NOW)
+    _sticky_client(repo, "cli-1", "ap-far", better=True)
+    (f,) = StickyClientDetector().evaluate(_ctx(repo))
+    assert f.evidence["better_ap"] == "ap-good"
+
+
+def test_sticky_client_no_better_ap_is_said_honestly(repo: Repository) -> None:
+    """No better AP means no finding, not an invented one (Gitea #42).
+
+    This client has a real prior attachment and a strong reading in its history,
+    but the reading was taken where it is now and its signal on the other AP was
+    no better. The old code paired the two and fabricated a recommendation.
+    """
+    seed_cov(repo)
+    mk_recommendable_ap(repo, "ap-good")
+    cid = _sticky_client(repo, "cli-1", "ap-far", better=True, prior_rssi=-80.0)
+    repo.record_samples([SampleReading(cid, "rssi", NOW - 1200, -45.0)])
+
+    result = StickyClientDetector().evaluate(_ctx(repo))
+    assert result == []  # an evaluated clear...
+    assert not isinstance(result, DetectorResult)  # ...not a per-entity gap
+
+
+def test_sticky_client_under_sampled_candidate_never_qualifies(repo: Repository) -> None:
+    seed_cov(repo)
+    mk_recommendable_ap(repo, "ap-good")
+    cid = mk_client(repo, "cli-1")
+    # Two readings on ap-good: a walk-past, not an attachment worth a median.
+    _prior_attachment(repo, cid, "ap-good", rssi=-55.0, samples=2)
+    repo.record_state_change(cid, "ap_mac", "ap-far", ts=STICKY_ROAM_TS)
+    gauge(repo, cid, "rssi", [-82.0] * 8)
+    assert StickyClientDetector().evaluate(_ctx(repo)) == []
+
+
+def test_sticky_client_unknown_ap_mac_is_never_recommended(repo: Repository) -> None:
+    """A wired stretch writes the *switch* MAC to the same ap_mac attribute."""
+    seed_cov(repo)
+    cid = mk_client(repo, "cli-1")
+    _prior_attachment(repo, cid, "sw-rack", rssi=-50.0)  # no AP entity by that MAC
+    repo.record_state_change(cid, "ap_mac", "ap-far", ts=STICKY_ROAM_TS)
+    gauge(repo, cid, "rssi", [-82.0] * 8)
+    assert StickyClientDetector().evaluate(_ctx(repo)) == []
+
+
+def test_sticky_client_interval_join_splits_at_each_roam(repo: Repository) -> None:
+    """Two separate stints on one AP sum; the stint in between does not count."""
+    seed_cov(repo)
+    mk_recommendable_ap(repo, "ap-good")
+    mk_recommendable_ap(repo, "ap-other")
+    cid = mk_client(repo, "cli-1")
+    _prior_attachment(
+        repo, cid, "ap-good", rssi=-58.0, samples=4, since=NOW - 6 * 3600, until=NOW - 5 * 3600
+    )
+    _prior_attachment(
+        repo, cid, "ap-other", rssi=-30.0, samples=5, since=NOW - 5 * 3600, until=NOW - 4 * 3600
+    )
+    _prior_attachment(repo, cid, "ap-good", rssi=-56.0, samples=3, since=NOW - 4 * 3600)
+    repo.record_state_change(cid, "ap_mac", "ap-far", ts=STICKY_ROAM_TS)
+    gauge(repo, cid, "rssi", [-82.0] * 8)
+
+    (f,) = StickyClientDetector().evaluate(_ctx(repo))
+    # ap-other's -30 dBm stint is the strongest signal in the window; the client
+    # is only offered it if the join is right about who measured what.
+    assert f.evidence["better_ap"] == "ap-other"
+    assert f.evidence["better_ap_samples"] == 5
+    assert f.evidence["better_ap_median_rssi"] == -30.0
 
 
 def test_sticky_client_suppressed_without_better_ap(repo: Repository) -> None:
     seed_cov(repo)
     # Sustained weak RSSI but no historically-better AP -> coverage hole, not sticky.
-    _sticky_client(repo, "cli-1", "ap-near", better=False)
+    mk_recommendable_ap(repo, "ap-good")
+    _sticky_client(repo, "cli-1", "ap-far", better=False)
     assert StickyClientDetector().evaluate(_ctx(repo)) == []
+
+
+def test_sticky_client_one_issue_per_client_across_aps(repo: Repository) -> None:
+    """A client bouncing between two far APs is one sticky issue, not two (Gitea #40)."""
+    seed_cov(repo)
+    later = NOW + 600
+    seed_cov(repo, now=later)
+    mk_recommendable_ap(repo, "ap-good")
+    cid = _sticky_client(repo, "cli-1", "ap-far-1", better=True)
+    (before,) = StickyClientDetector().evaluate(_ctx(repo))
+
+    # It bounces to the other far AP, still weak, still with nowhere better than
+    # ap-good to be.
+    repo.record_state_change(cid, "ap_mac", "ap-far-2", ts=NOW + 60)
+    gauge(repo, cid, "rssi", [-82.0] * 8, now=later)
+    gauge(repo, cid, "tx_rate", [12_000.0] * 8, now=later)
+    (after,) = StickyClientDetector().evaluate(_ctx(repo, now=later))
+
+    assert before.evidence["current_ap"] == "ap-far-1"
+    assert after.evidence["current_ap"] == "ap-far-2"  # evidence follows the client...
+    assert fingerprint(after) == fingerprint(before)  # ...its identity does not
 
 
 def test_sticky_client_clustered_is_p2(repo: Repository) -> None:
     seed_cov(repo)
+    mk_recommendable_ap(repo, "ap-good")
     for i in range(3):
-        _sticky_client(repo, f"cli-{i}", "ap-near", better=True)
+        _sticky_client(repo, f"cli-{i}", "ap-far", better=True)
     findings = StickyClientDetector().evaluate(_ctx(repo))
     assert len(findings) == 3
     assert all(f.severity is Severity.P2 for f in findings)
@@ -231,7 +467,8 @@ def test_sticky_client_clustered_is_p2(repo: Repository) -> None:
 
 def test_sticky_client_unknown_on_low_coverage(repo: Repository) -> None:
     seed_low_cov(repo)
-    _sticky_client(repo, "cli-1", "ap-near", better=True)
+    mk_recommendable_ap(repo, "ap-good")
+    _sticky_client(repo, "cli-1", "ap-far", better=True)
     assert StickyClientDetector().evaluate(_ctx(repo)) is UNKNOWN
 
 
@@ -243,8 +480,9 @@ def test_sticky_client_rate_confounder_reads_kbps_as_mbps(repo: Repository) -> N
     check was dead for every sticky client ever raised (Gitea #41).
     """
     seed_cov(repo)
+    mk_recommendable_ap(repo, "ap-good")
     # 1_152_900 kbps = 1152.9 Mbps: a fast client, nothing to corroborate.
-    _sticky_client(repo, "cli-fast", "ap-near", better=True, tx_rate_kbps=1_152_900.0)
+    _sticky_client(repo, "cli-fast", "ap-far", better=True, tx_rate_kbps=1_152_900.0)
     (fast,) = StickyClientDetector().evaluate(_ctx(repo))
     assert fast.evidence["median_tx_rate_mbps"] == 1152.9
     assert fast.evidence["low_rate_corroborated"] is False
@@ -252,8 +490,9 @@ def test_sticky_client_rate_confounder_reads_kbps_as_mbps(repo: Repository) -> N
 
 def test_sticky_client_low_rate_corroborates(repo: Repository) -> None:
     seed_cov(repo)
+    mk_recommendable_ap(repo, "ap-good")
     # 12_000 kbps = 12 Mbps, under the 24 Mbps floor -> the confounder fires.
-    _sticky_client(repo, "cli-slow", "ap-near", better=True, tx_rate_kbps=12_000.0)
+    _sticky_client(repo, "cli-slow", "ap-far", better=True, tx_rate_kbps=12_000.0)
     (slow,) = StickyClientDetector().evaluate(_ctx(repo))
     assert slow.evidence["median_tx_rate_mbps"] == 12.0
     assert slow.evidence["low_rate_corroborated"] is True

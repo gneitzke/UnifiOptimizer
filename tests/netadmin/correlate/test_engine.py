@@ -322,6 +322,46 @@ def test_sticky_client_glued_to_other_ap_not_attributed(topo: TopologyBuilder) -
     assert set(incidents) == {10, 11}, "sticky client is not pinned to an unrelated loud AP"
 
 
+def test_sticky_client_attribution_follows_its_live_current_ap(topo: TopologyBuilder) -> None:
+    """One sticky row per client (Gitea #40) means its AP hint moves between passes.
+
+    A boundary-bouncing client used to hold two rows, one frozen on each AP; now
+    it holds one whose ``current_ap`` is refreshed on every refire. So the
+    attributed-AP guard's answer changes as the client bounces, and the symptom
+    migrates in and out of the loud AP's incident. That churn is the honest
+    consequence of a live hint -- the alternative was a permanently stale row --
+    and this pins it, so a future regression in either direction is loud.
+    """
+    ap_loud = topo.add(1, "ap", name="AP-Loud", native_id="aa:bb:cc:00:00:01")
+    topo.add(2, "ap", name="AP-Quiet", native_id="aa:bb:cc:00:00:02")
+    client = topo.add(3, "client", parent_id=ap_loud, name="Speaker")
+    topology = topo.build()
+
+    def sticky(ap_mac: str) -> list[Issue]:
+        return [
+            make_issue(10, "wifi.tx_power_loud", ap_loud, first_seen_ts=T),
+            make_issue(
+                11,
+                "wifi.sticky_client",
+                client,
+                first_seen_ts=T + 50,
+                evidence={"current_ap": ap_mac},
+            ),
+        ]
+
+    # Glued to the loud AP: the symptom belongs to that AP's incident.
+    store = _run(sticky("aa:bb:cc:00:00:01"), topology)
+    (inc,) = store.all_incidents()
+    assert _role_of(store, inc.id, 11) == IncidentRole.SYMPTOM
+
+    # It bounces to the quiet AP; the same row now names a different AP, so the
+    # guard refuses the link and the client stands alone again.
+    store.set_issues(sticky("aa:bb:cc:00:00:02"))
+    CorrelationEngine(store).run(NOW + 600)
+    roots = {i.root_issue_id for i in store.all_incidents() if i.state == IncidentState.OPEN}
+    assert roots == {10, 11}
+
+
 def test_firmware_regression_does_not_sweep_volatile_client(topo: TopologyBuilder) -> None:
     """A blanket firmware subtree sweep must not claim a client child.
 

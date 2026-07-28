@@ -436,10 +436,13 @@ _PLAYBOOKS: dict[str, Playbook] = {
         "shutdown, so treat that arm as urgent.",
     ),
     "wifi.sticky_client": Playbook(
-        signature="RSSI < −75 sustained ≥ 10 min while a historically-better AP exists for this "
-        "client; corroborated by low rates and high retries.",
+        signature="RSSI < −75 sustained ≥ 10 min while another AP measured materially better for "
+        "this same client, over that AP's own attachment intervals; corroborated by low rates and "
+        "high retries.",
         confounders="No better AP in the client's history, so that is a coverage hole, a different "
-        "issue, not a sticky client.",
+        "issue, not a sticky client. A candidate AP that is itself out of airtime or hanging off a "
+        "weak mesh backhaul, which is not somewhere better. A signal high-water mark measured on "
+        "some third AP, which says nothing about the one being recommended.",
         fix_guidance="Enable 802.11k/v (UniFi calls it Roaming Assistant) so the client is handed "
         "a neighbour list and asked to move; lower the far AP's TX power so it has a reason to. "
         "Review AP placement if it clusters on one AP. Do NOT reach for min-RSSI: it "
@@ -453,18 +456,33 @@ _PLAYBOOKS: dict[str, Playbook] = {
             EvidenceField("current_ap", "Current AP"),
             EvidenceField("ap", "Current AP"),
             EvidenceField("better_ap", "Better AP"),
+            EvidenceField("better_ap_name", "Better AP"),
             EvidenceField("better_ap_median_rssi", "Better AP's RSSI", "dBm"),
+            EvidenceField("better_ap_samples", "Readings on that AP"),
             EvidenceField("median_tx_rate_mbps", "TX rate (median)", "Mbps"),
             EvidenceField("low_rate_corroborated", "Low rate corroborates it"),
             EvidenceField("clustered_on_ap", "Clustered with other stuck clients"),
         ),
         confounder_notes={
             "better_ap_exists": lambda ev: (
-                f"A better AP exists: this client saw {_n(ev.get('better_ap_median_rssi'), 0)} "
-                "dBm on a different AP in its own history, well above the "
-                f"{_n(ev.get('median_rssi', ev.get('rssi')), 0)} dBm it gets now."
+                f"A better AP exists: this client held "
+                f"{_n(ev.get('better_ap_median_rssi'), 0)} dBm while attached to "
+                f"{ev.get('better_ap_name') or ev.get('better_ap') or 'another AP'}, well above "
+                f"the {_n(ev.get('median_rssi', ev.get('rssi')), 0)} dBm it gets where it is now."
                 if ev.get("better_ap_median_rssi") is not None
                 else "A better AP exists in this client's own roam history, not a coverage hole."
+            ),
+            "per_ap_rssi_attributed": lambda ev: (
+                f"That reading is credited to one AP: it is the median of "
+                f"{_n(ev.get('better_ap_samples'), 0)} samples taken while the client was "
+                "attached there, not its best signal anywhere on the site."
+                if ev.get("better_ap_samples") is not None
+                else None
+            ),
+            "candidate_ap_health_screened": lambda _ev: (
+                "The suggested AP was checked for its own problems first: a radio running out of "
+                "airtime, or a weak mesh backhaul, disqualifies it — a stronger signal behind a "
+                "full cell is not somewhere better."
             ),
             "sustained_not_transient": lambda ev: (
                 "Sustained, not transient: weak signal held for "

@@ -33,7 +33,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from netadmin.detect.detectors.wifi import STICKY_LOW_RATE_MBPS, sticky_rate_evidence
+from netadmin.detect.detectors.wifi import (
+    STICKY_BETTER_AP_MARGIN_DB,
+    STICKY_LOW_RATE_MBPS,
+    STICKY_RSSI_FLOOR_DBM,
+    sticky_better_ap_evidence,
+    sticky_per_ap_rssi,
+    sticky_rate_evidence,
+)
 from netadmin.domain.entities import Entity
 from netadmin.domain.types import EntityType, FixState, IssueState, Severity
 from netadmin.issues.models import EventKind
@@ -90,6 +97,14 @@ DAY = 86_400
 # as live data.
 BASE_STEP = 900
 FINE_STEP = 300
+
+# The sticky client's two signal regimes, in dBm: what it held on the AP it left,
+# and what it has held on the one it is stuck to since. The gap has to clear
+# wifi.sticky_client's 8 dB better-AP margin and the weak side has to sit under
+# its -75 dBm floor, because the demo's evidence is computed from these samples
+# by the detector's own code, not asserted next to them.
+_STICKY_PRIOR_RSSI = -57
+_STICKY_STUCK_RSSI = -81
 
 # The default demo DB filename; the real production DB name is refused as an out
 # target so a demo-seed can never clobber a live install.
@@ -264,6 +279,15 @@ class _Seeder:
         # read back in the issue phase, so the demo's evidence is *derived* from
         # the series the UI charts rather than asserted alongside it.
         self.sticky_rates_kbps: list[float] = []
+        # The sticky client's RSSI samples and the roam that splits them. The
+        # client sat near Office at a comfortable signal, moved, and has been
+        # stuck on Basement since; `_issue_sticky` runs these very samples
+        # through the detector's own attribution and better-AP test, so the
+        # recommendation the demo shows is measured on the AP it names.
+        self.sticky_rssi: list[tuple[int, float]] = []
+        self.sticky_prior_ap = "Office"
+        self.sticky_prior_since = now - 5 * DAY
+        self.sticky_roam_ts = now - 2 * DAY
         self.pingpong_client: dict[str, Any] = {}
         self.flaky_client: dict[str, Any] = {}
         self._series_units: dict[str, str] = {}
@@ -636,10 +660,26 @@ class _Seeder:
             cid = client["id"]
             if not client["wired"]:
                 base = client["base_rssi"]
-                rssi = [(ts, _clamp(base + self._jit(3), -90, -30)) for ts in self.grid]
-                sat = [(ts, _clamp(_client_sat(base) + self._jit(5), 20, 100)) for ts in self.grid]
+                # The sticky client is the one whose signal has a story: it was
+                # comfortable on its old AP and has been weak since it roamed.
+                # Same number of jitter draws either way, so the rest of the
+                # deterministic stream is unaffected.
+                sticky = cid == self.sticky_client["id"]
+                bases = [
+                    (_STICKY_PRIOR_RSSI if ts < self.sticky_roam_ts else _STICKY_STUCK_RSSI)
+                    if sticky
+                    else base
+                    for ts in self.grid
+                ]
+                rssi = [(ts, _clamp(b + self._jit(3), -90, -30)) for ts, b in zip(self.grid, bases)]
+                sat = [
+                    (ts, _clamp(_client_sat(b) + self._jit(5), 20, 100))
+                    for ts, b in zip(self.grid, bases)
+                ]
                 self._write(cid, "rssi", rssi, "dbm")
                 self._write(cid, "satisfaction", sat, "percent")
+                if sticky:
+                    self.sticky_rssi = rssi
             if i % 3 == 0 or client["wired"]:
                 peak = 21 if not client["iot"] else 12
                 lo, hi = (2e5, 4e6) if not client["iot"] else (2e4, 2e5)
@@ -1063,11 +1103,51 @@ class _Seeder:
 
     def _issue_sticky(self) -> None:
         client = self.sticky_client
-        living_mac = self.aps["Living Room"]["mac"]
+        prior = self.aps[self.sticky_prior_ap]
+        basement_mac = self.aps["Basement"]["mac"]
         first = self.now - 2 * DAY
-        # Same call the detector makes, on the same samples the charts draw: the
-        # median and the verdict are computed here, never asserted.
-        evidence: dict[str, Any] = {"ap": living_mac, "rssi": -57, "clustered_on_ap": False}
+        # The roam trail: comfortable near Office, then stuck on Basement.
+        self._state(client["id"], "ap_mac", prior["mac"], self.sticky_prior_since)
+        self._state(client["id"], "ap_mac", basement_mac, self.sticky_roam_ts)
+
+        # Every number below is the detector's own code run over the samples the
+        # charts draw, never asserted alongside them. In particular the better-AP
+        # claim goes through the same attribution the detector uses, so the demo
+        # can only say "Office measured -57 dBm" if the readings taken while the
+        # client was actually on Office say so (Gitea #42).
+        # The intervals are the trail written just above, so every reading
+        # credited to Office was taken while the store says the client was there.
+        per_ap = sticky_per_ap_rssi(
+            [
+                (self.sticky_prior_since, self.sticky_roam_ts, prior["mac"]),
+                (self.sticky_roam_ts, self.now, basement_mac),
+            ],
+            self.sticky_rssi,
+        )
+        stuck = sorted(per_ap.get(basement_mac, []))
+        median_rssi = round(_percentile(stuck, 0.5), 1)
+        evidence: dict[str, Any] = {
+            "current_ap": basement_mac,
+            "median_rssi": median_rssi,
+            "sustained_fraction_below": round(
+                sum(1 for v in stuck if v < STICKY_RSSI_FLOOR_DBM) / len(stuck), 3
+            ),
+            "rssi_floor_dbm": STICKY_RSSI_FLOOR_DBM,
+            "clustered_on_ap": False,
+        }
+        better = sticky_better_ap_evidence(
+            {mac: vals for mac, vals in per_ap.items() if mac != basement_mac},
+            median_rssi,
+            rssi_floor=STICKY_RSSI_FLOOR_DBM,
+            margin=STICKY_BETTER_AP_MARGIN_DB,
+            names={prior["mac"]: self.sticky_prior_ap},
+        )
+        if better is None:  # pragma: no cover - the seeded samples cannot fail this
+            raise RuntimeError(
+                "demo sticky client has no better AP: the seeded RSSI no longer "
+                "supports the finding it is used to show"
+            )
+        evidence.update(better)
         sticky_rate_evidence(self.sticky_rates_kbps, STICKY_LOW_RATE_MBPS, evidence)
         iid = self._insert(
             detector_key="wifi.sticky_client",
@@ -1079,13 +1159,17 @@ class _Seeder:
             first_seen=first,
             last_seen=self.now - FINE_STEP,
             evidence=evidence,
-            confounders=["better_ap_exists", "sustained_not_transient", "low_rate_corroborated"],
-            dims={"ap": living_mac},
+            confounders=[
+                "better_ap_exists",
+                "per_ap_rssi_attributed",
+                "candidate_ap_health_screened",
+                "sustained_not_transient",
+                "low_rate_corroborated",
+            ],
+            # One sticky issue per client, whichever AP it is glued to (#40).
+            dims={},
             occurrences=22,
         )
-        # ap_mac history: was on Living Room, now stuck on Basement.
-        self._state(client["id"], "ap_mac", living_mac, self.now - 5 * DAY)
-        self._state(client["id"], "ap_mac", self.aps["Basement"]["mac"], self.now - 2 * DAY)
         self._detected(iid, first, Severity.P3)
         self._escalated(iid, first + 3 * 900, 3)
 

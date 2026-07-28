@@ -138,6 +138,23 @@ def _values(window: Any) -> list[float]:
     return out
 
 
+def _samples(window: Any) -> list[tuple[int, float]]:
+    """A :class:`WindowResult` as ``(ts, value)`` pairs, oldest first, or ``[]``.
+
+    :func:`_values` throws the timestamp away, which is right for every
+    threshold-over-a-window question. Anything that has to *attribute* a reading
+    to what else was true at that instant needs the instant too.
+    """
+    if window is None:
+        return []
+    out: list[tuple[int, float]] = []
+    for row in window.rows:
+        v = row.get("value")
+        if v is not None:
+            out.append((int(row["ts"]), float(v)))
+    return out
+
+
 def _kbps_to_mbps(values: list[float]) -> list[float]:
     return [v / _KBPS_PER_MBPS for v in values]
 
@@ -377,6 +394,35 @@ def _bssid_set(raw: Any) -> set[str]:
 #: must corroborate for the same reason a real one does, not by assertion.
 STICKY_LOW_RATE_MBPS = 24.0
 
+#: Default sticky floor and better-AP margin, named for the same reason: the
+#: demo's sticky client has to clear the same two numbers a real one does.
+STICKY_RSSI_FLOOR_DBM = -75.0
+STICKY_BETTER_AP_MARGIN_DB = 8.0
+
+#: How far back the better-AP interval join looks (7 days), and deliberately the
+#: same horizon as ``net.coverage_hole``'s ``history_s``. That detector drops a
+#: weak client whose best RSSI inside its lookback was strong ("it can reach a
+#: better AP, so this is not a hole"); a shorter horizon here would leave a
+#: client stuck longer than that span invisible to both detectors. Raw retention
+#: is 30 days, so the whole span is served sample-by-sample from the raw tier and
+#: every reading joins to exactly one attachment interval -- no rollup bucket can
+#: straddle a roam.
+STICKY_HISTORY_WINDOW_S = 7 * 86_400
+
+#: Minimum RSSI samples inside one AP's attachment intervals before that AP's
+#: median may stand as "what this client got there". Three samples is three
+#: minutes at the 60 s client cadence: enough that one lucky reading during a
+#: walk-past cannot become a recommendation, low enough that a genuine prior
+#: attachment (which is shorter than an analysis window) still counts.
+STICKY_MIN_AP_SAMPLES = 3
+
+#: Row cap for the ``ap_mac`` trail read. The repository default is 200 rows,
+#: newest first, which a ping-pong client changing AP every 10 s exceeds in about
+#: 35 minutes; the truncation would drop the *oldest* rows and corrupt the
+#: opening interval. 10_000 mirrors ``SleMinutesJob._state_at``'s read of the
+#: same table.
+_STATE_TRAIL_LIMIT = 10_000
+
 
 def sticky_rate_evidence(
     rates_kbps: list[float], low_rate_mbps: float, evidence: dict[str, Any]
@@ -397,15 +443,206 @@ def sticky_rate_evidence(
     evidence["low_rate_corroborated"] = med <= low_rate_mbps
 
 
+def sticky_per_ap_rssi(
+    intervals: list[tuple[int, int, str]], samples: list[tuple[int, float]]
+) -> dict[str, list[float]]:
+    """Credit each RSSI reading to the AP the client was attached to at that instant.
+
+    ``intervals`` are half-open ``(from_ts, to_ts, ap_mac)`` attachments, oldest
+    first and non-overlapping; ``samples`` are ``(ts, value)`` pairs, oldest
+    first. A reading outside every interval (the client's attachment was never
+    recorded then) is credited to nobody rather than to a guess.
+
+    This is the join that makes "AP X measured -57 dBm for this client" a single
+    fact instead of two unrelated ones. The demo seed runs its own fabricated
+    trail through it for the same reason it runs rates through
+    :func:`sticky_rate_evidence`: so a broken attribution fails the demo instead
+    of hiding in it.
+    """
+    per_ap: dict[str, list[float]] = {}
+    i = 0
+    for ts, value in samples:
+        while i < len(intervals) and intervals[i][1] <= ts:
+            i += 1
+        if i >= len(intervals):
+            break
+        start, end, ap_mac = intervals[i]
+        if start <= ts < end:
+            per_ap.setdefault(ap_mac, []).append(value)
+    return per_ap
+
+
+def sticky_better_ap_evidence(
+    per_ap_rssi: dict[str, list[float]],
+    current_median: float,
+    *,
+    rssi_floor: float,
+    margin: float,
+    min_samples: int = STICKY_MIN_AP_SAMPLES,
+    names: Optional[dict[str, str]] = None,
+) -> Optional[dict[str, Any]]:
+    """The AP that has genuinely served this client better, or ``None``.
+
+    ``per_ap_rssi`` holds only candidates already screened as fit to recommend
+    (see :class:`_CandidateApScreen`); this decides whether any of them is
+    actually *better*. A candidate qualifies when its own median clears the
+    sticky floor and beats the client's current median by ``margin`` dB, and the
+    winner is the highest median among those -- not the first in sort order,
+    which is what made the old evidence fiction (Gitea #42).
+
+    ``None`` is a real answer: no AP in this client's history is better, so
+    there is nothing to steer it to and the symptom is ``net.coverage_hole``'s.
+    """
+    best: Optional[tuple[str, float, int]] = None
+    for ap_mac in sorted(per_ap_rssi):  # sorted: ties resolve deterministically
+        values = per_ap_rssi[ap_mac]
+        if len(values) < min_samples:
+            continue
+        med = _median(values)
+        if med is None or med < rssi_floor or (med - current_median) < margin:
+            continue
+        if best is None or med > best[1]:
+            best = (ap_mac, med, len(values))
+    if best is None:
+        return None
+    ap_mac, med, count = best
+    evidence: dict[str, Any] = {"better_ap": ap_mac}
+    name = (names or {}).get(ap_mac)
+    if name:
+        evidence["better_ap_name"] = name
+    evidence["better_ap_median_rssi"] = round(med, 1)
+    evidence["better_ap_samples"] = count
+    return evidence
+
+
+def _attachment_intervals(
+    ctx: Any, entity_id: int, start_ts: int, end_ts: int
+) -> list[tuple[int, int, str]]:
+    """A client's ``ap_mac`` trail over ``[start_ts, end_ts)`` as attachment intervals.
+
+    Two reads: the newest change *before* the window (the value the window opens
+    on -- the same seeding ``SleMinutesJob._state_at`` does, without which the
+    whole span before the first roam is unattributed), then the changes inside
+    it. Both are time-bounded and read with an explicit row cap; the repository
+    default of 200 is not enough for a churny roamer (see
+    :data:`_STATE_TRAIL_LIMIT`).
+    """
+    opening = ctx.repo.list_state_changes(0, start_ts, entity_id=entity_id, attr="ap_mac", limit=1)
+    changes = ctx.repo.list_state_changes(
+        start_ts, end_ts, entity_id=entity_id, attr="ap_mac", limit=_STATE_TRAIL_LIMIT
+    )
+    intervals: list[tuple[int, int, str]] = []
+    current = _norm_mac(opening[0]["new_value"]) if opening else None
+    since = start_ts
+    for row in reversed(changes):  # list_state_changes is newest-first
+        ts = int(row["ts"])
+        if current and ts > since:
+            intervals.append((since, ts, current))
+        current = _norm_mac(row["new_value"])
+        since = ts
+    if current and end_ts > since:
+        intervals.append((since, end_ts, current))
+    return intervals
+
+
+class _CandidateApScreen:
+    """Which APs are fit to be recommended to a sticky client, this cycle.
+
+    A stronger radio behind a saturated cell or a marginal mesh hop is not a
+    better place to be, so both disqualifiers are re-derived here from the same
+    metrics and thresholds their owning detectors use
+    (``wifi.airtime_saturation``, ``wifi.mesh_uplink``). Re-derived, not read off
+    the issues table: detectors never consume issues, and issue state trails
+    detection by M cycles, so an issue-based exclusion would be stale in exactly
+    the window where it matters most.
+
+    The predicates are a conservative *approximation* of their detectors', not a
+    copy: those fire when 80% of samples cross a line, this excludes when the
+    median does. Sharing the thresholds while tripping sooner is the safe
+    direction for advice -- the cost of wrongly excluding a candidate is silence,
+    the cost of wrongly recommending one is steering a client into a full cell.
+
+    An AP nothing can be judged about is not recommended either: a MAC off the
+    roam trail that resolves to no AP we manage (a switch MAC, which is what a
+    wired attachment writes to the same ``ap_mac`` attribute), or an AP with no
+    airtime samples in the window at all.
+    """
+
+    def __init__(self, ctx: Any) -> None:
+        self._ctx = ctx
+        self._aps: dict[str, Entity] = {}
+        for ap in ctx.entities(EntityType.AP):
+            mac = _norm_mac(ap.native_id)
+            if mac and ap.entity_id is not None:
+                self._aps[mac] = ap
+        self._radios = _radios_by_ap(ctx.entities(EntityType.RADIO))
+        self._congest_window = int(ctx.threshold(KEY_AIRTIME_SATURATION, "window_s", 900))
+        self._congest_cu = float(ctx.threshold(KEY_AIRTIME_SATURATION, "degraded_pct", 50))
+        self._congest_min_samples = int(ctx.threshold(KEY_AIRTIME_SATURATION, "min_samples", 4))
+        self._mesh_window = int(ctx.threshold(KEY_MESH_UPLINK, "window_s", 900))
+        self._mesh_warn = float(ctx.threshold(KEY_MESH_UPLINK, "warn_rssi_dbm", -65))
+        self._mesh_min_samples = int(ctx.threshold(KEY_MESH_UPLINK, "min_samples", 4))
+        self._verdicts: dict[str, bool] = {}
+
+    def names(self) -> dict[str, str]:
+        """AP MAC -> display name, for the APs that have one."""
+        return {mac: ap.name for mac, ap in self._aps.items() if ap.name}
+
+    def healthy(self, ap_mac: str) -> bool:
+        verdict = self._verdicts.get(ap_mac)
+        if verdict is None:
+            verdict = self._screen(ap_mac)
+            self._verdicts[ap_mac] = verdict
+        return verdict
+
+    def _screen(self, ap_mac: str) -> bool:
+        ap = self._aps.get(ap_mac)
+        if ap is None:
+            return False
+        judged = False
+        for radio in self._radios.get(ap.entity_id, []):
+            if radio.entity_id is None:
+                continue
+            cu = _values(self._ctx.window(radio.entity_id, "cu_total", self._congest_window))
+            if len(cu) < self._congest_min_samples:
+                continue
+            judged = True
+            med = _median(cu)
+            if med is not None and med >= self._congest_cu:
+                return False
+        if not judged:
+            return False
+        return self._backhaul_ok(ap)
+
+    def _backhaul_ok(self, ap: Entity) -> bool:
+        uplink = str(self._ctx.repo.current_state(ap.entity_id, "uplink_type") or "").lower()
+        if uplink != "wireless":
+            # Wired, or an install whose inventory never captured uplink_type.
+            # ``wifi.mesh_uplink`` reads it exactly this way, and its
+            # ``wired_with_mesh_enabled`` case is a latent-failover note, not a
+            # backhaul that is bad now.
+            return True
+        rssi = _values(self._ctx.window(ap.entity_id, "uplink_rssi", self._mesh_window))
+        if len(rssi) < self._mesh_min_samples:
+            return False  # meshed, and nothing to judge the hop by
+        med = _median(rssi)
+        return med is not None and med >= self._mesh_warn
+
+
 class StickyClientDetector:
     """``wifi.sticky_client`` — a client glued to a far AP while a better one exists.
 
     Fires when a wireless client's RSSI is sustained below the sticky floor
-    (default -75 dBm) for the analysis window **and** that same client has, in its
-    own roam history, been served materially better by a *different* AP. Without
-    that historically-better-AP evidence the symptom is a coverage hole, not
-    stickiness — the detector suppresses and lets ``net.coverage_hole`` own it.
-    Concentration of sticky clients on one current AP raises the finding to P2.
+    (default -75 dBm) for the analysis window **and** a *different* AP has
+    measurably served this same client better — measured on that AP, over its own
+    attachment intervals, and only if that AP is not itself saturated or on a
+    marginal mesh backhaul. Without such an AP the symptom is a coverage hole,
+    not stickiness — the detector suppresses and lets ``net.coverage_hole`` own
+    it. Concentration of sticky clients on one current AP raises the finding to
+    P2.
+
+    One open issue per client: see ``_build`` on why the AP is evidence and not
+    part of the identity.
     """
 
     key = KEY_STICKY_CLIENT
@@ -417,13 +654,22 @@ class StickyClientDetector:
             return UNKNOWN
 
         window_s = int(ctx.threshold(self.key, "window_s", 600))
-        rssi_floor = float(ctx.threshold(self.key, "rssi_floor_dbm", -75))
+        rssi_floor = float(ctx.threshold(self.key, "rssi_floor_dbm", STICKY_RSSI_FLOOR_DBM))
         sustained_frac = float(ctx.threshold(self.key, "sustained_fraction", 0.8))
         min_samples = int(ctx.threshold(self.key, "min_samples", 4))
-        better_margin = float(ctx.threshold(self.key, "better_ap_margin_db", 8))
+        better_margin = float(
+            ctx.threshold(self.key, "better_ap_margin_db", STICKY_BETTER_AP_MARGIN_DB)
+        )
         cluster_min = int(ctx.threshold(self.key, "cluster_min", 3))
         low_rate_mbps = float(ctx.threshold(self.key, "low_rate_mbps", STICKY_LOW_RATE_MBPS))
+        history_s = int(ctx.threshold(self.key, "history_window_s", STICKY_HISTORY_WINDOW_S))
+        min_ap_samples = int(
+            ctx.threshold(self.key, "better_ap_min_samples", STICKY_MIN_AP_SAMPLES)
+        )
 
+        # Built on first use: most cycles have no sustained-weak client at all,
+        # and the screen reads every AP's radios.
+        screen: Optional[_CandidateApScreen] = None
         raw: list[tuple[Entity, dict[str, Any], Optional[str]]] = []
         unknown: set[int] = set()
         for client in ctx.entities(EntityType.CLIENT):
@@ -439,19 +685,29 @@ class StickyClientDetector:
                 continue  # not sustained-weak
 
             current_ap = ctx.repo.current_state(client.entity_id, "ap_mac")
+            current_med = _median(values)
+            if screen is None:
+                screen = _CandidateApScreen(ctx)
             better = self._better_ap_evidence(
-                ctx, client, current_ap, window_s, rssi_floor, better_margin
+                ctx,
+                client,
+                current_ap,
+                current_med if current_med is not None else rssi_floor,
+                screen,
+                history_s=history_s,
+                rssi_floor=rssi_floor,
+                margin=better_margin,
+                min_ap_samples=min_ap_samples,
             )
             if better is None:
                 continue  # no better AP -> coverage hole, suppressed here
 
             evidence = {
                 "current_ap": current_ap,
-                "median_rssi": _median(values),
+                "median_rssi": current_med,
                 "sustained_fraction_below": round(_fraction_below(values, rssi_floor), 3),
                 "rssi_floor_dbm": rssi_floor,
-                "better_ap": better["ap"],
-                "better_ap_median_rssi": better["rssi"],
+                **better,
             }
             self._corroborate(ctx, client, window_s, low_rate_mbps, evidence)
             raw.append((client, evidence, current_ap))
@@ -463,37 +719,45 @@ class StickyClientDetector:
         ctx: Any,
         client: Entity,
         current_ap: Optional[str],
-        window_s: int,
+        current_median: float,
+        screen: _CandidateApScreen,
+        *,
+        history_s: int,
         rssi_floor: float,
         margin: float,
+        min_ap_samples: int,
     ) -> Optional[dict[str, Any]]:
         """Has THIS client been served materially better by a different AP?
 
-        Reads the client's ``ap_mac`` roam history: a prior attachment to another
-        AP whose recorded RSSI beat the current median by ``margin`` dB (and sat
-        above the sticky floor) is proof a better AP exists for this device.
+        Every reading behind the answer was measured *while the client was
+        attached to the AP it is credited to*: the ``ap_mac`` trail becomes
+        attachment intervals and the client's own RSSI samples are joined onto
+        them. The recommendation and the number it carries are then one fact
+        about one AP. (The old code paired the alphabetically first AP in the
+        trail with the client's best RSSI anywhere in the window -- two facts
+        with nothing to do with each other, Gitea #42.)
+
+        Candidates that are themselves degraded are dropped before the
+        comparison, and ``None`` -- no AP in this client's history is better --
+        is an honest answer, not a failure to find one.
         """
-        history = ctx.repo.state_history(client.entity_id, "ap_mac", limit=50)
-        prior_aps = {
-            row["new_value"]
-            for row in history
-            if row["new_value"] and row["new_value"] != current_ap
+        start_ts = ctx.now_ts - history_s
+        intervals = _attachment_intervals(ctx, client.entity_id, start_ts, ctx.now_ts)
+        samples = _samples(ctx.window(client.entity_id, "rssi", history_s))
+        current = _norm_mac(current_ap)
+        candidates = {
+            ap_mac: values
+            for ap_mac, values in sticky_per_ap_rssi(intervals, samples).items()
+            if ap_mac != current and len(values) >= min_ap_samples and screen.healthy(ap_mac)
         }
-        if not prior_aps:
-            return None
-        # Compare against the client's own better historical RSSI on another AP:
-        # its long RSSI window spans those prior attachments, so its high-water
-        # mark is the signal it enjoyed on a nearer AP.
-        long_window = int(ctx.threshold(self.key, "history_window_s", 6 * 3600))
-        hist_values = _values(ctx.window(client.entity_id, "rssi", long_window))
-        if not hist_values:
-            return None
-        best = max(hist_values)
-        current_values = _values(ctx.window(client.entity_id, "rssi", window_s))
-        current_med = _median(current_values) or best
-        if best >= rssi_floor and (best - current_med) >= margin:
-            return {"ap": sorted(prior_aps)[0], "rssi": best}
-        return None
+        return sticky_better_ap_evidence(
+            candidates,
+            current_median,
+            rssi_floor=rssi_floor,
+            margin=margin,
+            min_samples=min_ap_samples,
+            names=screen.names(),
+        )
 
     def _corroborate(
         self, ctx: Any, client: Entity, window_s: int, low_rate_mbps: float, evidence: dict
@@ -511,7 +775,12 @@ class StickyClientDetector:
         findings: list[Finding] = []
         for client, evidence, ap in raw:
             clustered = ap is not None and by_ap.get(ap, 0) >= cluster_min
-            confounders = ["better_ap_exists", "sustained_not_transient"]
+            confounders = [
+                "better_ap_exists",
+                "per_ap_rssi_attributed",
+                "candidate_ap_health_screened",
+                "sustained_not_transient",
+            ]
             if "low_rate_corroborated" in evidence:
                 confounders.append("low_rate_corroborated")
             label = client.name or client.native_id
@@ -521,7 +790,14 @@ class StickyClientDetector:
                     entity=client,
                     severity=Severity.P2 if clustered else Severity.P3,
                     title=f"Sticky client {label} on far AP",
-                    dims={"ap": str(ap)} if ap else {},
+                    # Per client, not per (client, AP): "this client will not
+                    # roam" is a property of the client, and which far AP it is
+                    # glued to right now is evidence, which refreshes on every
+                    # refire. Keying the fingerprint on the AP minted a second
+                    # issue every time a boundary-bouncing client landed
+                    # somewhere else, and left the abandoned row describing an
+                    # attachment the detector no longer claims (Gitea #40).
+                    dims={},
                     evidence={**evidence, "clustered_on_ap": clustered},
                     confounders_checked=confounders,
                 )
