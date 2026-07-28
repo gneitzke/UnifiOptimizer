@@ -46,8 +46,16 @@ def _ap(repo: Repository, native_id: str, name: str | None = None, model: str | 
     )
 
 
-def _client(repo: Repository, mac: str, ap_id: int) -> int:
-    return repo.upsert_entity(
+def _client(
+    repo: Repository, mac: str, ap_id: int, ap_mac: str, *, attach_ts: int = NOW - 100_000
+) -> int:
+    """A client attached to ``ap_mac`` since ``attach_ts`` (before any window).
+
+    The detector credits each RSSI reading to the AP the client was attached to
+    when it was taken, so a client needs a recorded ``ap_mac`` trail before its
+    RSSI counts toward any AP -- exactly what the production ingest writes.
+    """
+    cid = repo.upsert_entity(
         Entity(
             entity_type=EntityType.CLIENT,
             native_id=mac,
@@ -57,6 +65,8 @@ def _client(repo: Repository, mac: str, ap_id: int) -> int:
         ),
         ts=NOW,
     )
+    repo.record_state_change(cid, "ap_mac", ap_mac, ts=attach_ts)
+    return cid
 
 
 def _rssi(repo: Repository, client_id: int, points) -> None:
@@ -70,7 +80,7 @@ def test_coverage_hole_fires(repo: Repository) -> None:
     seed_coverage(repo, job="fast_sta", now=NOW, window_s=21600, interval_s=60)
     ap = _ap(repo, "ap-1", "ap-basement")
     for i in range(3):
-        cid = _client(repo, f"cc:{i}", ap)
+        cid = _client(repo, f"cc:{i}", ap, "ap-1")
         # 10 weak samples inside the 6 h window; nothing better anywhere in history.
         _rssi(repo, cid, [(NOW - 20000 + k * 300, -82.0) for k in range(10)])
     findings = CoverageHoleDetector().evaluate(_ctx(repo))
@@ -88,7 +98,7 @@ def test_coverage_hole_confounder_sticky_client_excluded(repo: Repository) -> No
     seed_coverage(repo, job="fast_sta", now=NOW, window_s=21600, interval_s=60)
     ap = _ap(repo, "ap-1")
     for i in range(3):
-        cid = _client(repo, f"dd:{i}", ap)
+        cid = _client(repo, f"dd:{i}", ap, "ap-1")
         recent = [(NOW - 20000 + k * 300, -82.0) for k in range(10)]
         strong_history = [(NOW - 25200, -55.0)]  # older than the 6 h window, within 7 d
         _rssi(repo, cid, strong_history + recent)
@@ -97,7 +107,7 @@ def test_coverage_hole_confounder_sticky_client_excluded(repo: Repository) -> No
 
 def test_coverage_hole_unknown_low_coverage(repo: Repository) -> None:
     ap = _ap(repo, "ap-1")
-    cid = _client(repo, "ee:1", ap)
+    cid = _client(repo, "ee:1", ap, "ap-1")
     _rssi(repo, cid, [(NOW - 20000 + k * 300, -82.0) for k in range(10)])
     repo.record_poll_run(job="fast_sta", ok=True, ts=NOW - 600)
     assert CoverageHoleDetector().evaluate(_ctx(repo)) is UNKNOWN
@@ -110,12 +120,55 @@ def test_coverage_hole_confounder_too_few_samples(repo: Repository) -> None:
     # empty-list clear that would resolve an open hole issue by absence.
     seed_coverage(repo, job="fast_sta", now=NOW, window_s=21600, interval_s=60)
     ap = _ap(repo, "ap-1")
-    cid = _client(repo, "ff:1", ap)
+    cid = _client(repo, "ff:1", ap, "ap-1")
     _rssi(repo, cid, [(NOW - 20000 + k * 300, -82.0) for k in range(3)])  # < min_samples
     result = CoverageHoleDetector().evaluate(_ctx(repo))
     assert isinstance(result, DetectorResult)
     assert result.findings == []
     assert result.unknown_entities == {ap}
+
+
+def test_coverage_hole_roamer_rssi_credited_to_measured_ap(repo: Repository) -> None:
+    """Gitea #46: a mid-window roamer's RSSI is credited to the AP that measured it.
+
+    The roamer read strong on ap-good for the first half of the window, then roamed
+    to ap-hole and read weak. Its ``parent_id`` is ap-hole now. The old grouping
+    credited its whole window to ap-hole, so ap-hole's histogram carried ten strong
+    readings ap-good actually measured -- inflating its sample_count and diluting
+    its very-weak share with signal earned elsewhere. Correct attribution keeps
+    ap-hole's histogram to the readings taken *on* ap-hole.
+    """
+    seed_coverage(repo, job="fast_sta", now=NOW, window_s=21600, interval_s=60)
+    hole = _ap(repo, "ap-hole", "ap-hole")
+    _ap(repo, "ap-good", "ap-good")
+
+    # Two clients genuinely stuck on ap-hole for the whole window (10 weak each).
+    for i in range(2):
+        cid = _client(repo, f"stuck:{i}", hole, "ap-hole")
+        _rssi(repo, cid, [(NOW - 20000 + k * 300, -82.0) for k in range(10)])
+
+    # The roamer: attached to ap-good before the window, ten strong readings taken
+    # there, then a mid-window roam to ap-hole where it reads weak. Its best RSSI
+    # anywhere is -50 (on ap-good), so the no-better-AP gate rightly does not count
+    # it as stuck -- it is a sticky client, not part of the hole.
+    roamer = _client(repo, "roamer", hole, "ap-good")
+    _rssi(repo, roamer, [(NOW - 21000 + k * 400, -50.0) for k in range(10)])  # ..NOW-17400
+    roam_ts = NOW - 17000
+    repo.record_state_change(roamer, "ap_mac", "ap-hole", ts=roam_ts)
+    _rssi(repo, roamer, [(roam_ts + 500 + k * 300, -82.0) for k in range(6)])  # NOW-16500..
+
+    result = CoverageHoleDetector().evaluate(_ctx(repo))
+    findings = result.findings if isinstance(result, DetectorResult) else result
+    holes = [f for f in findings if f.entity.native_id == "ap-hole"]
+    assert len(holes) == 1
+    f = holes[0]
+    # 20 stuck-client readings + the roamer's 6 weak readings taken on ap-hole = 26.
+    # The old code credited the roamer's whole window (16 samples) to ap-hole -> 36.
+    assert f.evidence["sample_count"] == 26
+    # Every sample in the honest histogram is below the very-weak line; the buggy
+    # one diluted it with the ten strong -50 readings ap-good measured -> 0.72.
+    assert f.evidence["very_weak_share"] == 1.0
+    assert f.evidence["stuck_clients"] == 2
 
 
 # ====================================================================== #

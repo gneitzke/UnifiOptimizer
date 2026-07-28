@@ -3,11 +3,14 @@
 Two detectors that reason across many entities at once rather than one:
 
 * :class:`CoverageHoleDetector` (``net.coverage_hole``) — a Cisco-CHD-style
-  per-AP client-RSSI histogram. An AP is a coverage hole when its attached
-  clients read weak (histogram p25 < −75 dBm, or > 20 % of client-samples
-  < −80 dBm) **and** those weak clients have no better AP anywhere in their
-  history — the check that separates a genuine dead spot from a sticky client
-  that simply refuses to roam to the strong AP it can reach.
+  per-AP client-RSSI histogram. Every RSSI sample is credited to the AP that
+  *measured* it — the client's attachment at that instant, not the AP it sits on
+  now — so a client that roamed mid-window can no longer poison its current AP's
+  histogram with signal it earned somewhere else (Gitea #46). An AP is a coverage
+  hole when the samples measured on it read weak (histogram p25 < −75 dBm, or
+  > 20 % of client-samples < −80 dBm) **and** those weak clients have no better AP
+  anywhere in their history — the check that separates a genuine dead spot from a
+  sticky client that simply refuses to roam to the strong AP it can reach.
 * :class:`FirmwareRegressionDetector` (``net.firmware_regression``) — a
   change-point around a firmware upgrade. For each device it compares the 7 days
   before the upgrade against the 7 days after (skipping the first 2 h of
@@ -24,6 +27,12 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from netadmin.detect.detectors._rssi import (
+    _attachment_intervals,
+    _norm_mac,
+    _samples,
+    sticky_per_ap_rssi,
+)
 from netadmin.detect.engine import COVERAGE_MIN, UNKNOWN, DetectorResult, EvalResult
 from netadmin.domain.entities import Entity, Finding
 from netadmin.domain.types import Cadence, EntityType, Severity
@@ -69,13 +78,15 @@ def _window_values(ctx: Any, entity_id: int, metric: str, seconds: int) -> list[
 class CoverageHoleDetector:
     """``net.coverage_hole`` — per-AP weak-client histogram + no-better-AP gate.
 
-    For each AP, the RSSI samples of its currently attached clients form a
-    histogram. The AP is flagged when that histogram is weak (p25 below the weak
-    line, or a large fraction below the very-weak line) **and** the weak clients
-    are stuck there — their best RSSI *anywhere* in recorded history is also weak,
-    proving no better AP exists for them. A client that has seen strong RSSI
-    elsewhere is a sticky/roaming problem (a different detector), not a hole, and
-    is excluded here.
+    For each AP, the RSSI samples *measured on it* form a histogram: each client's
+    readings are joined onto its ``ap_mac`` attachment trail, so a client that
+    roamed mid-window counts toward an AP only for the minutes it was actually on
+    it (Gitea #46) — one AP is never credited with signal another measured. The AP
+    is flagged when that histogram is weak (p25 below the weak line, or a large
+    fraction below the very-weak line) **and** the weak clients are stuck there —
+    their best RSSI *anywhere* in recorded history is also weak, proving no better
+    AP exists for them. A client that has seen strong RSSI elsewhere is a
+    sticky/roaming problem (a different detector), not a hole, and is excluded here.
     """
 
     key = KEY_COVERAGE_HOLE
@@ -94,11 +105,31 @@ class CoverageHoleDetector:
         history_s = int(ctx.threshold(self.key, "history_s", 604800))  # 7 d best-RSSI lookback
         min_samples = int(ctx.threshold(self.key, "min_samples", 20))
 
-        clients_by_ap: dict[Any, list[Entity]] = {}
-        for client in ctx.entities(EntityType.CLIENT):
-            if client.entity_id is None or client.parent_id is None:
+        aps_by_mac: dict[str, Entity] = {}
+        for ap in ctx.entities(EntityType.AP):
+            if ap.entity_id is None:
                 continue
-            clients_by_ap.setdefault(client.parent_id, []).append(client)
+            mac = _norm_mac(ap.native_id)
+            if mac is not None:
+                aps_by_mac[mac] = ap
+
+        # Credit each client's readings to the AP that measured them, not the AP it
+        # sits on now: the client's own RSSI window joined onto its ap_mac trail. A
+        # roamer lands in an AP's histogram only for the minutes it was on that AP,
+        # and a reading on a MAC we manage no AP for (a wired stretch writes the
+        # switch MAC here) is dropped rather than mis-credited.
+        start_ts = ctx.now_ts - window_s
+        per_ap: dict[int, dict[int, list[float]]] = {}
+        for client in ctx.entities(EntityType.CLIENT):
+            if client.entity_id is None:
+                continue
+            intervals = _attachment_intervals(ctx, client.entity_id, start_ts, ctx.now_ts)
+            samples = _samples(ctx.window(client.entity_id, "rssi", window_s))
+            for ap_mac, vals in sticky_per_ap_rssi(intervals, samples).items():
+                ap = aps_by_mac.get(ap_mac)
+                if ap is None or ap.entity_id is None:
+                    continue
+                per_ap.setdefault(ap.entity_id, {}).setdefault(client.entity_id, []).extend(vals)
 
         findings: list[Finding] = []
         unknown: set[int] = set()
@@ -108,8 +139,7 @@ class CoverageHoleDetector:
             finding, ap_unknown = self._evaluate_ap(
                 ctx,
                 ap,
-                clients_by_ap.get(ap.entity_id, []),
-                window_s=window_s,
+                per_ap.get(ap.entity_id, {}),
                 weak_dbm=weak_dbm,
                 very_weak_dbm=very_weak_dbm,
                 very_weak_frac=very_weak_frac,
@@ -118,8 +148,8 @@ class CoverageHoleDetector:
                 min_samples=min_samples,
             )
             if ap_unknown:
-                # Too little client-signal on this AP this window to judge coverage
-                # -> freeze any open hole issue on it, never clear it by absence.
+                # Too little client-signal measured on this AP this window to judge
+                # coverage -> freeze any open hole issue on it, never clear by absence.
                 unknown.add(ap.entity_id)
             elif finding is not None:
                 findings.append(finding)
@@ -129,9 +159,8 @@ class CoverageHoleDetector:
         self,
         ctx: Any,
         ap: Entity,
-        clients: list[Entity],
+        per_client: dict[int, list[float]],
         *,
-        window_s: int,
         weak_dbm: float,
         very_weak_dbm: float,
         very_weak_frac: float,
@@ -143,17 +172,17 @@ class CoverageHoleDetector:
         AP had too few client-RSSI samples to judge (a per-AP coverage gap); a
         weak-but-not-a-hole or no-stuck-clients outcome returns ``(None, False)`` —
         a genuine clear.
+
+        ``per_client`` maps a client's entity id to the RSSI samples *measured on
+        this AP* — its readings taken while attached here, never any it took on
+        another AP (:func:`sticky_per_ap_rssi` did the attribution).
         """
         all_rssi: list[float] = []
-        per_client: dict[int, list[float]] = {}
-        for client in clients:
-            vals = _window_values(ctx, client.entity_id, "rssi", window_s)
-            if vals:
-                per_client[client.entity_id] = vals
-                all_rssi.extend(vals)
+        for vals in per_client.values():
+            all_rssi.extend(vals)
 
         if len(all_rssi) < min_samples:
-            return None, True  # too little client-signal on this AP -> UNKNOWN
+            return None, True  # too little client-signal measured here -> UNKNOWN
 
         ordered = sorted(all_rssi)
         p25 = _percentile(ordered, 0.25)
@@ -165,16 +194,15 @@ class CoverageHoleDetector:
         # No-better-AP gate: keep only weak clients whose *best ever* RSSI is also
         # weak. A client with strong RSSI somewhere in history can reach a better
         # AP -> sticky client, not a coverage hole.
-        stuck: list[Entity] = []
-        for client in clients:
-            vals = per_client.get(client.entity_id)
+        stuck = 0
+        for client_id, vals in per_client.items():
             if not vals or _percentile(sorted(vals), 0.5) >= weak_dbm:
                 continue
-            best_ever = self._best_ever_rssi(ctx, client.entity_id, history_s)
+            best_ever = self._best_ever_rssi(ctx, client_id, history_s)
             if best_ever is not None and best_ever < better_dbm:
-                stuck.append(client)
+                stuck += 1
 
-        if not stuck:
+        if stuck == 0:
             return None, False  # weak histogram but everyone can reach a better AP -> sticky
 
         label = ap.name or ap.native_id
@@ -182,14 +210,14 @@ class CoverageHoleDetector:
             detector_key=self.key,
             entity=ap,
             severity=Severity.P2,
-            title=f"Coverage hole at {label} ({len(stuck)} stuck clients)",
+            title=f"Coverage hole at {label} ({stuck} stuck clients)",
             dims={},
             evidence={
                 "client_rssi_p25": round(p25, 1),
                 "very_weak_share": round(very_weak_share, 2),
                 "weak_line_dbm": weak_dbm,
                 "very_weak_line_dbm": very_weak_dbm,
-                "stuck_clients": len(stuck),
+                "stuck_clients": stuck,
                 "sample_count": len(ordered),
             },
             confounders_checked=[
