@@ -74,7 +74,12 @@ test = [
 # The read-only MCP server (docs/MCP_SERVER.md). Deliberately an extra, not a core
 # dependency: the daemon does not need it, and the core install stays at 11 runtime
 # deps. `netadmin-mcp` imports the SDK lazily and prints this install line if absent.
-mcp = ["mcp>=1.2"]
+# Upper bound is load-bearing, not caution. The SDK's 2.0 removed
+# `mcp.shared.memory.create_connected_server_and_client_session` and changed
+# `Server.list_tools`, both of which this code and its tests use. While the spec
+# said only `>=1.2`, a fresh `pip install "unifioptimizer[mcp]"` resolved 2.0 and
+# produced an MCP server that could not start. Widen this only alongside the port.
+mcp = ["mcp>=1.2,<2"]
 
 [project.scripts]
 netadmin = "netadmin.cli:main"
