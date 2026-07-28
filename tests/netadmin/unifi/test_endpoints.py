@@ -8,6 +8,7 @@ import httpx
 import pytest
 import respx
 
+from netadmin.ingest.unifi.auth import UnifiError
 from netadmin.ingest.unifi.client import UnifiClient
 from netadmin.ingest.unifi.endpoints import EVENT_PAGE_CAP, Endpoints
 
@@ -29,8 +30,15 @@ def _mock_login() -> None:
     )
 
 
-async def _endpoints() -> tuple[UnifiClient, Endpoints]:
-    client = UnifiClient(host=HOST, site=SITE, username="u", password="p", min_request_interval=0.0)
+async def _endpoints(max_retries: int = 3) -> tuple[UnifiClient, Endpoints]:
+    client = UnifiClient(
+        host=HOST,
+        site=SITE,
+        username="u",
+        password="p",
+        min_request_interval=0.0,
+        max_retries=max_retries,
+    )
     await client.connect()
     return client, Endpoints(client)
 
@@ -265,6 +273,57 @@ async def test_stat_rogueap_within_and_alarm():
     assert json.loads(rogue.calls.last.request.content)["within"] == 48
     alarms = await ep.list_alarm()
     assert alarms[0].key == "EVT_A"
+    await client.aclose()
+
+
+@respx.mock
+async def test_list_alarm_absent_route_degrades_and_latches_off():
+    # LIVE-VALIDATED QUIRK: this console rejects list/alarm with 400
+    # api.err.InvalidObject for our POST *and* for a bare GET carrying no payload,
+    # so no body shape can satisfy it -- the alarm read route is gone. A job that
+    # fails every cycle would pin /api/health at degraded forever, so degrade to
+    # [] and stop asking for the rest of the session.
+    _mock_login()
+    route = respx.post(f"{API}/list/alarm").mock(return_value=httpx.Response(400, json=_INVALID))
+    client, ep = await _endpoints()
+
+    assert await ep.list_alarm() == []
+    assert route.call_count == 1
+    assert ep._alarm_disabled is True
+
+    assert await ep.list_alarm() == []  # short-circuits, no HTTP
+    assert route.call_count == 1
+    await client.aclose()
+
+
+@respx.mock
+async def test_list_alarm_notfound_route_degrades_to_empty():
+    # A console that removed the route outright (404) degrades the same way as
+    # one that keeps it and rejects every body (400).
+    _mock_login()
+    respx.post(f"{API}/list/alarm").mock(return_value=httpx.Response(404, json=_NOTFOUND))
+    client, ep = await _endpoints()
+    assert await ep.list_alarm() == []
+    await client.aclose()
+
+
+@respx.mock
+async def test_list_alarm_server_error_still_raises():
+    # Only the route-absent markers degrade. A real outage must still fail the
+    # job loudly and must not latch the feed off for the session.
+    _mock_login()
+    route = respx.post(f"{API}/list/alarm").mock(
+        return_value=httpx.Response(500, json={"meta": {"rc": "error", "msg": "boom"}})
+    )
+    client, ep = await _endpoints(max_retries=0)
+
+    with pytest.raises(UnifiError):
+        await ep.list_alarm()
+    assert ep._alarm_disabled is False
+
+    with pytest.raises(UnifiError):  # still asking, because nothing is known broken
+        await ep.list_alarm()
+    assert route.call_count == 2
     await client.aclose()
 
 

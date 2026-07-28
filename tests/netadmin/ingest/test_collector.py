@@ -395,6 +395,36 @@ async def test_alarms_recorded_as_events_and_deduped(repo):
     assert len(repo.read_events(0, 2_000_000_000)) == 1
 
 
+async def test_alarms_job_ok_when_console_has_no_alarm_route(repo):
+    # The real Endpoints wrapper over a console that rejects every list/alarm
+    # body: the job must record nothing and still report ok. One dead read route
+    # holding /api/health at degraded forever is what costs the banner its
+    # credibility -- a failing job should mean something is actually wrong.
+    from netadmin.ingest.unifi.auth import UnifiError
+    from netadmin.ingest.unifi.endpoints import Endpoints
+
+    class NoAlarmRouteClient:
+        """Minimal client stand-in: list/alarm answers 400 api.err.InvalidObject."""
+
+        def __init__(self):
+            self.calls = 0
+
+        async def post_data(self, endpoint, body=None):
+            self.calls += 1
+            raise UnifiError(
+                f'{endpoint} -> 400: {{"meta":{{"rc":"error","msg":"api.err.InvalidObject"}}}}'
+            )
+
+    fake_client = NoAlarmRouteClient()
+    col = Collector(Endpoints(fake_client), repo, clock=_clock())
+
+    assert await col.alarms() is True
+    assert repo.read_events(0, 2_000_000_000) == []
+
+    assert await col.alarms() is True
+    assert fake_client.calls == 1  # latched off, controller not re-asked
+
+
 async def test_alarms_without_id_hash_dedupes_distinct(repo):
     alarms = [
         Alarm(key="EVT_LAN_Loop", time=1_000_000_000_000, msg="loop A"),

@@ -64,11 +64,14 @@ _ROUTE_ABSENT_MARKERS: tuple[str, ...] = ("api.err.notfound", "api.err.invalidob
 
 
 def _route_absent(exc: UnifiError) -> bool:
-    """True when a ``UnifiError`` means the event route/body is unusable here.
+    """True when a ``UnifiError`` means the route/body is unusable on this console.
 
-    Distinguishes "this console does not serve this event endpoint" (a 404
-    ``NotFound`` or a 400 ``InvalidObject``) -- which should fall through to the
-    next candidate -- from a genuine server/transport error, which must surface.
+    Distinguishes "this console does not serve this endpoint" (a 404 ``NotFound``
+    or a 400 ``InvalidObject``) -- which should fall through to the next candidate
+    or degrade to no data -- from a genuine server/transport error, which must
+    surface. Shared by :meth:`Endpoints.stat_event` (fall through),
+    :meth:`Endpoints.rest_wlanconf` (degrade per call) and
+    :meth:`Endpoints.list_alarm` (degrade, sticky for the session).
     """
     text = str(exc).lower()
     return any(marker in text for marker in _ROUTE_ABSENT_MARKERS)
@@ -97,6 +100,9 @@ class Endpoints:
         # :meth:`stat_event`). Reset on process restart, which re-probes.
         self._event_endpoint: Optional[str] = None
         self._event_disabled: bool = False
+        # Sticky "this console has no usable alarm read route" latch; see
+        # :meth:`list_alarm`. Reset on process restart, which re-probes.
+        self._alarm_disabled: bool = False
 
     # --------------------------------------------------------------- #
     # 60 s cadence
@@ -293,7 +299,34 @@ class Endpoints:
         return [Wlan.model_validate(r) for r in rows]
 
     async def list_alarm(self, *, archived: bool = False) -> list[Alarm]:
-        rows = await self._c.post_data("list/alarm", {"archived": archived})
+        """``list/alarm`` -- controller alarms (LIVE-VALIDATED QUIRK).
+
+        Some UniFi OS consoles no longer serve any classic alarm read route: this
+        one answers ``400 api.err.InvalidObject`` to our POST *and* to a bare GET
+        carrying no payload at all, so no body shape can satisfy it -- the same
+        removal already documented for ``stat/event`` (see :data:`_EVENT_ENDPOINTS`).
+        When that happens we log once, latch off for the session and return ``[]``:
+        alarms are a supplementary feed (the live WebSocket carries the events), and
+        a permanently failing job would hold ``/api/health`` at ``degraded`` forever,
+        which costs the health banner its credibility. Genuine 5xx / transport
+        errors still raise, so a real outage still fails the job loudly, and the
+        latch resets on restart so firmware that restores the route recovers itself.
+        """
+        if self._alarm_disabled:
+            return []
+        try:
+            rows = await self._c.post_data("list/alarm", {"archived": archived})
+        except UnifiError as exc:
+            if not _route_absent(exc):
+                raise
+            self._alarm_disabled = True
+            logger.warning(
+                "No alarm route available on this console (list/alarm -> %s); alarm "
+                "ingest disabled for this session -- the live WebSocket remains the "
+                "event source.",
+                exc,
+            )
+            return []
         return [Alarm.model_validate(r) for r in rows]
 
     async def stat_anomalies(
