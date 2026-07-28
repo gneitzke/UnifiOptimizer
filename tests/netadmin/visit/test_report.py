@@ -55,3 +55,42 @@ def test_html_escapes_untrusted_text(fake_controller, visit_store, visit_setting
     html_doc = render_html(report)
     assert "<script>alert(1)</script>" not in html_doc
     assert "&lt;script&gt;" in html_doc
+
+
+# --------------------------------------------------------------------------- #
+# the header must describe the window actually analysed
+# --------------------------------------------------------------------------- #
+def _capped_report(fake, store, settings):
+    """A visit whose requested lookback exceeds the SLE sweep cap.
+
+    ``_MAX_SLE_SWEEP_S`` clamps the analysed window to the most recent 3 days, and
+    the report is built with ``window_start_ts=sle_start`` — the clamped value —
+    while ``lookback_days`` keeps the larger number that was asked for.
+    """
+    return run_visit(settings, endpoints=fake, store=store, now=NOW, lookback_days=7)
+
+
+def test_header_does_not_claim_a_window_it_did_not_analyse(
+    fake_controller, visit_store, visit_settings
+):
+    """A 7-day lookback capped to 3 days must not print "7-day lookback".
+
+    The console line and the HTML header both render the real window next to
+    ``lookback_days``, so a capped run advertised a span it never looked at: the
+    reader compares two reports of the same network, sees scores 24 points apart,
+    and has nothing to tell them the windows differed. The caveat says the sweep
+    was capped; the header must not contradict it.
+    """
+    report = _capped_report(fake_controller, visit_store, visit_settings)
+    analysed_days = round((report.window_end_ts - report.window_start_ts) / 86_400)
+    assert analysed_days < report.lookback_days, "fixture must actually trip the cap"
+
+    summary = console_summary(report)
+    html_doc = render_html(report)
+
+    # Whatever wording is used, neither surface may present the requested lookback
+    # as if it described the window that was analysed.
+    assert f"{report.lookback_days}d lookback)" not in summary
+    assert f"{report.lookback_days}-day lookback ·" not in html_doc
+    assert f"{analysed_days}-day" in html_doc
+    assert f"{analysed_days}d" in summary

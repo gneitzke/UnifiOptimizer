@@ -114,6 +114,22 @@ class VisitReport:
     def duration_s(self) -> int:
         return max(0, self.finished_ts - self.started_ts)
 
+    @property
+    def window_days(self) -> int:
+        """Days actually analysed, which is NOT always ``lookback_days``.
+
+        The SLE sweep is capped (``_MAX_SLE_SWEEP_S``), and the report is built
+        with the capped start, so a 7-day request can analyse 3 days. Anything
+        describing the window to a human must use this, or two reports of one
+        network disagree by tens of points with nothing to explain why.
+        """
+        return max(1, round((self.window_end_ts - self.window_start_ts) / 86_400))
+
+    @property
+    def window_was_capped(self) -> bool:
+        """True when less was analysed than the caller asked for."""
+        return self.window_days < self.lookback_days
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
