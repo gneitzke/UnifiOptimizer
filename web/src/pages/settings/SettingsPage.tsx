@@ -5,6 +5,7 @@ import { useHealth, type Health, type JobHealth } from '../../api';
 import { startTour } from '../onboarding';
 import { AccessTokenSection } from './AccessTokenSection';
 import { McpTokenSection } from './McpTokenSection';
+import { SoftwareUpdateSection } from './SoftwareUpdateSection';
 
 /**
  * /settings — read-only view of the daemon's live configuration and health. No
@@ -309,6 +310,13 @@ export default function SettingsPage() {
         <>
           <Section title="System" description="Current daemon status, reported live by /api/health.">
             <SystemSection health={health} />
+          </Section>
+
+          <Section
+            title="Software update"
+            description="Which version is installed, whether PyPI has a newer one, and how old that answer is (ARCHITECTURE §23)."
+          >
+            <SoftwareUpdateSection />
           </Section>
 
           <Section

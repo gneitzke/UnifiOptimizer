@@ -11,13 +11,15 @@ from netadmin.config import Settings, UpdatesConfig
 def test_defaults() -> None:
     cfg = UpdatesConfig()
     assert cfg.check is True
-    assert cfg.interval_s == 86_400
+    # Six hours, not the original day: a release sitting on PyPI most of a day
+    # before the banner mentions it reads as the check being broken.
+    assert cfg.interval_s == 21_600
 
 
 def test_settings_carries_the_default_block() -> None:
     settings = Settings(_env_file=None)
     assert settings.updates.check is True
-    assert settings.updates.interval_s == 86_400
+    assert settings.updates.interval_s == 21_600
 
 
 def test_env_override_disables_the_check(monkeypatch: pytest.MonkeyPatch) -> None:

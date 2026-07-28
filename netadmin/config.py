@@ -255,7 +255,12 @@ class UpdatesConfig(BaseModel):
     """
 
     check: bool = True
-    interval_s: int = Field(default=86_400, ge=60)  # re-check cadence after the first
+    # Six hours. A daily check meant a release could sit on PyPI most of a day
+    # before the banner mentioned it, which reads as the check being broken
+    # rather than merely patient. Six is frequent enough that a release lands
+    # the same working session and still only four GETs a day. Anyone wanting
+    # it sooner clicks Check now, which bypasses the cadence entirely.
+    interval_s: int = Field(default=21_600, ge=60)  # re-check cadence after the first
 
 
 class HaConfig(BaseModel):

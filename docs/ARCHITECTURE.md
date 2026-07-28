@@ -1347,7 +1347,8 @@ true). It sends one `GET https://pypi.org/pypi/unifioptimizer/json` with a
 `User-Agent` naming this build's version, nothing in the body, no telemetry.
 First check lands 60-300 s after the daemon is ready (jittered, so a fleet
 restarting together does not all hit PyPI at once), then again every
-`updates.interval_s` (default 86400 s / one day). A strict `X.Y.Z` tuple
+`updates.interval_s` (default 21600 s / six hours; "Check now" in Settings
+bypasses the cadence). A strict `X.Y.Z` tuple
 compare decides `update_available`; anything looser (a pre-release, a stray
 suffix) fails the parse and is treated as unknown rather than guessed at.
 
@@ -1364,7 +1365,7 @@ Config (`data/config.yaml`, `netadmin:`):
 ```yaml
 updates:
   check: true       # default on; sends nothing but the GET above
-  interval_s: 86400  # re-check cadence after the first
+  interval_s: 21600  # re-check cadence after the first (6 h)
 ```
 
 `UPDATES__CHECK=0` (or any nested-env override) works the same as every other
@@ -1574,6 +1575,46 @@ enforces server-side:
   a human would run by hand.
 
 Both light and dark themes, like every surface in this project.
+
+### Settings -> Software update (`web/src/pages/settings/SoftwareUpdateSection.tsx`)
+
+The banner only speaks when there is news, which leaves its silence ambiguous:
+no banner reads the same whether the check ran ten minutes ago and found
+nothing, ran hours before the release landed, or has never completed. This
+section is where that silence gets a date on it -- the verdict, the age of the
+last *completed* check ("Checked 4h ago", one `RelativeTime` with the exact
+local timestamp on hover), and **Check now**, which calls `POST
+/system/update/check` to ask PyPI immediately, bypassing `updates.interval_s`.
+It re-checks a version number and nothing else; no upgrade is ever started from
+that button. The POST is token-gated like any other mutation on a configured
+install, so `guarded()` raises the shared just-in-time prompt on a 401 and the
+click resumes once a token is entered.
+
+Its whole reason to exist is not lying about freshness, so three hollow
+verdicts are called out rather than collapsed into "up to date":
+
+- **The forced check never reached PyPI.** `check_now` logs the failure and
+  falls back to the cache, so the endpoint answers **200 with the previous
+  result** -- the only signal is that `checked_ts` did not move. When it
+  doesn't, the row reads "Couldn't reach PyPI, so this answer is unverified"
+  and the previous answer is shown underneath, dated and in the past tense.
+  (A background check landing in the very same wall-clock second would look
+  like a failure here; that errs toward "unverified", which is the safe way to
+  be wrong.)
+- **No check has ever completed** (`latest_version` is null, e.g. the first
+  60-300 s after a cold start) -- says exactly that, never "you're on the
+  latest".
+- **The versions don't compare** -- a build whose string fails `parse_version`
+  comes back `update_available: false`, which is not the same as being current,
+  so the row names both versions and says they can't be compared.
+
+The available-update footer follows the banner's `self_upgrade_supported` rule
+rather than inventing a second one: a real "Update" button (the same
+`PipUpdateSheet`) only where the daemon can actually upgrade itself, and "How
+to update" (the same `HowToUpdatePanel`) everywhere else -- so a container
+install, where a pip upgrade would write to a layer that vanishes on restart,
+is told to run `./deploy/update-macmini.sh` on the host instead of being handed
+a button that cannot work.
 
 ### Sidebar version footer (`web/src/layout/Sidebar.tsx`)
 

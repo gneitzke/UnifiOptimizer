@@ -31,6 +31,14 @@ export default defineConfig({
       testMatch: /report\.spec\.ts/,
     },
     {
+      // Settings → Software update (§23). Self-contained: /api/setup/status,
+      // /api/health and both /api/system/update verbs are mocked, so it needs no
+      // backend, no auth-setup, and never reaches PyPI. Guards the three honest
+      // outcomes of "Check now" and emits the light/dark screenshots.
+      name: 'update-check-tests',
+      testMatch: /update-check\.spec\.ts/,
+    },
+    {
       name: 'auth-setup',
       testMatch: /auth\.setup\.ts/,
     },

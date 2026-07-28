@@ -9,9 +9,11 @@ import {
 /**
  * Polls `GET /api/system/update` for the update banner (docs/ARCHITECTURE.md §23).
  *
- * Two cadences: a slow 60s poll normally (there is rarely anything new — PyPI is
- * only checked once a day), and a fast 4s poll while a self-upgrade is actively
- * running, so the banner's progress line tracks the runner's phase closely.
+ * Two cadences: a slow 60s poll normally (there is rarely anything new — the
+ * daemon only re-checks PyPI on `updates.interval_s`, six hours by default), and
+ * a fast 4s poll while a self-upgrade is actively running, so the banner's
+ * progress line tracks the runner's phase closely. Settings → Software update
+ * forces a re-check out of band, and this poll picks that result up within 60s.
  *
  * The runner restarts the daemon partway through (`swapping` → `restarting` →
  * `verifying`), so the poll is *expected* to fail for a few seconds around the
