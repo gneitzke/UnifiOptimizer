@@ -353,7 +353,11 @@ class Applier:
             if live is None:
                 drifted.append(step)
                 continue
-            if any(live.get(k) != v for k, v in expected.items()):
+            # A key the live read could not produce is drift, not a match: an
+            # expected value of None (a radio_table entry with no channel key)
+            # must never be satisfied by the empty extract of a radio that has
+            # vanished from the device entirely.
+            if any(k not in live or live[k] != v for k, v in expected.items()):
                 drifted.append(step)
         return drifted
 

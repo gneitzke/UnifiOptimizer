@@ -531,3 +531,38 @@ async def test_partial_apply_still_arms_verification(store):
     v = svc.verification(issue_id)
     assert v.status is VerificationStatus.PENDING, "a partial apply must still arm"
     assert v.armed_ts == NOW
+
+
+# --------------------------------------------------------------------------- #
+# a fix only applies while its issue is live
+# --------------------------------------------------------------------------- #
+async def test_apply_refuses_a_resolving_or_resolved_issue(store):
+    """A saved confirm token must not outlive the problem it was minted for.
+
+    Evidence refreshes only while the detector fires; once the issue clears it
+    freezes while the network keeps moving. On an auto-channel radio nothing
+    else in the chain notices — config stays "auto", the precondition passes,
+    and the token stays valid indefinitely. The state gate bounds the apply
+    window to the life of the problem: a self-resolved issue's fix is refused,
+    and the next detection pass re-raises with fresh evidence if it returns.
+    """
+    from netadmin.fixes.service import IssueNotActionable
+
+    issue_id = _seed_channel_plan_issue(store)
+    writer = FakeControllerWriter()
+    svc = _service(store, writer=writer)
+    dry = await svc.dry_run(issue_id)  # preview stays open regardless of state
+
+    for state in ("resolving", "resolved"):
+        store._conn.execute("UPDATE issues SET state=? WHERE id=?", (state, issue_id))
+        store._conn.commit()
+        with pytest.raises(IssueNotActionable):
+            await svc.apply(issue_id, confirm_token=dry.confirm_token)
+        assert writer.call_count == 0
+
+    # A live issue still applies with the very same token.
+    store._conn.execute("UPDATE issues SET state='active' WHERE id=?", (issue_id,))
+    store._conn.commit()
+    result = await svc.apply(issue_id, confirm_token=dry.confirm_token)
+    assert result.applied is True
+    assert writer.call_count == 1

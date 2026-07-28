@@ -423,3 +423,110 @@ def test_band_replan_still_plans_when_the_live_layout_matches():
 
     assert len(plan.steps) == 1
     assert plan.manual_action_required is False
+
+
+# --------------------------------------------------------------------------- #
+# auto-channel radios: the plan must be appliable, not just renderable
+# --------------------------------------------------------------------------- #
+def test_auto_channel_radio_precondition_expects_auto():
+    """The precondition must assert the CONFIGURED channel, not the operating one.
+
+    Auto is UniFi's factory default. The detector's evidence carries the channel
+    the radio is operating on (an int); the device object's configured channel is
+    the string "auto". Asserting the operating int against the configured string
+    is a precondition no live read can ever satisfy: the plan renders, the apply
+    always aborts with drift, and the fix is dead on arrival for every
+    default-configured radio — which is how it shipped.
+    """
+    device = make_ap_device(radios=[{"radio": "ng", "channel": "auto", "ht": 20}])
+    finding = make_finding(
+        "wifi.channel_plan",
+        radio_entity("ng"),
+        dims={"subtype": "channel_off_grid", "band": "2.4"},
+        evidence={"subtype": "channel_off_grid", "band": "2.4", "channel": 3},
+    )
+    plan = plan_fix(finding, device=device)
+    step = plan.steps[0]
+    assert step.action is ActionType.CHANNEL_CHANGE
+    assert step.precondition.expected == {"channel": "auto"}
+
+
+def test_auto_channel_radio_with_no_channel_key_is_not_planned():
+    """A radio_table entry with no channel at all yields an advisory, not a step.
+
+    ``{"channel": None}`` is the one expected value a VANISHED radio's empty live
+    extract would satisfy — planning on it would quietly defeat the
+    missing-target drift guard on a device-mutating PUT.
+    """
+    device = make_ap_device(radios=[{"radio": "ng", "ht": 20}])
+    finding = make_finding(
+        "wifi.channel_plan",
+        radio_entity("ng"),
+        dims={"subtype": "channel_off_grid", "band": "2.4"},
+        evidence={"subtype": "channel_off_grid", "band": "2.4", "channel": 3},
+    )
+    plan = plan_fix(finding, device=device)
+    assert plan.steps == []
+    assert plan.manual_action_required
+
+
+def test_band_replan_drops_an_auto_radio_that_hopped_since_detection():
+    """An auto radio is drift-checked on its OPERATING channel from stats.
+
+    Config "auto" never changes, so the configured-channel comparison is blind
+    to a hop; skipping auto radios (the old behaviour) let a joint solve run
+    against a band layout the radio had already left.
+    """
+    natives = [f"aa:bb:cc:00:00:0{i}:ng" for i in (1, 2)]
+    finding = _band_finding([(1, natives)], per_channel={"1": 2, "6": 0, "11": 0})
+    devices = {}
+    for i, native in enumerate(sorted(natives)):
+        mac = native.rsplit(":", 1)[0]
+        devices[mac] = make_ap_device(
+            device_id=f"dev{i}",
+            mac=mac,
+            radios=[{"radio": "ng", "channel": "auto", "ht": 20}],
+        )
+        # dev0 hopped to 6 since detection; dev1 still operates on 1.
+        devices[mac]["radio_table_stats"] = [{"radio": "ng", "channel": 6 if i == 0 else 1}]
+
+    plan = plan_fix(finding, devices=devices)
+    assert plan.steps == []
+    assert plan.manual_action_required
+
+
+def test_band_replan_of_unhopped_auto_radios_renders_and_survives_the_live_read():
+    """The factory-default fleet case: all-auto radios, none hopped, plan applies.
+
+    This is the joint-path twin of the single-radio regression test — the
+    multi-AP scenario is where the unsatisfiable precondition actually bit.
+    """
+    from netadmin.fixes.applier import Applier
+    from netadmin.fixes.service import _extract_target_attrs
+
+    natives = [f"aa:bb:cc:00:00:0{i}:ng" for i in (1, 2)]
+    finding = _band_finding([(1, natives)], per_channel={"1": 2, "6": 0, "11": 0})
+    devices = {}
+    for i, native in enumerate(sorted(natives)):
+        mac = native.rsplit(":", 1)[0]
+        devices[mac] = make_ap_device(
+            device_id=f"dev{i}",
+            mac=mac,
+            radios=[{"radio": "ng", "channel": "auto", "ht": 20}],
+        )
+        devices[mac]["radio_table_stats"] = [{"radio": "ng", "channel": 1}]
+
+    plan = plan_fix(finding, devices=devices)
+    assert len(plan.steps) == 1  # one radio moves off the shared channel
+    step = plan.steps[0]
+    assert step.precondition.expected == {"channel": "auto"}
+
+    mac = step.precondition.target_native_id.rsplit(":", 1)[0]
+    live = _extract_target_attrs(
+        devices[mac], step.precondition.target_native_id, step.precondition.expected
+    )
+    # State-free check; instantiating a full Applier here would add nothing.
+    drifted = Applier.__new__(Applier)._precondition_drift(
+        plan, {step.precondition.target_native_id: live}
+    )
+    assert drifted == []
