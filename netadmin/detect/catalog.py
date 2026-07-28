@@ -409,7 +409,10 @@ _PLAYBOOKS: dict[str, Playbook] = {
     ),
     "wired.broadcast_storm": Playbook(
         signature="Broadcast/multicast pps > 10× the 24 h baseline on multiple ports at once.",
-        confounders="A legitimate multicast burst (imaging, discovery sweep).",
+        confounders="A legitimate multicast burst (imaging, discovery sweep). A port whose "
+        "link is down is skipped rather than counted: combo uplinks (USW Flex 2.5G "
+        "10GE/SFP+) mirror one uplink's counters onto both port entries, and the dead "
+        "half would double-count the live one into a false multi-port storm.",
         fix_guidance="Enable storm control, locate the offending port/device, and rule out a "
         "loop feeding the storm.",
     ),
