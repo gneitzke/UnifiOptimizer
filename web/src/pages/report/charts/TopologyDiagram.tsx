@@ -1,4 +1,5 @@
 import { Fragment } from 'react';
+import { maxCharsForWidth as fitChars, truncateChars } from '../../../components/ui/chart-utils';
 import type { TopologyModel, TopoNode } from '../model';
 import { BAND_COLOR } from '../severity';
 import { useMeasuredWidth } from './useMeasuredWidth';
@@ -273,9 +274,10 @@ const KIND_TAG: Record<TopoNode['kind'], string> = {
  *  always fits the box it's drawn in rather than a fixed guess. `reserveRight`
  *  carves out room for a badge sharing the same text line. */
 function maxCharsForWidth(w: number, fontSize: number, reserveRight = 0): number {
-  const avgAdvance = fontSize * 0.58; // Inter's roughly average glyph advance at this size
-  const usable = w - 20 - reserveRight; // 10px inner padding on each side
-  return Math.max(3, Math.floor(usable / avgAdvance));
+  // 10px inner padding on each side, plus whatever a badge on the same line takes.
+  // The advance estimate itself is shared with the bar charts, which face the same
+  // "fit this label in a known box or it gets clipped" problem.
+  return fitChars(w, fontSize, 20 + reserveRight);
 }
 
 function Node({ node, x, y, w }: { node: TopoNode; x: number; y: number; w: number }) {
@@ -340,6 +342,4 @@ function Node({ node, x, y, w }: { node: TopoNode; x: number; y: number; w: numb
   );
 }
 
-function truncate(s: string, maxChars: number): string {
-  return s.length > maxChars ? `${s.slice(0, Math.max(1, maxChars - 1))}…` : s;
-}
+const truncate = truncateChars;

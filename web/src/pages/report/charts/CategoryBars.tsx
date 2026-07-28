@@ -1,4 +1,4 @@
-import { fmt, linScale, niceYScale } from '../../../components/ui/chart-utils';
+import { fmt, linScale, niceYScale, truncateToWidth } from '../../../components/ui/chart-utils';
 import { cn } from '../../../components/ui/cn';
 import { useMeasuredWidth } from './useMeasuredWidth';
 
@@ -330,6 +330,11 @@ function HorizontalBars({
         const bx = val != null ? x(val) : M.left;
         return (
           <g key={i}>
+            {/* Anchored at the gutter's right edge and growing leftwards, so a label
+                wider than the gutter runs past x=0 and the viewBox clips its first
+                characters — "U7 Pro - Kitchen · ch 6" arrives as "ro - Kitchen · ch 6".
+                Truncating keeps the identifying head of the name and loses the tail,
+                which is the readable half. */}
             <text
               x={M.left - 8}
               y={cy}
@@ -339,7 +344,7 @@ function HorizontalBars({
               fontSize={11}
               fill="var(--fg-muted)"
             >
-              {d.label}
+              {truncateToWidth(d.label, labelW - 8, 11)}
             </text>
             <line
               x1={M.left}

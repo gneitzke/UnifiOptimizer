@@ -273,3 +273,18 @@ export function nearestIndex(points: ChartPoint[], x: Scale, px: number): number
   }
   return best;
 }
+
+/** How many characters of `fontSize` text fit in `width` px (never below 3). */
+export function maxCharsForWidth(width: number, fontSize: number, reserve = 0): number {
+  return Math.max(3, Math.floor((width - reserve) / (fontSize * 0.58)));
+}
+
+/** `text` shortened to `maxChars` with an ellipsis, or unchanged if it fits. */
+export function truncateChars(text: string, maxChars: number): string {
+  return text.length > maxChars ? `${text.slice(0, Math.max(1, maxChars - 1))}…` : text;
+}
+
+/** `text` shortened to fit `width` px at `fontSize`. */
+export function truncateToWidth(text: string, width: number, fontSize: number): string {
+  return truncateChars(text, maxCharsForWidth(width, fontSize));
+}

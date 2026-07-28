@@ -11,6 +11,34 @@ import { demoReport } from './fixtures/demoReport';
  */
 
 const BASE = 'http://localhost:5173';
+
+/** The demo network, re-shaped to the density a real site produces: long AP names
+ *  and a full 2.4/5/6 GHz neighbour scan. Used only by the label-geometry test. */
+const denseReport = {
+  ...demoReport,
+  rf: {
+    ...demoReport.rf,
+    utilization: [
+      { entity_id: 31, ap_name: 'U7 Pro - Kitchen Ceiling', band: '2.4', channel: 6, cu_total: 45, cu_self: 20, cu_non_self: 25 },
+      { entity_id: 41, ap_name: 'U7 Pro - Garage Workshop', band: '2.4', channel: 1, cu_total: 74, cu_self: 30, cu_non_self: 44 },
+      { entity_id: 51, ap_name: 'U7 Pro XG - Upstairs Landing', band: '2.4', channel: 1, cu_total: 75, cu_self: 31, cu_non_self: 44 },
+    ],
+    neighbor_density: {
+      ...demoReport.rf.neighbor_density,
+      by_channel: [
+        { band: '2.4', channel: 1, count: 128 }, { band: '2.4', channel: 2, count: 2 },
+        { band: '2.4', channel: 3, count: 4 }, { band: '2.4', channel: 4, count: 3 },
+        { band: '2.4', channel: 5, count: 3 }, { band: '2.4', channel: 6, count: 165 },
+        { band: '2.4', channel: 8, count: 1 }, { band: '2.4', channel: 9, count: 3 },
+        { band: '2.4', channel: 11, count: 94 }, { band: '5', channel: 36, count: 3 },
+        { band: '5', channel: 40, count: 2 }, { band: '5', channel: 44, count: 6 },
+        { band: '5', channel: 48, count: 7 }, { band: '5', channel: 149, count: 2 },
+        { band: '5', channel: 153, count: 4 }, { band: '5', channel: 157, count: 3 },
+        { band: '5', channel: 161, count: 3 }, { band: '6', channel: 197, count: 1 },
+      ],
+    },
+  },
+};
 const OUT = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   '../../scratch_validation/report',
@@ -99,5 +127,77 @@ test.describe('Report page', () => {
       preferCSSPageSize: true,
     });
     expect(pdf.byteLength).toBeGreaterThan(20_000);
+  });
+
+  /**
+   * Chart labels must fit the box they are painted in.
+   *
+   * SVG silently paints text outside its viewBox and lets the clip eat it, and a
+   * categorical axis happily paints every label on top of its neighbour. Both
+   * shipped: the RF "airtime by radio" rows lost their leading characters
+   * ("U7 Pro - Kitchen . ch 6" arrived as "ro - Kitchen . ch 6"), and the
+   * service-level axis ran together as "CoverageRoamingCapacityConnectivity...".
+   * Neither is visible to a DOM-text assertion -- the text nodes are all present
+   * and correct -- so this measures rendered geometry instead.
+   */
+  test('chart labels are neither clipped nor overlapping', async ({ page }) => {
+    // Both defects are width-dependent and invisible at a desktop viewport: the
+    // charts get generous slots and everything fits. They appear at the width the
+    // PDF actually renders at, so emulate that page box rather than the browser's.
+    await page.setViewportSize({ width: 816, height: 1056 }); // US Letter @ 96dpi
+    await page.emulateMedia({ media: 'print' });
+
+    // The shared demo fixture is a small, tidily-named network and does not
+    // reproduce either defect. Both need what real sites have: device names long
+    // enough to overflow the label gutter, and a 2.4/5/6 GHz scan covering enough
+    // channels that the categorical axis runs out of room. Registered after
+    // mockApi so this denser payload wins.
+    await mockApi(page);
+    await page.route(api('report'), (r) => r.fulfill({ json: denseReport }));
+    await page.goto(`${BASE}/report`);
+    await expect(page.getByRole('heading', { name: 'Network Assessment' })).toBeVisible({
+      timeout: 15000,
+    });
+    await page.waitForTimeout(600);
+    await expect(page.getByRole('heading', { name: /RF environment/ })).toBeVisible();
+
+    const problems = await page.evaluate(() => {
+      const clipped: string[] = [];
+      const overlapping: string[] = [];
+
+      for (const svg of Array.from(document.querySelectorAll('figure svg'))) {
+        const texts = Array.from(svg.querySelectorAll('text')) as SVGTextElement[];
+        const boxes = texts.map((t) => ({ text: t.textContent ?? '', box: t.getBBox() }));
+
+        for (const { text, box } of boxes) {
+          // Painted past the left edge of the viewBox: the head of the string is
+          // clipped away and the reader sees a different word.
+          if (box.x < -0.5) clipped.push(text);
+        }
+
+        // Same baseline == same axis row. Sorted by x, each label must start after
+        // the previous one ends.
+        const rows = new Map<number, { text: string; box: DOMRect }[]>();
+        for (const b of boxes) {
+          const key = Math.round(b.box.y);
+          if (!rows.has(key)) rows.set(key, []);
+          rows.get(key)!.push(b as { text: string; box: DOMRect });
+        }
+        for (const row of rows.values()) {
+          const sorted = row.slice().sort((a, b) => a.box.x - b.box.x);
+          for (let i = 1; i < sorted.length; i++) {
+            const prev = sorted[i - 1];
+            const cur = sorted[i];
+            if (cur.box.x < prev.box.x + prev.box.width - 0.5) {
+              overlapping.push(`${prev.text} / ${cur.text}`);
+            }
+          }
+        }
+      }
+      return { clipped, overlapping };
+    });
+
+    expect(problems.clipped, 'labels painted outside the chart viewBox').toEqual([]);
+    expect(problems.overlapping, 'labels painted over their neighbour').toEqual([]);
   });
 });
