@@ -308,6 +308,7 @@ function Node({ node, x, y, w }: { node: TopoNode; x: number; y: number; w: numb
         fill="var(--fg-subtle)"
         style={{ letterSpacing: '0.03em', textTransform: 'uppercase' }}
       >
+        <title>{KIND_TAG[node.kind]}</title>
         {truncate(KIND_TAG[node.kind], maxCharsForWidth(w, 9))}
       </text>
       <text
@@ -317,10 +318,16 @@ function Node({ node, x, y, w }: { node: TopoNode; x: number; y: number; w: numb
         fontWeight={500}
         fill="var(--fg)"
       >
+        {/* The box is fixed-width, so a long device name is shortened to fit. The
+            full name stays here: a truncated label is the only thing identifying
+            the node, and two devices sharing a prefix would otherwise be
+            indistinguishable with no way to recover either. */}
+        <title>{node.label}</title>
         {truncate(node.label, maxCharsForWidth(w, 12, badgeReserve))}
       </text>
       {node.sublabel && (
         <text x={left + 10} y={top + 41} fontSize={9.5} fill="var(--fg-subtle)">
+          <title>{node.sublabel}</title>
           {truncate(node.sublabel, maxCharsForWidth(w, 9.5))}
         </text>
       )}

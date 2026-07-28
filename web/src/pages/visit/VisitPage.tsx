@@ -396,8 +396,9 @@ function ReportView({
             </span>
           </div>
           <span className="t-caption" style={{ color: 'var(--fg-subtle)' }}>
-            {report.controller_host ?? 'controller'} · {report.lookback_days}-day
-            window · ran in {formatDuration(durationS)}
+            {report.controller_host ?? 'controller'} · {report.window_days}-day window
+            {report.window_was_capped ? ` (${report.lookback_days}-day lookback requested)` : ''} ·
+            ran in {formatDuration(durationS)}
           </span>
         </Card>
 

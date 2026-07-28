@@ -109,6 +109,25 @@ def render_json(report: VisitReport) -> str:
 # --------------------------------------------------------------------------- #
 # Console
 # --------------------------------------------------------------------------- #
+def _window_phrase(report: VisitReport, unit: str = "d") -> str:
+    """How long a window the report actually analysed, said honestly.
+
+    ``lookback_days`` is what the caller asked for; the SLE sweep cap can make
+    the analysed window shorter, and the report is built with the capped start.
+    Printing the request beside the real dates advertised a span nobody looked
+    at -- two reports of the same network then differ by tens of points with
+    nothing on either to explain it. When the two agree this reads exactly as
+    before; when they differ, both numbers are shown and neither is a claim
+    about the other. Carries no brackets of its own -- the console wraps it in
+    one pair, and a nested set read as a typo.
+    """
+    suffix = "-day" if unit == "day" else "d"
+    analysed = f"{report.window_days}{suffix}"
+    if not report.window_was_capped:
+        return f"{analysed} lookback"
+    return f"{analysed} window, {report.lookback_days}{suffix} lookback requested"
+
+
 def console_summary(report: VisitReport) -> str:
     """A compact, human-readable terminal summary (no colour codes)."""
     lines: list[str] = []
@@ -116,7 +135,7 @@ def console_summary(report: VisitReport) -> str:
     lines.append(f"Tech visit — {host} (site {report.site_id})")
     lines.append(
         f"  window: {_fmt_ts(report.window_start_ts)} → {_fmt_ts(report.window_end_ts)}"
-        f"  ({report.lookback_days}d lookback)"
+        f"  ({_window_phrase(report)})"
     )
     lines.append(f"  run in {_fmt_duration(report.duration_s)}")
 
@@ -183,7 +202,7 @@ def _html_header(report: VisitReport) -> str:
   <div class="sub">
     Site <span class="mono">{html.escape(report.site_id)}</span> ·
     {_fmt_ts(report.window_start_ts)} &rarr; {_fmt_ts(report.window_end_ts)} ·
-    {report.lookback_days}-day lookback · run in {_fmt_duration(report.duration_s)}
+    {_window_phrase(report, unit="day")} · run in {_fmt_duration(report.duration_s)}
   </div>
 </header>"""
 

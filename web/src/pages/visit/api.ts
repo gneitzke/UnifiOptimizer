@@ -66,6 +66,11 @@ export interface VisitReport {
   window_end_ts: number;
   site_id: string;
   lookback_days: number;
+  /** Days actually analysed. The SLE sweep is capped, so this is not always
+   *  `lookback_days` — describe the run with this, never with the request. */
+  window_days: number;
+  /** True when less was analysed than was asked for. */
+  window_was_capped: boolean;
   controller_host: string | null;
   headline_score: number | null;
   sles: { sles: Record<string, VisitSleEntry> };
