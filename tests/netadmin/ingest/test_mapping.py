@@ -9,6 +9,7 @@ from __future__ import annotations
 from netadmin.domain.types import EntityType
 from netadmin.ingest import mapping as m
 from netadmin.ingest.mapping import METRICS, map_clients, map_device, map_devices, map_health
+from netadmin.ingest.unifi.models import Client
 from netadmin.store.metrics import MetricKind, metric_kind
 
 from .conftest import make_client, make_device, make_health
@@ -346,6 +347,36 @@ def test_wired_client_parent_is_switch():
     rec = map_clients([client], TS).inventory[0]
     assert rec.parent_ref == (EntityType.SWITCH, "02:00:sw:00:00:0a")
     assert rec.tracked_attrs["ap_mac"] == "02:00:sw:00:00:0a"
+
+
+def test_wired_client_switch_port_reaches_entity_meta():
+    """The seam: controller payload -> Client model -> entity meta.
+
+    ``wired.bad_cable`` narrows its 10/100-by-design suppression to the peer on
+    the affected port, which only works if ``sw_port`` actually survives ingest.
+    The field was parsed by the model and then dropped here for a long time, and
+    both halves can be individually correct while the join is not — so this
+    asserts the join, from a raw controller-shaped payload.
+    """
+    client = Client.model_validate(
+        {
+            "mac": "02:00:bb:00:00:03",
+            "is_wired": True,
+            "sw_mac": "02:00:sw:00:00:0a",
+            "sw_port": 4,
+            "oui": "Ubiquiti Inc",
+            "name": "g6-turret---driveway",
+        }
+    )
+    rec = map_clients([client], TS).inventory[0]
+    assert rec.entity.meta["sw_port"] == 4
+    assert rec.entity.meta["is_wired"] is True
+
+
+def test_wireless_client_has_no_switch_port():
+    """A wireless client must not carry a stale or invented port number."""
+    client = make_client(mac="02:00:aa:00:00:07", ap_mac="02:00:ap:00:00:09", is_wired=False)
+    assert map_clients([client], TS).inventory[0].entity.meta["sw_port"] is None
 
 
 def test_client_without_mac_is_skipped():

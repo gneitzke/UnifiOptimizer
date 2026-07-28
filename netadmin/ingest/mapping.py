@@ -482,6 +482,10 @@ def map_clients(clients: list[Client], ts: int, *, site_id: str = "default") -> 
                         "oui": client.oui,
                         "is_wired": client.is_wired,
                         "essid": client.essid,
+                        # Which switch port this client is on. The bad_cable
+                        # downshift arm needs it to weigh the peer on THIS port
+                        # rather than every client on the switch.
+                        "sw_port": client.sw_port,
                     },
                 ),
                 tracked_attrs={"ap_mac": attach_mac, "ip": client.ip},
