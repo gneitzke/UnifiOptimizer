@@ -1,7 +1,7 @@
 {
-    "_comment": "WiFi device capability database - defines which devices support which WiFi standards",
+    "_comment": "WiFi device capability database - device-name patterns grouped by class. Only known_2.4ghz_only currently drives detection; the other sections are reserved.",
     "_last_updated": "2025-01-05",
-    "_instructions": "Add device name patterns (case-insensitive, partial match). Patterns are checked in order, most specific first.",
+    "_instructions": "Add device name patterns as lowercase substrings of the client name as the controller reports it. Matching is plain case-insensitive substring, so 'iphone 16' does NOT match 'iPhone-16-Pro' (hyphens are not normalized).",
     "wifi7_devices": {
         "_description": "WiFi 7 (802.11be) capable devices - support 2.4/5/6 GHz with 320MHz channels and MLO",
         "_standards": [
@@ -166,10 +166,11 @@
     },
     "_version": "1.0.0",
     "_schema_notes": {
-        "pattern_matching": "All patterns are converted to lowercase and spaces/hyphens are normalized for flexible matching",
-        "priority_order": "Patterns are checked in order: WiFi 7 → WiFi 6E → Dual-band → 2.4GHz-only",
-        "partial_match": "Patterns use substring matching, so 'iphone 16' matches 'iPhone-16-Pro', 'Johns-iPhone-16', etc.",
-        "updating": "To add new devices, simply append to the appropriate patterns array. No code changes needed.",
-        "testing": "After updates, run: python tests/test_wifi7_validation.py"
+        "pattern_matching": "Patterns are lowercased and matched as plain substrings against the lowercased client name plus OUI. No normalization of spaces or hyphens.",
+        "priority_order": "Reserved for future use. Only known_2.4ghz_only is read today, so no cross-section ordering applies.",
+        "partial_match": "Substring matching: 'iphone' matches 'Johns-iPhone-16-Pro', but 'iphone 16' does not, because the hostname separates the words with hyphens.",
+        "updating": "Append to the appropriate patterns array. No code changes needed.",
+        "shape": "Each section must be an object with a 'patterns' list of non-empty strings. A bare list, a string 'patterns' value, or an empty string is ignored.",
+        "testing": "After updates: python -c \"from netadmin.detect import device_kb; kb=device_kb.load_kb(); print(device_kb.default_kb_path()); print(len(device_kb.section_patterns(kb,'known_2.4ghz_only')),'patterns')\""
     }
 }

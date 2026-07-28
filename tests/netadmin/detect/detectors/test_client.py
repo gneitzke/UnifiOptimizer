@@ -6,8 +6,14 @@ case, and an UNKNOWN-coverage case.
 
 from __future__ import annotations
 
+import json
+import logging
+from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
+from netadmin import config
 from netadmin.detect.context import DetectorContext
 from netadmin.detect.detectors.client import (
     KEY_DHCP,
@@ -24,6 +30,19 @@ from netadmin.store.repository import Repository, SampleReading
 from tests.netadmin.detect.support import FakeBaselines, seed_coverage
 
 NOW = 4_000_000
+
+
+@pytest.fixture(autouse=True)
+def _pin_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep KB resolution off the developer's real ``./data``.
+
+    ``config.DATA_DIR`` is ``Path.cwd() / "data"``, and docs/DEVICE_DATABASE.md now
+    tells operators to put their own ``wifi_device_capabilities.json`` there. Without
+    this, anyone who follows that advice on their dev box gets unrelated failures in
+    the known_pathology tests. Pinning it at an empty tmp dir also makes "no override"
+    mean the *packaged baseline*, specifically.
+    """
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "data")
 
 
 def _ctx(repo: Repository, *, settings=None, now: int = NOW) -> DetectorContext:
@@ -266,3 +285,117 @@ def test_known_pathology_threshold_override(repo: Repository) -> None:
     )
     findings = KnownPathologyDetector().evaluate(_ctx(repo, settings=settings))
     assert len(findings) == 1
+
+
+def _iot_client_with_disconnects(repo: Repository, *, mac: str, name: str) -> None:
+    seed_coverage(repo, job="fast_sta", now=NOW, window_s=3600, interval_s=60)
+    ap = _ap(repo, "ap-1")
+    cid = _client(repo, mac=mac, name=name, ap_id=ap)
+    for k in range(4):
+        _disconnect(repo, cid, ap, NOW - 100 - k * 10, reason=15)
+
+
+def test_known_pathology_kb_path_override_is_honoured(repo: Repository, tmp_path: Path) -> None:
+    """An explicit kb_path outranks the default location.
+
+    The device name matches nothing in the shipped KB, so a finding here can only
+    come from the override actually being read.
+    """
+    custom_kb = tmp_path / "custom_kb.json"
+    custom_kb.write_text(json.dumps({"known_2.4ghz_only": {"patterns": ["widgetron"]}}))
+    _iot_client_with_disconnects(repo, mac="io:5", name="Widgetron-9000")
+
+    settings = SimpleNamespace(
+        thresholds={KEY_KNOWN_PATHOLOGY: {"kb_path": str(custom_kb)}}, poll=None
+    )
+    findings = KnownPathologyDetector().evaluate(_ctx(repo, settings=settings))
+    assert len(findings) == 1
+    assert findings[0].evidence["pathology"] == "iot_pmf_11r"
+
+
+def test_known_pathology_degrades_quietly_when_the_kb_is_missing(
+    repo: Repository, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """KB-empty must return no findings rather than raise -- but must SAY so.
+
+    The iot_pmf_11r branch is driven entirely by the KB's known_2.4ghz_only list,
+    so with no KB it goes quiet. That silence is the whole bug this commit fixes,
+    so the warning is the early-warning system and is asserted, not assumed.
+    """
+    _iot_client_with_disconnects(repo, mac="io:6", name="ESP32-sensor")
+    missing = tmp_path / "absent.json"
+
+    settings = SimpleNamespace(
+        thresholds={KEY_KNOWN_PATHOLOGY: {"kb_path": str(missing)}}, poll=None
+    )
+    with caplog.at_level(logging.WARNING):
+        assert KnownPathologyDetector().evaluate(_ctx(repo, settings=settings)) == []
+
+    assert str(missing) in caplog.text
+    # The remediation matters: a typo'd kb_path otherwise leaves no way to know
+    # a working baseline exists.
+    assert "packaged baseline" in caplog.text
+
+
+def test_known_pathology_retries_a_failed_kb_instead_of_caching_it(
+    repo: Repository, tmp_path: Path
+) -> None:
+    """A KB that fails once must not disable the branch until the daemon restarts.
+
+    The daemon runs for months; a half-written save or a mount blip would
+    otherwise poison the detector permanently, reporting "no IoT pathologies"
+    with total confidence.
+    """
+    kb_path = tmp_path / "later.json"
+    _iot_client_with_disconnects(repo, mac="io:a", name="ESP32-sensor")
+    settings = SimpleNamespace(
+        thresholds={KEY_KNOWN_PATHOLOGY: {"kb_path": str(kb_path)}}, poll=None
+    )
+    detector = KnownPathologyDetector()
+    assert detector.evaluate(_ctx(repo, settings=settings)) == []  # nothing there yet
+
+    kb_path.write_text(json.dumps({"known_2.4ghz_only": {"patterns": ["esp32"]}}))
+    findings = detector.evaluate(_ctx(repo, settings=settings))
+    assert len(findings) == 1, "the same detector instance must pick up the repaired KB"
+
+
+def test_known_pathology_survives_a_malformed_kb_section(repo: Repository, tmp_path: Path) -> None:
+    """A hand-edited section of the wrong shape must not take the detector offline.
+
+    ``{"known_2.4ghz_only": [...]}`` (a bare list rather than an object with a
+    ``patterns`` key) used to raise AttributeError on ``list.get``; the engine
+    isolates a raising detector, so one typo cost the whole pass.
+    """
+    broken_kb = tmp_path / "broken_kb.json"
+    broken_kb.write_text(json.dumps({"known_2.4ghz_only": ["esp32", "tuya"]}))
+    _iot_client_with_disconnects(repo, mac="io:8", name="ESP32-sensor")
+
+    settings = SimpleNamespace(
+        thresholds={KEY_KNOWN_PATHOLOGY: {"kb_path": str(broken_kb)}}, poll=None
+    )
+    assert KnownPathologyDetector().evaluate(_ctx(repo, settings=settings)) == []
+
+
+def test_known_pathology_ignores_string_valued_patterns(repo: Repository, tmp_path: Path) -> None:
+    """A string is iterable: 'e' would otherwise match nearly every device name."""
+    broken_kb = tmp_path / "string_patterns.json"
+    broken_kb.write_text(json.dumps({"known_2.4ghz_only": {"patterns": "esp32"}}))
+    _iot_client_with_disconnects(repo, mac="io:9", name="Johns-MacBook-Pro")
+
+    settings = SimpleNamespace(
+        thresholds={KEY_KNOWN_PATHOLOGY: {"kb_path": str(broken_kb)}}, poll=None
+    )
+    assert KnownPathologyDetector().evaluate(_ctx(repo, settings=settings)) == []
+
+
+def test_known_pathology_finds_the_default_kb_with_no_override(repo: Repository) -> None:
+    """The counterpart: with no kb_path configured, the shipped KB must be found.
+
+    This is the regression guard -- an ESP32 fires only if the default resolution
+    landed on a real KB file.
+    """
+    _iot_client_with_disconnects(repo, mac="io:7", name="ESP32-sensor")
+
+    findings = KnownPathologyDetector().evaluate(_ctx(repo))
+    assert len(findings) == 1
+    assert findings[0].evidence["device_class"] == "known_2.4ghz_only"

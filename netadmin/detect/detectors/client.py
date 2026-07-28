@@ -14,7 +14,8 @@ infrastructure:
   grace period. Severity scales with breadth: a single client is P3, a
   site-wide DHCP failure (many clients at once) is P1.
 * :class:`KnownPathologyDetector` (``client.known_pathology``) — a device-class
-  knowledge base (``data/wifi_device_capabilities.json``) plus a small built-in
+  knowledge base (``wifi_device_capabilities.json``, located by
+  :mod:`netadmin.detect.device_kb`) plus a small built-in
   symptom table: a 2.4-GHz-only IoT chip that disconnects (PMF / 802.11r
   intolerance), or an Apple client roam-scanning near its −70 dBm trigger.
 
@@ -27,9 +28,10 @@ so a client keeps one stable issue identity as its attribution is refined.
 from __future__ import annotations
 
 import json
-from pathlib import Path
+import time
 from typing import Any, Iterable, Optional
 
+from netadmin.detect import device_kb
 from netadmin.detect.engine import COVERAGE_MIN, UNKNOWN, EvalResult
 from netadmin.domain.entities import Entity, Finding
 from netadmin.domain.types import Cadence, EntityType, Severity
@@ -55,10 +57,10 @@ DEFAULT_DISCONNECT_KEYS: tuple[str, ...] = ("EVT_WU_Disconnected", "EVT_LU_Disco
 # APIPA / link-local self-assigned prefix: a client showing this got no DHCP lease.
 _APIPA_PREFIX = "169.254."
 
-# Default location of the device-capability KB, resolved relative to the repo root
-# (netadmin/detect/detectors/client.py -> parents[3] == repo root). Overridable via
-# ``settings.thresholds['client.known_pathology']['kb_path']``.
-_DEFAULT_KB_PATH = Path(__file__).resolve().parents[3] / "data" / "wifi_device_capabilities.json"
+# A KB that cannot be read is re-reported at most this often. The load is retried
+# every pass (a corrupt or half-written file is usually transient), but one line
+# per pass on a WINDOW-cadence detector would drown the log.
+_KB_REWARN_S = 3600.0
 
 
 # --------------------------------------------------------------------------- #
@@ -436,6 +438,7 @@ class KnownPathologyDetector:
     def __init__(self) -> None:
         self._kb: Optional[dict[str, Any]] = None
         self._kb_path_loaded: Optional[str] = None
+        self._kb_warned_at: Optional[float] = None
 
     def evaluate(self, ctx: Any) -> EvalResult:
         window_s = int(ctx.threshold(self.key, "window_s", 3600))
@@ -471,7 +474,7 @@ class KnownPathologyDetector:
         haystack = f"{name} {oui}"
 
         # --- IoT 2.4-only + disconnects -> PMF/11r intolerance ---
-        if _matches_patterns(haystack, kb.get("known_2.4ghz_only", {}).get("patterns", [])):
+        if _matches_patterns(haystack, device_kb.section_patterns(kb, "known_2.4ghz_only")):
             disconnects = len(
                 ctx.events(
                     entity_id=client.entity_id,
@@ -526,19 +529,41 @@ class KnownPathologyDetector:
         return None
 
     def _load_kb(self, ctx: Any) -> dict[str, Any]:
-        path = str(ctx.threshold(self.key, "kb_path", str(_DEFAULT_KB_PATH)))
+        """The device KB, cached per resolved path; ``{}`` when it cannot be read.
+
+        A configured ``kb_path`` is used verbatim: it does NOT fall back to the
+        data-dir or packaged copies, because silently reading a different file
+        than the operator named would be worse than running KB-empty. An empty
+        or unset value falls through to :func:`device_kb.default_kb_path`.
+
+        Only a *successful* load is cached. A failure is retried on the next
+        pass and re-reported every :data:`_KB_REWARN_S`, so a transient unreadable
+        file (a half-written save, a mount blip) recovers on its own rather than
+        disabling the ``iot_pmf_11r`` branch until the daemon restarts.
+        """
+        override = ctx.threshold(self.key, "kb_path", None)
+        path = str(override) if override else str(device_kb.default_kb_path())
         if self._kb is not None and self._kb_path_loaded == path:
             return self._kb
-        kb: dict[str, Any] = {}
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                loaded = json.load(fh)
-            if isinstance(loaded, dict):
-                kb = loaded
-        except (OSError, ValueError):
-            _log.warning("known_pathology: could not load device KB at %s; running KB-empty", path)
+
+        kb = device_kb.load_kb(path)
+        if kb is None:
+            now = time.monotonic()
+            if self._kb_warned_at is None or now - self._kb_warned_at >= _KB_REWARN_S:
+                self._kb_warned_at = now
+                _log.warning(
+                    "known_pathology: device KB at %s is missing or unparseable, so the "
+                    "iot_pmf_11r branch is disabled. Fix the JSON, or remove the file "
+                    "(and any kb_path override) to fall back to the packaged baseline "
+                    "at %s.",
+                    path,
+                    device_kb.PACKAGED_KB_PATH,
+                )
+            return {}  # not cached: retried next pass
+
         self._kb = kb
         self._kb_path_loaded = path
+        self._kb_warned_at = None
         return kb
 
 

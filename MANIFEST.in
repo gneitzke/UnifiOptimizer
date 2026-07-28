@@ -10,6 +10,13 @@ graft netadmin/_webui
 # Numbered SQL migrations applied at store startup — runtime data, must ship.
 recursive-include netadmin/store/migrations *.sql
 
+# Device-capability KB read by netadmin/detect/device_kb.py. Also declared in
+# pyproject.toml [tool.setuptools.package-data]; stated here too for the same
+# reason the migrations are: an install that silently loses this file still
+# starts, and the only symptom is detectors quietly running with no device
+# knowledge base.
+recursive-include netadmin/data *.json
+
 include README.md
 include LICENSE
 include requirements.txt

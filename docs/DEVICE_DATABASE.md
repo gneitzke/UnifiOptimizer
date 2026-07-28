@@ -2,30 +2,80 @@
 
 ## Overview
 
-The WiFi device capability database (`wifi_device_capabilities.json`) is an external configuration file that defines which devices support which WiFi standards. This allows for easy updates without modifying code.
+The WiFi device capability database (`wifi_device_capabilities.json`) defines which devices support which WiFi standards. A baseline ships with the package; you can override it with your own copy, so devices can be added without modifying code.
 
 ## Location
+
+A baseline copy ships inside the package, so every install — wheel, container, or
+source checkout — has a working database with nothing to set up:
+
+```
+netadmin/data/wifi_device_capabilities.json
+```
+
+To customise it, put your own copy in the runtime data directory (the same one
+holding `secrets.env` and the database). It replaces the baseline wholesale:
 
 ```
 data/wifi_device_capabilities.json
 ```
 
+Resolution order:
+
+1. `thresholds['client.known_pathology']['kb_path']` in `data/config.yaml` — an
+   explicit path, if you want the file somewhere else entirely. **Used as-is: if
+   that file is missing or invalid it does *not* fall back to the paths below**,
+   because quietly reading a different file than you named would be worse. It
+   also applies to `client.known_pathology` only — the wired bad-cable detector
+   always resolves through 2 and 3, so setting it splits the two readers.
+2. `<data dir>/wifi_device_capabilities.json` — your copy. The data directory is
+   `NETADMIN_DATA_DIR` when set, otherwise `./data` relative to the working
+   directory the daemon was started from (under systemd, `WorkingDirectory=`).
+3. The packaged baseline above.
+
+With no `kb_path` set, the loader takes the first of 2 and 3 that exists. On a
+successful load the daemon logs one line naming the file and which tier it came
+from — the quickest way to confirm your copy is the one being read.
+
+Because your copy lives in the data directory, `pip install --upgrade` never
+touches it. Copy the packaged file to start from the shipped baseline:
+
+```bash
+mkdir -p data && cp "$(python -c 'import netadmin.detect.device_kb as k; print(k.PACKAGED_KB_PATH)')" data/
+```
+
 ## Purpose
 
-The analyzer uses this database to detect:
-- **WiFi 7 (802.11be)** devices: 6GHz capable with 320MHz channels and MLO
-- **WiFi 6E (802.11ax-6e)** devices: 6GHz capable with 160MHz channels
-- **Dual-band (WiFi 5/6)** devices: 2.4GHz + 5GHz capable
-- **2.4GHz-only** devices: IoT/smart home devices that should not be flagged
+> **Only `known_2.4ghz_only` currently drives detection.** The `wifi7_devices`,
+> `wifi6e_devices` and `dual_band_devices` sections are reserved — no code reads
+> them yet, so adding patterns there has no effect on what the daemon reports.
+> They are kept because the classification is useful reference and the sections
+> are expected to gain consumers.
+
+The `known_2.4ghz_only` list drives two detectors:
+
+- **`client.known_pathology`** fires a P3 `iot_pmf_11r` finding when a device in
+  this class disconnects repeatedly — the pattern of a 2.4-GHz-only chip that is
+  PMF / 802.11r intolerant, rather than a coverage problem.
+- **`wired.bad_cable`** uses the same list to *suppress* a speed-downshift
+  finding: a gigabit port sitting at 100 Mbps to one of these devices is the
+  device's design, not a broken pair.
+
+The device classes:
+- **WiFi 7 (802.11be)** devices: 6GHz capable with 320MHz channels and MLO *(reserved)*
+- **WiFi 6E (802.11ax-6e)** devices: 6GHz capable with 160MHz channels *(reserved)*
+- **Dual-band (WiFi 5/6)** devices: 2.4GHz + 5GHz capable *(reserved)*
+- **2.4GHz-only** devices: IoT/smart home devices — the one section read today
 
 ## Adding New Devices
 
 ### Quick Start
 
-To add a new device, simply edit `data/wifi_device_capabilities.json` and add the device name pattern to the appropriate section:
+To add a new device, edit your copy at `data/wifi_device_capabilities.json` (see
+[Location](#location)) and add the device name pattern to the appropriate section:
 
 **For a new WiFi 7 device:**
-```json
+```
 "wifi7_devices": {
   "patterns": [
     "iphone 16",
@@ -36,7 +86,7 @@ To add a new device, simply edit `data/wifi_device_capabilities.json` and add th
 ```
 
 **For a new WiFi 6E device:**
-```json
+```
 "wifi6e_devices": {
   "patterns": [
     "iphone 13",
@@ -48,18 +98,30 @@ To add a new device, simply edit `data/wifi_device_capabilities.json` and add th
 
 ### Pattern Matching Rules
 
-1. **Case-Insensitive**: Patterns are matched without regard to case
-   - Pattern: `"iphone 16"` matches `"iPhone-16-Pro"`, `"IPHONE 16"`, etc.
+Matching is a plain case-insensitive substring test against the client name (as
+the controller reports it) plus the OUI. That is all it is — there is no
+normalization and no regex.
 
-2. **Punctuation Normalization**: Hyphens, underscores, and extra spaces are normalized
-   - Pattern: `"galaxy s24"` matches `"Galaxy-S24"`, `"Galaxy_S24"`, `"Galaxy  S24"`, etc.
+1. **Case-Insensitive**: patterns and the name are both lowercased
+   - `"echo dot"` matches `"Kitchen-Echo Dot"` and `"ECHO DOT 3"`
 
-3. **Substring Matching**: Patterns match anywhere in the hostname
-   - Pattern: `"iphone 16"` matches `"Johns-iPhone-16-Pro"`, `"iPhone-16"`, `"Work-iPhone-16-Max"`, etc.
+2. **No punctuation normalization**: hyphens and underscores are *not* treated as
+   spaces. This is the mistake that costs people the most time
+   - ✅ `"iphone"` matches `"Johns-iPhone-16-Pro"`
+   - ❌ `"iphone 16"` does **not** match `"Johns-iPhone-16-Pro"` — the hostname
+     separates those words with a hyphen, not a space
+   - Prefer single-word patterns, or match the punctuation your controller
+     actually reports
 
-4. **Order Matters**: More specific patterns should come first
-   - ✅ Good: WiFi 7 → WiFi 6E → Dual-band → 2.4GHz-only
-   - ❌ Bad: Generic "galaxy" before specific "galaxy s24 ultra"
+3. **Substring Matching**: a pattern matches anywhere in the name
+   - `"esp32"` matches `"Garage-ESP32-sensor"`
+
+4. **Order does not matter**: sections are read independently and there is no
+   cross-section precedence. Keep patterns specific enough not to over-match
+   within their own section
+
+5. **No empty patterns**: an empty string would match every device, so blank
+   entries are discarded on load
 
 ### Best Practices
 
@@ -68,7 +130,8 @@ To add a new device, simply edit `data/wifi_device_capabilities.json` and add th
 - Use spaces (not hyphens) in patterns
 - Be specific for newer devices (`"iphone 16"`, `"galaxy s24 ultra"`)
 - Be generic for older device families (`"iphone"`, `"galaxy"`)
-- Add comments for clarity (use `"_comment"` fields or inline comments in arrays)
+- Add comments for clarity using `"_comment"` fields — JSON has no inline
+  comment syntax, and a `//` or `#` anywhere makes the whole file unparseable
 
 **❌ DON'T:**
 - Use overly generic patterns in WiFi 7/6E sections (will match too many devices)
@@ -79,7 +142,7 @@ To add a new device, simply edit `data/wifi_device_capabilities.json` and add th
 ### Examples
 
 **Adding a New WiFi 7 Phone:**
-```json
+```
 "wifi7_devices": {
   "patterns": [
     "iphone 16",
@@ -91,7 +154,7 @@ To add a new device, simply edit `data/wifi_device_capabilities.json` and add th
 ```
 
 **Adding a New WiFi 6E Laptop:**
-```json
+```
 "wifi6e_devices": {
   "patterns": [
     "macbook pro 2024",
@@ -103,7 +166,7 @@ To add a new device, simply edit `data/wifi_device_capabilities.json` and add th
 ```
 
 **Adding IoT Devices (2.4GHz-only):**
-```json
+```
 "known_2.4ghz_only": {
   "patterns": [
     "ring doorbell",
@@ -119,17 +182,29 @@ To add a new device, simply edit `data/wifi_device_capabilities.json` and add th
 After updating the device database, validate your changes:
 
 ```bash
-# Run validation tests
-python tests/test_wifi7_validation.py
-
-# Check that patterns are loading correctly
+# Confirm which file is being read, and that it parses
 python -c "
-from core.advanced_analyzer import AdvancedNetworkAnalyzer
-analyzer = AdvancedNetworkAnalyzer(client=None)
-print('WiFi 7 devices:', len(analyzer.device_capabilities['wifi7_devices']['patterns']))
-print('WiFi 6E devices:', len(analyzer.device_capabilities['wifi6e_devices']['patterns']))
-print('Patterns:', analyzer.device_capabilities['wifi7_devices']['patterns'][:10])
+from netadmin.detect import device_kb
+print('reading:', device_kb.default_kb_path())
+kb = device_kb.load_kb()
+print('parsed OK' if kb is not None else 'NOT LOADED - check JSON syntax and path')
+for section in ('wifi7_devices', 'wifi6e_devices', 'known_2.4ghz_only'):
+    print(section, len(device_kb.section_patterns(kb, section)), 'patterns')
 "
+```
+
+Run it from the same working directory the daemon uses, so `./data` resolves the
+same way. If `reading:` prints a path ending in `netadmin/data/` — whether under
+`site-packages` or inside a source checkout — your own copy was not found and the
+packaged baseline is in use.
+
+A section reporting `0 patterns` when you have entries in it means that section is
+the wrong shape. Each one must be an object with a `patterns` list — a bare list
+(`"known_2.4ghz_only": ["esp32"]`) or a bare string (`"patterns": "esp32"`) is
+ignored:
+
+```json
+"known_2.4ghz_only": { "patterns": ["esp32", "tuya"] }
 ```
 
 ## Database Structure
@@ -138,10 +213,10 @@ print('Patterns:', analyzer.device_capabilities['wifi7_devices']['patterns'][:10
 
 | Section | Purpose | Example Patterns |
 |---------|---------|------------------|
-| `wifi7_devices` | WiFi 7 (802.11be) capable - 6GHz + 320MHz + MLO | `iphone 16`, `galaxy s25` |
-| `wifi6e_devices` | WiFi 6E (802.11ax-6e) capable - 6GHz + 160MHz | `iphone 14`, `pixel 7` |
-| `dual_band_devices` | Dual-band (2.4/5 GHz) capable - WiFi 5/6 | `iphone`, `galaxy`, `macbook` |
-| `known_2.4ghz_only` | 2.4GHz-only devices - don't flag as misplaced | `ring doorbell`, `echo dot` |
+| `wifi7_devices` | WiFi 7 (802.11be) capable - 6GHz + 320MHz + MLO *(reserved, unread)* | `iphone 16`, `galaxy s25` |
+| `wifi6e_devices` | WiFi 6E (802.11ax-6e) capable - 6GHz + 160MHz *(reserved, unread)* | `iphone 14`, `pixel 7` |
+| `dual_band_devices` | Dual-band (2.4/5 GHz) capable - WiFi 5/6 *(reserved, unread)* | `iphone`, `galaxy`, `macbook` |
+| `known_2.4ghz_only` | 2.4GHz-only devices - fires `iot_pmf_11r` on repeat disconnects, and suppresses `wired.bad_cable` downshifts | `ring doorbell`, `echo dot` |
 
 ### Metadata Fields
 
@@ -188,17 +263,27 @@ print('Patterns:', analyzer.device_capabilities['wifi7_devices']['patterns'][:10
 
 ## Real-World Example
 
-**Scenario**: You just bought an iPhone 16 Pro Max and it's showing as "5GHz capable" instead of "WiFi 7 capable" in your network analysis.
+**Scenario**: a 2.4-GHz-only smart plug keeps dropping off the network. The
+daemon reports the disconnects but never explains them, because the plug is not
+in the database — so `client.known_pathology` cannot tell a chip limitation from
+a coverage problem, and no `iot_pmf_11r` finding is raised.
 
 **Solution**:
-1. Open `data/wifi_device_capabilities.json`
-2. Find the `wifi7_devices` section
-3. Check if `"iphone 16"` is in the patterns list (it should be)
-4. If not, add it: `"iphone 16 pro max"` or just `"iphone 16"`
+1. Find the name the controller shows for it, e.g. `Laundry-Tasmota-Plug`
+2. Open your copy at `data/wifi_device_capabilities.json` (see [Location](#location))
+3. Find the `known_2.4ghz_only` section
+4. Add a pattern that appears in that name: `"tasmota"`
 5. Save the file
-6. Re-run the analysis: `python optimize_network.py analyze`
+6. Restart the daemon so the detectors reload the database
 
-The pattern `"iphone 16"` will match all variants: iPhone 16, iPhone 16 Plus, iPhone 16 Pro, iPhone 16 Pro Max.
+After the next WINDOW pass the repeat disconnects are attributed as
+`iot_pmf_11r` (a 2.4-GHz-only device likely PMF / 802.11r intolerant) rather than
+left unexplained. The same entry stops a gigabit switch port that negotiates 100
+Mbps to that plug from being reported as a bad cable.
+
+Note `"tasmota"` is a single word on purpose. `"tasmota plug"` would **not**
+match `Laundry-Tasmota-Plug`, because the hostname uses hyphens and no
+normalization happens.
 
 ## Troubleshooting
 
@@ -207,15 +292,18 @@ The pattern `"iphone 16"` will match all variants: iPhone 16, iPhone 16 Plus, iP
 **Problem**: Your device shows as "Unknown" or wrong capability level.
 
 **Solutions**:
-1. Check hostname format: Run analysis with `--verbose` to see actual hostnames
+1. Check the hostname the controller actually reports — patterns match the client
+   name as UniFi sees it, which is often not the name on the device itself
 2. Add pattern: Ensure pattern is in correct section and lowercase
 3. Check priority: More specific patterns should be in higher-priority sections (WiFi 7 before dual-band)
 4. Test matching:
    ```python
-   from core.advanced_analyzer import AdvancedNetworkAnalyzer
-   analyzer = AdvancedNetworkAnalyzer(client=None)
-   result = analyzer._check_device_pattern("Your-Device-Name", ["your pattern"])
-   print(f"Match result: {result}")
+   from netadmin.detect import device_kb
+   kb = device_kb.load_kb()
+   name = "Your-Device-Name".lower()
+   for section in ("wifi7_devices", "wifi6e_devices", "dual_band_devices", "known_2.4ghz_only"):
+       hits = [p for p in device_kb.section_patterns(kb, section) if p in name]
+       print(section, "->", hits)
    ```
 
 ### Pattern Not Loading
@@ -223,10 +311,17 @@ The pattern `"iphone 16"` will match all variants: iPhone 16, iPhone 16 Plus, iP
 **Problem**: Changes to JSON file not taking effect.
 
 **Solutions**:
-1. Check JSON syntax: Validate at https://jsonlint.com
-2. Check file location: Must be in `data/wifi_device_capabilities.json`
-3. Restart analysis: Python caches imports, restart your analysis script
-4. Check permissions: Ensure file is readable
+1. Check which file is actually being read: run the snippet under
+   [Testing Changes](#testing-changes). If it prints a `site-packages` path, your
+   copy is not where the loader looks — see [Location](#location).
+2. Check the data directory: your copy must be at
+   `<data dir>/wifi_device_capabilities.json`, where the data directory is
+   `NETADMIN_DATA_DIR` if set, else `./data` relative to the daemon's working
+   directory (for systemd, that is `WorkingDirectory=`).
+3. Check JSON syntax: a malformed file is skipped, and the daemon logs
+   `known_pathology: could not load device KB at ...; running KB-empty`.
+4. Restart the daemon: the database is cached in-process.
+5. Check permissions: ensure the file is readable by the daemon's user.
 
 ### False Positives
 
