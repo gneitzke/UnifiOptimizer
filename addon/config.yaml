@@ -9,7 +9,7 @@
 # the pinned install in Dockerfile, because the add-on installs the published
 # wheel of exactly that version. A test enforces all three agree.
 name: UnifiOptimizer
-version: "0.7.3"
+version: "0.7.4"
 slug: unifioptimizer
 description: Keeps the UniFi history your controller throws away and turns it into tracked, root-caused issues.
 url: https://github.com/gneitzke/UnifiOptimizer
