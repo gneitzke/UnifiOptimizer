@@ -19,9 +19,11 @@ import {
   isSuppressedNow,
   issueDurationSeconds,
   recurrencePhrase,
+  suppressionEscalationVoid,
   suppressionNote,
 } from '../shared/format';
 import { ackIssue, getIssue, suppressIssue, unsuppressIssue } from '../shared/api';
+import { SUPPRESS_OPTIONS } from '../shared/suppress';
 import { usePageAsync, useNowSeconds } from '../shared/hooks';
 import { EvidenceView } from './EvidenceView';
 import { InvestigationPanel } from './InvestigationPanel';
@@ -38,17 +40,6 @@ import { metricHintsForIssue } from './metricHints';
  * with an optional expiry; it parks counts/alerts and never touches measured
  * impact, Gitea #49) — and the LLM investigation section (§10).
  */
-
-/** Suppress durations, subsuming the old snooze menu (Gitea #49). `s: null` is
- * the indefinite "until I unsuppress" option. */
-const SUPPRESS_OPTIONS: { label: string; s: number | null }[] = [
-  { label: '1 hour', s: 3_600 },
-  { label: '8 hours', s: 28_800 },
-  { label: '24 hours', s: 86_400 },
-  { label: '3 days', s: 259_200 },
-  { label: '7 days', s: 604_800 },
-  { label: 'Until I unsuppress', s: null },
-];
 
 function SectionCard({ title, children }: { title: string; children: React.ReactNode }) {
   return (
@@ -391,7 +382,12 @@ export function IssueDetailPage() {
 
         <div className="flex flex-col gap-4">
           <SectionCard title="Lifecycle">
-            <LifecycleTrail events={events} currentState={issue.state} clearStreak={issue.clear_streak} />
+            <LifecycleTrail
+              events={events}
+              currentState={issue.state}
+              clearStreak={issue.clear_streak}
+              escalationVoid={suppressionEscalationVoid(issue, now)}
+            />
           </SectionCard>
 
           <SectionCard title="Ruled out">

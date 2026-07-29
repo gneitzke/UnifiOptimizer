@@ -1,9 +1,9 @@
 import { Fragment, type ReactNode, useMemo } from 'react';
 import { Link } from 'react-router-dom';
-import { CircleDashed } from 'lucide-react';
-import type { IssueState } from '../../api/types';
+import { BellOff, CircleDashed } from 'lucide-react';
+import type { IssueState, Severity } from '../../api/types';
 import { RelativeTime } from '../../components/ui/RelativeTime';
-import { humanizeKey } from '../shared/format';
+import { humanizeKey, severityLabel } from '../shared/format';
 import type { IssueEventRow } from '../shared/api';
 
 /**
@@ -185,6 +185,7 @@ export function LifecycleTrail({
   events,
   currentState,
   clearStreak,
+  escalationVoid,
 }: {
   events: IssueEventRow[];
   /** The issue's live state (docs §12): while it's still `resolving`, a trailing
@@ -196,6 +197,13 @@ export function LifecycleTrail({
   /** The issue's live `clear_streak` (IssueRow), paired with the `k` the
    * `resolving` event recorded to render "N of K" without a new event per tick. */
   clearStreak?: number;
+  /** The captured→current severities when suppression was lifted by an escalation
+   * past the suppressed severity (Gitea #50). This lift is DERIVED — no
+   * `unsuppressed` event fires — so the trail synthesizes a row for it here, the
+   * same way the resolving progress row is synthesized, or the muted issue
+   * reappears in the counts with nothing in the trail to explain it. Null when no
+   * escalation-void applies. */
+  escalationVoid?: { from: Severity; to: Severity } | null;
 }) {
   const ordered = useMemo(
     () => [...events].sort((a, b) => a.ts - b.ts || a.id - b.id),
@@ -221,13 +229,14 @@ export function LifecycleTrail({
   }
 
   const showProgress = currentState === 'resolving' && clearStreak != null && clearStreak > 0;
+  const showVoid = escalationVoid != null;
 
   return (
     <ol className="flex flex-col">
       {ordered.map((ev, i) => {
         const color = KIND_COLOR[ev.kind] ?? 'var(--fg-subtle)';
         const summary = eventSummary(ev.kind, ev.detail);
-        const last = i === ordered.length - 1 && !showProgress;
+        const last = i === ordered.length - 1 && !showProgress && !showVoid;
         return (
           <li key={ev.id} className="flex gap-3">
             {/* Rail */}
@@ -281,6 +290,32 @@ export function LifecycleTrail({
               {resolvingK != null
                 ? `${plural(clearStreak as number, 'consecutive clean check')} so far, of ${resolvingK} needed.`
                 : `${plural(clearStreak as number, 'consecutive clean check')} so far.`}
+            </div>
+          </div>
+        </li>
+      )}
+      {/* Escalation-void (Gitea #50): the mute lifted with no `unsuppressed` event
+          because severity rose past the suppressed level, so the trail synthesizes
+          the row that explains why a suppressed issue is back in the counts. */}
+      {escalationVoid && (
+        <li className="flex gap-3">
+          <div className="flex flex-col items-center shrink-0" style={{ width: 12 }}>
+            <BellOff
+              size={10}
+              strokeWidth={2.5}
+              className="mt-1.5"
+              style={{ color: 'var(--sev-p2)' }}
+              aria-hidden
+            />
+          </div>
+          <div className="pb-0.5">
+            <span className="t-label" style={{ color: 'var(--fg)' }}>
+              Suppression lifted
+            </span>
+            <div className="t-caption mt-0.5" style={{ color: 'var(--fg-muted)' }}>
+              Severity rose from {severityLabel(escalationVoid.from)} to{' '}
+              {severityLabel(escalationVoid.to)}, so this issue is back in the counts
+              and alerts. Re-suppress it to mute it at the new severity.
             </div>
           </div>
         </li>

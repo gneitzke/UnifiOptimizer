@@ -8,21 +8,26 @@ the incident-aware issue read model over ``httpx.ASGITransport``.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import httpx
 import pytest
 
+from netadmin.analytics.offenders import rank_offenders
 from netadmin.correlate.engine import CorrelationEngine
 from netadmin.correlate.store_repository import StoreCorrelationRepository
 from netadmin.domain.entities import Entity
 from netadmin.domain.types import EntityType
 from netadmin.server.main import DaemonComponents, create_app
+from netadmin.sle.scores import sle_scores
 from netadmin.store.repository import Repository
 
 pytestmark = pytest.mark.asyncio
 
 BASE = 1_700_000_000
+_WIN = (BASE - 60, BASE + 3600)
+_DEVICE_TYPES = (EntityType.AP.value, EntityType.SWITCH.value, EntityType.GATEWAY.value)
 
 
 def _seed_incident_store(settings, tmp_db_path) -> Repository:
@@ -233,3 +238,120 @@ async def test_incident_drops_only_when_all_members_suppressed(
         body = (await c.get("/api/incidents")).json()
     assert body["count"] == 0
     assert body["suppressed_excluded"] == 1
+
+
+# --- bulk incident suppress / unsuppress (Gitea #50) ------------------------- #
+
+
+async def _mesh_incident_id(c: httpx.AsyncClient) -> int:
+    listing = (await c.get("/api/incidents")).json()
+    return next(
+        i["id"] for i in listing["incidents"] if i["root"]["detector_key"] == "wifi.mesh_uplink"
+    )
+
+
+async def test_bulk_suppress_suppresses_every_member_with_incident_source(
+    incident_app, incident_store
+) -> None:
+    """One POST parks the whole incident: the root and the symptom both gain a
+    ``suppressed`` event stamped ``source="incident"`` (Gitea #50)."""
+    async with await _client(incident_app) as c:
+        mesh_id = await _mesh_incident_id(c)
+        resp = await c.post(f"/api/incidents/{mesh_id}/suppress", json={})
+        assert resp.status_code == 200
+        assert resp.json() == {"incident_id": mesh_id, "count": 2}  # root + symptom
+
+        for iid in (incident_store.root_id, incident_store.symptom_id):
+            detail = (await c.get(f"/api/issues/{iid}")).json()
+            assert detail["issue"]["suppressed_ts"] is not None
+            suppressed = [e for e in detail["events"] if e["kind"] == "suppressed"]
+            assert suppressed and suppressed[-1]["detail"]["source"] == "incident"
+
+
+async def test_bulk_suppress_honors_until_ts(incident_app, incident_store) -> None:
+    until = BASE + 100_000
+    async with await _client(incident_app) as c:
+        mesh_id = await _mesh_incident_id(c)
+        await c.post(f"/api/incidents/{mesh_id}/suppress", json={"until_ts": until})
+        for iid in (incident_store.root_id, incident_store.symptom_id):
+            detail = (await c.get(f"/api/issues/{iid}")).json()
+            assert detail["issue"]["suppress_until_ts"] == until
+
+
+async def test_bulk_unsuppress_lifts_every_member(incident_app, incident_store) -> None:
+    async with await _client(incident_app) as c:
+        mesh_id = await _mesh_incident_id(c)
+        await c.post(f"/api/incidents/{mesh_id}/suppress", json={})
+        resp = await c.post(f"/api/incidents/{mesh_id}/unsuppress")
+        assert resp.status_code == 200
+        assert resp.json() == {"incident_id": mesh_id, "count": 2}
+        for iid in (incident_store.root_id, incident_store.symptom_id):
+            detail = (await c.get(f"/api/issues/{iid}")).json()
+            assert detail["issue"]["suppressed_ts"] is None
+            assert "unsuppressed" in [e["kind"] for e in detail["events"]]
+
+
+async def test_bulk_suppress_unknown_incident_404(incident_app) -> None:
+    async with await _client(incident_app) as c:
+        suppress = await c.post("/api/incidents/999999/suppress", json={})
+        unsuppress = await c.post("/api/incidents/999999/unsuppress")
+    assert suppress.status_code == 404
+    assert unsuppress.status_code == 404
+
+
+def _measured(store: Repository) -> tuple[Any, list[Any]]:
+    """Every measured surface for the incident's AP, as comparable plain data."""
+    report = sle_scores(store, *_WIN)
+    offenders = rank_offenders(store, _DEVICE_TYPES, *_WIN)
+    return dataclasses.asdict(report), [dataclasses.asdict(o) for o in offenders]
+
+
+async def test_bulk_suppress_moves_no_measured_number(incident_app, incident_store) -> None:
+    """The invariant, for the bulk path (Gitea #50): suppressing a whole incident
+    parks attention only. The health score, per-SLE scores, and the offenders
+    burden — burden's severity-weighted open-issue channel included — must not
+    move, because suppression does not un-suffer the client-minutes the incident
+    cost. Sibling of tests/netadmin/sle/test_suppression_invariant.py, exercising
+    the HTTP bulk route rather than a single engine.suppress call."""
+    # Seed measured grief attributed to the incident's AP so the offenders burden
+    # (and its open-issue channel, which the two members feed) has a value to pin.
+    ap_id = int(incident_store.get_issue(incident_store.root_id)["entity_id"])
+    phone = incident_store.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="11:22:33:44:55:99", name="phone"), ts=BASE
+    )
+    incident_store.upsert_sle_minute(
+        bucket_ts=BASE,
+        sle="coverage",
+        classifier="weak_signal",
+        entity_id=phone,
+        attributed_entity_id=ap_id,
+        minutes=500.0,
+    )
+    incident_store.upsert_sle_minute(
+        bucket_ts=BASE,
+        sle="coverage",
+        classifier="ok",
+        entity_id=phone,
+        attributed_entity_id=ap_id,
+        minutes=100.0,
+    )
+
+    before_report, before_offenders = _measured(incident_store)
+    # Guard against a vacuous test: the AP must actually carry the open issues that
+    # feed the burden channel, so suppressing them is a real chance to move it.
+    ap_offender = next(o for o in before_offenders if o["entity_id"] == ap_id)
+    assert ap_offender["issue_counts"]["total"] == 2  # root + symptom
+
+    async with await _client(incident_app) as c:
+        mesh_id = await _mesh_incident_id(c)
+        resp = await c.post(f"/api/incidents/{mesh_id}/suppress", json={})
+        assert resp.json()["count"] == 2
+        # The suppression took: both members read as suppressed now.
+        for iid in (incident_store.root_id, incident_store.symptom_id):
+            assert (await c.get(f"/api/issues/{iid}")).json()["issue"]["suppressed_ts"] is not None
+
+    after_report, after_offenders = _measured(incident_store)
+
+    # Byte-identical: nothing measured moved.
+    assert after_report == before_report
+    assert after_offenders == before_offenders

@@ -33,10 +33,13 @@ import time
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 
 from netadmin.domain.types import Severity
+from netadmin.issues.engine import IssueEngine
 from netadmin.issues.suppression import row_is_suppressed
 from netadmin.server.serialize import decode_json, entity_ref_map, get_store
+from netadmin.store.repository import Repository
 
 router = APIRouter(prefix="/api", tags=["incidents"])
 
@@ -50,6 +53,33 @@ _SEVERITY_RANK: dict[str, int] = {
 
 def _severity_rank(severity: str) -> int:
     return _SEVERITY_RANK.get(severity, len(_SEVERITY_RANK))
+
+
+def _engine(request: Request, store: Repository) -> IssueEngine:
+    """The shared issue engine, or an ephemeral one bound to this store.
+
+    Mirrors :func:`netadmin.server.routers.issues._engine`: the running daemon's
+    lifespan builds one engine (with the WebSocket broadcaster registered) and the
+    bulk suppress/unsuppress routes reuse it so each member's ``suppressed`` event
+    fans out on ``/ws``; router tests that never enter the lifespan get a throwaway
+    engine bound to the same store, which still writes ``issue_events`` correctly.
+    """
+    engine = request.app.state.issue_engine
+    if engine is not None:
+        return engine
+    from netadmin.issues.store_repository import StoreIssueRepository
+
+    return IssueEngine(StoreIssueRepository(store))
+
+
+class IncidentSuppressBody(BaseModel):
+    """Body for ``POST /api/incidents/{id}/suppress``: park the whole incident's
+    attention claim, optionally until ``until_ts`` (omit / null = until
+    unsuppressed). Same shape and semantics as the per-issue suppress body."""
+
+    until_ts: Optional[int] = Field(
+        default=None, ge=0, description="epoch seconds to suppress until; null = indefinite"
+    )
 
 
 def _issue_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -220,6 +250,54 @@ async def get_incident(request: Request, incident_id: int) -> dict[str, Any]:
         # Investigate the root to narrate the whole story (section 10 + 17).
         "investigation": {"issue_id": root_issue_id},
     }
+
+
+@router.post("/incidents/{incident_id}/suppress")
+async def suppress_incident(
+    request: Request, incident_id: int, body: IncidentSuppressBody
+) -> dict[str, Any]:
+    """Suppress a whole incident in one action: the root and every symptom (Gitea
+    #50). Each member is suppressed *individually* — its own ``suppressed`` event,
+    stamped ``source="incident"`` so the trail distinguishes a bulk mute from a
+    per-issue one — because suppression lives on the issue row, not the incident
+    projection. Measured impact is untouched, exactly as for the per-issue route:
+    this parks attention (counts, alerts, HA sensors), never a measured number.
+
+    Token-gated as a mutation (fans out on the WebSocket via the engine). 404 if
+    the incident is unknown. Idempotent per member: re-suppressing an already-muted
+    member simply restamps it.
+    """
+    store = get_store(request)
+    if store.get_incident(incident_id) is None:
+        raise HTTPException(status_code=404, detail=f"incident {incident_id} not found")
+    engine = _engine(request, store)
+    now = int(time.time())
+    count = 0
+    for member in store.list_incident_members(incident_id):
+        transition = engine.suppress(
+            int(member["issue_id"]), now, until_ts=body.until_ts, source="incident"
+        )
+        if transition is not None:
+            count += 1
+    return {"incident_id": incident_id, "count": count}
+
+
+@router.post("/incidents/{incident_id}/unsuppress")
+async def unsuppress_incident(request: Request, incident_id: int) -> dict[str, Any]:
+    """Lift a bulk incident suppression: unsuppress the root and every symptom,
+    each writing its own ``unsuppressed`` event (Gitea #50). Mirrors
+    :func:`suppress_incident`. 404 if the incident is unknown."""
+    store = get_store(request)
+    if store.get_incident(incident_id) is None:
+        raise HTTPException(status_code=404, detail=f"incident {incident_id} not found")
+    engine = _engine(request, store)
+    now = int(time.time())
+    count = 0
+    for member in store.list_incident_members(incident_id):
+        transition = engine.unsuppress(int(member["issue_id"]), now)
+        if transition is not None:
+            count += 1
+    return {"incident_id": incident_id, "count": count}
 
 
 __all__ = ["router"]

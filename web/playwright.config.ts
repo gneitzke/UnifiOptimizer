@@ -39,6 +39,15 @@ export default defineConfig({
       testMatch: /update-check\.spec\.ts/,
     },
     {
+      // Operator suppression surfaces (Gitea #49/#50). Self-contained: every
+      // /api/* call is mocked with page.route, so it needs no backend and no
+      // auth-setup. Guards the Suppressed filter + disclosure, the escalation-void
+      // trail note (D3), and the incident bulk-suppress round-trip (D4/D5); emits
+      // the light/dark screenshots.
+      name: 'suppression-tests',
+      testMatch: /suppression\.spec\.ts/,
+    },
+    {
       name: 'auth-setup',
       testMatch: /auth\.setup\.ts/,
     },

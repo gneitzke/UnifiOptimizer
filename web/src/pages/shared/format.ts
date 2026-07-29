@@ -234,6 +234,34 @@ export function suppressionNote(issue: IssueRow, nowSec: number): string {
   return `${sinceClause}${untilClause}. Excluded from counts and alerts; measured impact is unchanged.`;
 }
 
+/** The two severities when an issue's suppression was lifted *specifically*
+ * because its severity escalated past the one captured at suppression — the
+ * captured severity and the current one, so a caller can say "rose from Low to
+ * Critical". Null in every other case: never suppressed, still suppressed, or
+ * lifted only by expiry.
+ *
+ * Escalation-void is DERIVED (rule 3 of `isSuppressedNow`): no `unsuppressed`
+ * event fires at the instant it lifts, so without this note an operator sees a
+ * muted issue silently return to the counts with nothing explaining why. Expiry
+ * is deliberately excluded — the `suppressed` trail row already dates the "until"
+ * — so this note names the one lift the trail otherwise cannot. */
+export function suppressionEscalationVoid(
+  issue: Suppressible,
+  nowSec: number,
+): { from: Severity; to: Severity } | null {
+  const captured = issue.suppressed_severity;
+  if (issue.suppressed_ts == null || captured == null) return null;
+  if (isSuppressedNow(issue, nowSec)) return null;
+  // Not expiry: an expired suppression is dated by its own `suppressed` trail row,
+  // so the escalation note stays silent and the two lifts never double up.
+  const until = issue.suppress_until_ts;
+  if (until != null && nowSec >= until) return null;
+  if (severityRank(issue.severity) < severityRank(captured)) {
+    return { from: captured, to: issue.severity };
+  }
+  return null;
+}
+
 /* ---- Issue impact (the Issues list's Impact column, Gitea #24, #36) ------ */
 
 /** What the Impact column measures, as a sentence — the column header's hover
@@ -408,6 +436,15 @@ export function impactDisplay(issue: IssueRow, nowSec: number): ImpactDisplay {
 /** Sort key: most severe first (p1 < p2 < p3). */
 export function severityRank(s: Severity): number {
   return s === 'p1' ? 0 : s === 'p2' ? 1 : 2;
+}
+
+/** The one severity word the app and the report both speak (Gitea #22): P1 =
+ * Critical, P2 = High, P3 = Low. Mirrors `SeverityPill`'s own labels so a
+ * sentence naming a severity ("rose from Low to Critical") reads the same word
+ * the pill next to it shows. */
+const SEVERITY_LABELS: Record<Severity, string> = { p1: 'Critical', p2: 'High', p3: 'Low' };
+export function severityLabel(s: Severity): string {
+  return SEVERITY_LABELS[s] ?? s;
 }
 
 /** Sort key grouping open work above resolved: active < resolving < pending < resolved. */

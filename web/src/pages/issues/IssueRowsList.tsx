@@ -1,11 +1,12 @@
 import { useState, type RefCallback } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { BellOff, ChevronDown, ChevronRight, RotateCcw } from 'lucide-react';
+import { ChevronDown, ChevronRight, RotateCcw } from 'lucide-react';
 import { SeverityPill, SeverityGlyph } from '../../components/ui/SeverityPill';
 import { StatePill } from '../../components/ui/StatePill';
 import { RelativeTime } from '../../components/ui/RelativeTime';
 import { useListNavigation } from '../../layout/keyboard/useListNavigation';
 import { EntityLink } from '../shared/EntityLink';
+import { SuppressedBadge } from '../shared/SuppressedBadge';
 import type { IssueRow } from '../shared/api';
 import {
   ISSUE_IMPACT_DEFINITION,
@@ -13,11 +14,9 @@ import {
   clearProgressNote,
   formatDuration,
   impactDisplay,
-  isSuppressedNow,
   ongoingLabel,
   recurrenceBadgeLabel,
   recurrenceNote,
-  suppressionNote,
 } from '../shared/format';
 import type { Severity } from '../../api/types';
 
@@ -255,29 +254,6 @@ function RecurrenceBadge({ issue }: { issue: IssueRow }) {
     >
       <RotateCcw size={10} strokeWidth={2.5} aria-hidden />
       <span aria-hidden>Recurring {label}</span>
-      <span className="sr-only">{note}</span>
-    </span>
-  );
-}
-
-/**
- * The neutral marker that an issue's claim on attention is parked (Gitea #49).
- * Same construction as RecurrenceBadge — a BellOff glyph on a neutral fill, never
- * a severity tint, because a suppressed issue's *facts* do not fade (its Sev pill
- * is unchanged); only its attention claim is set aside. The hover/sr sentence
- * carries the load-bearing "measured impact is unchanged".
- */
-function SuppressedBadge({ issue, now }: { issue: IssueRow; now: number }) {
-  if (!isSuppressedNow(issue, now)) return null;
-  const note = suppressionNote(issue, now);
-  return (
-    <span
-      className="relative inline-flex items-center gap-0.5 shrink-0 h-[18px] px-1.5 rounded-full t-micro"
-      style={{ background: 'var(--sev-neutral-fill)', color: 'var(--fg-muted)' }}
-      title={note}
-    >
-      <BellOff size={10} strokeWidth={2.5} aria-hidden />
-      <span aria-hidden>Suppressed</span>
       <span className="sr-only">{note}</span>
     </span>
   );

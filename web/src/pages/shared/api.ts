@@ -545,6 +545,27 @@ export const listIncidents = (includeResolved = false, includeSingletons = false
 export const getIncident = (id: number) =>
   request<IncidentDetailResponse>(`/api/incidents/${id}`);
 
+/** Response from the incident bulk suppress / unsuppress routes: how many member
+ * issues were affected (root + every symptom), each suppressed individually with
+ * `source="incident"` on its own trail event (Gitea #50). */
+export interface IncidentSuppressResponse {
+  incident_id: number;
+  count: number;
+}
+
+/** Suppress a whole incident: the root and every symptom, in one action, each as
+ * its own suppression (Gitea #50). `untilTs` omitted = "until I unsuppress".
+ * Measured impact is untouched, exactly as for a per-issue suppress. */
+export const suppressIncident = (id: number, untilTs?: number) =>
+  request<IncidentSuppressResponse>(`/api/incidents/${id}/suppress`, {
+    method: 'POST',
+    body: JSON.stringify({ until_ts: untilTs ?? null }),
+  });
+
+/** Lift a bulk incident suppression: unsuppress the root and every symptom. */
+export const unsuppressIncident = (id: number) =>
+  request<IncidentSuppressResponse>(`/api/incidents/${id}/unsuppress`, { method: 'POST' });
+
 export const listDeviceOffenders = (windowS?: number, topN?: number) =>
   request<OffendersResponse>(`/api/devices/offenders${qs({ window_s: windowS, top_n: topN })}`);
 
