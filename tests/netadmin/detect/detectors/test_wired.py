@@ -1163,3 +1163,79 @@ def test_broadcast_storm_says_why_a_down_port_was_not_counted(repo: Repository) 
     skips = [m for m in messages if "mirrored combo-uplink" in m]
     assert len(skips) == 1, messages
     assert "sw:1:10" in skips[0]
+
+
+# ====================================================================== #
+# title qualification (Gitea #54/#55)
+# ====================================================================== #
+def _named_switch_and_port(
+    repo: Repository, *, switch_name: str, port_name: str, port_nid: str
+) -> int:
+    """A switch with a friendly name and one child port, both named the way a real
+    controller names them. Returns the port entity id."""
+    sw = repo.upsert_entity(
+        Entity(
+            entity_type=EntityType.SWITCH,
+            native_id="sw:named",
+            site_id="default",
+            name=switch_name,
+        ),
+        ts=NOW,
+    )
+    return repo.upsert_entity(
+        Entity(
+            entity_type=EntityType.PORT,
+            native_id=port_nid,
+            site_id="default",
+            name=port_name,
+            parent_id=sw,
+            meta={"media": "GE", "is_uplink": False},
+        ),
+        ts=NOW,
+    )
+
+
+def test_bad_cable_title_qualifies_port_and_drops_doubled_noun(repo: Repository) -> None:
+    """The title names the switch ("Office switch / Port 5"), never a bare,
+    site-ambiguous "Port 5" nor the old doubled "on port Port 5" (Gitea #54/#55)."""
+    full_coverage(repo)
+    pid = _named_switch_and_port(
+        repo, switch_name="Office switch", port_name="Port 5", port_nid="sw:named:5"
+    )
+    seed_counter(repo, pid, "rx_errors", step=20)
+    f = BadCableDetector().evaluate(_ctx(repo))[0]
+    assert f.title == "Cable/link fault on Office switch / Port 5"
+    assert "port Port" not in f.title
+
+
+def test_stp_loop_title_qualifies_port(repo: Repository) -> None:
+    """The "on port" doubling is gone across every port detector, not just one."""
+    full_coverage(repo)
+    pid = _named_switch_and_port(
+        repo, switch_name="Core switch", port_name="Port 3", port_nid="sw:named:3"
+    )
+    repo.record_state_change(pid, "stp_state", "blocking", ts=NOW)
+    f = StpLoopDetector().evaluate(_ctx(repo))[0]
+    assert f.title == "STP loop / blocking on Core switch / Port 3"
+    assert "on port Port" not in f.title
+
+
+def test_bad_cable_title_degrades_to_bare_port_when_switch_unresolved(repo: Repository) -> None:
+    """A port whose parent switch is unresolved degrades to the bare port name,
+    never "None / Port 7" (Gitea #55, the degraded case)."""
+    full_coverage(repo)
+    pid = repo.upsert_entity(
+        Entity(
+            entity_type=EntityType.PORT,
+            native_id="sw:ghost:7",
+            site_id="default",
+            name="Port 7",
+            parent_id=None,  # no resolvable switch
+            meta={"media": "GE", "is_uplink": False},
+        ),
+        ts=NOW,
+    )
+    seed_counter(repo, pid, "rx_errors", step=20)
+    f = BadCableDetector().evaluate(_ctx(repo))[0]
+    assert f.title == "Cable/link fault on Port 7"
+    assert "None" not in f.title

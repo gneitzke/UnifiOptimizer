@@ -43,7 +43,7 @@ from typing import Any, Iterable, Optional
 from netadmin.detect import device_kb
 from netadmin.detect.baseline import hour_label
 from netadmin.detect.engine import COVERAGE_MIN, UNKNOWN, EvalResult
-from netadmin.domain.entities import Entity, Finding
+from netadmin.domain.entities import Entity, Finding, entity_display_label
 from netadmin.domain.types import Cadence, EntityType, Severity
 from netadmin.logging import get_logger
 
@@ -224,6 +224,20 @@ def _switches_by_id(ctx: Any) -> dict[int, Entity]:
     return {s.entity_id: s for s in ctx.entities(EntityType.SWITCH) if s.entity_id is not None}
 
 
+def _port_label(port: Entity, switches: dict[int, Entity]) -> str:
+    """Parent-qualified display name for a port -- ``"Office Switch / Port 5"``.
+
+    Every switch has a ``Port 5``, so the bare port name identifies nothing on a
+    site-wide surface (an issues list, the report, an alert). Qualifying it with
+    its switch is the disambiguation (Gitea #44/#55), via the one shared rule the
+    API serializer, MCP tools and report assembler already use. A port whose
+    parent switch is unresolved degrades to the bare name, never ``"None / Port 5"``.
+    """
+    switch = switches.get(port.parent_id) if port.parent_id is not None else None
+    parent_name = switch.name if switch is not None else None
+    return entity_display_label(port.name or port.native_id, EntityType.PORT.value, parent_name)
+
+
 def _is_infra_port(port: Entity) -> bool:
     """A switch-to-switch / switch-to-AP uplink port (weighted higher, P1)."""
     return bool(port.meta.get("is_uplink"))
@@ -359,13 +373,13 @@ class BadCableDetector:
                 continue
             infra = _is_infra_port(port)
             sev = Severity.P1 if infra else Severity.P2
-            label = port.name or port.native_id
+            label = _port_label(port, switches)
             findings.append(
                 _finding(
                     self.key,
                     port,
                     sev,
-                    f"Cable/link fault on port {label}",
+                    f"Cable/link fault on {label}",
                     evidence,
                     confounders,
                 )
@@ -515,6 +529,7 @@ class DuplexMismatchDetector:
             return UNKNOWN
         modern_min = int(ctx.threshold(self.key, "modern_speed_min", 100))
 
+        switches = _switches_by_id(ctx)
         findings: list[Finding] = []
         for port in _ports(ctx):
             up = _as_bool(ctx.repo.current_state(port.entity_id, "up"))
@@ -524,13 +539,13 @@ class DuplexMismatchDetector:
             speed = _as_int(ctx.repo.current_state(port.entity_id, "speed"))
             if full is not False or speed is None or speed < modern_min:
                 continue
-            label = port.name or port.native_id
+            label = _port_label(port, switches)
             findings.append(
                 _finding(
                     self.key,
                     port,
                     Severity.P2,
-                    f"Half-duplex on modern link: port {label}",
+                    f"Half-duplex on modern link: {label}",
                     {"full_duplex": False, "speed": speed, "modern_speed_min": modern_min},
                     ["coverage_gated", "link_up_checked", "modern_speed_link"],
                 )
@@ -562,6 +577,7 @@ class PortFlappingDetector:
         n_long = int(ctx.threshold(self.key, "transitions_long", 10))
         poe_floor = float(ctx.threshold(self.key, "poe_reboot_floor_w", 0.5))
 
+        switches = _switches_by_id(ctx)
         findings: list[Finding] = []
         for port in _ports(ctx):
             history = ctx.repo.state_history(port.entity_id, "up", limit=500)
@@ -590,7 +606,7 @@ class PortFlappingDetector:
 
             infra = _is_infra_port(port)
             sev = Severity.P1 if infra else Severity.P2
-            label = port.name or port.native_id
+            label = _port_label(port, switches)
             findings.append(
                 _finding(
                     self.key,
@@ -627,6 +643,7 @@ class UplinkSaturationDetector:
         degraded_pct = float(ctx.threshold(self.key, "degraded_pct", 80.0))
         critical_pct = float(ctx.threshold(self.key, "critical_pct", 95.0))
 
+        switches = _switches_by_id(ctx)
         findings: list[Finding] = []
         for port in _ports(ctx):
             if not _is_infra_port(port):
@@ -657,7 +674,7 @@ class UplinkSaturationDetector:
                 continue  # saturation without drops is headroom, not a problem
             confounders.append("tx_dropped_corroborated")
 
-            label = port.name or port.native_id
+            label = _port_label(port, switches)
             findings.append(
                 _finding(
                     self.key,
@@ -787,6 +804,7 @@ class StpLoopDetector:
             int(r["entity_id"]) for r in blocking_events if r["entity_id"] is not None
         }
 
+        switches = _switches_by_id(ctx)
         findings: list[Finding] = []
         for port in _ports(ctx):
             has_event = port.entity_id in event_entity_ids
@@ -794,13 +812,13 @@ class StpLoopDetector:
             state_blocking = state is not None and str(state).lower() in blocking_states
             if not has_event and not state_blocking:
                 continue
-            label = port.name or port.native_id
+            label = _port_label(port, switches)
             findings.append(
                 _finding(
                     self.key,
                     port,
                     Severity.P1,
-                    f"STP loop / blocking on port {label}",
+                    f"STP loop / blocking on {label}",
                     {
                         "stp_state": None if state is None else str(state),
                         "blocking_event": has_event,
@@ -945,6 +963,7 @@ class SfpDegradedDetector:
         bias_drift_pct = float(ctx.threshold(self.key, "bias_drift_pct", 25.0))
         chassis_hot_c = float(ctx.threshold(self.key, "chassis_hot_c", 60.0))
 
+        switches = _switches_by_id(ctx)
         findings: list[Finding] = []
         for port in _ports(ctx):
             rx = _latest_gauge(ctx.window(port.entity_id, "sfp_rxpower", window_s))
@@ -1019,13 +1038,13 @@ class SfpDegradedDetector:
 
             evidence["signals"] = signals
             severity = Severity.P3 if set(signals) <= self.DRIFT_SIGNALS else Severity.P2
-            label = port.name or port.native_id
+            label = _port_label(port, switches)
             findings.append(
                 _finding(
                     self.key,
                     port,
                     severity,
-                    f"SFP degraded on port {label}",
+                    f"SFP degraded on {label}",
                     evidence,
                     confounders,
                 )

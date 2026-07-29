@@ -12,9 +12,14 @@ The daemon binds a LAN-reachable port. The auth model (revised in ARCHITECTURE.m
   — require ``Authorization: Bearer <token>``. The UI keeps the token in
   ``localStorage`` and prompts for it just-in-time on the first mutation.
 
-The ``/ws`` socket takes the same token as a ``?token=`` query parameter (browsers
-cannot set WebSocket headers), so its auth lives beside the endpoint in
-:mod:`netadmin.server.ws`.
+The ``/ws`` socket is a **read channel** and follows the open-reads posture above:
+it is not gated on the token, because both frames it carries are projections of
+already-open reads (``heartbeat`` = ``GET /api/health``; ``issue_transition`` = the
+persisted trail served by ``GET /api/issues/{id}``). Like those GETs, when viewing
+must be gated it is gated by a reverse proxy or the loopback-only bind, not
+per-frame; an old client's ``?token=`` is accepted and ignored. The guard for this
+— any future gated frame type must re-gate the socket — lives beside the endpoint
+in :mod:`netadmin.server.ws` (Gitea #51).
 
 Token comparison is **constant-time** (:func:`hmac.compare_digest` via the
 module-level :data:`_compare` seam) so a timing side-channel cannot recover the
@@ -90,7 +95,6 @@ __all__ = [
     "SYSTEM_MCP_TOKEN_REGENERATE_PATH",
     "SYSTEM_UPDATE_APPLY_PATH",
     "MUTATION_PATH_SUFFIXES",
-    "WS_UNAUTHORIZED_CODE",
     "DEFAULT_WRITE_MAX",
     "DEFAULT_WRITE_WINDOW_S",
     "FixedWindowRateLimiter",
@@ -142,9 +146,6 @@ SYSTEM_MCP_TOKEN_REGENERATE_PATH = "/api/system/mcp-token/regenerate"
 # mutation -- it upgrades the daemon's own code, never the live network -- but it
 # fails closed exactly like one: see is_system_update_apply.
 SYSTEM_UPDATE_APPLY_PATH = "/api/system/update/apply"
-
-# WebSocket close code for an auth failure: 1008 (policy violation).
-WS_UNAUTHORIZED_CODE = 1008
 
 # Write-op rate limit defaults: at most N controller-mutation requests per client
 # per rolling window. Generous for a single operator; low enough that a token guess

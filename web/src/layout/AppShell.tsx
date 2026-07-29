@@ -80,12 +80,15 @@ function ShellInner() {
     if (frame.type === 'issue_transition') reload();
   });
 
+  // `/ws` is an open read channel (Gitea #51), so this indicator tracks daemon
+  // reachability, not auth: "Offline" means the daemon is unreachable, never that
+  // live updates need a token. The `title` spells that out on hover.
   const wsState =
     wsStatus === 'open'
-      ? { label: 'Live', color: 'var(--sev-healthy)' }
+      ? { label: 'Live', color: 'var(--sev-healthy)', title: 'Live updates connected' }
       : wsStatus === 'connecting'
-        ? { label: 'Connecting', color: 'var(--sev-p3)' }
-        : { label: 'Offline', color: 'var(--fg-subtle)' };
+        ? { label: 'Connecting', color: 'var(--sev-p3)', title: 'Connecting to the daemon…' }
+        : { label: 'Offline', color: 'var(--fg-subtle)', title: 'Daemon unreachable — no live updates' };
 
   return (
     <div className="flex flex-col min-h-screen" style={{ background: 'var(--canvas)' }}>
@@ -111,7 +114,11 @@ function ShellInner() {
             </h1>
 
             <div className="flex items-center gap-2">
-              <span className="inline-flex items-center gap-1.5 t-caption mr-1" style={{ color: 'var(--fg-muted)' }}>
+              <span
+                className="inline-flex items-center gap-1.5 t-caption mr-1"
+                style={{ color: 'var(--fg-muted)' }}
+                title={wsState.title}
+              >
                 <span
                   aria-hidden
                   className="inline-block w-2 h-2 rounded-full"

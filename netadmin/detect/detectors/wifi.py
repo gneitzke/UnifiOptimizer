@@ -54,7 +54,7 @@ from netadmin.detect.detectors._rssi import (
     sticky_per_ap_rssi,
 )
 from netadmin.detect.engine import COVERAGE_MIN, UNKNOWN, DetectorResult, EvalResult
-from netadmin.domain.entities import Entity, Finding
+from netadmin.domain.entities import Entity, Finding, entity_display_label
 from netadmin.domain.types import Cadence, EntityType, Severity
 from netadmin.logging import get_logger
 
@@ -282,6 +282,26 @@ def _radios_by_ap(radios: Iterable[Entity]) -> dict[int, list[Entity]]:
         if radio.parent_id is not None:
             grouped.setdefault(radio.parent_id, []).append(radio)
     return grouped
+
+
+def _aps_by_id(ctx: Any) -> dict[int, Entity]:
+    """AP ``entity_id`` -> AP entity, for parent-qualifying a radio's title."""
+    return {ap.entity_id: ap for ap in ctx.entities(EntityType.AP) if ap.entity_id is not None}
+
+
+def _radio_label(radio: Entity, aps: dict[int, Entity]) -> str:
+    """Parent-qualified display name for a radio -- ``"Loft / wifi0"`` (Gitea #44/#55).
+
+    A real controller names every AP's radios ``wifi0``/``wifi1``, so the bare
+    name is ambiguous across APs on any site-wide surface (the issues list, the
+    report, an alert). Qualifying it with its AP is the disambiguation, via the
+    one shared rule (:func:`entity_display_label`) the API serializer, MCP tools
+    and report assembler already use. A radio whose parent AP is unresolved
+    degrades to the bare name, never ``"None / wifi0"``.
+    """
+    parent = aps.get(radio.parent_id) if radio.parent_id is not None else None
+    parent_name = parent.name if parent is not None else None
+    return entity_display_label(radio.name or radio.native_id, EntityType.RADIO.value, parent_name)
 
 
 def _event_data(row: Any) -> dict[str, Any]:
@@ -970,7 +990,7 @@ class MinRssiMisconfigDetector:
             else:
                 severity, reason = Severity.P3, "stricter_than_floor"
 
-            label = radio.name or radio.native_id
+            label = _radio_label(radio, aps)
             findings.append(
                 Finding(
                     detector_key=self.key,
@@ -1063,11 +1083,8 @@ class ChannelPlanDetector:
         }
 
         radios = [r for r in ctx.entities(EntityType.RADIO) if r.entity_id is not None]
-        ap_names = {
-            ap.entity_id: (ap.name or ap.native_id)
-            for ap in ctx.entities(EntityType.AP)
-            if ap.entity_id is not None
-        }
+        aps = _aps_by_id(ctx)
+        ap_names = {eid: (ap.name or ap.native_id) for eid, ap in aps.items()}
         ap_count = len({r.parent_id for r in radios if r.parent_id is not None})
 
         findings: list[Finding] = []
@@ -1079,9 +1096,13 @@ class ChannelPlanDetector:
             ht = _as_int(radio.meta.get("ht"))
 
             if band == "2.4" and channel is not None and channel not in _VALID_24_CHANNELS:
-                findings.append(self._radio_finding(radio, "channel_off_grid", band, channel, ht))
+                findings.append(
+                    self._radio_finding(radio, "channel_off_grid", band, channel, ht, aps)
+                )
             if band == "2.4" and ht is not None and ht >= 40:
-                findings.append(self._radio_finding(radio, "wide_channel_24ghz", band, channel, ht))
+                findings.append(
+                    self._radio_finding(radio, "wide_channel_24ghz", band, channel, ht, aps)
+                )
             if band == "5" and ht is not None and ht >= 80 and ap_count >= wide_ap_min:
                 wide_5.append(radio)
             if band is not None and channel is not None and channel in candidates.get(band, ()):
@@ -1118,8 +1139,9 @@ class ChannelPlanDetector:
         band: Optional[str],
         channel: Optional[int],
         ht: Optional[int],
+        aps: dict[int, Entity],
     ) -> Finding:
-        label = radio.name or radio.native_id
+        label = _radio_label(radio, aps)
         return Finding(
             detector_key=self.key,
             entity=radio,
@@ -1347,6 +1369,7 @@ class AirtimeSaturationDetector:
         sustained_frac = float(ctx.threshold(self.key, "sustained_fraction", 0.8))
         min_samples = int(ctx.threshold(self.key, "min_samples", 4))
 
+        aps = _aps_by_id(ctx)
         findings: list[Finding] = []
         unknown: set[int] = set()
         for radio in ctx.entities(EntityType.RADIO):
@@ -1373,7 +1396,7 @@ class AirtimeSaturationDetector:
             cu_nonself = max(0.0, cu_med - cu_self)
             dominant = "self" if cu_self >= cu_nonself else "non_self"
 
-            label = radio.name or radio.native_id
+            label = _radio_label(radio, aps)
             findings.append(
                 Finding(
                     detector_key=self.key,
@@ -1424,7 +1447,8 @@ class TxPowerLoudDetector:
 
         radios = [r for r in ctx.entities(EntityType.RADIO) if r.entity_id is not None]
         by_ap = _radios_by_ap(radios)
-        ap_count = len([a for a in ctx.entities(EntityType.AP) if a.entity_id is not None])
+        aps = _aps_by_id(ctx)
+        ap_count = len(aps)
         if ap_count < 2:
             return []  # single-AP: loud power is not a cell-overlap problem
 
@@ -1439,7 +1463,7 @@ class TxPowerLoudDetector:
                 confounders = ["multi_ap_site"]
                 if radio.parent_id is not None:
                     confounders.append("sticky_concentration_checked")
-                label = radio.name or radio.native_id
+                label = _radio_label(radio, aps)
                 findings.append(
                     Finding(
                         detector_key=self.key,
@@ -1457,7 +1481,7 @@ class TxPowerLoudDetector:
                     )
                 )
 
-        findings.extend(self._imbalance_findings(by_ap, imbalance_db))
+        findings.extend(self._imbalance_findings(by_ap, imbalance_db, aps))
         return findings
 
     @staticmethod
@@ -1487,7 +1511,7 @@ class TxPowerLoudDetector:
         return counts
 
     def _imbalance_findings(
-        self, by_ap: dict[int, list[Entity]], imbalance_db: float
+        self, by_ap: dict[int, list[Entity]], imbalance_db: float, aps: dict[int, Entity]
     ) -> list[Finding]:
         out: list[Finding] = []
         for radios in by_ap.values():
@@ -1501,7 +1525,7 @@ class TxPowerLoudDetector:
                 continue
             # 2.4 should sit ~imbalance_db below 5 GHz; flag when it does not.
             if p24 > p5 - imbalance_db:
-                label = r24.name or r24.native_id
+                label = _radio_label(r24, aps)
                 out.append(
                     Finding(
                         detector_key=self.key,

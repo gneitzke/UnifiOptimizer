@@ -6,6 +6,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { EmptyState, RelativeTime, cn } from '../../components/ui';
+import { anomalyLabel, eventSentence } from '../shared/eventVocab';
 import type { JourneyEvent } from '../devices/api';
 
 /**
@@ -46,12 +47,6 @@ function humanBytes(bytes: number): string {
   }
   return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
 }
-
-const ANOMALY_LABEL: Record<string, string> = {
-  USER_DNS_TIMEOUT: 'DNS timeout',
-  USER_HIGH_DNS_LATENCY: 'High DNS latency',
-  USER_HIGH_TCP_LATENCY: 'High TCP latency',
-};
 
 function describe(ev: JourneyEvent): Described {
   const d = ev.data as Record<string, unknown>;
@@ -107,13 +102,12 @@ function describe(ev: JourneyEvent): Described {
   }
 
   if (ev.key.startsWith('ANOMALY_')) {
-    const name = (d.anomaly as string) ?? '';
-    const label = ANOMALY_LABEL[name] ?? ev.msg ?? name.replace(/^USER_|^AP_/, '').replace(/_/g, ' ');
-    return { icon: TriangleAlert, title: `Anomaly · ${label}`, tone: 'warn' };
+    const raw = (d.anomaly as string) ?? ev.msg ?? undefined;
+    return { icon: TriangleAlert, title: `Anomaly · ${anomalyLabel(ev.key, raw)}`, tone: 'warn' };
   }
 
-  // Unknown event — show it honestly rather than dropping it.
-  return { icon: ArrowRightLeft, title: ev.msg ?? ev.key, tone: 'neutral' };
+  // Unknown event — show it honestly (plain sentence) rather than dropping it.
+  return { icon: ArrowRightLeft, title: eventSentence(ev.key, ev.msg), tone: 'neutral' };
 }
 
 const TONE_COLOR: Record<Described['tone'], string> = {

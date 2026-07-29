@@ -842,6 +842,16 @@ just load. Revised model:
   inventory, metrics, incidents, events, health, and the setup *status*) is served
   without a token. A configured daemon never shows a gate for viewing — the
   dashboard just works for any device on the network.
+- **Live updates (`/ws`) ride the same open-reads posture (Gitea #51).** The one
+  WebSocket is a read channel: its two frames are projections of already-open reads
+  (`heartbeat` mirrors `GET /api/health`; `issue_transition` mirrors the persisted
+  issue-event trail served by `GET /api/issues/{id}`), so it is not gated on a token
+  either — gating it while those GETs were open was a joint lie the header's
+  "Offline" indicator paid for. A configured daemon's live indicator connects for
+  any LAN device, so "Offline" means the daemon is unreachable, never "live updates
+  need a token." Viewing is gated, when it must be, at the same layer as the GETs — a
+  reverse proxy or the loopback-only bind — and any future gated frame type must
+  re-gate the socket (guard in `netadmin/server/ws.py`).
 - **Mutations require the access token, prompted just-in-time.** Only the handful
   of endpoints that change something — `fix/apply`, `fix/revert`, `setup/connect`,
   `ack`/`snooze` — require the bearer token and fail closed without it. The UI

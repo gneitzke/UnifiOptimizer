@@ -6,7 +6,7 @@
  */
 
 import type { NetEvent } from '../../api';
-import { familyOf, isFaultKey, type FamilyId } from './eventKeys';
+import { familyOf, isFaultKey, type FamilyId } from '../shared/eventVocab';
 
 export interface WindowSpec {
   id: string;

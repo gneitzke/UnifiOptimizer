@@ -7,7 +7,8 @@ means fully open access with a startup warning (controller mutations still fail
 closed). These tests pin: GET reads open even with a token set, a state-changing
 POST gated without the token, health always open, OPTIONS/preflight pass-through,
 the constant-time comparator is the one exercised on a gated route, controller
-mutations fail closed + rate limited, and the WebSocket ``?token=`` gate.
+mutations fail closed + rate limited, and that the WebSocket read channel is open
+on the LAN (like GET reads) while writes stay gated (Gitea #51).
 """
 
 from __future__ import annotations
@@ -255,7 +256,9 @@ class _FakeQueryParams:
 class _AuthFakeWebSocket:
     """A WebSocket stand-in that carries query params + app state for auth checks."""
 
-    def __init__(self, app: object, token: Optional[str]) -> None:
+    def __init__(
+        self, app: object, token: Optional[str], headers: Optional[dict[str, str]] = None
+    ) -> None:
         from starlette.websockets import WebSocketState
 
         self.app = app
@@ -265,6 +268,9 @@ class _AuthFakeWebSocket:
         self.closed = False
         self.close_code: Optional[int] = None
         self.query_params = _FakeQueryParams({"token": token} if token is not None else {})
+        # Case-insensitive header lookup, like Starlette's Headers (the Origin
+        # guard reads "origin"/"host").
+        self.headers = {k.lower(): v for k, v in (headers or {}).items()}
         self.sent: list[dict] = []
 
     async def accept(self) -> None:
@@ -283,21 +289,96 @@ class _AuthFakeWebSocket:
         self.application_state = self._State.DISCONNECTED
 
 
+async def _drive_endpoint_until_accepted(ws: _AuthFakeWebSocket) -> None:
+    """Run ``websocket_endpoint`` until it accepts, then tear the task down.
+
+    Post-#51 every LAN client clears the (now absent) gate and accepts; the endpoint
+    then blocks racing its send/recv loops, so -- like ``test_ws_accepted_with_token``
+    -- we poll for ``accepted`` and cancel.
+    """
+    import asyncio
+
+    task = asyncio.create_task(websocket_endpoint(ws))  # type: ignore[arg-type]
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if ws.accepted:
+            break
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        pass
+
+
 @pytest.mark.asyncio
-async def test_ws_rejected_without_token(token_app: object) -> None:
+async def test_ws_accepted_without_token(token_app: object) -> None:
+    # Gitea #51: ``/ws`` is a READ channel, open on the LAN exactly like a GET read.
+    # A client with no token connects -- so the header's "Offline" indicator now
+    # means the daemon is unreachable, never "live updates need a token."
+    # (Was test_ws_rejected_without_token: closed 1008.)
     ws = _AuthFakeWebSocket(token_app, token=None)
+    await _drive_endpoint_until_accepted(ws)
+    assert ws.accepted is True
+
+
+@pytest.mark.asyncio
+async def test_ws_same_origin_lan_connects(token_app: object) -> None:
+    # Gitea #51 safeguard: the LAN dashboard is same-origin with its own daemon
+    # even though a LAN IP is never in the CORS allowlist. Origin == Host must
+    # connect, or the fix would break the exact surface it is meant to heal.
+    ws = _AuthFakeWebSocket(
+        token_app,
+        token=None,
+        headers={"origin": "http://192.0.2.10:8765", "host": "192.0.2.10:8765"},
+    )
+    await _drive_endpoint_until_accepted(ws)
+    assert ws.accepted is True
+
+
+@pytest.mark.asyncio
+async def test_ws_foreign_origin_rejected(token_app: object) -> None:
+    # The drive-by vector this closes: a page the operator visits opens a socket
+    # to the daemon to read live telemetry. A cross-origin browser Origin that is
+    # not in the pinned CORS allowlist is refused (1008) before accept, matching
+    # the GET reads' same-origin-policy protection that a WebSocket otherwise lacks.
+    ws = _AuthFakeWebSocket(
+        token_app,
+        token=None,
+        headers={"origin": "http://evil.example", "host": "192.0.2.10:8765"},
+    )
     await websocket_endpoint(ws)  # type: ignore[arg-type]
     assert ws.accepted is False
     assert ws.closed is True
-    assert ws.close_code == auth_mod.WS_UNAUTHORIZED_CODE
+    assert ws.close_code == 1008
 
 
 @pytest.mark.asyncio
-async def test_ws_rejected_with_wrong_token(token_app: object) -> None:
+async def test_ws_accepted_with_stale_token(token_app: object) -> None:
+    # A stale/wrong token is accepted and ignored -- the same posture as an open GET
+    # read carrying a wrong token (test_get_read_open_even_with_wrong_token). The
+    # socket never rejects a client over a drifted cached token.
+    # (Was test_ws_rejected_with_wrong_token: closed 1008.)
     ws = _AuthFakeWebSocket(token_app, token="wrong")
-    await websocket_endpoint(ws)  # type: ignore[arg-type]
-    assert ws.accepted is False
-    assert ws.close_code == auth_mod.WS_UNAUTHORIZED_CODE
+    await _drive_endpoint_until_accepted(ws)
+    assert ws.accepted is True
+
+
+@pytest.mark.asyncio
+async def test_ws_read_open_but_controller_mutation_stays_gated(token_app: object) -> None:
+    # The #51 safeguard, both halves against the real configured app: the ``/ws``
+    # READ channel connects WITHOUT a token (LAN viewing is open), yet the token
+    # still gates WRITES -- a controller mutation is refused 401 without it. Opening
+    # the read socket did not open the write path; a deliberately locked-down deploy
+    # still authenticates at the reverse proxy / loopback bind, the same layer that
+    # gates the open GET reads (ARCHITECTURE.md 18.1).
+    ws = _AuthFakeWebSocket(token_app, token=None)
+    await _drive_endpoint_until_accepted(ws)
+    assert ws.accepted is True  # read half: tokenless LAN client connects
+
+    async with await _client(token_app) as c:
+        refused = await c.post(_APPLY_PATH, json={"confirm": True, "confirm_token": "x"})
+    assert refused.status_code == 401  # write half: the token is still required
+    assert refused.headers.get("www-authenticate") == "Bearer"
 
 
 @pytest.mark.asyncio

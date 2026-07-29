@@ -1,4 +1,5 @@
 import { EmptyState, RelativeTime, cn } from '../../components/ui';
+import { deviceStateLabel } from '../shared/eventVocab';
 import type { StateChange } from './api';
 
 /**
@@ -26,13 +27,22 @@ function attrLabel(attr: string): string {
   return ATTR_LABEL[attr] ?? attr;
 }
 
-/** Humanise a couple of raw state values so the rail reads cleanly. */
+/** Humanise a couple of raw state values so the rail reads cleanly. `attrLabel`
+ * already prints the "State" noun, so the device-state value is just the word
+ * ("offline"/"connected"), never the doubled "State state 0" (Gitea #52). */
 function valueLabel(attr: string, value: string | null): string {
   if (value == null) return '—';
-  if (attr === 'state') return value === '1' ? 'connected' : `state ${value}`;
+  if (attr === 'state') return deviceStateLabel(value);
   if (attr === 'up') return value === 'True' ? 'up' : 'down';
   if (attr === 'full_duplex') return value === 'True' ? 'full duplex' : 'half duplex';
   return value;
+}
+
+/** The raw stored value, surfaced on hover for the expert whenever we relabel a
+ * device-state integer to a word. */
+function rawTitle(attr: string, value: string | null): string | undefined {
+  if (value == null || attr !== 'state') return undefined;
+  return `state ${value}`;
 }
 
 export function StateHistory({
@@ -84,17 +94,29 @@ export function StateHistory({
                 {first ? (
                   <>
                     set to{' '}
-                    <span className="tnum" style={{ color: 'var(--fg)' }}>
+                    <span
+                      className="tnum"
+                      style={{ color: 'var(--fg)' }}
+                      title={rawTitle(c.attr, c.new_value)}
+                    >
                       {valueLabel(c.attr, c.new_value)}
                     </span>
                   </>
                 ) : (
                   <>
-                    <span className="tnum" style={{ color: 'var(--fg-muted)' }}>
+                    <span
+                      className="tnum"
+                      style={{ color: 'var(--fg-muted)' }}
+                      title={rawTitle(c.attr, c.old_value)}
+                    >
                       {valueLabel(c.attr, c.old_value)}
                     </span>
                     {' → '}
-                    <span className="tnum" style={{ color: 'var(--fg)' }}>
+                    <span
+                      className="tnum"
+                      style={{ color: 'var(--fg)' }}
+                      title={rawTitle(c.attr, c.new_value)}
+                    >
                       {valueLabel(c.attr, c.new_value)}
                     </span>
                   </>

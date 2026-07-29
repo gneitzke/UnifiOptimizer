@@ -49,7 +49,7 @@ from netadmin.correlate.models import (
 )
 from netadmin.correlate.rules import match_link, root_rank
 from netadmin.correlate.topology import TopologyIndex, TopoNode
-from netadmin.domain.entities import Timestamp
+from netadmin.domain.entities import Timestamp, entity_display_label
 from netadmin.issues.models import Issue
 from netadmin.logging import get_logger
 
@@ -520,10 +520,19 @@ class CorrelationEngine:
 
     @staticmethod
     def _label(issue: Issue, topo: TopologyIndex) -> str:
-        """Human name for an issue's entity (topology name, else a fallback)."""
+        """Human name for an issue's entity: the topology name, parent-qualified
+        for a child radio/port (``"Loft / wifi0"``, Gitea #44/#55), else a fallback.
+
+        A radio/port root (airtime, loud TX, port flapping, bad cable, STP loop)
+        names ``wifi0``/``Port 5`` -- ambiguous across the site -- so an incident
+        title/rationale must qualify it with its parent, the same one rule the
+        detectors and API use. Top-level roots (AP, switch, gateway) pass through.
+        """
         node: Optional[TopoNode] = topo.get(issue.entity_id)
         if node is not None and node.name:
-            return node.name
+            parent = topo.get(node.parent_id)
+            parent_name = parent.name if parent is not None else None
+            return entity_display_label(node.name, node.entity_type, parent_name)
         if issue.entity_id is not None:
             return f"entity {issue.entity_id}"
         return issue.title

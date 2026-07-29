@@ -54,8 +54,11 @@ KEY_DEVICE_OVERHEATING = "infra.device_overheating"
 DEVICE_TYPES: tuple[EntityType, ...] = (EntityType.AP, EntityType.SWITCH, EntityType.GATEWAY)
 
 # UniFi ``device.state`` codes, recorded as strings in ``state_changes``:
-#   1 = connected/online, 0 = disconnected/offline,
-#   2 = pending adoption, 4 = upgrading, 5 = provisioning (transitional).
+#   0 = offline, 1 = connected, 2 = pending adoption, 4 = upgrading,
+#   5 = provisioning, 6 = heartbeat missed, 7 = adopting.
+# Only 2/4/5 are treated as transitional here (DEFAULT_TRANSITIONAL_STATES); 6/7
+# are listed for completeness because the web UI's ``deviceStateLabel`` mirrors
+# this whole set and shows "state N" for anything outside it.
 DEFAULT_ONLINE_STATES: tuple[str, ...] = ("1",)
 DEFAULT_DOWN_STATES: tuple[str, ...] = ("0",)
 DEFAULT_TRANSITIONAL_STATES: tuple[str, ...] = ("2", "4", "5")

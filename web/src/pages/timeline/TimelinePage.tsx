@@ -14,10 +14,10 @@ import {
   FAMILIES,
   familyLabel,
   familyOf,
-  humanizeKey,
+  eventSentence,
   isFaultKey,
   type FamilyId,
-} from './eventKeys';
+} from '../shared/eventVocab';
 import { WINDOWS, bucketize, eventsInBucket } from './buckets';
 import { EventDensityChart } from './EventDensityChart';
 import { useTimelineEvents } from './useTimelineEvents';
@@ -119,15 +119,18 @@ export default function TimelinePage() {
       ),
     },
     {
-      // Sentence primary, code secondary in mono (Gitea #25: this used to lead
-      // with the machine code — "WU Roam Radio" — and bury the human sentence
-      // in a separate, truncated "Detail" column that duplicated Entity).
+      // Sentence primary, raw code secondary in mono (Gitea #25/#52: this used
+      // to lead with the machine code — "WU Roam Radio" — and bury the human
+      // sentence in a separate, truncated "Detail" column that duplicated Entity;
+      // anomalies still surfaced as raw "ANOMALY_USER_HIGH_TCP_LATENCY"). The
+      // plain sentence now comes from the shared vocabulary, and the exact key
+      // stays beside it for the expert.
       key: 'event',
       header: 'Event',
-      sortAccessor: (e) => e.msg ?? humanizeKey(e.key),
+      sortAccessor: (e) => eventSentence(e.key, e.msg),
       render: (e) => {
         const fault = isFaultKey(e.key);
-        const sentence = e.msg ?? humanizeKey(e.key);
+        const sentence = eventSentence(e.key, e.msg);
         return (
           <span className="inline-flex items-baseline gap-1.5 min-w-0" title={sentence}>
             {fault ? (
@@ -150,7 +153,7 @@ export default function TimelinePage() {
                 className="t-caption font-mono ml-2"
                 style={{ color: 'var(--fg-subtle)' }}
               >
-                {humanizeKey(e.key)}
+                {e.key}
               </code>
             </span>
           </span>

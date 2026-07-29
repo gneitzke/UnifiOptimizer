@@ -37,6 +37,10 @@ class FakeWebSocket:
         self.accepted = False
         self.closed = False
         self.close_code = None
+        # A real Starlette WebSocket always exposes .headers; the #51 Origin guard
+        # reads it. Empty here == a non-browser client (no Origin), which is
+        # allowed, so these streaming tests exercise the accept path unchanged.
+        self.headers: dict[str, str] = {}
         self.sent: list[dict] = []
         self.incoming: asyncio.Queue = asyncio.Queue()
 

@@ -35,7 +35,6 @@ from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
 from netadmin.issues.models import Transition
 from netadmin.logging import get_logger
-from netadmin.server.auth import WS_UNAUTHORIZED_CODE, token_matches
 
 _log = get_logger("server.ws")
 
@@ -235,6 +234,38 @@ async def _recv_loop(websocket: WebSocket) -> None:
         return
 
 
+def _origin_allowed(websocket: WebSocket) -> bool:
+    """Whether this ``/ws`` upgrade may proceed, by the request's ``Origin``.
+
+    Three cases, mirroring what the same-origin policy + pinned CORS already give
+    the open GET reads:
+
+    * **No ``Origin``** -- a non-browser client (python, ``mcp-remote``, curl).
+      Not subject to the cross-site drive-by vector, so allowed.
+    * **Same-origin** -- the ``Origin`` matches the ``Host`` this socket is served
+      on. This is the dashboard talking to its own daemon, including the LAN case
+      (``http://<lan-ip>:8765``) that is *not* in the CORS allowlist because
+      same-origin requests never needed CORS. Allowed.
+    * **Cross-origin** -- allowed only if the ``Origin`` is in the pinned CORS
+      allowlist (a configured dev/frontend origin). Otherwise refused.
+    """
+    origin = websocket.headers.get("origin")
+    if not origin:
+        return True
+    host = websocket.headers.get("host", "")
+    if host and origin in (f"http://{host}", f"https://{host}"):
+        return True
+    try:
+        from netadmin.server.main import _cors_origins
+
+        settings = getattr(websocket.app.state, "settings", None)
+        if settings is not None and origin in _cors_origins(settings):
+            return True
+    except Exception:  # noqa: BLE001 - a missing/odd settings must fail closed, not crash
+        pass
+    return False
+
+
 async def websocket_endpoint(websocket: WebSocket) -> None:
     """The ``/ws`` handler: accept, stream frames, reap on disconnect.
 
@@ -248,20 +279,35 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         await websocket.close(code=1011)
         return
 
-    # Static-token auth (section 12): when a token is configured the socket takes it
-    # as ``?token=`` (browsers cannot set WebSocket headers, so the query param is the
-    # documented channel), constant-time compared. Unconfigured -> open, like the API.
-    settings = getattr(websocket.app.state, "settings", None)
-    expected = getattr(settings, "api_token", None) if settings is not None else None
-    if expected:
-        supplied: Optional[str] = None
-        try:
-            supplied = websocket.query_params.get("token")
-        except Exception:  # noqa: BLE001 - a malformed query string is just "no token"
-            supplied = None
-        if not token_matches(supplied, expected):
-            await websocket.close(code=WS_UNAUTHORIZED_CODE)
-            return
+    # No token gate here: ``/ws`` is a READ channel and follows the open-reads
+    # posture of every ``GET /api/*`` (ARCHITECTURE.md 18.1). Both frame types it
+    # carries are byte-for-byte projections of already-open reads -- ``heartbeat``
+    # mirrors ``GET /api/health`` and ``issue_transition`` mirrors the persisted
+    # issue-event trail served by ``GET /api/issues/{id}`` -- so gating this socket
+    # while those GETs are open was a joint lie the UI's "Offline" indicator paid
+    # for (Gitea #51). Viewing is gated, when it must be, at the same layer that
+    # gates those GETs: a reverse proxy terminating the HTTP upgrade, or the
+    # loopback-only bind (the default) -- never a per-frame token here. An old
+    # client's ``?token=`` is simply ignored, so proxied deploys and cached tokens
+    # keep working.
+    #
+    # GUARD: this endpoint may accept a connection ONLY while every frame the
+    # broadcaster can push is read-open data. If a future frame type ever carries
+    # something a LAN GET would not already return, it MUST re-gate this socket
+    # (re-introduce a token check before ``accept``) rather than leak here.
+    #
+    # ORIGIN CHECK (Gitea #51): open reads are only *GET-parity* if a foreign site
+    # cannot read them. For GETs the browser's same-origin policy enforces that --
+    # a cross-origin page may send the GET but cannot read the response, and CORS
+    # is pinned so it is never granted permission. A WebSocket has NO same-origin
+    # policy: without this check any page the operator visits could open
+    # ``ws://<lan-ip>:8765/ws`` and read their live issue/health telemetry. So we
+    # reject a browser Origin that is neither same-origin nor in the pinned CORS
+    # allowlist. A missing Origin (non-browser client -- python, mcp-remote) is
+    # allowed: those are not subject to the drive-by vector this closes.
+    if not _origin_allowed(websocket):
+        await websocket.close(code=1008)
+        return
 
     await websocket.accept()
     conn = broadcaster.register()

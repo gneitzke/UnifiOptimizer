@@ -1812,3 +1812,49 @@ def test_controller_flagged_rogue_still_fires_when_it_is_close_and_persistent(
     findings = RogueApDetector().evaluate(_ctx(repo))
     assert len(findings) == 1
     assert findings[0].dims["subtype"] == "controller_flagged"
+
+
+# ====================================================================== #
+# title qualification (Gitea #55)
+# ====================================================================== #
+def _named_radio(
+    repo: Repository, *, ap_name: Optional[str], radio_name: str, band: str = "na"
+) -> int:
+    """A radio named the way a real controller names it (``wifi0``/``wifi1``),
+    under an AP with (or without) a resolvable name. Returns the radio id."""
+    if ap_name is not None:
+        parent = mk_ap(repo, "ap-named", name=ap_name)
+    else:
+        parent = None
+    return repo.upsert_entity(
+        Entity(
+            entity_type=EntityType.RADIO,
+            native_id="ap-named:na",
+            site_id="default",
+            name=radio_name,
+            parent_id=parent,
+            meta={"band": band},
+        ),
+        ts=NOW,
+    )
+
+
+def test_airtime_title_qualifies_radio_with_ap(repo: Repository) -> None:
+    """The radio title names its AP ("Loft / wifi0"), not the bare "wifi0" that
+    repeats identically across every AP on the site (Gitea #44/#55)."""
+    seed_cov(repo)
+    rid = _named_radio(repo, ap_name="Loft", radio_name="wifi0")
+    gauge(repo, rid, "cu_total", [60.0] * 8)
+    f = AirtimeSaturationDetector().evaluate(_ctx(repo))[0]
+    assert f.title == "Airtime saturation (degraded) on Loft / wifi0"
+
+
+def test_airtime_title_degrades_to_bare_radio_when_ap_unresolved(repo: Repository) -> None:
+    """A radio whose parent AP is unresolved degrades to the bare name, never
+    "None / wifi0" (Gitea #55, the degraded case)."""
+    seed_cov(repo)
+    rid = _named_radio(repo, ap_name=None, radio_name="wifi0")
+    gauge(repo, rid, "cu_total", [60.0] * 8)
+    f = AirtimeSaturationDetector().evaluate(_ctx(repo))[0]
+    assert f.title == "Airtime saturation (degraded) on wifi0"
+    assert "None" not in f.title

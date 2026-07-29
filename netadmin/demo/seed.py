@@ -1058,7 +1058,7 @@ class _Seeder:
             entity_id=self.bad_cable_port_id,
             severity=Severity.P2,
             state=IssueState.ACTIVE,
-            title=f"Cable/link fault on port {self.bad_cable_port_nid}",
+            title="Cable/link fault on Office Switch / Port 6",
             first_seen=first,
             last_seen=self.now - FINE_STEP,
             evidence={
@@ -1107,7 +1107,7 @@ class _Seeder:
             entity_id=self.flap_port_id,
             severity=Severity.P1,  # uplink / infra port
             state=IssueState.ACTIVE,
-            title=f"Port flapping: Port 2 (6 transitions/10m)",
+            title="Port flapping: Office Switch / Port 2 (6 transitions/10m)",
             first_seen=first,
             last_seen=self.now - 2 * MINUTE,
             evidence={
@@ -1142,7 +1142,7 @@ class _Seeder:
             entity_id=radio["id"],
             severity=Severity.P2,
             state=IssueState.ACTIVE,
-            title="Airtime saturation (degraded) on Living Room 2.4G",
+            title="Airtime saturation (degraded) on Living Room / wifi0",
             first_seen=first,
             last_seen=self.now - FINE_STEP,
             evidence={
@@ -1355,7 +1355,7 @@ class _Seeder:
             entity_id=radio["id"],
             severity=Severity.P3,
             state=IssueState.ACTIVE,
-            title="min-RSSI misconfigured on Primary Bedroom 5G",
+            title="min-RSSI misconfigured on Primary Bedroom / wifi1",
             first_seen=first,
             last_seen=self.now - 2 * HOUR,
             evidence={
@@ -1418,7 +1418,7 @@ class _Seeder:
             entity_id=self.duplex_port_id,
             severity=Severity.P2,
             state=IssueState.RESOLVED,
-            title=f"Half-duplex on modern link: port {self.duplex_port_nid}",
+            title="Half-duplex on modern link: Rack Switch / Port 4",
             first_seen=first,
             last_seen=resolved,
             evidence={"full_duplex": False, "speed": 1000, "modern_speed_min": 1000},
@@ -1447,7 +1447,7 @@ class _Seeder:
             entity_id=radio["id"],
             severity=Severity.P3,
             state=IssueState.RESOLVED,
-            title="Channel-plan issue (co_channel_reuse) on Office 2.4G",
+            title="Channel-plan issue (co_channel_reuse) on Office / wifi0",
             first_seen=first,
             last_seen=resolved,
             evidence={"subtype": "co_channel_reuse", "band": "2.4", "channel": 6, "ht_mhz": 20},
@@ -1552,7 +1552,7 @@ class _Seeder:
             entity_id=radio["id"],
             severity=Severity.P2,
             state=IssueState.ACTIVE,
-            title="Airtime saturation (degraded) on Back Porch 2.4G",
+            title="Airtime saturation (degraded) on Back Porch / wifi0",
             first_seen=air_first,
             last_seen=self.now - FINE_STEP,
             evidence={

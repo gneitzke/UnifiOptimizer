@@ -6,6 +6,7 @@ import { RelativeTime } from '../../components/ui/RelativeTime';
 import { Skeleton } from '../../components/ui/Skeleton';
 import { EntityLink } from '../shared/EntityLink';
 import { listEvents, type NetEventRow } from '../shared/api';
+import { eventSentence } from '../shared/eventVocab';
 import { usePageAsync } from '../shared/hooks';
 import type { IssueTransitionFrame, Severity } from '../../api/types';
 
@@ -129,7 +130,7 @@ function EventRow({ ev }: { ev: NetEventRow }) {
   return (
     <div className="flex flex-col min-w-0 flex-1">
       <span className="t-body truncate" style={{ color: 'var(--fg)' }}>
-        {ev.msg || ev.key}
+        {eventSentence(ev.key, ev.msg)}
       </span>
       <span className="t-caption truncate flex items-center gap-1" style={{ color: 'var(--fg-muted)' }}>
         <code className="t-micro" style={{ color: 'var(--fg-subtle)' }}>
