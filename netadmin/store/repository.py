@@ -1206,6 +1206,9 @@ class Repository:
         resolved_ts: Optional[int] = None,
         ack_ts: Optional[int] = None,
         snooze_until_ts: Optional[int] = None,
+        suppressed_ts: Optional[int] = None,
+        suppress_until_ts: Optional[int] = None,
+        suppressed_severity: Optional[str] = None,
         fix_state: Optional[str] = None,
         reopened_from: Optional[int] = None,
     ) -> int:
@@ -1219,8 +1222,9 @@ class Repository:
                 "INSERT INTO issues "
                 "(fingerprint, detector_key, entity_id, severity, state, first_seen_ts, "
                 " last_seen_ts, resolved_ts, clear_streak, occurrences, ack_ts, "
-                " snooze_until_ts, title, evidence, fix_state, reopened_from) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " snooze_until_ts, suppressed_ts, suppress_until_ts, suppressed_severity, "
+                " title, evidence, fix_state, reopened_from) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     fingerprint,
                     detector_key,
@@ -1234,6 +1238,9 @@ class Repository:
                     occurrences,
                     ack_ts,
                     snooze_until_ts,
+                    suppressed_ts,
+                    suppress_until_ts,
+                    suppressed_severity,
                     title,
                     evidence_json,
                     fix_state,
@@ -1256,6 +1263,9 @@ class Repository:
             "occurrences",
             "ack_ts",
             "snooze_until_ts",
+            "suppressed_ts",
+            "suppress_until_ts",
+            "suppressed_severity",
             "title",
             "evidence",
             "fix_state",

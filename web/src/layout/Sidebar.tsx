@@ -111,7 +111,15 @@ export function Sidebar({ expanded, onToggle, summary, version, installMethod, i
                 <>
                   <span className="flex-1 t-body">{item.label}</span>
                   {item.badge === 'issues' && (
-                    <CountBadge count={count} alert={alert} title={`${count} open issues`} />
+                    <CountBadge
+                      count={count}
+                      alert={alert}
+                      title={
+                        item.badge === 'issues' && summary && summary.suppressed > 0
+                          ? `${count} open issues · ${summary.suppressed} suppressed`
+                          : `${count} open issues`
+                      }
+                    />
                   )}
                 </>
               )}

@@ -911,3 +911,38 @@ def test_publisher_has_no_subscribe_surface(
     pub = build_ha_publisher(_settings(tmp_db_path), store, engine)
     assert not hasattr(pub, "subscribe")
     assert not hasattr(pub, "on_message")
+
+
+@pytest.mark.asyncio
+async def test_state_doc_excludes_suppressed_from_counts_and_discloses(
+    store: Repository, engine: IssueEngine, tmp_db_path: Path
+) -> None:
+    """A suppressed issue leaves the per-severity counts and is disclosed as its
+    own ``suppressed`` field, never a silent shrink (Gitea #49)."""
+    import time as _time
+
+    now = int(_time.time())
+    a = _seed_issue(store, fingerprint="a" * 40, severity="p2", state=IssueState.ACTIVE.value)
+    _seed_issue(store, fingerprint="b" * 40, severity="p2", state=IssueState.ACTIVE.value)
+    engine.suppress(a, now)
+
+    pub = build_ha_publisher(_settings(tmp_db_path), store, engine, client_factory=FakeMqttClient)
+    doc = pub._build_state_doc()
+
+    assert doc.issues["p2"] == 1  # the suppressed p2 is excluded from the count
+    assert doc.suppressed == 1  # ...and disclosed here
+    assert '"suppressed": 1' in doc.as_json()
+
+
+@pytest.mark.asyncio
+async def test_suppressed_severe_issue_gets_no_binary_sensor(
+    store: Repository, engine: IssueEngine, tmp_db_path: Path
+) -> None:
+    """A suppressed P1/P2 loses its dynamic binary_sensor — no attention pull."""
+    import time as _time
+
+    p1 = _seed_issue(store, fingerprint="c" * 40, severity="p1", state=IssueState.ACTIVE.value)
+    engine.suppress(p1, int(_time.time()))
+
+    pub = build_ha_publisher(_settings(tmp_db_path), store, engine, client_factory=FakeMqttClient)
+    assert pub._active_issue_views() == {}

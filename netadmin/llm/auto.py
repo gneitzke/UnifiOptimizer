@@ -268,7 +268,14 @@ class AutoInvestigator:
         ``resolving``, and a ``reopened`` issue. ``PENDING`` never qualifies. The
         ``escalated`` clause additionally catches a severity raise on an
         already-active issue, should the engine ever emit one.
+
+        A *suppressed* issue never qualifies (Gitea #49): the operator has parked
+        its claim on attention, and auto-investigation is paid attention — spending
+        an LLM call on a fault the operator muted is exactly what suppression
+        exists to stop. The flag rides on the transition, so no store read.
         """
+        if transition.suppressed:
+            return False
         severity = getattr(transition.severity, "value", transition.severity)
         if str(severity) not in self._severities:
             return False

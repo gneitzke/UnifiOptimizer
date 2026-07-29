@@ -16,10 +16,12 @@ import {
   formatDurationLong,
   humanizeKey,
   impactDisplay,
+  isSuppressedNow,
   issueDurationSeconds,
   recurrencePhrase,
+  suppressionNote,
 } from '../shared/format';
-import { ackIssue, getIssue, snoozeIssue } from '../shared/api';
+import { ackIssue, getIssue, suppressIssue, unsuppressIssue } from '../shared/api';
 import { usePageAsync, useNowSeconds } from '../shared/hooks';
 import { EvidenceView } from './EvidenceView';
 import { InvestigationPanel } from './InvestigationPanel';
@@ -31,17 +33,21 @@ import { metricHintsForIssue } from './metricHints';
 /**
  * Issue detail (`/issues/:id`): the full lifecycle trail, evidence as compact
  * labeled numbers, the confounders the detector ruled out, the related metric
- * chart from the evidence's series hints, the ack/snooze operator actions (which
- * mute notifications only — never touch evaluation, §7), and the LLM
- * investigation section (dossier → provider → response, §10).
+ * chart from the evidence's series hints, the operator actions — Acknowledge (a
+ * provenance stamp, no behavioural effect) and Suppress (the one attention mute,
+ * with an optional expiry; it parks counts/alerts and never touches measured
+ * impact, Gitea #49) — and the LLM investigation section (§10).
  */
 
-const SNOOZE_OPTIONS = [
+/** Suppress durations, subsuming the old snooze menu (Gitea #49). `s: null` is
+ * the indefinite "until I unsuppress" option. */
+const SUPPRESS_OPTIONS: { label: string; s: number | null }[] = [
   { label: '1 hour', s: 3_600 },
   { label: '8 hours', s: 28_800 },
   { label: '24 hours', s: 86_400 },
   { label: '3 days', s: 259_200 },
   { label: '7 days', s: 604_800 },
+  { label: 'Until I unsuppress', s: null },
 ];
 
 function SectionCard({ title, children }: { title: string; children: React.ReactNode }) {
@@ -84,7 +90,7 @@ export function IssueDetailPage() {
 
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [showSnooze, setShowSnooze] = useState(false);
+  const [showSuppress, setShowSuppress] = useState(false);
   const now = useNowSeconds();
 
   async function runAction(fn: () => Promise<unknown>) {
@@ -97,7 +103,7 @@ export function IssueDetailPage() {
       setActionError((e as Error).message || 'Action failed');
     } finally {
       setBusy(false);
-      setShowSnooze(false);
+      setShowSuppress(false);
     }
   }
 
@@ -136,7 +142,7 @@ export function IssueDetailPage() {
     data;
   const durSecs = issueDurationSeconds(issue, now);
   const impact = impactDisplay(issue, now);
-  const snoozed = issue.snooze_until_ts != null && issue.snooze_until_ts > now;
+  const suppressed = isSuppressedNow(issue, now);
   const hints = metricHintsForIssue(issue);
   const isOpen = issue.state !== 'resolved';
   const recurrence = recurrencePhrase(issue);
@@ -223,38 +229,31 @@ export function IssueDetailPage() {
                   variant="secondary"
                   size="sm"
                   disabled={busy}
-                  onClick={() => setShowSnooze((v) => !v)}
+                  onClick={() =>
+                    suppressed
+                      ? runAction(() => unsuppressIssue(issueId))
+                      : setShowSuppress((v) => !v)
+                  }
                 >
                   <BellOff size={14} />
-                  {snoozed ? 'Snoozed' : 'Snooze'}
+                  {suppressed ? 'Unsuppress' : 'Suppress'}
                 </Button>
               </div>
-              {snoozed && (
-                <span className="t-micro" style={{ color: 'var(--fg-subtle)' }}>
-                  until <RelativeTime ts={issue.snooze_until_ts} mode="at" />
-                  {' · '}
-                  <button
-                    type="button"
-                    className="hover:underline cursor-pointer"
-                    style={{ color: 'var(--accent)' }}
-                    disabled={busy}
-                    onClick={() => runAction(() => snoozeIssue(issueId, now))}
-                  >
-                    clear
-                  </button>
-                </span>
-              )}
-              {showSnooze && (
+              {showSuppress && !suppressed && (
                 <div
                   className="flex flex-col p-1 rounded-control"
                   style={{ background: 'var(--elevated)', border: '1px solid var(--hairline)', boxShadow: 'var(--shadow-elevated)' }}
                 >
-                  {SNOOZE_OPTIONS.map((o) => (
+                  {SUPPRESS_OPTIONS.map((o) => (
                     <button
-                      key={o.s}
+                      key={o.label}
                       type="button"
                       disabled={busy}
-                      onClick={() => runAction(() => snoozeIssue(issueId, now + o.s))}
+                      onClick={() =>
+                        runAction(() =>
+                          suppressIssue(issueId, o.s == null ? undefined : now + o.s),
+                        )
+                      }
                       className="text-left px-3 py-1.5 rounded t-caption cursor-pointer hover:bg-canvas"
                       style={{ color: 'var(--fg)' }}
                     >
@@ -271,6 +270,40 @@ export function IssueDetailPage() {
             </div>
           )}
         </div>
+
+        {/* Suppressed banner: facts intact, attention claim visibly parked. The
+            load-bearing clause is "measured impact unchanged" — the mute never
+            un-suffers the client-minutes this issue cost (Gitea #49). */}
+        {suppressed && (
+          <div
+            className="flex items-center gap-2 flex-wrap px-3 py-2 rounded-control t-caption"
+            style={{ background: 'var(--sev-neutral-fill)', color: 'var(--fg-muted)' }}
+            title={suppressionNote(issue, now)}
+          >
+            <BellOff size={13} className="shrink-0" style={{ color: 'var(--fg-subtle)' }} />
+            <span>
+              Suppressed <RelativeTime ts={issue.suppressed_ts ?? now} mode="relative" />
+              {issue.suppress_until_ts != null ? (
+                <>
+                  {' · until '}
+                  <RelativeTime ts={issue.suppress_until_ts} mode="at" />
+                </>
+              ) : (
+                ' · until unsuppressed'
+              )}
+              {' · excluded from counts and alerts; measured impact unchanged'}
+            </span>
+            <button
+              type="button"
+              className="hover:underline cursor-pointer"
+              style={{ color: 'var(--accent)' }}
+              disabled={busy}
+              onClick={() => runAction(() => unsuppressIssue(issueId))}
+            >
+              Unsuppress
+            </button>
+          </div>
+        )}
 
         {/* Meta grid */}
         <div

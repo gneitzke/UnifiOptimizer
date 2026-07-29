@@ -6,7 +6,7 @@ import { SeverityPill } from '../../components/ui/SeverityPill';
 import { StatePill } from '../../components/ui/StatePill';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { Skeleton } from '../../components/ui/Skeleton';
-import { ongoingLabel, severityRank, issueDurationSeconds } from '../shared/format';
+import { isSuppressedNow, ongoingLabel, severityRank, issueDurationSeconds } from '../shared/format';
 import { listIssues, entityLabel, type IssueRow } from '../shared/api';
 import { usePageAsync, useNowSeconds } from '../shared/hooks';
 import type { Severity } from '../../api/types';
@@ -26,9 +26,13 @@ export function IssueSeveritySummary({ reloadKey }: { reloadKey: number }) {
   });
   const now = useNowSeconds();
 
-  const { counts, open, top } = useMemo(() => {
+  const { counts, open, top, suppressed } = useMemo(() => {
     const issues = data?.issues ?? [];
-    const openIssues = issues.filter((i) => i.state !== 'resolved');
+    const notResolved = issues.filter((i) => i.state !== 'resolved');
+    // Suppressed issues leave the tiles and the top-5 (Gitea #49); they are
+    // disclosed as a caption below, never a silent shrink.
+    const suppressedCount = notResolved.filter((i) => isSuppressedNow(i, now)).length;
+    const openIssues = notResolved.filter((i) => !isSuppressedNow(i, now));
     const c: Record<Severity, number> = { p1: 0, p2: 0, p3: 0 };
     for (const i of openIssues) c[i.severity] += 1;
     const sorted = [...openIssues].sort((a, b) => {
@@ -36,7 +40,7 @@ export function IssueSeveritySummary({ reloadKey }: { reloadKey: number }) {
       if (s !== 0) return s;
       return issueDurationSeconds(b, now) - issueDurationSeconds(a, now);
     });
-    return { counts: c, open: openIssues, top: sorted.slice(0, 5) };
+    return { counts: c, open: openIssues, top: sorted.slice(0, 5), suppressed: suppressedCount };
   }, [data, now]);
 
   return (
@@ -82,8 +86,24 @@ export function IssueSeveritySummary({ reloadKey }: { reloadKey: number }) {
             ))}
           </div>
 
+          {suppressed > 0 && (
+            <Link
+              to="/issues?state=suppressed"
+              className="t-caption hover:underline self-start"
+              style={{ color: 'var(--fg-muted)' }}
+            >
+              · {suppressed} suppressed
+            </Link>
+          )}
+
           {open.length === 0 ? (
-            <EmptyState variant="healthy" />
+            suppressed > 0 ? (
+              <span className="t-secondary" style={{ color: 'var(--fg-muted)' }}>
+                No active issues need attention.
+              </span>
+            ) : (
+              <EmptyState variant="healthy" />
+            )
           ) : (
             <ul className="flex flex-col">
               {top.map((issue) => (

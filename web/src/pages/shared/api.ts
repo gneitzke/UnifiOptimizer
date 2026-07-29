@@ -150,6 +150,14 @@ export interface IssueRow {
   occurrences: number;
   ack_ts: number | null;
   snooze_until_ts: number | null;
+  /** Operator suppression (Gitea #49), derived at read time by `isSuppressedNow`
+   * in `format.ts`. `suppressed_ts` = when muted (null = never); `suppress_until_ts`
+   * = optional expiry (null = indefinite); `suppressed_severity` = severity at
+   * suppression, so an escalation past it voids the mute. Optional so a UI ahead
+   * of its daemon reads an older payload as never-suppressed. */
+  suppressed_ts?: number | null;
+  suppress_until_ts?: number | null;
+  suppressed_severity?: Severity | null;
   title: string;
   evidence: Record<string, unknown>;
   fix_state: FixState | null;
@@ -264,6 +272,10 @@ export interface IncidentSummary {
 export interface IncidentListResponse {
   incidents: IncidentSummary[];
   count: number;
+  /** How many incidents were dropped because ALL their members are
+   * operator-suppressed (Gitea #49) — the disclosure that keeps the shrunk list
+   * from being silent. Optional so an older daemon's payload still reads. */
+  suppressed_excluded?: number;
 }
 
 export interface IncidentMember {
@@ -549,6 +561,21 @@ export const snoozeIssue = (id: number, untilTs: number) =>
     method: 'POST',
     body: JSON.stringify({ until_ts: untilTs }),
   }).then((r) => r.issue);
+
+/** Suppress an issue: park its claim on attention (counts, alerts) with an
+ * optional expiry (Gitea #49). `untilTs` omitted = "until I unsuppress".
+ * Measured impact is untouched. Subsumes snooze — this is the one mute. */
+export const suppressIssue = (id: number, untilTs?: number) =>
+  request<{ issue: IssueRow }>(`/api/issues/${id}/suppress`, {
+    method: 'POST',
+    body: JSON.stringify({ until_ts: untilTs ?? null }),
+  }).then((r) => r.issue);
+
+/** Lift an operator suppression: the issue re-enters counts and alerts. */
+export const unsuppressIssue = (id: number) =>
+  request<{ issue: IssueRow }>(`/api/issues/${id}/unsuppress`, { method: 'POST' }).then(
+    (r) => r.issue,
+  );
 
 /* ---- Fixes (ARCHITECTURE.md §9) ---------------------------------------- */
 

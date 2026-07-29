@@ -47,6 +47,7 @@ from netadmin.issues.models import (
     IssueRepository,
     Transition,
 )
+from netadmin.issues.suppression import issue_is_suppressed
 from netadmin.logging import get_logger
 
 _log = get_logger("issues.engine")
@@ -204,7 +205,11 @@ class IssueEngine:
     def ack(
         self, issue_id: int, now: Timestamp, detail: Optional[dict[str, Any]] = None
     ) -> Optional[Transition]:
-        """Acknowledge an issue: set ``ack_ts`` (mutes notifications only)."""
+        """Acknowledge an issue: stamp ``ack_ts`` as provenance ("a human has seen
+        this"). No behavioural effect, ever (Gitea #49). Acknowledging and
+        suppressing are different acts: an operator acks a P1 they are actively
+        working, and it must keep counting and keep alerting. Suppression, not ack,
+        is the attention mute — see :meth:`suppress`."""
         issue = self.repo.get_issue(issue_id)
         if issue is None:
             return None
@@ -219,7 +224,11 @@ class IssueEngine:
         now: Timestamp,
         detail: Optional[dict[str, Any]] = None,
     ) -> Optional[Transition]:
-        """Snooze notifications until ``until_ts`` (evaluation is untouched)."""
+        """DEPRECATED (Gitea #49): use :meth:`suppress` with ``until_ts``. Kept —
+        with its endpoint — because tests pin its behaviour and migration 0009
+        carries live snoozes into suppression; the UI no longer calls it. Sets
+        ``snooze_until_ts``, which nothing now reads (a timed suppression is the
+        real mute)."""
         issue = self.repo.get_issue(issue_id)
         if issue is None:
             return None
@@ -227,6 +236,57 @@ class IssueEngine:
         self.repo.update_issue(issue)
         payload = {"until_ts": until_ts, **(detail or {})}
         return self._emit([], issue, EventKind.SNOOZED, now, None, None, payload)
+
+    def suppress(
+        self,
+        issue_id: int,
+        now: Timestamp,
+        *,
+        until_ts: Optional[Timestamp] = None,
+        source: str = "operator",
+        detail: Optional[dict[str, Any]] = None,
+    ) -> Optional[Transition]:
+        """Suppress an issue: park its claim on attention (counts, badges, alert
+        dispatch, HA sensors) with an optional expiry (Gitea #49).
+
+        ``ack``/``snooze``'s sibling in the operator-hooks section: it sets the
+        three suppression fields, writes one ``suppressed`` event, and emits —
+        touching no state-machine branch and no measured number. Suppression is
+        *derived* from these fields at read time
+        (:mod:`netadmin.issues.suppression`), so expiry and severity-escalation
+        void it with no further engine write. ``suppressed_severity`` captures the
+        current severity so that escalation past it lifts the mute. ``source``
+        distinguishes ``operator`` from ``incident`` (bulk) and ``migration``.
+        """
+        issue = self.repo.get_issue(issue_id)
+        if issue is None:
+            return None
+        issue.suppressed_ts = now
+        issue.suppress_until_ts = until_ts
+        issue.suppressed_severity = issue.severity
+        self.repo.update_issue(issue)
+        payload: dict[str, Any] = {"source": source, "severity": issue.severity.value}
+        if until_ts is not None:
+            payload["until_ts"] = until_ts
+        payload.update(detail or {})
+        return self._emit([], issue, EventKind.SUPPRESSED, now, None, None, payload)
+
+    def unsuppress(
+        self, issue_id: int, now: Timestamp, detail: Optional[dict[str, Any]] = None
+    ) -> Optional[Transition]:
+        """Lift an operator suppression: clear the three fields and write an
+        ``unsuppressed`` event (Gitea #49). The only event-producing un-mute path;
+        expiry and escalation-void are derived and readable from adjacent trail
+        rows, so they need no event of their own."""
+        issue = self.repo.get_issue(issue_id)
+        if issue is None:
+            return None
+        issue.suppressed_ts = None
+        issue.suppress_until_ts = None
+        issue.suppressed_severity = None
+        self.repo.update_issue(issue)
+        payload = {"reason": "operator", **(detail or {})}
+        return self._emit([], issue, EventKind.UNSUPPRESSED, now, None, None, payload)
 
     def propose_fix(
         self, issue_id: int, now: Timestamp, detail: Optional[dict[str, Any]] = None
@@ -668,6 +728,10 @@ class IssueEngine:
             from_state=from_state,
             to_state=to_state,
             detail=dict(detail),
+            # Carried so alert classify() can gate an OPENED/REOPENED on a
+            # suppressed issue with no DB read (Gitea #49). Derived from the same
+            # read-time helper every surface uses, so the gate agrees with the UI.
+            suppressed=issue_is_suppressed(issue, now),
         )
         transitions.append(transition)
         self._notify(transition)

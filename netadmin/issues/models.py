@@ -40,6 +40,14 @@ class EventKind:
     RESOLVED = "resolved"
     REOPENED = "reopened"
     INVESTIGATED = "investigated"
+    # Operator suppression (Gitea #49). SUPPRESSED parks an issue's claim on
+    # attention (counts, alerts, HA sensors) with an optional expiry; UNSUPPRESSED
+    # lifts it. Both are the operator-facing mute — distinct from the engine's
+    # automatic inhibition (``netadmin.issues.inhibition``), which also says
+    # "suppressed" but means cause-mutes-symptom. Neither touches measured
+    # experience: suppressing an issue does not un-suffer its client-minutes.
+    SUPPRESSED = "suppressed"
+    UNSUPPRESSED = "unsuppressed"
 
 
 # ``issue_events.detail["reason"]`` on the ``escalated`` row the engine writes
@@ -76,6 +84,14 @@ class Issue:
     occurrences: int = 1
     ack_ts: Optional[Timestamp] = None
     snooze_until_ts: Optional[Timestamp] = None
+    # Operator suppression (Gitea #49), derived at read time via
+    # :mod:`netadmin.issues.suppression`. ``suppressed_ts`` is when it was muted
+    # (NULL = never); ``suppress_until_ts`` an optional expiry (NULL = until
+    # unsuppressed); ``suppressed_severity`` the severity captured then, so an
+    # escalation past it voids the mute by derivation with no engine write.
+    suppressed_ts: Optional[Timestamp] = None
+    suppress_until_ts: Optional[Timestamp] = None
+    suppressed_severity: Optional[Severity] = None
     evidence: dict[str, Any] = field(default_factory=dict)
     fix_state: Optional[FixState] = None
     reopened_from: Optional[int] = None
@@ -116,6 +132,13 @@ class Transition:
     from_state: Optional[IssueState]
     to_state: Optional[IssueState]
     detail: dict[str, Any] = field(default_factory=dict)
+    # Whether the owning issue was suppressed at the moment this transition fired
+    # (Gitea #49), carried so :func:`netadmin.integrations.alerts.policy.classify`
+    # can gate an OPENED/REOPENED alert without a DB read — the same "carry it so
+    # the callback needs no store handle" precedent as ``severity``/``title``.
+    # Defaulted, so the one production construction site and every test
+    # constructor stay valid without change.
+    suppressed: bool = False
 
 
 # Inhibition sources must activate on their first fire: a downed controller or

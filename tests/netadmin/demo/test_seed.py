@@ -120,6 +120,32 @@ def test_issue_counts_by_state_and_severity(demo_db) -> None:
     assert stats.issues_by_severity == {"p1": 1, "p2": 9, "p3": 7}
 
 
+def test_seed_has_one_suppressed_active_issue(demo_db) -> None:
+    """The demo carries exactly one operator-suppressed, still-active issue (Gitea
+    #49) — the neighbor-density nuisance — so the screenshots and e2e have a real
+    suppressed row. Suppression is derived, so state/severity are untouched (the
+    count fixtures above still hold); this pins that the row and its trail event
+    exist and cannot silently drop out of the seed."""
+    path, _stats = demo_db
+    conn = Repository.open(path, read_only=True).connection
+    rows = conn.execute(
+        "SELECT detector_key, state, suppressed_severity FROM issues "
+        "WHERE suppressed_ts IS NOT NULL"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["detector_key"] == "wifi.neighbor_density"
+    assert rows[0]["state"] == "active"  # suppressed AND still active
+    assert rows[0]["suppressed_severity"] == "p3"
+    kinds = [
+        r["kind"]
+        for r in conn.execute(
+            "SELECT e.kind FROM issue_events e JOIN issues i ON i.id = e.issue_id "
+            "WHERE i.suppressed_ts IS NOT NULL"
+        )
+    ]
+    assert "suppressed" in kinds
+
+
 def test_supporting_data_populated(demo_db) -> None:
     _path, stats = demo_db
     # Time series + rollups + events + accounting are all present and non-trivial.

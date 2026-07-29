@@ -54,6 +54,11 @@ def _issue_from_row(row: sqlite3.Row) -> Issue:
         occurrences=row["occurrences"],
         ack_ts=row["ack_ts"],
         snooze_until_ts=row["snooze_until_ts"],
+        suppressed_ts=row["suppressed_ts"],
+        suppress_until_ts=row["suppress_until_ts"],
+        suppressed_severity=(
+            Severity(row["suppressed_severity"]) if row["suppressed_severity"] else None
+        ),
         title=row["title"],
         evidence=json.loads(row["evidence"] or "{}"),
         fix_state=FixState(row["fix_state"]) if row["fix_state"] else None,
@@ -95,6 +100,11 @@ def _issue_columns(issue: Issue) -> dict[str, object]:
         "occurrences": issue.occurrences,
         "ack_ts": issue.ack_ts,
         "snooze_until_ts": issue.snooze_until_ts,
+        "suppressed_ts": issue.suppressed_ts,
+        "suppress_until_ts": issue.suppress_until_ts,
+        "suppressed_severity": (
+            issue.suppressed_severity.value if issue.suppressed_severity else None
+        ),
         "title": issue.title,
         "evidence": issue.evidence,
         "fix_state": issue.fix_state.value if issue.fix_state else None,

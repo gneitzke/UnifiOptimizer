@@ -1,6 +1,6 @@
 import { Fragment, type ReactNode, useMemo } from 'react';
 import { Link } from 'react-router-dom';
-import { Loader2 } from 'lucide-react';
+import { CircleDashed } from 'lucide-react';
 import type { IssueState } from '../../api/types';
 import { RelativeTime } from '../../components/ui/RelativeTime';
 import { humanizeKey } from '../shared/format';
@@ -122,6 +122,19 @@ function eventSummary(kind: string, detail: Record<string, unknown>): ReactNode 
         'Snoozed.'
       );
     }
+    case 'suppressed': {
+      const until = typeof detail.until_ts === 'number' ? detail.until_ts : null;
+      return until != null ? (
+        <>
+          Suppressed until <RelativeTime ts={until} mode="at" />: kept off the
+          counts and alerts, still tracked.
+        </>
+      ) : (
+        'Suppressed: kept off the counts and alerts, still tracked.'
+      );
+    }
+    case 'unsuppressed':
+      return 'Suppression lifted: back in the counts and alerts.';
     case 'fix_proposed': {
       const action = actionLabel(detail);
       const from = detail.from;
@@ -252,11 +265,12 @@ export function LifecycleTrail({
       {showProgress && (
         <li className="flex gap-3">
           <div className="flex flex-col items-center shrink-0" style={{ width: 12 }}>
-            <Loader2
+            <CircleDashed
               size={10}
               strokeWidth={3}
-              className="mt-1.5 animate-spin"
+              className="mt-1.5"
               style={{ color: 'var(--accent)' }}
+              aria-hidden
             />
           </div>
           <div className="pb-0.5">

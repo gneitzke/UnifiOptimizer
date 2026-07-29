@@ -188,3 +188,48 @@ async def test_issue_read_model_carries_incident(incident_app, incident_store) -
         solo_detail = (await c.get(f"/api/issues/{incident_store.standalone_id}")).json()
         assert solo_detail["incident"] is not None
         assert solo_detail["incident"]["symptom_count"] == 0
+
+
+def _suppress(store: Repository, *issue_ids: int) -> None:
+    from netadmin.issues.engine import IssueEngine
+    from netadmin.issues.store_repository import StoreIssueRepository
+
+    engine = IssueEngine(StoreIssueRepository(store))
+    import time as _time
+
+    for iid in issue_ids:
+        engine.suppress(int(iid), int(_time.time()))
+
+
+async def test_fully_suppressed_singleton_drops_out_and_is_disclosed(
+    incident_app, incident_store
+) -> None:
+    """The standalone issue's only member suppressed -> its incident-of-one leaves
+    the "Needs attention" view, and the drop is disclosed, never silent."""
+    _suppress(incident_store, incident_store.standalone_id)
+    async with await _client(incident_app) as c:
+        body = (await c.get("/api/incidents?include_singletons=true")).json()
+    detectors = {i["root"]["detector_key"] for i in body["incidents"]}
+    assert "wan.isp_degraded" not in detectors  # fully suppressed -> dropped
+    assert "wifi.mesh_uplink" in detectors  # the live cluster stays
+    assert body["suppressed_excluded"] == 1
+
+
+async def test_partially_suppressed_incident_stays(incident_app, incident_store) -> None:
+    """A suppressed root with a live symptom keeps the incident: the symptom is an
+    unanswered ask (correlation rule)."""
+    _suppress(incident_store, incident_store.root_id)  # root only, symptom live
+    async with await _client(incident_app) as c:
+        body = (await c.get("/api/incidents")).json()
+    assert body["count"] == 1  # still surfaced
+    assert body["suppressed_excluded"] == 0
+
+
+async def test_incident_drops_only_when_all_members_suppressed(
+    incident_app, incident_store
+) -> None:
+    _suppress(incident_store, incident_store.root_id, incident_store.symptom_id)
+    async with await _client(incident_app) as c:
+        body = (await c.get("/api/incidents")).json()
+    assert body["count"] == 0
+    assert body["suppressed_excluded"] == 1

@@ -43,6 +43,7 @@ from netadmin.config import HaConfig, MqttCredentials, Settings
 from netadmin.domain.types import IssueState, Severity
 from netadmin.issues.engine import IssueEngine
 from netadmin.issues.models import EventKind, Transition
+from netadmin.issues.suppression import row_is_suppressed
 from netadmin.logging import get_logger
 from netadmin.sle.classifiers import ALL_SLES
 from netadmin.sle.scores import sle_scores
@@ -95,6 +96,11 @@ _ISSUE_SET_KINDS = frozenset(
         EventKind.ESCALATED,
         EventKind.RESOLVED,
         EventKind.REOPENED,
+        # Operator suppression changes which issues surface as sensors/counts, so
+        # reconcile immediately rather than waiting for the periodic refresh
+        # (Gitea #49).
+        EventKind.SUPPRESSED,
+        EventKind.UNSUPPRESSED,
     }
 )
 
@@ -403,10 +409,21 @@ class _StateDoc:
     health: Optional[int]
     sle: dict[str, Optional[int]]
     issues: dict[str, int]
+    # Disclosure (Gitea #49): the per-severity counts above EXCLUDE operator-
+    # suppressed issues; this names how many were parked so the shrink is never
+    # silent. An attribute on the state doc, not a new discovered sensor, to keep
+    # discovery churn out of the broker.
+    suppressed: int = 0
 
     def as_json(self) -> str:
         return json.dumps(
-            {"health": self.health, "sle": self.sle, "issues": self.issues}, sort_keys=True
+            {
+                "health": self.health,
+                "sle": self.sle,
+                "issues": self.issues,
+                "suppressed": self.suppressed,
+            },
+            sort_keys=True,
         )
 
 
@@ -770,9 +787,15 @@ class HaPublisher:
 
     # -- store projection (sync, loop-thread reads) -------------------- #
     def _open_issue_rows(self) -> list[Any]:
-        """Open issues in a visible (active/resolving) state, newest first."""
+        """Open, visible (active/resolving), NOT operator-suppressed issues (Gitea
+        #49): a suppressed issue leaves the per-severity counts and gets no
+        binary_sensor. Its measured impact is untouched — this is the attention
+        surface only. The suppressed *count* is disclosed on the state doc."""
+        now = int(time.time())
         return [
-            r for r in self._store.list_issues(open_only=True) if r["state"] in _OPEN_VISIBLE_STATES
+            r
+            for r in self._store.list_issues(open_only=True)
+            if r["state"] in _OPEN_VISIBLE_STATES and not row_is_suppressed(r, now)
         ]
 
     def _build_state_doc(self) -> _StateDoc:
@@ -786,12 +809,19 @@ class HaPublisher:
         pass on its own cadence, so a throttled score is never stale for long.
         """
         health, sle_pct = self._headline_and_sle()
+        now = int(time.time())
         counts = {"p1": 0, "p2": 0, "p3": 0}
-        for row in self._open_issue_rows():
+        suppressed = 0
+        for row in self._store.list_issues(open_only=True):
+            if row["state"] not in _OPEN_VISIBLE_STATES:
+                continue
+            if row_is_suppressed(row, now):
+                suppressed += 1  # excluded from counts, disclosed as its own field
+                continue
             sev = row["severity"]
             if sev in counts:
                 counts[sev] += 1
-        return _StateDoc(health=health, sle=sle_pct, issues=counts)
+        return _StateDoc(health=health, sle=sle_pct, issues=counts, suppressed=suppressed)
 
     def _headline_and_sle(self) -> tuple[Optional[int], dict[str, Optional[int]]]:
         """The (headline%, per-SLE%) pair, recomputed at most once per interval."""

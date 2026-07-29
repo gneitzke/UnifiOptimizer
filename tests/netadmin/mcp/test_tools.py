@@ -558,3 +558,52 @@ def test_client_experience_resolves_ap_macs_to_names(demo_repo: Repository) -> N
     labels = [entry["to"] for entry in result["ap_history"]["items"] if entry["to"]]
     ap_names = {str(row["name"]) for row in demo_repo.list_entities("ap")}
     assert any(label in ap_names for label in labels)
+
+
+# --------------------------------------------------------------------------- #
+# Suppression disclosure (Gitea #49)
+# --------------------------------------------------------------------------- #
+def test_overview_lists_suppressed_issues_and_discloses_the_count(tmp_db_path) -> None:
+    """A suppressed issue stays LISTED with a ``suppressed`` flag (the model must
+    see it), and the summary discloses the count — no silent green dashboard."""
+    from netadmin.domain.entities import Entity
+    from netadmin.domain.types import EntityType
+    from netadmin.issues.engine import IssueEngine
+    from netadmin.issues.store_repository import StoreIssueRepository
+
+    now = DEMO_NOW
+    repo = Repository.open(tmp_db_path)
+    try:
+        ap = repo.upsert_entity(
+            Entity(entity_type=EntityType.AP, native_id="aa:bb:cc:00:00:09", name="ap-x"), ts=now
+        )
+        muted = repo.insert_issue(
+            fingerprint="fp-mute",
+            detector_key="wifi.airtime_saturation",
+            severity="p2",
+            state="active",
+            first_seen_ts=now - 3600,
+            last_seen_ts=now,
+            title="muted",
+            entity_id=ap,
+        )
+        repo.insert_issue(
+            fingerprint="fp-live",
+            detector_key="wifi.airtime_saturation",
+            severity="p2",
+            state="active",
+            first_seen_ts=now - 3600,
+            last_seen_ts=now,
+            title="live",
+            entity_id=ap,
+        )
+        IssueEngine(StoreIssueRepository(repo)).suppress(int(muted), now)
+
+        result = tools.call_tool(repo, "netadmin_overview", {"window": "24h"}, now=now)
+
+        briefs = {b["title"]: b for b in result["open_issues"]["items"]}
+        assert briefs["muted"].get("suppressed") is True  # listed AND flagged
+        assert "suppressed" not in briefs["live"]  # lean when not muted
+        assert "1 suppressed by the operator" in result["summary"]
+    finally:
+        repo.close()

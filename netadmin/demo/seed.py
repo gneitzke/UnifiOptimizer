@@ -1649,6 +1649,26 @@ class _Seeder:
         )
         self._detected(iid, first, Severity.P3)
         self._escalated(iid, first + 3 * 900, 3)
+        # The operator suppressed this known, low-priority nuisance two days ago,
+        # indefinitely (Gitea #49): it leaves the counts, the sidebar badge and
+        # alerts, but its measured impact is untouched — suppressing an issue does
+        # not un-suffer client-minutes. Written the way the engine's `suppress`
+        # does: the derived fields on the row plus one `suppressed` trail event.
+        # State and severity columns are unchanged, so the issue-count fixtures
+        # still hold; only attention surfaces move.
+        suppressed_at = self.now - 2 * DAY
+        self.repo.update_issue(
+            iid,
+            suppressed_ts=suppressed_at,
+            suppress_until_ts=None,
+            suppressed_severity=Severity.P3.value,
+        )
+        self.repo.record_issue_event(
+            iid,
+            EventKind.SUPPRESSED,
+            ts=suppressed_at,
+            detail={"source": "operator", "severity": Severity.P3.value},
+        )
 
     def _issue_legacy_rates(self) -> None:
         """An 802.11b-rate client dragging the cell -- so ``wifi.legacy_rates``

@@ -1,6 +1,6 @@
 import { useState, type RefCallback } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { ChevronDown, ChevronRight, RotateCcw } from 'lucide-react';
+import { BellOff, ChevronDown, ChevronRight, RotateCcw } from 'lucide-react';
 import { SeverityPill, SeverityGlyph } from '../../components/ui/SeverityPill';
 import { StatePill } from '../../components/ui/StatePill';
 import { RelativeTime } from '../../components/ui/RelativeTime';
@@ -13,9 +13,11 @@ import {
   clearProgressNote,
   formatDuration,
   impactDisplay,
+  isSuppressedNow,
   ongoingLabel,
   recurrenceBadgeLabel,
   recurrenceNote,
+  suppressionNote,
 } from '../shared/format';
 import type { Severity } from '../../api/types';
 
@@ -258,6 +260,29 @@ function RecurrenceBadge({ issue }: { issue: IssueRow }) {
   );
 }
 
+/**
+ * The neutral marker that an issue's claim on attention is parked (Gitea #49).
+ * Same construction as RecurrenceBadge — a BellOff glyph on a neutral fill, never
+ * a severity tint, because a suppressed issue's *facts* do not fade (its Sev pill
+ * is unchanged); only its attention claim is set aside. The hover/sr sentence
+ * carries the load-bearing "measured impact is unchanged".
+ */
+function SuppressedBadge({ issue, now }: { issue: IssueRow; now: number }) {
+  if (!isSuppressedNow(issue, now)) return null;
+  const note = suppressionNote(issue, now);
+  return (
+    <span
+      className="relative inline-flex items-center gap-0.5 shrink-0 h-[18px] px-1.5 rounded-full t-micro"
+      style={{ background: 'var(--sev-neutral-fill)', color: 'var(--fg-muted)' }}
+      title={note}
+    >
+      <BellOff size={10} strokeWidth={2.5} aria-hidden />
+      <span aria-hidden>Suppressed</span>
+      <span className="sr-only">{note}</span>
+    </span>
+  );
+}
+
 interface RowActivationProps {
   rowRef: RefCallback<HTMLElement>;
   isActive: boolean;
@@ -294,6 +319,7 @@ function SoloIssueRow({
         <span className="t-body truncate" style={{ color: 'var(--fg)' }}>
           {issue.title}
         </span>
+        <SuppressedBadge issue={issue} now={now} />
         <RecurrenceBadge issue={issue} />
       </span>
       <EntityCell entity={issue.entity} />
@@ -383,9 +409,9 @@ function GroupRow({
           <span className="t-micro" style={{ color: 'var(--fg-subtle)' }}>
             {memberCount} issues
           </span>
-          <GroupMemberRow issue={group.root} tag="root cause" />
+          <GroupMemberRow issue={group.root} tag="root cause" now={now} />
           {group.symptoms.map((s) => (
-            <GroupMemberRow key={s.id} issue={s} indent />
+            <GroupMemberRow key={s.id} issue={s} indent now={now} />
           ))}
         </div>
       )}
@@ -396,10 +422,12 @@ function GroupRow({
 function GroupMemberRow({
   issue,
   tag,
+  now,
   indent = false,
 }: {
   issue: IssueRow;
   tag?: string;
+  now: number;
   indent?: boolean;
 }) {
   return (
@@ -413,6 +441,7 @@ function GroupMemberRow({
       >
         {issue.title}
       </Link>
+      <SuppressedBadge issue={issue} now={now} />
       {tag && (
         <span className="t-micro" style={{ color: 'var(--fg-subtle)' }}>
           ({tag})

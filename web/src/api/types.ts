@@ -74,6 +74,15 @@ export interface Issue {
   occurrences: number;
   ack_ts: number | null;
   snooze_until_ts: number | null;
+  /** Operator suppression (Gitea #49), derived at read time via
+   * `isSuppressedNow` in `pages/shared/format.ts`. `suppressed_ts` is when it was
+   * muted (null = never); `suppress_until_ts` an optional expiry (null = until
+   * unsuppressed); `suppressed_severity` the severity captured then, so an
+   * escalation past it voids the mute. Optional so a UI ahead of its daemon still
+   * reads an older payload as never-suppressed. */
+  suppressed_ts?: number | null;
+  suppress_until_ts?: number | null;
+  suppressed_severity?: Severity | null;
   title: string;
   evidence: Record<string, unknown>;
   fix_state: FixState | null;

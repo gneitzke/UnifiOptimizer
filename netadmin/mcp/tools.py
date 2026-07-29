@@ -39,6 +39,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 from netadmin.analytics.offenders import CLIENT_ENTITY_TYPES, DEVICE_ENTITY_TYPES, rank_offenders
 from netadmin.domain.entities import entity_display_label
 from netadmin.domain.types import EntityType
+from netadmin.issues.suppression import row_is_suppressed
 from netadmin.mcp import format as fmt
 from netadmin.sle.scores import sle_scores
 from netadmin.store import db as _db
@@ -405,6 +406,12 @@ def _issue_brief(
         "last_seen": fmt.iso(row["last_seen_ts"]),
         "occurrences": int(row["occurrences"]),
     }
+    # Suppressed issues stay LISTED — an LLM surface that silently hid operator-
+    # muted faults would reproduce green-dashboard syndrome one level up (Gitea
+    # #49). The flag lets the model say "muted by the operator" rather than
+    # re-raise it. Only present when true, so an unsuppressed brief stays lean.
+    if row_is_suppressed(row, now):
+        brief["suppressed"] = True
     if resolved_ts is not None:
         brief["resolved"] = fmt.iso(resolved_ts)
         brief["lasted"] = fmt.duration(int(resolved_ts) - first_seen_ts)
@@ -535,6 +542,7 @@ def overview(repo: Repository, params: Mapping[str, Any], now: int) -> dict[str,
 
     collectors = _collector_health(repo, start_ts, end_ts)
     counts = _severity_counts(open_issues)
+    suppressed_count = sum(1 for r in open_issues if row_is_suppressed(r, now))
 
     if not open_issues and headline is None and not collectors["jobs"]:
         summary = (
@@ -553,9 +561,15 @@ def overview(repo: Repository, params: Mapping[str, Any], now: int) -> dict[str,
             incident_clause = (
                 f"{len(genuine_incidents)} incidents grouping {grouped_issue_count} of them"
             )
+        # Disclosure (Gitea #49): the total counts every open issue, but names how
+        # many the operator has muted, so the split is never silent.
+        suppressed_clause = (
+            f", of which {suppressed_count} suppressed by the operator" if suppressed_count else ""
+        )
         first = (
             f"{len(open_issues)} open issue(s) "
-            f"(P1 {counts['p1']}, P2 {counts['p2']}, P3 {counts['p3']}); {incident_clause}."
+            f"(P1 {counts['p1']}, P2 {counts['p2']}, P3 {counts['p3']}){suppressed_clause}; "
+            f"{incident_clause}."
         )
         if headline is None:
             second = "No SLE minutes recorded in this window, so there is no health score."

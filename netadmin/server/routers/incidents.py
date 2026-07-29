@@ -29,11 +29,13 @@ SQL lives in the store, section 4). ``async`` because the connection is loop-bou
 from __future__ import annotations
 
 import sqlite3
+import time
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from netadmin.domain.types import Severity
+from netadmin.issues.suppression import row_is_suppressed
 from netadmin.server.serialize import decode_json, entity_ref_map, get_store
 
 router = APIRouter(prefix="/api", tags=["incidents"])
@@ -109,8 +111,26 @@ async def list_incidents(
     entity_refs = entity_ref_map(store, root_entity_ids)
     counts = store.incident_member_counts([int(i["id"]) for i in incidents])
 
+    # An incident is suppressed for attention purposes only when ALL its members
+    # are (Gitea #49): a suppressed root with a live symptom keeps the incident in
+    # the "Needs attention" surfaces, because the symptom is an unanswered ask. A
+    # fully-suppressed incident drops out here, server-side (the compact list
+    # payload can't carry member states for the client to derive it), and the
+    # count of dropped incidents is disclosed so the shrink is never silent.
+    now = int(time.time())
+
+    def _all_members_suppressed(incident_id: int) -> bool:
+        members = store.list_incident_members(incident_id)
+        rows = [all_issues.get(int(m["issue_id"])) for m in members]
+        rows = [r for r in rows if r is not None]
+        return bool(rows) and all(row_is_suppressed(r, now) for r in rows)
+
     items = []
+    suppressed_excluded = 0
     for inc in incidents:
+        if not include_resolved and _all_members_suppressed(int(inc["id"])):
+            suppressed_excluded += 1
+            continue
         incident = dict(inc)
         member_count = counts.get(int(inc["id"]), 0)
         incident["member_count"] = member_count
@@ -127,7 +147,11 @@ async def list_incidents(
             -int(i["last_seen_ts"]),
         )
     )
-    return {"incidents": items, "count": len(items)}
+    return {
+        "incidents": items,
+        "count": len(items),
+        "suppressed_excluded": suppressed_excluded,
+    }
 
 
 @router.get("/incidents/{incident_id}")

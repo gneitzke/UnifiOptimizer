@@ -1,4 +1,4 @@
-import { Check, Loader2 } from 'lucide-react';
+import { Check, CircleDashed } from 'lucide-react';
 import type { IssueState, Severity } from '../../api/types';
 import { cn } from './cn';
 
@@ -6,10 +6,13 @@ import { cn } from './cn';
  * Lifecycle pill (docs §Severity & lifecycle presentation):
  * - pending   → neutral gray OUTLINE (not yet real)
  * - active    → severity-tinted (the only severity fills in the UI besides P1)
- * - resolving → tinted + a progress affordance (spinner, and the streak when the
- *   caller has it: "Resolving · 3 of 6 clean checks"). A spinner alone says only
- *   that something is in flight, which is what made a list of them read as stuck
- *   (Gitea #39); the fraction says how far along it is and what would finish it.
+ * - resolving → tinted + a STATIC open glyph (CircleDashed), no motion. Resolving
+ *   is a passive countdown toward K clean checks — nothing runs between checks,
+ *   and on an intermittent fault the count never completes. A spinner claimed
+ *   activity that isn't happening and made a list of them read as stuck
+ *   (Gitea #39, #49). The dashed unclosed circle is the "loop not closed yet"
+ *   metaphor one step before resolved's solid check; the fraction is the sole
+ *   progress affordance and lives in text ("Resolving · 3 of 6 clean checks").
  * - resolved  → gray + checkmark, NEVER green (green is reserved for health, so
  *   real "healthy" signals stay meaningful)
  */
@@ -84,7 +87,7 @@ export function StatePill({ state, severity, label, progress, title, className }
   return (
     <span className={cn(base, className)} style={{ background: fill, color }} title={title}>
       {state === 'resolving' && (
-        <Loader2 size={12} strokeWidth={2.5} className="animate-spin" />
+        <CircleDashed size={12} strokeWidth={2.5} aria-hidden />
       )}
       {text}
     </span>

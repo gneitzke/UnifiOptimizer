@@ -176,6 +176,64 @@ export function recurrenceNote(issue: IssueRow): string | null {
   return `Recurring: it came back ${n} ${n === 1 ? 'time' : 'times'} in the last 7 days, each time resetting the count of clean checks. That is how often it returned, not how often it fired.`;
 }
 
+/* ---- Operator suppression (Gitea #49) ------------------------------------
+ *
+ * Suppression is the one attention mute: an operator parks an issue's claim on
+ * counts, badges and alerts without touching a measured number. It is DERIVED
+ * here at read time from three row fields plus `now` — the single source on the
+ * web side, mirroring `netadmin/issues/suppression.py`, so the sidebar badge, the
+ * issues list, the dashboard and the detail page all agree. Two clocks (server
+ * `time.time()` vs the browser) mean a timed suppression expires at slightly
+ * different instants across surfaces; that is the same harmless skew the snooze
+ * caption already had, and it self-heals on the next poll.
+ *
+ * The disclosure rule is absolute: any count that shrank because of suppression
+ * must name the amount it shrank by ("9 open · 3 suppressed"), never a silent 6.
+ */
+
+/** The minimal shape suppression is derived from — a structural subset that both
+ * `IssueRow` (pages) and `Issue` (shell/api) satisfy, so this stays the single
+ * source of the rule on the web side. */
+export interface Suppressible {
+  severity: Severity;
+  suppressed_ts?: number | null;
+  suppress_until_ts?: number | null;
+  suppressed_severity?: Severity | null;
+}
+
+/** Is this issue suppressed *right now* (the three rules): a set `suppressed_ts`,
+ * not past `suppress_until_ts`, and current severity not more severe than the
+ * severity captured at suppression (an escalation past it voids the mute). */
+export function isSuppressedNow(issue: Suppressible, nowSec: number): boolean {
+  const ts = issue.suppressed_ts;
+  if (ts == null) return false;
+  const until = issue.suppress_until_ts;
+  if (until != null && nowSec >= until) return false;
+  const captured = issue.suppressed_severity;
+  if (captured != null && severityRank(issue.severity) < severityRank(captured)) return false;
+  return true;
+}
+
+/** "9 open · 3 suppressed" — the disclosed count. When nothing is suppressed it
+ * is just "9 open", so a surface can use it unconditionally. `noun` lets a
+ * caller say "issues" where the context needs it. */
+export function disclosedOpenCount(open: number, suppressed: number, noun = ''): string {
+  const unit = noun ? ` ${noun}` : '';
+  const head = `${open} open${unit}`;
+  return suppressed > 0 ? `${head} · ${suppressed} suppressed` : head;
+}
+
+/** Hover / screen-reader sentence for a suppressed issue's badge and detail line:
+ * when it was muted, until when, and — load-bearing — that measured impact is
+ * untouched, so nobody reads the mute as "the harm went away". */
+export function suppressionNote(issue: IssueRow, nowSec: number): string {
+  const since = issue.suppressed_ts != null ? formatDuration(nowSec - issue.suppressed_ts) : null;
+  const sinceClause = since ? `Suppressed ${since} ago` : 'Suppressed';
+  const until = issue.suppress_until_ts;
+  const untilClause = until != null ? `, until it expires` : ', until unsuppressed';
+  return `${sinceClause}${untilClause}. Excluded from counts and alerts; measured impact is unchanged.`;
+}
+
 /* ---- Issue impact (the Issues list's Impact column, Gitea #24, #36) ------ */
 
 /** What the Impact column measures, as a sentence — the column header's hover

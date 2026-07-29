@@ -5,7 +5,7 @@ import { EmptyState } from '../../components/ui/EmptyState';
 import { Skeleton } from '../../components/ui/Skeleton';
 import { useRegisterFilter } from '../../layout/keyboard/filterFocusContext';
 import { useWsFrames } from '../../api/WsProvider';
-import { issueDurationSeconds, severityRank } from '../shared/format';
+import { isSuppressedNow, issueDurationSeconds, severityRank } from '../shared/format';
 import { entityLabel, listIssues, type IssueRow } from '../shared/api';
 import { usePageAsync, useNowSeconds } from '../shared/hooks';
 import { IssueRowsList, type DisplayRow, type IssueGroup } from './IssueRowsList';
@@ -29,24 +29,29 @@ import type { Severity } from '../../api/types';
  * the other, gave a reader no way to know that (Gitea #24). So the subset says
  * it is one, and every option carries the states it actually matches.
  */
-type StateFilter = 'open' | 'active' | 'resolved' | 'all';
+type StateFilter = 'open' | 'active' | 'suppressed' | 'resolved' | 'all';
 const STATE_OPTIONS: { value: StateFilter; label: string; hint: string }[] = [
   {
     value: 'open',
     label: 'Open',
-    hint: 'Everything not resolved: pending, active and resolving issues.',
+    hint: 'Everything not resolved and not suppressed: the issues asking for attention.',
   },
   {
     value: 'active',
     label: 'Active only',
-    hint: 'The confirmed, still-firing subset of Open. Excludes pending (not yet confirmed) and resolving (clearing).',
+    hint: 'The confirmed, still-firing subset of Open (suppressed issues excluded). Excludes pending (not yet confirmed) and resolving (clearing).',
+  },
+  {
+    value: 'suppressed',
+    label: 'Suppressed',
+    hint: 'Open issues an operator has muted (Gitea #49): excluded from counts and alerts, still measured. Their facts are unchanged.',
   },
   {
     value: 'resolved',
     label: 'Resolved',
     hint: 'Closed after the detector reported the condition clear for enough consecutive cycles.',
   },
-  { value: 'all', label: 'All', hint: 'Every issue, resolved history included.' },
+  { value: 'all', label: 'All', hint: 'Every issue, resolved history and suppressed included.' },
 ];
 const SEV_OPTIONS: { value: '' | Severity; label: string }[] = [
   { value: '', label: 'All severities' },
@@ -57,8 +62,20 @@ const SEV_OPTIONS: { value: '' | Severity; label: string }[] = [
 
 function stateMatches(state: string, filter: StateFilter): boolean {
   if (filter === 'all') return true;
+  if (filter === 'suppressed') return state !== 'resolved'; // suppression tested separately
   if (filter === 'open') return state !== 'resolved';
   return state === filter;
+}
+
+/** Whether a display row is suppressed *now*. An incident group is suppressed
+ * only when ALL its members are (Gitea #49): a suppressed root with a live
+ * symptom keeps its claim on attention, because the symptom is unanswered. */
+function rowSuppressed(r: DisplayRow, now: number): boolean {
+  if (r.kind === 'issue') return isSuppressedNow(r.issue, now);
+  return (
+    isSuppressedNow(r.group.root, now) &&
+    r.group.symptoms.every((s) => isSuppressedNow(s, now))
+  );
 }
 
 /** Group issues that share a genuine `incident_brief` into `IssueGroup`s, and
@@ -136,6 +153,12 @@ export function IssuesPage() {
     const rows = displayRows.filter((r) => {
       const state = r.kind === 'group' ? r.group.root.state : r.issue.state;
       if (!stateMatches(state, stateFilter)) return false;
+      // Suppression is an orthogonal axis on the open states, not a state itself
+      // (Gitea #49). The attention views (Open, Active) hide suppressed rows; the
+      // Suppressed view shows only them; All and Resolved are unaffected.
+      const supp = rowSuppressed(r, now);
+      if (stateFilter === 'suppressed' && !supp) return false;
+      if ((stateFilter === 'open' || stateFilter === 'active') && supp) return false;
       const severity = r.kind === 'group' ? r.group.severity : r.issue.severity;
       if (sevFilter && severity !== sevFilter) return false;
       if (q) {
@@ -174,7 +197,12 @@ export function IssuesPage() {
   // The reconciliation line (Gitea #21): one honest number in the nav badge,
   // and here the sentence that explains it — "14 open issues · 1 incident
   // groups 4 of them" — instead of two nav destinations quietly disagreeing.
-  const openIssueCount = (data?.issues ?? []).filter((i) => i.state !== 'resolved').length;
+  // Suppression (Gitea #49) shrinks the open count; the shrink is disclosed here,
+  // never silent — "6 open issues · 3 suppressed" so the Open list showing 6 rows
+  // reconciles with the 3 the operator has muted.
+  const openRows = (data?.issues ?? []).filter((i) => i.state !== 'resolved');
+  const suppressedOpenCount = openRows.filter((i) => isSuppressedNow(i, now)).length;
+  const openIssueCount = openRows.length - suppressedOpenCount; // the attention count
   const openGroups = groups.filter((g) => g.root.state !== 'resolved');
   const groupedOpenIssueCount = openGroups.reduce((n, g) => n + 1 + g.symptoms.length, 0);
   // Once a filter or search narrows the list, the standing reconciliation is no
@@ -182,12 +210,14 @@ export function IssuesPage() {
   // instead. A "No matches" state under a header still claiming 14 open issues is
   // the page contradicting itself.
   const filtering = query.trim() !== '' || filtered.length !== total;
-  const reconciliation =
+  const openLabel = `${openIssueCount} open issue${openIssueCount === 1 ? '' : 's'}`;
+  const suppressedClause = suppressedOpenCount > 0 ? ` · ${suppressedOpenCount} suppressed` : '';
+  const incidentClause =
     openGroups.length === 0
-      ? `${openIssueCount} open issue${openIssueCount === 1 ? '' : 's'}`
-      : `${openIssueCount} open issue${openIssueCount === 1 ? '' : 's'} · ` +
-        `${openGroups.length} incident${openGroups.length === 1 ? '' : 's'} ` +
+      ? ''
+      : ` · ${openGroups.length} incident${openGroups.length === 1 ? '' : 's'} ` +
         `group${openGroups.length === 1 ? 's' : ''} ${groupedOpenIssueCount} of them`;
+  const reconciliation = `${openLabel}${suppressedClause}${incidentClause}`;
 
   function renderEmpty() {
     if (total === 0) {
@@ -310,6 +340,22 @@ export function IssuesPage() {
         renderEmpty()
       ) : (
         <IssueRowsList rows={filtered} now={now} />
+      )}
+
+      {/* Suppressed-but-open rows do not vanish silently: in the Open view, a
+          footer discloses how many are muted and links to the Suppressed segment
+          (Gitea #49). They are still active and still measured. */}
+      {stateFilter === 'open' && suppressedOpenCount > 0 && (
+        <button
+          type="button"
+          onClick={() => patch({ state: 'suppressed' })}
+          className="self-start t-caption hover:underline cursor-pointer"
+          style={{ color: 'var(--fg-muted)' }}
+        >
+          {suppressedOpenCount} suppressed issue{suppressedOpenCount === 1 ? '' : 's'}{' '}
+          {suppressedOpenCount === 1 ? 'is' : 'are'} still active ·{' '}
+          <span style={{ color: 'var(--accent)' }}>view</span>
+        </button>
       )}
     </div>
   );

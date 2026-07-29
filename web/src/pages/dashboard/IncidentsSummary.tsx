@@ -32,6 +32,7 @@ export function IncidentsSummary({ reloadKey }: { reloadKey: number }) {
   const now = useNowSeconds();
 
   const incidents = data?.incidents ?? [];
+  const suppressedExcluded = data?.suppressed_excluded ?? 0;
   const counts: Record<Severity, number> = { p1: 0, p2: 0, p3: 0 };
   for (const inc of incidents) counts[inc.severity] += 1;
   const sorted = [...incidents].sort((a, b) => {
@@ -103,6 +104,18 @@ export function IncidentsSummary({ reloadKey }: { reloadKey: number }) {
                 </li>
               )}
             </ul>
+          )}
+          {/* Disclosure, not decoration: a fully-suppressed incident drops out of
+              this card, so it must say how many, or the count reads as a silent
+              improvement. Mirrors IssueSeveritySummary's "N suppressed" caption. */}
+          {suppressedExcluded > 0 && (
+            <Link
+              to="/issues?state=suppressed"
+              className="t-caption hover:underline"
+              style={{ color: 'var(--fg-muted)' }}
+            >
+              {suppressedExcluded} suppressed, not shown
+            </Link>
           )}
         </>
       )}

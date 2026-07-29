@@ -79,10 +79,19 @@ def classify(transition: Transition) -> Optional[str]:
     ``reason == "refire_during_resolving"`` is a flap snap-back: the open was
     already announced and never resolved-announced, so re-announcing it would be a
     duplicate. Ack / snooze / investigate / all ``fix_*`` rows are bookkeeping.
+
+    **Suppression gate (Gitea #49).** An OPENED/REOPENED on a *suppressed* issue
+    returns ``None``: the operator has parked its claim on attention, so no
+    channel announces it. RESOLVED deliberately passes through even when
+    suppressed — the dedupe invariant drops a resolve the channel never
+    announced, so a suppressed issue that was never announced open cannot leak a
+    resolve, while one announced *before* it was suppressed still gets its close.
+    The flag rides on the transition (populated in the engine's ``_emit``), so
+    this stays pure — no store handle, no clock.
     """
     kind = transition.kind
     if kind == EventKind.REOPENED:
-        return REOPENED
+        return None if transition.suppressed else REOPENED
     if kind == EventKind.RESOLVED:
         return RESOLVED
     if kind == EventKind.ESCALATED:
@@ -90,7 +99,7 @@ def classify(transition: Transition) -> Optional[str]:
             transition.to_state is IssueState.ACTIVE
             and (transition.detail or {}).get("reason") == _REASON_M_REACHED
         ):
-            return OPENED
+            return None if transition.suppressed else OPENED
     return None
 
 

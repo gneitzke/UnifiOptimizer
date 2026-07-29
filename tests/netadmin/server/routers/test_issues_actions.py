@@ -76,3 +76,48 @@ async def test_ack_and_snooze_unknown_issue_404(rich_app) -> None:
         snooze = await c.post("/api/issues/999999/snooze", json={"until_ts": 1})
     assert ack.status_code == 404
     assert snooze.status_code == 404
+
+
+async def test_suppress_sets_fields_and_writes_event(rich_app) -> None:
+    until = BASE_TS + 500_000
+    async with await _client(rich_app) as c:
+        issue_id = await _active_issue_id(c)
+        resp = await c.post(f"/api/issues/{issue_id}/suppress", json={"until_ts": until})
+        assert resp.status_code == 200
+        issue = resp.json()["issue"]
+        assert issue["suppressed_ts"] is not None
+        assert issue["suppress_until_ts"] == until
+        assert issue["suppressed_severity"] == issue["severity"]
+        detail = (await c.get(f"/api/issues/{issue_id}")).json()
+    suppressed = [e for e in detail["events"] if e["kind"] == "suppressed"]
+    assert suppressed and suppressed[0]["detail"]["until_ts"] == until
+    assert suppressed[0]["detail"]["source"] == "operator"
+
+
+async def test_suppress_indefinite_when_no_until(rich_app) -> None:
+    async with await _client(rich_app) as c:
+        issue_id = await _active_issue_id(c)
+        resp = await c.post(f"/api/issues/{issue_id}/suppress", json={})
+        assert resp.status_code == 200
+        assert resp.json()["issue"]["suppress_until_ts"] is None
+
+
+async def test_unsuppress_clears_fields_and_writes_event(rich_app) -> None:
+    async with await _client(rich_app) as c:
+        issue_id = await _active_issue_id(c)
+        await c.post(f"/api/issues/{issue_id}/suppress", json={})
+        resp = await c.post(f"/api/issues/{issue_id}/unsuppress")
+        assert resp.status_code == 200
+        issue = resp.json()["issue"]
+        assert issue["suppressed_ts"] is None
+        assert issue["suppressed_severity"] is None
+        detail = (await c.get(f"/api/issues/{issue_id}")).json()
+    assert "unsuppressed" in [e["kind"] for e in detail["events"]]
+
+
+async def test_suppress_unsuppress_unknown_issue_404(rich_app) -> None:
+    async with await _client(rich_app) as c:
+        suppress = await c.post("/api/issues/999999/suppress", json={})
+        unsuppress = await c.post("/api/issues/999999/unsuppress")
+    assert suppress.status_code == 404
+    assert unsuppress.status_code == 404

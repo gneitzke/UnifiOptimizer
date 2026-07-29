@@ -253,6 +253,15 @@ class SnoozeBody(BaseModel):
     until_ts: int = Field(..., ge=0, description="epoch seconds to snooze until")
 
 
+class SuppressBody(BaseModel):
+    """Body for ``POST /api/issues/{id}/suppress``: park the issue's attention
+    claim, optionally until ``until_ts`` (omit / null = until unsuppressed)."""
+
+    until_ts: Optional[int] = Field(
+        default=None, ge=0, description="epoch seconds to suppress until; null = indefinite"
+    )
+
+
 class InvestigateBody(BaseModel):
     """Body for ``POST /api/issues/{id}/investigate``: which provider to run."""
 
@@ -476,7 +485,8 @@ async def get_issue(request: Request, issue_id: int) -> dict[str, Any]:
 
 @router.post("/issues/{issue_id}/ack")
 async def ack_issue(request: Request, issue_id: int) -> dict[str, Any]:
-    """Acknowledge an issue (mutes notifications only). 404 if unknown."""
+    """Acknowledge an issue: a provenance stamp ("a human has seen this"), no
+    behavioural effect. Suppress, not ack, is the attention mute. 404 if unknown."""
     store = get_store(request)
     engine = _engine(request, store)
     transition = engine.ack(issue_id, int(time.time()))
@@ -487,10 +497,38 @@ async def ack_issue(request: Request, issue_id: int) -> dict[str, Any]:
 
 @router.post("/issues/{issue_id}/snooze")
 async def snooze_issue(request: Request, issue_id: int, body: SnoozeBody) -> dict[str, Any]:
-    """Snooze notifications until ``until_ts`` (evaluation untouched). 404 if unknown."""
+    """DEPRECATED (Gitea #49): use ``/suppress`` with ``until_ts``. Retained —
+    the UI no longer calls it — because its behaviour is pinned by tests. Sets
+    ``snooze_until_ts``, which nothing reads. 404 if unknown."""
     store = get_store(request)
     engine = _engine(request, store)
     transition = engine.snooze(issue_id, body.until_ts, int(time.time()))
+    if transition is None:
+        raise HTTPException(status_code=404, detail=f"issue {issue_id} not found")
+    return {"issue": _issue_dict(store.get_issue(issue_id))}
+
+
+@router.post("/issues/{issue_id}/suppress")
+async def suppress_issue(request: Request, issue_id: int, body: SuppressBody) -> dict[str, Any]:
+    """Suppress an issue: park its claim on attention (counts, alerts, HA sensors)
+    with an optional expiry (Gitea #49). Measured impact is untouched — suppressing
+    does not un-suffer client-minutes. Goes through the engine, so it writes a
+    ``suppressed`` event and fans out on the WebSocket. 404 if unknown."""
+    store = get_store(request)
+    engine = _engine(request, store)
+    transition = engine.suppress(issue_id, int(time.time()), until_ts=body.until_ts)
+    if transition is None:
+        raise HTTPException(status_code=404, detail=f"issue {issue_id} not found")
+    return {"issue": _issue_dict(store.get_issue(issue_id))}
+
+
+@router.post("/issues/{issue_id}/unsuppress")
+async def unsuppress_issue(request: Request, issue_id: int) -> dict[str, Any]:
+    """Lift an operator suppression: the issue re-enters counts, alerts and HA
+    sensors. Writes an ``unsuppressed`` event. 404 if unknown."""
+    store = get_store(request)
+    engine = _engine(request, store)
+    transition = engine.unsuppress(issue_id, int(time.time()))
     if transition is None:
         raise HTTPException(status_code=404, detail=f"issue {issue_id} not found")
     return {"issue": _issue_dict(store.get_issue(issue_id))}

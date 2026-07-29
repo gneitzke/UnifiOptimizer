@@ -27,12 +27,23 @@ def test_connect_creates_parent_dir(tmp_path: Path) -> None:
     conn.close()
 
 
+def _rewind_below_0009(conn: sqlite3.Connection, version: int) -> None:
+    """Reconstruct a pre-0009 schema at ``version``. 0009 is the first ALTER TABLE
+    migration, so a bare ``PRAGMA user_version`` rewind after a full apply would
+    leave its columns in place and re-running it would fail on a duplicate column.
+    Drop them first, so the rewound-and-reapplied chain runs 0009 against v8
+    cleanly — the shape the runner actually meets in production on a v8 database."""
+    for col in ("suppressed_ts", "suppress_until_ts", "suppressed_severity"):
+        conn.execute(f"ALTER TABLE issues DROP COLUMN {col}")
+    conn.execute(f"PRAGMA user_version={version}")
+
+
 def test_migration_sets_user_version(tmp_db_path: Path) -> None:
     conn = db.connect(tmp_db_path)
     assert db.schema_version(conn) == 0
     applied = db.apply_migrations(conn)
-    assert applied == [1, 2, 3, 4, 5, 6, 7, 8]
-    assert db.schema_version(conn) == 8
+    assert applied == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    assert db.schema_version(conn) == 9
     conn.close()
 
 
@@ -104,10 +115,10 @@ def test_migration_idempotent(tmp_db_path: Path) -> None:
     first = db.apply_migrations(conn)
     second = db.apply_migrations(conn)
     third = db.apply_migrations(conn)
-    assert first == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert first == [1, 2, 3, 4, 5, 6, 7, 8, 9]
     assert second == []  # nothing re-applied
     assert third == []
-    assert db.schema_version(conn) == 8
+    assert db.schema_version(conn) == 9
     conn.close()
 
 
@@ -136,14 +147,15 @@ def _seed_legacy_rogue_issues(conn: sqlite3.Connection) -> None:
 def test_migration_0005_retires_legacy_rogue_ap_issues(tmp_db_path: Path) -> None:
     conn = db.connect(tmp_db_path)
     db.apply_migrations(conn)
-    conn.execute("PRAGMA user_version=4")  # rewind to the pre-split schema
+    _rewind_below_0009(conn, 4)  # rewind to the pre-split schema
     _seed_legacy_rogue_issues(conn)
 
     # 0006 rides along on the same rewind; it retires a different taxonomy and
     # leaves the channel_plan survivor below untouched. 0007 (app_meta) rides
     # along too -- it is schema-only and touches none of the rows asserted here,
-    # as does 0008 (sticky_client, a third taxonomy this fixture never seeds).
-    assert db.apply_migrations(conn) == [5, 6, 7, 8]
+    # as does 0008 (sticky_client, a third taxonomy this fixture never seeds), and
+    # 0009 (suppression columns; none of these seeded rows carry a live snooze).
+    assert db.apply_migrations(conn) == [5, 6, 7, 8, 9]
 
     rows = conn.execute(
         "SELECT state, resolved_ts FROM issues WHERE detector_key = 'wifi.rogue_ap'"
@@ -215,12 +227,13 @@ def _seed_per_radio_channel_plan(conn: sqlite3.Connection) -> None:
 def test_migration_0006_retires_plan_level_channel_plan_issues(tmp_db_path: Path) -> None:
     conn = db.connect(tmp_db_path)
     db.apply_migrations(conn)
-    conn.execute("PRAGMA user_version=5")  # rewind to the pre-aggregation schema
+    _rewind_below_0009(conn, 5)  # rewind to the pre-aggregation schema
     _seed_per_radio_channel_plan(conn)
 
     # 0007 (app_meta) rides along too -- schema-only, touches none of the rows
-    # asserted below -- and so does 0008, which retires a different detector.
-    assert db.apply_migrations(conn) == [6, 7, 8]
+    # asserted below -- and so does 0008, which retires a different detector, and
+    # 0009 (suppression columns; none of these seeded rows carry a live snooze).
+    assert db.apply_migrations(conn) == [6, 7, 8, 9]
 
     states = dict(
         conn.execute(
@@ -299,10 +312,12 @@ def _seed_per_ap_sticky_clients(conn: sqlite3.Connection) -> None:
 def test_migration_0008_retires_per_ap_sticky_client_issues(tmp_db_path: Path) -> None:
     conn = db.connect(tmp_db_path)
     db.apply_migrations(conn)
-    conn.execute("PRAGMA user_version=7")  # rewind to the pre-rescope schema
+    _rewind_below_0009(conn, 7)  # rewind to the pre-rescope schema
     _seed_per_ap_sticky_clients(conn)
 
-    assert db.apply_migrations(conn) == [8]
+    # 0009 (suppression columns) rides along; none of these seeded rows carry a
+    # live snooze, so it leaves them untouched and writes no audit event.
+    assert db.apply_migrations(conn) == [8, 9]
 
     # Every sticky fingerprint is retired: the ap dim lives only inside the hash,
     # so SQL cannot tell the two-AP rows from the legacy dims={} one, and
@@ -510,4 +525,68 @@ def test_schema_gate_leaves_user_version_untouched_on_refusal(tmp_db_path: Path)
 
     # Refusing to start must not itself mutate the version it is refusing over.
     assert db.schema_version(conn) == poisoned
+    conn.close()
+
+
+def _seed_snoozes_pre_0009(conn: sqlite3.Connection) -> None:
+    """Pre-0009 state: a live snooze (carried into suppression), an expired snooze
+    and a resolved snooze (both left alone), and an un-snoozed row (untouched)."""
+    far_future = 9_999_999_999  # year 2286, comfortably after strftime('now')
+    rows = [
+        ("fp-live", "active", far_future),  # live snooze -> becomes a suppression
+        ("fp-expired", "active", 1),  # expired snooze -> untouched
+        ("fp-resolved", "resolved", far_future),  # resolved -> not a mute to carry
+        ("fp-none", "active", None),  # never snoozed -> untouched
+    ]
+    with db.begin_immediate(conn):
+        for fp, state, snooze in rows:
+            conn.execute(
+                "INSERT INTO issues (fingerprint, detector_key, severity, state, "
+                "first_seen_ts, last_seen_ts, title, snooze_until_ts) "
+                "VALUES (?, 'wifi.airtime_saturation', 'p2', ?, 1, 1, 'Air', ?)",
+                (fp, state, snooze),
+            )
+
+
+def test_migration_0009_carries_live_snoozes_into_suppression(tmp_db_path: Path) -> None:
+    conn = db.connect(tmp_db_path)
+    db.apply_migrations(conn)
+    # Reconstruct the true v8 schema: 0009 is the first ALTER TABLE migration, so a
+    # plain rewind would leave its columns in place and re-running it would fail on
+    # a duplicate column. Drop them, then rewind, so 0009 applies against v8 cleanly.
+    for col in ("suppressed_ts", "suppress_until_ts", "suppressed_severity"):
+        conn.execute(f"ALTER TABLE issues DROP COLUMN {col}")
+    conn.execute("PRAGMA user_version=8")  # rewind to the pre-suppression schema
+    _seed_snoozes_pre_0009(conn)
+
+    assert db.apply_migrations(conn) == [9]
+
+    # The three suppression columns now exist.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(issues)").fetchall()}
+    assert {"suppressed_ts", "suppress_until_ts", "suppressed_severity"} <= cols
+
+    def suppression(fp: str) -> tuple:
+        return tuple(
+            conn.execute(
+                "SELECT suppressed_ts, suppress_until_ts, suppressed_severity "
+                "FROM issues WHERE fingerprint=?",
+                (fp,),
+            ).fetchone()
+        )
+
+    # The live snooze became a timed suppression carrying its expiry + severity.
+    live = suppression("fp-live")
+    assert live[0] is not None
+    assert live[1] == 9_999_999_999
+    assert live[2] == "p2"
+
+    # The expired snooze, the resolved row, and the never-snoozed row are untouched.
+    for fp in ("fp-expired", "fp-resolved", "fp-none"):
+        assert suppression(fp) == (None, None, None)
+
+    # Exactly one audit row, for the one carried mute, stamped source=migration.
+    events = conn.execute("SELECT kind, detail FROM issue_events").fetchall()
+    assert len(events) == 1
+    assert events[0][0] == "suppressed"
+    assert '"source":"migration"' in events[0][1]
     conn.close()
