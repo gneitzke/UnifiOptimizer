@@ -42,6 +42,7 @@ class EventListener:
         backoff_max: float = 60.0,
         ping_interval: float = 20.0,
         ping_timeout: float = 20.0,
+        empty_reauth_threshold: int = 3,
     ) -> None:
         self._client = client
         self._verify_ssl = verify_ssl
@@ -49,6 +50,12 @@ class EventListener:
         self._backoff_max = backoff_max
         self._ping_interval = ping_interval
         self._ping_timeout = ping_timeout
+        # After this many consecutive connections that were accepted at the
+        # handshake but closed with zero event frames, force a fresh login. That
+        # pattern is a stale session the controller tolerates at the HTTP layer
+        # but rejects for the events subscription -- it never 401s, so the
+        # handshake-status re-auth path below can't see it.
+        self._empty_reauth_threshold = max(1, empty_reauth_threshold)
         self._stop = asyncio.Event()
 
     def stop(self) -> None:
@@ -72,9 +79,11 @@ class EventListener:
         strategy = await self._client.connect()
         url = strategy.ws_url(self._client.host, self._client.site)
         backoff = self._backoff_base
+        empty_connects = 0  # consecutive connections that yielded zero event frames
 
         while not self._stop.is_set():
             headers = strategy.ws_headers(self._client.http.cookies)
+            got_frame = False
             try:
                 async with ws_connect(
                     url,
@@ -85,11 +94,23 @@ class EventListener:
                     open_timeout=15,
                 ) as socket:
                     logger.info("WebSocket connected: %s", url)
-                    backoff = self._backoff_base  # reset on a clean connect
                     async for raw in socket:
                         if self._stop.is_set():
                             break
                         for event in self._parse(raw):
+                            if not got_frame:
+                                # First real data on this connection: it is
+                                # healthy, so clear the backoff and the empty
+                                # counter. Reset ONLY here, never merely on
+                                # connect -- a controller that accepts the
+                                # handshake then instantly closes the events
+                                # subscription (a stale session, no 401) would
+                                # otherwise reset the backoff every time and
+                                # reconnect once per second forever, hammering
+                                # the controller (the 46-hour storm this fixes).
+                                got_frame = True
+                                backoff = self._backoff_base
+                                empty_connects = 0
                             yield event
             except asyncio.CancelledError:
                 raise
@@ -97,15 +118,9 @@ class EventListener:
                 status = getattr(getattr(exc, "response", None), "status_code", None)
                 if status in (401, 403):
                     logger.info("WebSocket handshake %s; forcing re-auth.", status)
-                    try:
-                        # connect() would no-op while the strategy is still marked
-                        # authenticated; relogin() forces a fresh login so the next
-                        # handshake carries new session material, not stale cookies.
-                        strategy = await self._client.relogin()
-                        url = strategy.ws_url(self._client.host, self._client.site)
-                    except UnifiAuthError as auth_exc:
-                        logger.error("WebSocket re-auth failed: %s", auth_exc)
-                        raise
+                    strategy = await self._reauth(strategy)
+                    url = strategy.ws_url(self._client.host, self._client.site)
+                    empty_connects = 0
                 else:
                     logger.warning("WebSocket handshake rejected: %s", exc)
             except (OSError, websockets.WebSocketException) as exc:
@@ -113,8 +128,39 @@ class EventListener:
 
             if self._stop.is_set():
                 break
+
+            # A connection that carried no events -- a clean immediate close or a
+            # fast drop. Never reset the backoff for one (that is the storm), and
+            # after a few in a row force a fresh login: a clean close never 401s,
+            # so it is invisible to the handshake-status re-auth above, and a
+            # stale 9.x session is the usual cause.
+            if not got_frame:
+                empty_connects += 1
+                if empty_connects >= self._empty_reauth_threshold:
+                    logger.warning(
+                        "WebSocket accepted then closed with no events %d times; "
+                        "forcing re-auth (stale session suspected).",
+                        empty_connects,
+                    )
+                    strategy = await self._reauth(strategy)
+                    url = strategy.ws_url(self._client.host, self._client.site)
+                    empty_connects = 0
+
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, self._backoff_max)
+
+    async def _reauth(self, strategy):
+        """Force a fresh login and return the new strategy, raising on failure.
+
+        ``connect()`` would no-op while the strategy is still marked
+        authenticated, so ``relogin()`` is what actually swaps stale session
+        material for new -- the whole point of a forced re-auth.
+        """
+        try:
+            return await self._client.relogin()
+        except UnifiAuthError as auth_exc:
+            logger.error("WebSocket re-auth failed: %s", auth_exc)
+            raise
 
     @staticmethod
     def _parse(raw: str | bytes) -> list[Event]:
