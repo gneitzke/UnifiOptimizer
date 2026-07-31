@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 # is fully supported: pip installs "unifioptimizer", `import netadmin` works, and
 # the `netadmin` command is registered via [project.scripts] below.
 name = "unifioptimizer"
-version = "0.7.7"
+version = "0.7.8"
 description = "The incident engine for UniFi: keeps the history your controller throws away and turns it into tracked, root-caused issues with revertible fixes."
 readme = "README.md"
 license = "MIT"
