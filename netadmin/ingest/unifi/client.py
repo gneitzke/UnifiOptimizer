@@ -84,6 +84,9 @@ class UnifiClient:
             follow_redirects=True,
         )
         self._strategy: Optional[AuthStrategy] = None
+        # A separate cookie strategy for the events WebSocket, which rejects
+        # API-key auth (see :meth:`ws_strategy`). None until first needed.
+        self._ws_strategy: Optional[AuthStrategy] = None
         self._auth_lock = asyncio.Lock()
         self._pace_lock = asyncio.Lock()
         self._last_request_ts = 0.0
@@ -182,6 +185,54 @@ class UnifiClient:
             self._strategy.authenticated = False
             await self._strategy.authenticate(self._http)
             self._login_epoch += 1
+
+    async def ws_strategy(self, *, force_reauth: bool = False) -> AuthStrategy:
+        """An auth strategy for the EVENTS WebSocket, which needs a cookie session.
+
+        UniFi's events socket rejects ``X-API-KEY``: it accepts the handshake
+        then closes 1000 with no frames. The API key stays correct for REST, so
+        when REST authenticates by key but a username and password are also
+        configured, the WS uses a cookie login instead. A cookie strategy already
+        in use for REST is reused as-is. With only an API key, events cannot be
+        subscribed on this controller, and this raises :class:`UnifiAuthError`
+        with guidance so the listener degrades cleanly rather than looping --
+        history and detection keep working, only live events are unavailable.
+        """
+        # Deferred import: these live in the same package; a module-level import
+        # would be circular through resolve_strategy's own imports.
+        from .auth import LegacyCookieAuth, UnifiOsCookieAuth, _CookieAuthBase, _is_unifi_os
+
+        await self.connect()
+        async with self._auth_lock:
+            if isinstance(self._strategy, _CookieAuthBase):
+                # REST already cookie-based; one session serves both. Still honour
+                # a forced re-auth by re-running the login on that shared strategy.
+                if force_reauth:
+                    self._strategy.authenticated = False
+                    await self._strategy.authenticate(self._http)
+                return self._strategy
+            if not (self._username and self._password):
+                raise UnifiAuthError(
+                    "The events WebSocket needs a username and password: UniFi's "
+                    "events socket rejects API-key auth. History and detection "
+                    "keep working; live events stay unavailable until a password "
+                    "login is configured."
+                )
+            if (
+                not force_reauth
+                and self._ws_strategy is not None
+                and self._ws_strategy.authenticated
+            ):
+                return self._ws_strategy
+            cookie_cls = (
+                UnifiOsCookieAuth
+                if await _is_unifi_os(self._http, self._host)
+                else LegacyCookieAuth
+            )
+            cookie = cookie_cls(self._host, self._site, self._username, self._password)
+            await cookie.authenticate(self._http)
+            self._ws_strategy = cookie
+            return cookie
 
     async def relogin(self) -> AuthStrategy:
         """Force a fresh login and return the re-authenticated strategy.

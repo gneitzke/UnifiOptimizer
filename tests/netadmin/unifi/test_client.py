@@ -201,3 +201,72 @@ async def test_csrf_echoed_on_post():
     await client.post_data("stat/report/hourly.ap", {"attrs": ["time"]})
     assert report.calls.last.request.headers["X-CSRF-Token"] == "echo-me"
     await client.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# ws_strategy: the events WebSocket needs a COOKIE session, never the API key
+# (UniFi accepts an API-key WS handshake then closes 1000 with no frames -- the
+# root cause of a two-day event-ingestion outage). Gitea #57.
+# --------------------------------------------------------------------------- #
+
+
+@respx.mock
+async def test_ws_strategy_uses_cookie_even_when_rest_uses_api_key():
+    """REST authenticates by API key, but the WS handshake must carry a cookie.
+
+    The controller closes an API-key events socket immediately, so a client with
+    an API key AND a username/password logs in for a cookie session and hands the
+    WS the Cookie header, not X-API-KEY.
+    """
+    respx.get(f"{HOST}/proxy/network/api/s/{SITE}/stat/health").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )  # API-key verification
+    respx.get(OS_PROBE).mock(return_value=httpx.Response(401))
+    respx.post(OS_LOGIN).mock(
+        return_value=httpx.Response(
+            200,
+            headers=[("X-CSRF-Token", "csrf"), ("set-cookie", "TOKEN=sess-abc; Path=/")],
+            json={},
+        )
+    )  # the cookie login the WS strategy must perform
+
+    client = _client(api_key="KEY123")
+    rest = await client.connect()
+    assert type(rest).__name__ == "ApiKeyAuth"  # REST prefers the key
+
+    ws = await client.ws_strategy()
+    assert type(ws).__name__ in ("UnifiOsCookieAuth", "LegacyCookieAuth")
+    headers = ws.ws_headers(client.http.cookies)
+    assert "Cookie" in headers and "X-API-KEY" not in headers
+    await client.aclose()
+
+
+@respx.mock
+async def test_ws_strategy_reuses_rest_cookie_session():
+    """When REST is already cookie-based, the WS shares that one session."""
+    _mock_login()
+    client = _client()  # username/password only -> cookie REST
+    rest = await client.connect()
+    ws = await client.ws_strategy()
+    assert ws is rest  # one session serves both
+    await client.aclose()
+
+
+@respx.mock
+async def test_ws_strategy_api_key_only_degrades_with_guidance():
+    """An API key with no username/password cannot subscribe to events.
+
+    It must raise clear guidance so the listener stops cleanly (history and
+    detection keep working) rather than looping against a socket that can never
+    authenticate.
+    """
+    from netadmin.ingest.unifi.auth import UnifiAuthError
+
+    respx.get(f"{HOST}/proxy/network/api/s/{SITE}/stat/health").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )  # API-key verification
+    client = _client(username=None, password=None, api_key="KEY123")
+    await client.connect()
+    with pytest.raises(UnifiAuthError, match="username and password"):
+        await client.ws_strategy()
+    await client.aclose()

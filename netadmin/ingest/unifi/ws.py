@@ -76,7 +76,17 @@ class EventListener:
 
         Terminates only when :meth:`stop` is called or the iterator is closed.
         """
-        strategy = await self._client.connect()
+        # The events socket needs a cookie session; UniFi rejects API-key auth on
+        # it (accepts the handshake, closes 1000, no frames). ws_strategy() gives
+        # a cookie strategy even when REST uses an API key, and raises when only an
+        # API key exists -- in which case events are simply unavailable on this
+        # controller and we stop cleanly instead of looping. History/detection are
+        # unaffected; they run off REST and the collector, not this socket.
+        try:
+            strategy = await self._client.ws_strategy()
+        except UnifiAuthError as exc:
+            logger.warning("Event WebSocket unavailable: %s", exc)
+            return
         url = strategy.ws_url(self._client.host, self._client.site)
         backoff = self._backoff_base
         empty_connects = 0  # consecutive connections that yielded zero event frames
@@ -150,14 +160,16 @@ class EventListener:
             backoff = min(backoff * 2, self._backoff_max)
 
     async def _reauth(self, strategy):
-        """Force a fresh login and return the new strategy, raising on failure.
+        """Force a fresh cookie session for the WS and return the new strategy.
 
-        ``connect()`` would no-op while the strategy is still marked
-        authenticated, so ``relogin()`` is what actually swaps stale session
-        material for new -- the whole point of a forced re-auth.
+        Re-auths the *WS* (cookie) strategy specifically, not the REST one: the
+        events socket authenticates by cookie, and forcing a fresh cookie login
+        is what recovers an expired session. A plain ``relogin()`` on an API-key
+        REST strategy would be a no-op -- exactly the trap that let the live
+        session stay dead through every reconnect.
         """
         try:
-            return await self._client.relogin()
+            return await self._client.ws_strategy(force_reauth=True)
         except UnifiAuthError as auth_exc:
             logger.error("WebSocket re-auth failed: %s", auth_exc)
             raise
