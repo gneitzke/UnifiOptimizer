@@ -236,8 +236,13 @@ async def test_ws_strategy_uses_cookie_even_when_rest_uses_api_key():
 
     ws = await client.ws_strategy()
     assert type(ws).__name__ in ("UnifiOsCookieAuth", "LegacyCookieAuth")
-    headers = ws.ws_headers(client.http.cookies)
+    headers = ws.ws_headers(client.ws_cookies)
     assert "Cookie" in headers and "X-API-KEY" not in headers
+    # Isolation (Gitea #57 follow-up): the WS cookie session must NOT land on the
+    # REST client, or its CSRF/TOKEN state 403s the older cookie-checked REST
+    # endpoints while the API key still works elsewhere.
+    assert "TOKEN" not in client.http.cookies
+    assert "TOKEN" in client.ws_cookies
     await client.aclose()
 
 

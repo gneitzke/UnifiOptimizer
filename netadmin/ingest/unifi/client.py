@@ -84,9 +84,12 @@ class UnifiClient:
             follow_redirects=True,
         )
         self._strategy: Optional[AuthStrategy] = None
-        # A separate cookie strategy for the events WebSocket, which rejects
-        # API-key auth (see :meth:`ws_strategy`). None until first needed.
+        # A separate cookie strategy + its own http client for the events
+        # WebSocket, which rejects API-key auth (see :meth:`ws_strategy`). Kept
+        # off the REST client so the cookie session cannot taint REST. None until
+        # first needed, and only ever created when REST is API-key based.
         self._ws_strategy: Optional[AuthStrategy] = None
+        self._ws_http: Optional[httpx.AsyncClient] = None
         self._auth_lock = asyncio.Lock()
         self._pace_lock = asyncio.Lock()
         self._last_request_ts = 0.0
@@ -130,6 +133,8 @@ class UnifiClient:
 
     async def aclose(self) -> None:
         await self._http.aclose()
+        if self._ws_http is not None:
+            await self._ws_http.aclose()
 
     @property
     def site(self) -> str:
@@ -224,15 +229,35 @@ class UnifiClient:
                 and self._ws_strategy.authenticated
             ):
                 return self._ws_strategy
+            # The cookie login goes on a SEPARATE http client, never the REST one.
+            # Logging in for a cookie session sets a TOKEN cookie and a CSRF token;
+            # left on the shared REST client alongside the API key, that mixed auth
+            # state makes the controller 403 the older cookie-checked endpoints
+            # (list/alarm, stat/event, stat/rogueap) with "session lost" while the
+            # API-key endpoints keep working. Isolating the WS session keeps REST
+            # pure API-key. Reads its cookies via :attr:`ws_cookies`.
+            if self._ws_http is None:
+                self._ws_http = httpx.AsyncClient(
+                    verify=self._verify_ssl, timeout=self._http.timeout, follow_redirects=True
+                )
             cookie_cls = (
                 UnifiOsCookieAuth
-                if await _is_unifi_os(self._http, self._host)
+                if await _is_unifi_os(self._ws_http, self._host)
                 else LegacyCookieAuth
             )
             cookie = cookie_cls(self._host, self._site, self._username, self._password)
-            await cookie.authenticate(self._http)
+            await cookie.authenticate(self._ws_http)
             self._ws_strategy = cookie
             return cookie
+
+    @property
+    def ws_cookies(self) -> httpx.Cookies:
+        """Cookie jar the events WebSocket handshake should use.
+
+        The isolated WS session's jar when REST uses an API key, else the shared
+        one (REST already cookie-based -- one session serves both).
+        """
+        return self._ws_http.cookies if self._ws_http is not None else self._http.cookies
 
     async def relogin(self) -> AuthStrategy:
         """Force a fresh login and return the re-authenticated strategy.

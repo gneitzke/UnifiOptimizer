@@ -92,7 +92,7 @@ class EventListener:
         empty_connects = 0  # consecutive connections that yielded zero event frames
 
         while not self._stop.is_set():
-            headers = strategy.ws_headers(self._client.http.cookies)
+            headers = strategy.ws_headers(self._client.ws_cookies)
             got_frame = False
             try:
                 async with ws_connect(
