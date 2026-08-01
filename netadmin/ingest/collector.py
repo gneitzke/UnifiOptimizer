@@ -391,6 +391,7 @@ class Collector:
                         "channel": r.channel,
                         "channels": channels or None,
                         "rssi": r.rssi,
+                        "signal": r.signal,
                         "band": r.band,
                         "security": r.security,
                         "is_rogue": r.is_rogue,
