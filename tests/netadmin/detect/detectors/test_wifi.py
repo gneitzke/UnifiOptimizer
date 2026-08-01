@@ -11,6 +11,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Optional
 
+import pytest
+
 from netadmin.detect.context import DetectorContext
 from netadmin.detect.detectors.wifi import (
     KEY_AIRTIME_SATURATION,
@@ -40,6 +42,7 @@ from netadmin.detect.detectors.wifi import (
     RogueApDetector,
     StickyClientDetector,
     TxPowerLoudDetector,
+    _neighbor_rssi_dbm,
 )
 from netadmin.detect.engine import UNKNOWN, DetectorResult
 from netadmin.domain.entities import Entity
@@ -1238,6 +1241,7 @@ def mk_rogue(
     *,
     channel: int,
     rssi: int,
+    signal: Optional[int] = None,
     band: Optional[str] = None,
     essid: str = "Neighbor",
     first_seen: Optional[int] = None,
@@ -1258,6 +1262,8 @@ def mk_rogue(
     hopping neighbour.
     """
     meta: dict = {"channel": channel, "rssi": rssi, "is_rogue": is_rogue, "seen_by_ap": seen_by_ap}
+    if signal is not None:
+        meta["signal"] = signal
     if band is not None:
         meta["band"] = band
     if is_ubnt is not None:
@@ -1386,6 +1392,101 @@ def test_neighbor_density_floor_is_tunable(repo: Repository) -> None:
     findings = NeighborDensityDetector().evaluate(_ctx(repo, settings=settings))
     assert len(findings) == 1
     assert findings[0].evidence["qualifying_count"] == 2
+
+
+@pytest.mark.parametrize(
+    "meta,expected",
+    [
+        ({"rssi": 9}, -86),  # bare quality index: 9 above a -95 dBm floor
+        ({"rssi": 49}, -46),  # the loudest index seen on a real store
+        ({"rssi": 0}, -95),  # a real reading AT the floor, not a missing one
+        ({"rssi": -72}, -72),  # already dBm: passed through, re-run safe
+        ({"signal": -88, "rssi": 40}, -88),  # signal is dBm and wins
+        ({"signal": -88}, -88),  # signal alone
+        ({"signal": 40, "rssi": 9}, -86),  # malformed positive signal: ignored
+        ({"signal": 0, "rssi": 9}, -86),  # 0 is not a plausible dBm: ignored
+        ({}, None),  # neither field: unplaceable
+        ({"rssi": None, "signal": None}, None),
+        ({"rssi": "notanumber"}, None),
+        # A small-negative sentinel is not a -1 dBm neighbour standing in the
+        # room. Reject it, or it clears every floor and inflates the count.
+        ({"signal": -1, "rssi": 9}, -86),  # sentinel ignored, index used
+        ({"signal": -1}, None),  # sentinel with nothing to fall back to
+        ({"rssi": -2}, None),  # corrupted index, not a -2 dBm sighting
+        ({"signal": -400, "rssi": 9}, -86),  # below any real noise floor
+    ],
+)
+def test_neighbor_rssi_dbm_normalizes_every_shape_the_scan_can_report(meta, expected) -> None:
+    """The scan's two strength fields, and the junk either can arrive as."""
+    assert _neighbor_rssi_dbm(meta) == expected
+
+
+def test_neighbor_rssi_dbm_honours_a_tuned_noise_floor() -> None:
+    """A driver referenced to a different floor is correctable, not hardcoded."""
+    assert _neighbor_rssi_dbm({"rssi": 9}, -90) == -81
+    assert _neighbor_rssi_dbm({"signal": -88}, -90) == -88  # dBm ignores the floor
+
+
+def test_neighbor_density_noise_floor_is_tunable_end_to_end(repo: Repository) -> None:
+    """The threshold reaches the decoder, not just the helper's default arg."""
+    seed_cov(repo)
+    _our_5ghz_radio(repo, channel=36)
+    _neighbors_on_36(repo, 5, rssi=22)  # -73 dBm by default: over the -75 floor
+    assert len(NeighborDensityDetector().evaluate(_ctx(repo))) == 1
+
+    # Same scan, a floor 10 dB lower: -83 dBm, now under the -75 line.
+    settings = _settings(KEY_NEIGHBOR_DENSITY, noise_floor_dbm=-105)
+    assert NeighborDensityDetector().evaluate(_ctx(repo, settings=settings)) == []
+
+
+def test_neighbor_density_reads_the_quality_index_as_dbm_not_as_a_raw_number(
+    repo: Repository,
+) -> None:
+    """A scan that reports the 0-based index must not sail past the dBm floor.
+
+    ``stat/rogueap`` reports strength as a positive quality index above the noise
+    floor. Compared raw against ``rssi_floor_dbm`` (-75) every neighbour passed,
+    because a positive number is never <= -75, and the filter became a no-op:
+    real sites reported hundreds of "neighbouring networks" that were in fact
+    barely audible. Index 9 is -86 dBm, well under the floor, so this is a clear.
+    """
+    seed_cov(repo)
+    _our_5ghz_radio(repo, channel=36)
+    _neighbors_on_36(repo, 6, rssi=9)
+    assert NeighborDensityDetector().evaluate(_ctx(repo)) == []
+
+
+def test_neighbor_density_counts_a_quality_index_that_is_genuinely_strong(
+    repo: Repository,
+) -> None:
+    """The conversion must not swing the other way and mute real neighbours."""
+    seed_cov(repo)
+    _our_5ghz_radio(repo, channel=36)
+    _neighbors_on_36(repo, 4, rssi=40)  # -55 dBm, comfortably over the floor
+    findings = NeighborDensityDetector().evaluate(_ctx(repo))
+    assert len(findings) == 1
+    assert findings[0].evidence["qualifying_count"] == 4
+    assert findings[0].evidence["top_offenders"][0]["rssi_dbm"] == -55
+
+
+def test_neighbor_density_prefers_the_signal_field_when_the_poll_captured_it(
+    repo: Repository,
+) -> None:
+    """``signal`` is already dBm, so it wins over the index it sits beside."""
+    seed_cov(repo)
+    _our_5ghz_radio(repo, channel=36)
+    for i in range(4):
+        mk_rogue(
+            repo,
+            f"de:ad:be:ef:20:{i:02x}",
+            channel=36,
+            rssi=40,  # index alone would read as -55 dBm
+            signal=-88,  # the controller's truth: far too weak to matter
+            band="na",
+            essid=f"Far-{i}",
+            scan_ts=[NOW - 86_400, NOW],
+        )
+    assert NeighborDensityDetector().evaluate(_ctx(repo)) == []
 
 
 def test_neighbor_density_p2_only_when_an_overlapped_radio_is_congested(repo: Repository) -> None:

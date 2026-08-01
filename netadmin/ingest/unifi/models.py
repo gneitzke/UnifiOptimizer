@@ -298,7 +298,8 @@ class RogueAp(_Base):
     bssid: Optional[str] = None
     essid: Optional[str] = None
     channel: Optional[int] = None
-    rssi: Optional[int] = None
+    rssi: Optional[int] = None  # 0-based signal-quality index, NOT dBm
+    signal: Optional[int] = None  # RSSI in dBm (negative); absent on older polls
     band: Optional[str] = None
     security: Optional[str] = None
     is_rogue: Optional[bool] = None

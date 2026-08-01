@@ -1866,6 +1866,70 @@ class MeshUplinkDetector:
 # ====================================================================== #
 # Shared neighbour-scan helpers (wifi.neighbor_density + wifi.rogue_ap)
 # ====================================================================== #
+
+# ``stat/rogueap`` reports a neighbour's strength two ways, and only one of them
+# is dBm. ``signal`` is the real RSSI (negative). ``rssi`` is the driver's
+# 0-based quality index above the noise floor (positive, ~2..50 in practice),
+# exactly as documented on the mesh-uplink fields in ``ingest/unifi/models.py``.
+# Both neighbour detectors compare against a ``*_rssi_floor_dbm`` threshold, so
+# feeding them the index made every ``rssi <= -75`` test false and the
+# "strong enough to matter" filter a no-op: every audible BSS qualified, and a
+# quiet suburb reported hundreds of "neighbouring networks". Convert once here,
+# in the shared decoder, so the two detectors cannot disagree.
+#
+# The offset is the driver's noise-floor reference. -95 dBm is the Atheros/QCA
+# convention UniFi APs report against, and it is tunable like every other number
+# in this module: ``noise_floor_dbm`` under ``wifi.neighbor_density``. It is read
+# from that one key even though both detectors use it, because it describes the
+# *scan*, not either detector's policy, and the two must not be able to disagree
+# about what a given index means.
+_ROGUE_NOISE_FLOOR_DBM = -95
+
+# A negative number alone does not prove a field is dBm. Drivers use small
+# negative sentinels for "no reading" -- this module already carries ``or -127.0``
+# fallbacks for exactly that -- and a -1 accepted verbatim would read as an
+# absurdly strong neighbour that clears every ``rssi_floor_dbm`` and silently
+# inflates the qualifying count. A real neighbour sighting lands between these
+# lines, so anything outside them is junk to be ignored, not converted.
+_PLAUSIBLE_DBM_MAX = -20
+_PLAUSIBLE_DBM_MIN = -120
+
+
+def _plausible_dbm(value: Optional[int]) -> Optional[int]:
+    """``value`` if it could be a real dBm sighting, else ``None``."""
+    if value is None or not (_PLAUSIBLE_DBM_MIN <= value <= _PLAUSIBLE_DBM_MAX):
+        return None
+    return value
+
+
+def _neighbor_rssi_dbm(
+    meta: dict[str, Any], noise_floor: int = _ROGUE_NOISE_FLOOR_DBM
+) -> Optional[int]:
+    """Neighbour strength in dBm, whichever way the scan reported it.
+
+    Prefers ``signal`` (already dBm, and what newer polls persist), but only when
+    it is plausibly a real sighting: a positive or sentinel value is ignored in
+    favour of the index rather than trusted into a nonsense dBm. Falls back to
+    the quality index offset by ``noise_floor``, which is what rows collected
+    before ``signal`` was captured carry. An index that is already a plausible
+    dBm is passed through untouched, so re-running over mixed-vintage rows is
+    safe; one that is negative but implausible is junk and drops out.
+
+    Returns ``None`` when the scan reported neither field usably, which the
+    callers treat as unplaceable and skip. An index of exactly 0 is a real
+    reading at the noise floor, not a missing one, so it converts.
+    """
+    signal = _plausible_dbm(_as_int(meta.get("signal")))
+    if signal is not None:
+        return signal
+    index = _as_int(meta.get("rssi"))
+    if index is None:
+        return None
+    if index < 0:
+        return _plausible_dbm(index)
+    return index + noise_floor
+
+
 def _neighbor_rows(ctx: Any) -> list[dict[str, Any]]:
     """Decode the ``rogue_bss`` inventory rows into judged neighbour dicts.
 
@@ -1875,7 +1939,13 @@ def _neighbor_rows(ctx: Any) -> list[dict[str, Any]]:
     poll) is parsed here; the normalized band folds the reported code with a
     channel-number fallback. Both neighbour detectors read the inventory through
     this one decoder so they never disagree about what the scan said.
+
+    The emitted ``rssi`` is **dBm**, normalized by :func:`_neighbor_rssi_dbm`.
+    Callers compare it to ``*_rssi_floor_dbm`` thresholds directly.
     """
+    noise_floor = int(
+        ctx.threshold(KEY_NEIGHBOR_DENSITY, "noise_floor_dbm", _ROGUE_NOISE_FLOOR_DBM)
+    )
     rows = ctx.repo.list_entities(ROGUE_BSS_TYPE, site_id=ctx.site_id)
     out: list[dict[str, Any]] = []
     for row in rows:
@@ -1902,7 +1972,7 @@ def _neighbor_rows(ctx: Any) -> list[dict[str, Any]]:
                 if isinstance(channels, list)
                 else None,
                 "band": _norm_rogue_band(meta.get("band"), channel),
-                "rssi": _as_int(meta.get("rssi")),
+                "rssi": _neighbor_rssi_dbm(meta, noise_floor),
                 "security": meta.get("security"),
                 "seen_by_ap": meta.get("seen_by_ap"),
                 "is_rogue": meta.get("is_rogue"),
