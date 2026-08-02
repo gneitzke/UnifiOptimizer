@@ -22,25 +22,22 @@ import { HowToUpdatePanel, PipUpdateSheet, useUpdateStatus } from '../../layout/
  * The one thing this must never do is turn a failed check into good news. The
  * endpoint answers **200 with the last cached result** when PyPI is unreachable
  * (`VersionChecker.check_now` logs the failure and falls back), so "did it
- * actually reach PyPI" is read off whether `checked_ts` moved, not off the HTTP
- * status. When it didn't move, the row says so and the previous answer is
- * labelled as the previous answer. Same rule for the two other ways a verdict
- * can be hollow: no check has ever completed (`latest_version === null`), and a
- * build whose version string PyPI's answer can't be compared against.
- *
- * The one-second caveat on `checked_ts`: a background check completing in the
- * very same wall-clock second as a forced one would look like a failure here.
- * That errs toward "unverified", which is the safe direction, and the honest
- * alternative (a per-request success flag on the endpoint) is a backend change.
+ * actually reach PyPI" is read directly off the response's `checked` field
+ * (Gitea #47) rather than guessed from whether `checked_ts` moved — `checked:
+ * false` plus `error` names the failure outright. When it's false, the row
+ * says so and the previous answer is labelled as the previous answer. Same
+ * rule for the two other ways a verdict can be hollow: no check has ever
+ * completed (`latest_version === null`), and a build whose version string
+ * PyPI's answer can't be compared against.
  */
 
 type Outcome =
   | { kind: 'idle' }
   | { kind: 'checking' }
-  /** The forced check reached PyPI: `checked_ts` advanced. */
+  /** The forced check reached PyPI: `checked === true`. */
   | { kind: 'answered' }
-  /** 200, but `checked_ts` stood still — PyPI never answered. */
-  | { kind: 'unanswered' }
+  /** 200, but `checked === false` — PyPI never answered this attempt. */
+  | { kind: 'unanswered'; error: string | null }
   /** 401 with the prompt dismissed or the token rejected. */
   | { kind: 'unauthorized' }
   | { kind: 'error'; message: string };
@@ -75,14 +72,11 @@ export function SoftwareUpdateSection() {
   const [sheet, setSheet] = useState<'none' | 'pip' | 'howto'>('none');
 
   const runCheck = async () => {
-    const before = status?.checked_ts ?? null;
     setOutcome({ kind: 'checking' });
     try {
       const next = await forceCheckUpdate();
       setStatus(next);
-      const reachedPypi =
-        next.checked_ts !== null && (before === null || next.checked_ts > before);
-      setOutcome({ kind: reachedPypi ? 'answered' : 'unanswered' });
+      setOutcome(next.checked ? { kind: 'answered' } : { kind: 'unanswered', error: next.error });
     } catch (e) {
       const err = e instanceof UpdateApiError ? e : new UpdateApiError(0, String(e));
       setOutcome(
@@ -250,6 +244,7 @@ function Verdict({ status, outcome }: { status: UpdateStatus; outcome: Outcome }
     return (
       <Line color="var(--sev-p3)" icon={<AlertTriangle size={16} />}>
         Couldn't reach PyPI, so this answer is unverified.
+        {outcome.error ? ` (${outcome.error})` : null}
       </Line>
     );
   }

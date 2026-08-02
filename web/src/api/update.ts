@@ -76,6 +76,13 @@ export interface UpdateStatus {
   variant: UpdateVariant;
   self_upgrade_supported: boolean;
   checked_ts: number | null;
+  /** Whether *this* response's check reached PyPI (Gitea #47) — distinct from
+   * `checked_ts`, which is the last time any check succeeded. A cache read
+   * (no live check, e.g. plain `GET /system/update`) is always `true` with a
+   * `null` error; only a forced check that hit an exception reports `false`
+   * with `error` set, while still carrying the last-known cached values. */
+  checked: boolean;
+  error: string | null;
   skipped_version: string | null;
   snoozed_until: number | null;
   upgrade_state: UpgradeState | null;

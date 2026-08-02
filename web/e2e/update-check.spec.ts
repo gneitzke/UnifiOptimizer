@@ -16,9 +16,10 @@ import { fileURLToPath } from 'node:url';
  *      self-upgrade; instructions on a container install),
  *   2. up to date               → says so, and says when it last knew,
  *   3. the check itself failed  → `POST /system/update/check` answers 200 with
- *      the *cached* result when PyPI is unreachable, so the only signal is that
- *      `checked_ts` stood still. That case must read as unverified, never as
- *      "up to date".
+ *      the *cached* result when PyPI is unreachable, flagged by `checked: false`
+ *      (and an `error` string) rather than left for the client to infer from a
+ *      stalled `checked_ts` (Gitea #47). That case must read as unverified,
+ *      never as "up to date".
  *
  * It also drops screenshots of all three, in both themes, into
  * scratch_validation/update-check/ (gitignored).
@@ -65,6 +66,8 @@ const containerUpdateAvailable = {
   variant: 'macmini',
   self_upgrade_supported: false,
   checked_ts: FOUR_HOURS_AGO,
+  checked: true,
+  error: null,
   skipped_version: null,
   snoozed_until: null,
   upgrade_state: null,
@@ -91,8 +94,9 @@ async function mockApi(
   page: Page,
   get: UpdatePayload,
   /** What `POST /system/update/check` answers. Defaults to a check that reached
-   *  PyPI (`checked_ts` moves to now); pass the unchanged body to simulate PyPI
-   *  being unreachable, which is exactly what the endpoint does today. */
+   *  PyPI (`checked_ts` moves to now, `checked: true`); pass a body with
+   *  `checked: false` (and an `error`) to simulate PyPI being unreachable,
+   *  which is exactly what the endpoint does today. */
   post?: UpdatePayload,
 ) {
   // Catch-all first: Playwright runs the most-recently-registered match first,
@@ -105,7 +109,9 @@ async function mockApi(
   );
   await page.route(api('system/update'), (r: Route) => {
     if (r.request().method() === 'POST') {
-      return r.fulfill({ json: post ?? { ...get, checked_ts: Math.floor(Date.now() / 1000) } });
+      return r.fulfill({
+        json: post ?? { ...get, checked_ts: Math.floor(Date.now() / 1000), checked: true, error: null },
+      });
     }
     return r.fulfill({ json: get });
   });
@@ -180,14 +186,18 @@ test.describe('Settings → Software update', () => {
   });
 
   test('a check that never reached PyPI does not render as up to date', async ({ page }) => {
-    // The real failure shape: 200, same body, `checked_ts` unmoved.
-    await mockApi(page, upToDate, upToDate);
+    // The real failure shape: 200, the stale cached body, `checked: false` and
+    // an `error` naming why (Gitea #47) — never inferred from a stalled
+    // `checked_ts` alone.
+    await mockApi(page, upToDate, { ...upToDate, checked: false, error: 'connection refused' });
     await gotoSettings(page, 'light');
     const s = section(page);
 
     await s.getByRole('button', { name: 'Check now' }).click();
 
-    await expect(s.getByText("Couldn't reach PyPI, so this answer is unverified.")).toBeVisible();
+    await expect(
+      s.getByText("Couldn't reach PyPI, so this answer is unverified. (connection refused)"),
+    ).toBeVisible();
     await expect(s.getByText('You are on 0.7.1, the latest release.')).toHaveCount(0);
     await expect(s.getByText(/Showing the last completed check/)).toBeVisible();
     await expect(s.getByText(/0\.7\.1 was the latest release/)).toBeVisible();
@@ -196,12 +206,18 @@ test.describe('Settings → Software update', () => {
   test('a failed check keeps a known-available update visible, in the past tense', async ({
     page,
   }) => {
-    await mockApi(page, containerUpdateAvailable, containerUpdateAvailable);
+    await mockApi(page, containerUpdateAvailable, {
+      ...containerUpdateAvailable,
+      checked: false,
+      error: 'timed out',
+    });
     await gotoSettings(page, 'light');
     const s = section(page);
 
     await s.getByRole('button', { name: 'Check now' }).click();
-    await expect(s.getByText("Couldn't reach PyPI, so this answer is unverified.")).toBeVisible();
+    await expect(
+      s.getByText("Couldn't reach PyPI, so this answer is unverified. (timed out)"),
+    ).toBeVisible();
     await expect(
       s.getByText(/0\.7\.2 was available, and you are on 0\.7\.1\./),
     ).toBeVisible();
@@ -296,7 +312,7 @@ for (const theme of ['light', 'dark'] as const) {
       [
         'check-failed',
         async () => {
-          await mockApi(page, upToDate, upToDate);
+          await mockApi(page, upToDate, { ...upToDate, checked: false, error: 'connection refused' });
           await gotoSettings(page, theme);
           await section(page).getByRole('button', { name: 'Check now' }).click();
           await expect(

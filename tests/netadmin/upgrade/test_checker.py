@@ -141,6 +141,75 @@ async def test_network_failure_keeps_the_previous_cache(settings: Settings, stor
 
 
 @respx.mock
+async def test_successful_check_reports_checked_true_and_no_error(
+    settings: Settings, store: Any
+) -> None:
+    respx.get(PYPI_URL).mock(return_value=_pypi_response("3.0.0"))
+    checker = VersionChecker(settings, store)
+
+    status = await checker.check_now()
+
+    assert status.checked is True
+    assert status.error is None
+    await checker.stop()
+
+
+@respx.mock
+async def test_failed_check_reports_checked_false_with_an_error_but_keeps_the_cache(
+    settings: Settings, store: Any
+) -> None:
+    """Gitea #47: a caller must be able to tell "PyPI says you're current"
+    from "PyPI was unreachable, here's the stale answer" -- the stale
+    ``checked_ts``/``latest_version`` are unchanged, but ``checked`` flips to
+    ``False`` for this attempt and ``error`` names the failure. This fails
+    against pre-fix code: ``VersionStatus`` has no ``checked``/``error``
+    fields at all.
+    """
+    respx.get(PYPI_URL).mock(return_value=_pypi_response("2.0.0"))
+    checker = VersionChecker(settings, store, wall_clock=lambda: 1_000)
+    first = await checker.check_now()
+    assert first.checked is True
+    assert first.error is None
+
+    respx.get(PYPI_URL).mock(side_effect=httpx.ConnectError("no route"))
+    second = await checker.check_now()
+
+    assert second.checked is False
+    assert second.error is not None
+    assert "no route" in second.error
+    assert second.latest_version == "2.0.0"  # the stale cache, unchanged
+    assert second.checked_ts == 1_000
+    await checker.stop()
+
+
+@respx.mock
+async def test_error_message_is_truncated_to_200_chars(settings: Settings, store: Any) -> None:
+    long_reason = "x" * 500
+    checker = VersionChecker(settings, store)
+    respx.get(PYPI_URL).mock(side_effect=httpx.ConnectError(long_reason))
+
+    status = await checker.check_now()
+
+    assert status.checked is False
+    assert status.error is not None
+    assert len(status.error) <= 200
+    await checker.stop()
+
+
+async def test_cached_status_and_background_loop_success_default_to_checked_true(
+    settings: Settings, store: Any
+) -> None:
+    """``cached_status()`` (a pure read, no network) always represents the last
+    known-good state: ``checked=True``, ``error=None`` -- never the freshness
+    of *this* call, which only ``check_now()`` can know."""
+    checker = VersionChecker(settings, store)
+    status = checker.cached_status()
+    assert status.checked is True
+    assert status.error is None
+    await checker.stop()
+
+
+@respx.mock
 async def test_http_error_status_keeps_cache_and_never_raises(
     settings: Settings, store: Any
 ) -> None:

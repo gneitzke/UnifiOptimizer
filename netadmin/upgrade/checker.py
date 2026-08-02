@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Optional
 
 import httpx
@@ -90,6 +90,16 @@ class VersionStatus:
     latest_version: Optional[str]
     update_available: bool
     checked_ts: Optional[int]
+    # Whether *this* check reached PyPI, distinct from ``checked_ts`` (the last
+    # time any check succeeded). A cache read via ``cached_status()`` or the
+    # background loop's own success is always ``checked=True, error=None`` --
+    # those represent the last known-good state, not a live attempt. Only
+    # ``check_now()``'s exception fallback sets ``checked=False`` and fills in
+    # ``error``, so a caller can tell "PyPI says you're current" from "PyPI was
+    # unreachable, here's the stale answer" instead of guessing from whether
+    # ``checked_ts`` moved.
+    checked: bool = True
+    error: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -97,6 +107,8 @@ class VersionStatus:
             "latest_version": self.latest_version,
             "update_available": self.update_available,
             "checked_ts": self.checked_ts,
+            "checked": self.checked,
+            "error": self.error,
         }
 
 
@@ -193,7 +205,7 @@ class VersionChecker:
                 raise ValueError(f"unparseable version from PyPI: {latest!r}")
         except Exception as exc:  # noqa: BLE001 - a check failure must never crash the daemon
             _log.warning("version check failed (keeping last known result): %s", exc)
-            return self.cached_status()
+            return replace(self.cached_status(), checked=False, error=str(exc)[:200])
 
         now = self._wall_clock()
         self._store.set_app_meta(_META_LATEST_VERSION, latest)

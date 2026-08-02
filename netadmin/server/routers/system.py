@@ -80,7 +80,12 @@ from netadmin import __version__
 from netadmin.config import SECRETS_ENV, Settings, write_secrets
 from netadmin.logging import get_logger
 from netadmin.server.runtime import build_health
-from netadmin.upgrade.checker import SKIP_VERSION_KEY, SNOOZE_UNTIL_KEY, read_cached_status
+from netadmin.upgrade.checker import (
+    SKIP_VERSION_KEY,
+    SNOOZE_UNTIL_KEY,
+    VersionStatus,
+    read_cached_status,
+)
 from netadmin.upgrade.detect import detect_install_method
 from netadmin.upgrade.journal import (
     PHASE_STARTING,
@@ -211,10 +216,22 @@ def _upgrade_state_payload(journal: Optional[UpgradeJournal]) -> Optional[dict[s
     }
 
 
-def _update_status_payload(request: Request) -> dict[str, Any]:
+def _update_status_payload(
+    request: Request, status: Optional[VersionStatus] = None
+) -> dict[str, Any]:
+    """Build the response body from ``status`` if given, else the cache.
+
+    ``status`` is only ever passed by :func:`force_check_update`, with the
+    :class:`VersionStatus` :meth:`VersionChecker.check_now` just returned --
+    the one place ``checked``/``error`` can be non-default, since only that
+    call knows whether *this* attempt reached PyPI. Every other caller reads
+    the cache, which is always the last known-good state (``checked=True``,
+    ``error=None``).
+    """
     settings: Settings = request.app.state.settings
     store = request.app.state.store
-    status = read_cached_status(store)
+    if status is None:
+        status = read_cached_status(store)
     info = detect_install_method()
     journal = read_journal(journal_path_for(settings.db_path))
     skip = store.get_app_meta(SKIP_VERSION_KEY)
@@ -231,6 +248,8 @@ def _update_status_payload(request: Request) -> dict[str, Any]:
         "variant": info.variant,
         "self_upgrade_supported": info.self_upgrade_supported,
         "checked_ts": status.checked_ts,
+        "checked": status.checked,
+        "error": status.error,
         "skipped_version": skip,
         "snoozed_until": snoozed_until,
         "upgrade_state": _upgrade_state_payload(journal),
@@ -269,9 +288,8 @@ async def dismiss_update(request: Request, body: DismissRequest) -> dict[str, An
 async def force_check_update(request: Request) -> dict[str, Any]:
     """Force a PyPI re-check right now (ARCHITECTURE.md 23), bypassing the interval."""
     checker = getattr(request.app.state, "version_checker", None)
-    if checker is not None:
-        await checker.check_now()
-    return _update_status_payload(request)
+    status = await checker.check_now() if checker is not None else None
+    return _update_status_payload(request, status=status)
 
 
 def _spawn_upgrade_runner(target_version: str) -> None:

@@ -24,6 +24,7 @@ from netadmin.server.auth import ApiTokenAuthMiddleware, is_system_update_apply
 from netadmin.server.main import DaemonComponents, create_app
 from netadmin.server.routers import system as system_router
 from netadmin.store.repository import Repository
+from netadmin.upgrade.checker import read_cached_status
 from netadmin.upgrade.journal import (
     PHASE_STARTING,
     PHASE_SWAPPING,
@@ -122,6 +123,8 @@ async def test_get_update_shape_and_defaults(
         "variant",
         "self_upgrade_supported",
         "checked_ts",
+        "checked",
+        "error",
         "skipped_version",
         "snoozed_until",
         "upgrade_state",
@@ -133,6 +136,8 @@ async def test_get_update_shape_and_defaults(
     assert body["update_available"] is False
     assert body["install_method"] == "pip"
     assert body["self_upgrade_supported"] is True
+    assert body["checked"] is True
+    assert body["error"] is None
     assert body["skipped_version"] is None
     assert body["snoozed_until"] is None
     assert body["upgrade_state"] is None
@@ -284,10 +289,11 @@ async def test_check_forces_a_refresh_through_the_live_checker(
         def __init__(self) -> None:
             self.called = 0
 
-        async def check_now(self) -> None:
+        async def check_now(self):
             self.called += 1
             token_store.set_app_meta("update.latest_version", "7.7.7")
             token_store.set_app_meta("update.checked_ts", "42")
+            return read_cached_status(token_store)
 
     fake = FakeChecker()
     token_app.state.version_checker = fake
@@ -296,7 +302,43 @@ async def test_check_forces_a_refresh_through_the_live_checker(
         resp = await c.post(_CHECK, headers=_auth())
     assert resp.status_code == 200
     assert fake.called == 1
-    assert resp.json()["latest_version"] == "7.7.7"
+    body = resp.json()
+    assert body["latest_version"] == "7.7.7"
+    assert body["checked"] is True
+    assert body["error"] is None
+
+
+@pytest.mark.asyncio
+async def test_check_surfaces_a_failed_attempt_without_lying_about_it(
+    token_app: object, token_store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PyPI-unreachable ``check_now()`` returns the stale cache marked
+    ``checked=False`` with an ``error`` -- the router must pass that through
+    verbatim rather than re-deriving a fresh (and misleadingly clean) status
+    from the cache."""
+    _install_info(monkeypatch)
+    token_store.set_app_meta("update.latest_version", "5.5.5")
+    token_store.set_app_meta("update.checked_ts", "10")
+
+    class FailingChecker:
+        async def check_now(self):
+            from dataclasses import replace
+
+            return replace(
+                read_cached_status(token_store),
+                checked=False,
+                error="PLACEHOLDER: connection refused",
+            )
+
+    token_app.state.version_checker = FailingChecker()
+
+    async with _client(token_app) as c:
+        resp = await c.post(_CHECK, headers=_auth())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["latest_version"] == "5.5.5"  # stale cache, unchanged
+    assert body["checked"] is False
+    assert body["error"] == "PLACEHOLDER: connection refused"
 
 
 @pytest.mark.asyncio
