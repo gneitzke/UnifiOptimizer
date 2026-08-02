@@ -188,6 +188,57 @@ def test_radio_meta_only_correlates_to_the_matching_named_row():
     assert radios["na"]["min_rssi_enabled"] is True
 
 
+# --------------------------------------------------------------------------- #
+# Gitea #59 follow-up: three more dead arms of the same shape -- detectors read
+# meta keys map_device never populated. wifi.tx_power_loud needs tx_power (stats)
+# and tx_power_mode (config); wifi.mesh_wired_redundant needs mesh_enabled.
+# --------------------------------------------------------------------------- #
+def test_radio_meta_carries_tx_power_from_stats_and_mode_from_config():
+    """``wifi.tx_power_loud`` reads ``meta["tx_power"]`` (a radio_table_stats
+    metric) and ``meta["tx_power_mode"]`` (a radio_table config field). Neither
+    was emitted, so the detector never fired. tx_power_mode lives on the config
+    row, NOT the stats row -- proven by supplying it only there.
+    """
+    device = make_device(
+        mac="aa:bb:cc:dd:ee:04",
+        radio_table_stats=[
+            {"name": "wifi0", "radio": "na", "channel": 36, "ht": 80, "tx_power": 26}
+        ],
+        radio_table=[{"name": "wifi0", "radio": "na", "tx_power_mode": "high"}],
+    )
+    mapping = map_device(device, TS)
+    radio = next(r for r in mapping.inventory if r.entity.entity_type is EntityType.RADIO)
+    assert radio.entity.meta["tx_power"] == 26
+    assert radio.entity.meta["tx_power_mode"] == "high"
+    assert radio.entity.meta["band"] == "na"
+
+
+def test_radio_meta_omits_tx_power_keys_when_absent():
+    """No tx_power on the stats row and no config row -> neither key appears
+    (the detector guards on presence; a controller that omits them is normal)."""
+    device = make_device(
+        mac="aa:bb:cc:dd:ee:05",
+        radio_table_stats=[{"name": "wifi0", "radio": "ng", "channel": 6, "ht": 20}],
+    )
+    mapping = map_device(device, TS)
+    radio = next(r for r in mapping.inventory if r.entity.entity_type is EntityType.RADIO)
+    assert "tx_power" not in radio.entity.meta
+    assert "tx_power_mode" not in radio.entity.meta
+
+
+def test_device_meta_carries_mesh_enabled_from_mesh_sta_vap_enabled():
+    """``wifi.mesh_wired_redundant`` reads ``meta["mesh_enabled"]``; the controller
+    field is ``mesh_sta_vap_enabled``. map_device renames it. Absent field -> no
+    key (an AP that never meshed must not look like one that did)."""
+    on = make_device(mac="aa:bb:cc:dd:ee:06", type="uap", mesh_sta_vap_enabled=True)
+    dev = next(r for r in map_device(on, TS).inventory if r.entity.entity_type is EntityType.AP)
+    assert dev.entity.meta["mesh_enabled"] is True
+
+    off = make_device(mac="aa:bb:cc:dd:ee:07", type="uap")
+    dev2 = next(r for r in map_device(off, TS).inventory if r.entity.entity_type is EntityType.AP)
+    assert "mesh_enabled" not in dev2.entity.meta
+
+
 def test_uplink_type_tracked_when_present(stat_devices):
     ap = stat_devices[0]
     rec = map_device(ap, TS).inventory[0]

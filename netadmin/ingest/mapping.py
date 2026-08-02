@@ -276,6 +276,16 @@ def map_device(device: Device, ts: int, *, site_id: str = "default") -> Mapping:
         dev_meta["has_temperature"] = device.has_temperature
     if device.has_fan is not None:
         dev_meta["has_fan"] = device.has_fan
+    # An AP wired to the LAN but still advertising its mesh/uplink VAP. The
+    # controller's field is mesh_sta_vap_enabled; wifi.mesh_wired_redundant reads
+    # it as meta["mesh_enabled"]. It was never emitted, so that latent-risk arm
+    # was dead (Gitea #59 follow-up).
+    if device.mesh_sta_vap_enabled is not None:
+        dev_meta["mesh_enabled"] = device.mesh_sta_vap_enabled
+    # An AP wired to the LAN but still advertising its mesh/uplink VAP. The
+    # controller's field is mesh_sta_vap_enabled; wifi.mesh_wired_redundant reads
+    # it as meta["mesh_enabled"]. It was never emitted, so that latent-risk arm
+    # was dead (Gitea #59 follow-up).
     dev_tracked: dict[str, Any] = {
         "firmware": device.version,
         "state": device.state,
@@ -381,6 +391,11 @@ def map_device(device: Device, ts: int, *, site_id: str = "default") -> Mapping:
         rnid = f"{mac}:{band}"
         rref: EntityRef = (EntityType.RADIO, rnid)
         meta: dict[str, Any] = {"band": radio.radio, "ht": radio.ht}
+        # tx_power is a radio *metric* (radio_table_stats). wifi.tx_power_loud's
+        # band-imbalance arm reads it off meta; it was never emitted, so that arm
+        # was dead (Gitea #59 follow-up).
+        if radio.tx_power is not None:
+            meta["tx_power"] = radio.tx_power
         cfg = radio_config_by_name.get(radio.name)
         if cfg is not None:
             # Only added when the config row exists and the value is non-None,
@@ -390,6 +405,12 @@ def map_device(device: Device, ts: int, *, site_id: str = "default") -> Mapping:
                 meta["min_rssi"] = cfg.min_rssi
             if cfg.min_rssi_enabled is not None:
                 meta["min_rssi_enabled"] = cfg.min_rssi_enabled
+            # The loud/auto tx-power setting -- radio_table config, not stats. Its
+            # absence here left wifi.tx_power_loud's PRIMARY arm dead: the detector
+            # read meta["tx_power_mode"], which map_device never populated, so the
+            # whole detector never fired (Gitea #59 follow-up).
+            if cfg.tx_power_mode is not None:
+                meta["tx_power_mode"] = cfg.tx_power_mode
         inv.append(
             EntityRecord(
                 entity=Entity(

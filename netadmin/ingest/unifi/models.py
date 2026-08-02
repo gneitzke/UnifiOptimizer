@@ -101,7 +101,11 @@ class RadioTableStat(_Base):
     channel: Optional[int] = None
     ht: Optional[int] = None  # channel width (MHz)
     tx_power: Optional[int] = None
-    tx_power_mode: Optional[str] = None
+    # NOTE: tx_power_mode is deliberately NOT here. A real controller reports it
+    # on the radio_table *config* rows, not on radio_table_stats -- it lived here
+    # as a declared-but-never-populated field, which is exactly what left
+    # wifi.tx_power_loud's primary arm dead (Gitea #59 follow-up). It now lives on
+    # RadioTable, where map_device can actually read it.
 
     # Channel utilization (percent)
     cu_total: Optional[int] = None
@@ -123,12 +127,16 @@ class RadioTable(_Base):
     from ``radio_table_stats`` (metrics). Carries the min-RSSI kick-roam setting
     (``wifi.min_rssi_misconfig``): ``min_rssi`` is a signed dBm floor, same unit
     as the detector's -70 dBm default, confirmed against a real controller.
+
+    Also the real home of ``tx_power_mode`` (``wifi.tx_power_loud``): the loud/high
+    vs auto setting the controller reports here, not on the stats rows.
     """
 
     name: Optional[str] = None  # "wifi0", "wifi1" -- joins to radio_table_stats
     radio: Optional[str] = None  # "ng", "na", "6e"
     min_rssi: Optional[int] = None
     min_rssi_enabled: Optional[bool] = None
+    tx_power_mode: Optional[str] = None  # "auto" | "medium" | "high" | "low" | "custom"
 
 
 class Uplink(_Base):
@@ -190,6 +198,12 @@ class Device(_Base):
     overheating: Optional[bool] = None
     has_fan: Optional[bool] = None
     fan_level: Optional[int] = None
+
+    # AP still running a mesh/uplink VAP. wifi.mesh_wired_redundant reads this off
+    # meta as "mesh_enabled" to flag an AP that is wired now but left meshing on
+    # (a latent RF cost). The controller's field name is mesh_sta_vap_enabled;
+    # map_device renames it to the shorter meta key the detector expects.
+    mesh_sta_vap_enabled: Optional[bool] = None
 
     system_stats: Optional[dict[str, Any]] = Field(default=None, alias="system-stats")
 
