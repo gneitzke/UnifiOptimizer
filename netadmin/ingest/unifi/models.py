@@ -118,6 +118,19 @@ class RadioTableStat(_Base):
     satisfaction: Optional[float] = None
 
 
+class RadioTable(_Base):
+    """One row of ``stat/device`` ``radio_table`` -- the *config* table, distinct
+    from ``radio_table_stats`` (metrics). Carries the min-RSSI kick-roam setting
+    (``wifi.min_rssi_misconfig``): ``min_rssi`` is a signed dBm floor, same unit
+    as the detector's -70 dBm default, confirmed against a real controller.
+    """
+
+    name: Optional[str] = None  # "wifi0", "wifi1" -- joins to radio_table_stats
+    radio: Optional[str] = None  # "ng", "na", "6e"
+    min_rssi: Optional[int] = None
+    min_rssi_enabled: Optional[bool] = None
+
+
 class Uplink(_Base):
     """``stat/device`` ``uplink`` block: the device's path to its parent."""
 
@@ -159,6 +172,7 @@ class Device(_Base):
 
     port_table: list[PortEntry] = Field(default_factory=list)
     radio_table_stats: list[RadioTableStat] = Field(default_factory=list)
+    radio_table: list[RadioTable] = Field(default_factory=list)
     uplink: Optional[Uplink] = None
 
     # Aggregate PoE budget on switches

@@ -123,6 +123,71 @@ def test_radio_and_system_metrics_from_stat_device(stat_devices):
     assert ng_radio.tracked_attrs["channel"] == 6
 
 
+# --------------------------------------------------------------------------- #
+# Gitea #59b: radio_table (config) -> radio meta, correlated by name
+# --------------------------------------------------------------------------- #
+def test_radio_meta_carries_min_rssi_from_the_matching_radio_table_row():
+    """``wifi.min_rssi_misconfig`` reads ``meta["min_rssi"]``/``["min_rssi_enabled"]``,
+    but until now ``map_device`` only ever wrote ``{"band", "ht"}`` -- the config
+    table (``radio_table``) was parsed nowhere. This fails against pre-fix code:
+    the meta dict has no ``min_rssi`` key at all.
+    """
+    device = make_device(
+        mac="aa:bb:cc:dd:ee:01",
+        radio_table_stats=[{"name": "wifi0", "radio": "ng", "channel": 6, "ht": 20}],
+        radio_table=[{"name": "wifi0", "radio": "ng", "min_rssi": -80, "min_rssi_enabled": True}],
+    )
+    mapping = map_device(device, TS)
+    radio = next(r for r in mapping.inventory if r.entity.entity_type is EntityType.RADIO)
+    assert radio.entity.meta["min_rssi"] == -80
+    assert radio.entity.meta["min_rssi_enabled"] is True
+    # the existing keys survive untouched
+    assert radio.entity.meta["band"] == "ng"
+    assert radio.entity.meta["ht"] == 20
+
+
+def test_radio_meta_omits_min_rssi_keys_when_radio_table_is_absent():
+    """A controller (or firmware) that omits ``radio_table`` entirely must not
+    crash the mapper, and must leave meta exactly as it was before this fix --
+    no ``min_rssi``/``min_rssi_enabled`` keys at all."""
+    device = make_device(
+        mac="aa:bb:cc:dd:ee:02",
+        radio_table_stats=[{"name": "wifi0", "radio": "na", "channel": 36, "ht": 80}],
+    )
+    mapping = map_device(device, TS)
+    radio = next(r for r in mapping.inventory if r.entity.entity_type is EntityType.RADIO)
+    assert "min_rssi" not in radio.entity.meta
+    assert "min_rssi_enabled" not in radio.entity.meta
+    assert radio.entity.meta == {"band": "na", "ht": 80}
+
+
+def test_radio_meta_only_correlates_to_the_matching_named_row():
+    """Two radios, two config rows -- each radio must pick up only its own
+    band's config, not the other radio's, proving the join is by ``name`` and
+    not "whatever config row happens to be present"."""
+    device = make_device(
+        mac="aa:bb:cc:dd:ee:03",
+        radio_table_stats=[
+            {"name": "wifi0", "radio": "ng", "channel": 6, "ht": 20},
+            {"name": "wifi1", "radio": "na", "channel": 36, "ht": 80},
+        ],
+        radio_table=[
+            {"name": "wifi0", "radio": "ng", "min_rssi": -75, "min_rssi_enabled": False},
+            {"name": "wifi1", "radio": "na", "min_rssi": -60, "min_rssi_enabled": True},
+        ],
+    )
+    mapping = map_device(device, TS)
+    radios = {
+        r.entity.meta["band"]: r.entity.meta
+        for r in mapping.inventory
+        if r.entity.entity_type is EntityType.RADIO
+    }
+    assert radios["ng"]["min_rssi"] == -75
+    assert radios["ng"]["min_rssi_enabled"] is False
+    assert radios["na"]["min_rssi"] == -60
+    assert radios["na"]["min_rssi_enabled"] is True
+
+
 def test_uplink_type_tracked_when_present(stat_devices):
     ap = stat_devices[0]
     rec = map_device(ap, TS).inventory[0]

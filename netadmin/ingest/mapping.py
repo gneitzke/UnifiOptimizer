@@ -67,6 +67,8 @@ METRICS: dict[str, tuple[MetricKind, str]] = {
     "tx_dropped": (MetricKind.COUNTER, "packets"),
     "rx_bytes": (MetricKind.COUNTER, "bytes"),
     "tx_bytes": (MetricKind.COUNTER, "bytes"),
+    "rx_packets": (MetricKind.COUNTER, "packets"),
+    "tx_packets": (MetricKind.COUNTER, "packets"),
     "rx_broadcast": (MetricKind.COUNTER, "packets"),
     "tx_broadcast": (MetricKind.COUNTER, "packets"),
     "rx_multicast": (MetricKind.COUNTER, "packets"),
@@ -348,6 +350,12 @@ def map_device(device: Device, ts: int, *, site_id: str = "default") -> Mapping:
         _emit(samples, pref, "tx_dropped", port.tx_dropped)
         _emit(samples, pref, "rx_bytes", port.rx_bytes)
         _emit(samples, pref, "tx_bytes", port.tx_bytes)
+        # Gitea #59: rx_packets is the volume bad_cable normalises errors against.
+        # The model parsed it and the counter was registered, but map_device never
+        # emitted it -- so the packet-fraction arm was silently dead and cable
+        # faults were judged on the absolute-error floor alone.
+        _emit(samples, pref, "rx_packets", port.rx_packets)
+        _emit(samples, pref, "tx_packets", port.tx_packets)
         _emit(samples, pref, "rx_broadcast", port.rx_broadcast)
         _emit(samples, pref, "tx_broadcast", port.tx_broadcast)
         _emit(samples, pref, "rx_multicast", port.rx_multicast)
@@ -360,12 +368,28 @@ def map_device(device: Device, ts: int, *, site_id: str = "default") -> Mapping:
         _emit(samples, pref, "sfp_current", port.sfp_current)
 
     # --- radios ---
+    # Gitea #59b: correlate each radio_table_stats row (metrics) to its
+    # radio_table row (config, distinct table) by ``name`` ("wifi0"/"wifi1" on
+    # both) to pull min_rssi/min_rssi_enabled into radio meta -- the field
+    # wifi.min_rssi_misconfig has always read but that map_device never
+    # populated, so the detector's config-audit arm was silently dead.
+    radio_config_by_name = {cfg.name: cfg for cfg in device.radio_table if cfg.name is not None}
     for radio in device.radio_table_stats:
         band = radio.radio or radio.name
         if band is None:
             continue
         rnid = f"{mac}:{band}"
         rref: EntityRef = (EntityType.RADIO, rnid)
+        meta: dict[str, Any] = {"band": radio.radio, "ht": radio.ht}
+        cfg = radio_config_by_name.get(radio.name)
+        if cfg is not None:
+            # Only added when the config row exists and the value is non-None,
+            # so a controller that omits them leaves meta exactly as before
+            # (the detector already guards on min_rssi_enabled being truthy).
+            if cfg.min_rssi is not None:
+                meta["min_rssi"] = cfg.min_rssi
+            if cfg.min_rssi_enabled is not None:
+                meta["min_rssi_enabled"] = cfg.min_rssi_enabled
         inv.append(
             EntityRecord(
                 entity=Entity(
@@ -375,7 +399,7 @@ def map_device(device: Device, ts: int, *, site_id: str = "default") -> Mapping:
                     name=radio.name,
                     first_seen_ts=ts,
                     last_seen_ts=ts,
-                    meta={"band": radio.radio, "ht": radio.ht},
+                    meta=meta,
                 ),
                 tracked_attrs={"channel": radio.channel},
                 parent_ref=dev_ref,
