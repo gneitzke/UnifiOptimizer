@@ -11,6 +11,7 @@ from __future__ import annotations
 from netadmin.sle.classifiers import (
     CLS_BUFFERBLOAT,
     CLS_CLIENT_LOAD,
+    CLS_ISP_LOSS,
     CLS_NON_WIFI_UTIL,
     CLS_PINGPONG,
     CLS_SW_DOWN,
@@ -404,9 +405,12 @@ def test_wan_not_down_when_dns_anchor_resolves(repo: Repository) -> None:
 
 
 def test_wan_down_not_fired_on_single_bucket_hiccup(repo: Repository) -> None:
-    # Finding 2: one bucket where the prober hiccuped (a few failures) while the
-    # sustained window is overwhelmingly healthy must NOT brand the WAN down for
-    # every active client. wan_down needs a sustained majority of failed probes.
+    # Finding 2: a burst of failed probes in an overwhelmingly healthy window must
+    # NOT brand the WAN *down* for every active client -- wan_down needs a sustained
+    # majority of failed probes (0.8), and 3/13 is far short of that. It IS, though,
+    # a real ~23% loss rate off a functional probe (10 successes prove ICMP works),
+    # so it correctly lands under isp_loss rather than being silently OK -- the
+    # loss-RATE judgement, never the old raw wan_drops COUNT.
     gw = seed_gateway(repo)
     ap = seed_ap(repo)
     c = seed_client(repo, "c1", parent_id=ap)
@@ -420,7 +424,32 @@ def test_wan_down_not_fired_on_single_bucket_hiccup(repo: Repository) -> None:
     result = SleMinutesJob(repo).run_bucket(0)
     assert result.wan_evaluated is True
     by = _by_classifier(_rows(repo, 0, sle=SLE_WAN, entity_id=c))
-    assert CLS_WAN_DOWN not in by
+    assert CLS_WAN_DOWN not in by  # not down: nowhere near a sustained majority
+    assert by == {CLS_ISP_LOSS: 5.0}
+
+
+def test_wan_isp_loss_not_fired_on_raw_drop_count(repo: Repository) -> None:
+    # The isp_loss bug: wan_drops/www_drops is a per-interval packet COUNT (unit
+    # "packets"), and the old rule fired isp_loss for every active client whenever
+    # that count exceeded a percentage threshold (2 packets > 1.0). A healthy link
+    # drops the odd packet constantly, so this over-fired on any gateway deployment.
+    # With every probe poll OK (0% real loss), a bucket carrying wan_drops of 2-3
+    # must stay OK -- the count is corroborating evidence, never the loss verdict.
+    gw = seed_gateway(repo)
+    ap = seed_ap(repo)
+    c = seed_client(repo, "c1", parent_id=ap)
+    make_active(repo, c, 0)
+    # Healthy latency (well under the 100 ms floor) and a raw drop count of 2-3.
+    put(repo, gw, "gw_rtt_ms", [(t, 22.0) for t in range(30, 300, 30)])
+    put(repo, gw, "wan_drops", [(30, 2.0), (90, 3.0), (150, 2.0)])
+    # Every gw_rtt probe in the lookback succeeded: 0% real (probe-measured) loss.
+    for ts in range(-570, 300, 60):
+        repo.record_poll_run(job="probe.gw_rtt", ok=True, ts=ts)
+
+    result = SleMinutesJob(repo).run_bucket(0)
+    assert result.wan_evaluated is True
+    by = _by_classifier(_rows(repo, 0, sle=SLE_WAN, entity_id=c))
+    assert CLS_ISP_LOSS not in by
     assert by == {OK: 5.0}
 
 

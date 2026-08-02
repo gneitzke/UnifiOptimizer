@@ -17,7 +17,8 @@ same classifier.
 
 Threshold provenance: the numeric defaults on :class:`SleConfig` are the researched
 section-6/8 values (coverage floor −72 dBm, sticky −75 dBm, >10 dB post-roam
-degradation, cu_total 50 % degraded, bufferbloat >200 ms, ISP loss >1 %). Metrics
+degradation, cu_total 50 % degraded, bufferbloat >200 ms, ISP loss = a failed-probe
+fraction >0.03, mirroring wan.IspDegradedDetector — never a raw drop count). Metrics
 that swing with time of day (channel utilisation, WAN throughput/latency) also get
 a **2σ-from-baseline** test via :func:`exceeds_baseline` so "busy at 2 pm" is not
 mistaken for a fault; RSSI, which baseline.py deliberately keeps time-of-day
@@ -183,7 +184,16 @@ class SleConfig:
     capacity_self_share_min: float = 0.6  # cu_self/cu_total at/above this = client_load
 
     # wan
-    wan_loss_threshold: float = 1.0  # WAN/www drops above this (per-sample) = loss
+    # isp_loss judges a loss RATE, never a raw drop count. The signal is the
+    # failed-probe FRACTION (n_fail / n_polls over the probe lookback window),
+    # mirroring wan.IspDegradedDetector's isp_min_loss_fraction (0.03) and
+    # isp_min_lost_probes (2): a bucket is isp_loss only when the failed fraction
+    # clears the floor AND at least this many probes were actually lost, so a lone
+    # dropped packet (normal LEO handoff/obstruction behaviour) never fires. The
+    # raw wan_drops/www_drops packet COUNT is corroborating evidence only, never the
+    # verdict — feeding that count to a percentage threshold was the isp_loss bug.
+    wan_loss_fraction: float = 0.03  # failed-probe fraction above this = isp_loss
+    wan_loss_min_probes: int = 2  # min lost probes before a bucket counts as loss
     wan_latency_abs_ms: float = 100.0
     wan_bufferbloat_ms: float = 200.0
     # isp_latency is judged on a rolling-window p50 of the latency signal, not the
@@ -402,11 +412,13 @@ def classify_connect(
 def classify_wan(
     *,
     reachable: bool,
-    loss: Optional[float],
+    loss_fraction: Optional[float],
+    lost_probes: int,
     latency_ms: Optional[float],
     rtt_loaded_ms: Optional[float],
     rtt_idle_ms: Optional[float],
-    loss_threshold: float,
+    loss_fraction_threshold: float,
+    min_lost_probes: int,
     latency_abs_ms: float,
     bufferbloat_ms: float,
     latency_band: Any = None,
@@ -419,19 +431,28 @@ def classify_wan(
 
     * ``wan_down`` — the uplink was unreachable this bucket (probe failures, no
       RTT samples at all).
-    * ``isp_loss`` — WAN/www drop rate above the loss floor.
+    * ``isp_loss`` — the failed-probe **fraction** (``lost_probes / total probes``
+      over the lookback window) is at/above ``loss_fraction_threshold`` **and** at
+      least ``min_lost_probes`` probes were actually lost. This is a loss RATE, not
+      a raw drop count: a single dropped packet (``wan_drops``/``www_drops`` is a
+      per-interval packet COUNT) is meaningless and never fires here, mirroring
+      ``wan.IspDegradedDetector``.
     * ``isp_latency`` — WAN/www latency above the absolute floor **or** >2σ over its
       7-day baseline (trend beats absolute, section 6).
     * ``bufferbloat`` — loaded RTT minus idle RTT over the bufferbloat floor.
 
     On the gateway-less site this fires only where probe metrics exist
-    (``gw_rtt`` → ``wan_down``/``bufferbloat``); ``isp_latency``/``isp_loss`` stay
+    (``gw_rtt`` → ``wan_down``/``isp_loss``/``bufferbloat``); ``isp_latency`` stays
     silent for want of ``stat/health`` WAN metrics. Returns the classifier or
     ``None`` (ok). The caller decides evaluability (no data at all → no-op).
     """
     if not reachable:
         return CLS_WAN_DOWN
-    if loss is not None and loss > loss_threshold:
+    if (
+        loss_fraction is not None
+        and lost_probes >= min_lost_probes
+        and loss_fraction >= loss_fraction_threshold
+    ):
         return CLS_ISP_LOSS
     if latency_ms is not None and (
         latency_ms > latency_abs_ms or exceeds_baseline(latency_ms, latency_band, sigmas)

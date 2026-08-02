@@ -478,15 +478,34 @@ class SleMinutesJob:
         gw_id = int(gw["entity_id"])
 
         latency, latency_metric = self._wan_latency_robust(gw_id, end)
-        loss = self._max_sample(gw_id, ("wan_drops", "www_drops"), start, end)
         rtt_rows = self._raw(gw_id, "gw_rtt_ms", start, end)
         rtts = [float(r["value"]) for r in rtt_rows]
 
-        # Sustained probe-failure accounting over a lookback window, not this bucket.
+        # Probe accounting over a lookback window, not this bucket. This failed/total
+        # split is BOTH the wan_down signal (a sustained majority of failed polls)
+        # and the isp_loss signal — a loss RATE (n_fail / n_polls), never the raw
+        # wan_drops/www_drops packet COUNT below.
         lb_start = end - int(self.cfg.wan_down_window_s)
         polls = self.repo.read_poll_runs("probe.gw_rtt", lb_start, end)
         n_polls = len(polls)
         n_fail = sum(1 for r in polls if int(r["ok"]) == 0)
+        n_ok = n_polls - n_fail
+        # A failed gw_rtt poll is a loss signal ONLY when the ICMP probe is actually
+        # functional (some polls succeed). When EVERY poll failed the probe is
+        # structurally unable to measure -- e.g. no unprivileged ICMP inside a
+        # container -- which is a measurement artifact, not packet loss, and must not
+        # brand isp_loss (the DNS anchor, not gw_rtt, is what proves reachability in
+        # that case; see internet_up below). A genuine total outage is caught by
+        # wan_down above, which has priority over isp_loss.
+        loss_fraction = (n_fail / n_polls) if n_ok >= 1 else None
+
+        # wan_drops/www_drops is a raw per-interval packet COUNT (mapping.py unit
+        # "packets"), not a rate: a single dropped packet is normal and meaningless,
+        # so it is corroborating evidence of WAN activity only (kept in has_data so a
+        # UniFi-gateway site that reports drops but no probe polls still counts as
+        # "we have WAN data") and never drives the isp_loss verdict. Feeding this
+        # count straight to a percentage threshold was the isp_loss over-fire bug.
+        drops = self._max_sample(gw_id, ("wan_drops", "www_drops"), start, end)
 
         # Internet-liveness comes from the PUBLIC DNS anchor (e.g. 1.1.1.1), not the
         # gateway RTT probe. The anchor resolving is direct proof the uplink is up.
@@ -503,7 +522,7 @@ class SleMinutesJob:
         has_data = (
             bool(rtts)
             or latency is not None
-            or loss is not None
+            or drops is not None
             or n_polls > 0
             or bool(anchor_samples)
             or bool(anchor_polls)
@@ -544,11 +563,13 @@ class SleMinutesJob:
 
         cls = classify_wan(
             reachable=reachable,
-            loss=loss,
+            loss_fraction=loss_fraction,
+            lost_probes=n_fail,
             latency_ms=latency,
             rtt_loaded_ms=rtt_loaded,
             rtt_idle_ms=rtt_idle,
-            loss_threshold=self.cfg.wan_loss_threshold,
+            loss_fraction_threshold=self.cfg.wan_loss_fraction,
+            min_lost_probes=self.cfg.wan_loss_min_probes,
             latency_abs_ms=self.cfg.wan_latency_abs_ms,
             bufferbloat_ms=self.cfg.wan_bufferbloat_ms,
             latency_band=latency_band,

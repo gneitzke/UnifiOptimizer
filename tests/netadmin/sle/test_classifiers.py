@@ -228,14 +228,22 @@ def test_connect_clean_is_ok() -> None:
 # --------------------------------------------------------------------------- #
 # wan
 # --------------------------------------------------------------------------- #
-_WAN_KW = dict(loss_threshold=1.0, latency_abs_ms=100.0, bufferbloat_ms=200.0)
+# loss is a failed-probe FRACTION (a rate), not a raw drop count. The threshold and
+# the min-lost-probes floor mirror wan.IspDegradedDetector (0.03 fraction, 2 probes).
+_WAN_KW = dict(
+    loss_fraction_threshold=0.03,
+    min_lost_probes=2,
+    latency_abs_ms=100.0,
+    bufferbloat_ms=200.0,
+)
 
 
 def test_wan_down_when_unreachable() -> None:
     assert (
         classify_wan(
             reachable=False,
-            loss=None,
+            loss_fraction=None,
+            lost_probes=0,
             latency_ms=None,
             rtt_loaded_ms=None,
             rtt_idle_ms=None,
@@ -246,18 +254,73 @@ def test_wan_down_when_unreachable() -> None:
 
 
 def test_wan_loss_beats_latency() -> None:
+    # A genuine loss rate (10% of probes lost, 5 lost) outranks high latency.
     assert (
         classify_wan(
-            reachable=True, loss=5, latency_ms=500, rtt_loaded_ms=None, rtt_idle_ms=None, **_WAN_KW
+            reachable=True,
+            loss_fraction=0.10,
+            lost_probes=5,
+            latency_ms=500,
+            rtt_loaded_ms=None,
+            rtt_idle_ms=None,
+            **_WAN_KW,
         )
         == CLS_ISP_LOSS
+    )
+
+
+def test_wan_loss_needs_a_rate_not_a_count() -> None:
+    # The isp_loss bug: a raw drop COUNT fed to a percentage threshold. Pin the unit
+    # as a rate — 0.005 (0.5%) must NOT fire; 0.04 (4%) with >=2 lost probes MUST.
+    below = classify_wan(
+        reachable=True,
+        loss_fraction=0.005,
+        lost_probes=3,
+        latency_ms=10,
+        rtt_loaded_ms=None,
+        rtt_idle_ms=None,
+        **_WAN_KW,
+    )
+    assert below != CLS_ISP_LOSS
+    above = classify_wan(
+        reachable=True,
+        loss_fraction=0.04,
+        lost_probes=3,
+        latency_ms=10,
+        rtt_loaded_ms=None,
+        rtt_idle_ms=None,
+        **_WAN_KW,
+    )
+    assert above == CLS_ISP_LOSS
+
+
+def test_wan_loss_needs_min_lost_probes() -> None:
+    # A high fraction off a single lost probe (below the 2-probe floor) is the
+    # single-packet quantum, not loss — it must NOT fire.
+    assert (
+        classify_wan(
+            reachable=True,
+            loss_fraction=1.0,
+            lost_probes=1,
+            latency_ms=10,
+            rtt_loaded_ms=None,
+            rtt_idle_ms=None,
+            **_WAN_KW,
+        )
+        != CLS_ISP_LOSS
     )
 
 
 def test_wan_latency_absolute() -> None:
     assert (
         classify_wan(
-            reachable=True, loss=0, latency_ms=150, rtt_loaded_ms=None, rtt_idle_ms=None, **_WAN_KW
+            reachable=True,
+            loss_fraction=0.0,
+            lost_probes=0,
+            latency_ms=150,
+            rtt_loaded_ms=None,
+            rtt_idle_ms=None,
+            **_WAN_KW,
         )
         == CLS_ISP_LATENCY
     )
@@ -266,7 +329,13 @@ def test_wan_latency_absolute() -> None:
 def test_wan_bufferbloat_on_loaded_minus_idle() -> None:
     assert (
         classify_wan(
-            reachable=True, loss=0, latency_ms=10, rtt_loaded_ms=260, rtt_idle_ms=20, **_WAN_KW
+            reachable=True,
+            loss_fraction=0.0,
+            lost_probes=0,
+            latency_ms=10,
+            rtt_loaded_ms=260,
+            rtt_idle_ms=20,
+            **_WAN_KW,
         )
         == CLS_BUFFERBLOAT
     )
@@ -275,7 +344,13 @@ def test_wan_bufferbloat_on_loaded_minus_idle() -> None:
 def test_wan_ok_when_all_healthy() -> None:
     assert (
         classify_wan(
-            reachable=True, loss=0, latency_ms=10, rtt_loaded_ms=30, rtt_idle_ms=20, **_WAN_KW
+            reachable=True,
+            loss_fraction=0.0,
+            lost_probes=0,
+            latency_ms=10,
+            rtt_loaded_ms=30,
+            rtt_idle_ms=20,
+            **_WAN_KW,
         )
         is None
     )
