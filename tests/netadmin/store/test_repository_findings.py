@@ -83,11 +83,18 @@ def test_prune_covers_poll_runs_events_and_state_changes(
     repo.record_event(ts=old, key="EVT_OLD", native_id="e-old")
     repo.record_event(ts=recent, key="EVT_NEW", native_id="e-new")
 
+    ancient = now - 90 * DAY_SECONDS
+
     eid = switch_entity_id
     # firmware set once long ago and never changed: its single old row must survive
     # (it is the current value), so it must NOT be counted/pruned.
     repo.record_state_change(eid, "firmware", "v1", ts=old)
-    # speed changed: the old superseded row is prunable, the recent one is kept.
+    # speed changed twice. Two rows past the window are protected for different
+    # reasons and one is genuinely disposable:
+    #   10   @ ancient -- superseded AND older than the boundary: prunable.
+    #   100  @ old     -- the value in effect ENTERING the retained window.
+    #   1000 @ recent  -- the current value.
+    repo.record_state_change(eid, "speed", "10", ts=ancient)
     repo.record_state_change(eid, "speed", "100", ts=old)
     repo.record_state_change(eid, "speed", "1000", ts=recent)
 
@@ -95,13 +102,21 @@ def test_prune_covers_poll_runs_events_and_state_changes(
 
     assert deleted["poll_runs"] == 1
     assert deleted["events"] == 1
-    assert deleted["state_changes"] == 1  # only the superseded old speed row
+    assert deleted["state_changes"] == 1  # only the doubly-superseded 10 Mbps row
 
     assert len(repo.read_poll_runs("device", 0, now + 1)) == 1
     assert len(repo.read_events(0, now + 1)) == 1
     # Current state survives the prune despite being older than the window.
     assert repo.current_state(eid, "firmware") == "v1"
     assert repo.current_state(eid, "speed") == "1000"
+
+    # The boundary row survives too, so a timeline reconstructed over the retained
+    # window still knows the port entered it at 100 Mbps rather than appearing to
+    # spring into existence at 1000. wired.bad_cable's observed-ceiling arm reads
+    # exactly this row; without it a link that degraded last week but had been
+    # stable for months reports nothing at all.
+    kept = [r["new_value"] for r in repo.state_history(eid, "speed", limit=10)]
+    assert kept == ["1000", "100"]
 
 
 # ---------------------------------------------------------------------------

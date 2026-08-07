@@ -99,6 +99,7 @@ _EXEMPT_THRESHOLD_KEYS: frozenset[str] = frozenset(
         "min_baseline_delta",  # dimensionless baseline delta
         "transitions_long",  # transition count (long window); count, no unit
         "transitions_short",  # transition count (short window); count, no unit
+        "transitions_sustained",  # transition count (24 h window); count, no unit
     }
 )
 

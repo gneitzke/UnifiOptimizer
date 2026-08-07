@@ -103,3 +103,74 @@ def test_catalog_is_iterable_and_sized() -> None:
     cat = build_catalog(list(DEFAULT_CATALOG.entries))
     assert isinstance(cat, Catalog)
     assert len(list(cat)) == len(cat) == CATALOG_V1_SIZE
+
+
+# ---------------------------------------------------------------------- #
+# Presentation coverage for the wired downshift/flapping evidence.
+#
+# The issue page renders an evidence field only if the catalog declares it, and a
+# confounder note only if the playbook has a closure for that key — both look up
+# by string and skip silently on a miss. So a detector can emit new evidence and
+# have it vanish from the UI with every test still green. These lock the keys the
+# multi-gig downshift arm and the sustained-flapping tier actually emit.
+# ---------------------------------------------------------------------- #
+def _playbook(key: str):
+    return DEFAULT_CATALOG.get(key).playbook
+
+
+def test_bad_cable_playbook_renders_observed_speed_regression() -> None:
+    pb = _playbook("wired.bad_cable")
+    assert "observed_speed_max" in {f.key for f in pb.evidence_fields}
+
+    evidence = {"negotiated_speed": 1000, "observed_speed_max": 2500, "port_capable_speed": 2500}
+    note = pb.confounder_notes["observed_speed_regression"](evidence)
+    assert note and "2500" in note and "1000" in note
+
+
+def test_bad_cable_observed_note_is_silent_without_its_evidence() -> None:
+    # The rated arm emits no observed_speed_max; the notes must not render a blank.
+    pb = _playbook("wired.bad_cable")
+    assert pb.confounder_notes["observed_speed_regression"]({"negotiated_speed": 100}) is None
+    assert pb.confounder_notes["peer_predates_observed_speed"]({"negotiated_speed": 100}) is None
+
+
+def test_bad_cable_playbook_renders_the_peer_age_guard() -> None:
+    pb = _playbook("wired.bad_cable")
+    note = pb.confounder_notes["peer_predates_observed_speed"]({"observed_speed_max": 2500})
+    assert note and "2500" in note
+
+
+def test_port_flapping_playbook_renders_the_sustained_tier() -> None:
+    pb = _playbook("wired.port_flapping")
+    keys = {f.key for f in pb.evidence_fields}
+    assert {"transitions_sustained", "window_sustained_s"} <= keys
+
+    evidence = {
+        "transitions_short": 0,
+        "transitions_long": 2,
+        "transitions_sustained": 38,
+        "window_short_s": 600,
+        "window_long_s": 3600,
+        "window_sustained_s": 86400,
+    }
+    note = pb.confounder_notes["sustained_transition_count"](evidence)
+    assert note and "38 in 24 h" in note
+
+
+def test_port_flapping_note_omits_the_sustained_clause_on_older_evidence() -> None:
+    """Issues predating the sustained tier carry no such keys.
+
+    A resolved port_flapping issue never gets its evidence refreshed, and the
+    demo seed writes the pre-tier shape too, so an unguarded f-string renders
+    "unknown in unknown" on the public demo forever.
+    """
+    pb = _playbook("wired.port_flapping")
+    old = {
+        "transitions_short": 6,
+        "transitions_long": 9,
+        "window_short_s": 600,
+        "window_long_s": 3600,
+    }
+    note = pb.confounder_notes["sustained_transition_count"](old)
+    assert note and "unknown" not in note
+    assert note.endswith("9 in 1 h.")

@@ -37,7 +37,7 @@ The detector tested and rejected these false-positive traps:
 - Counter age
 - Unmanaged switch hop
 
-**Traps this class of problem is known for:** Known 100 Mbps device classes; counter age (a stale cumulative counter); an unmanaged-switch hop hiding the real port.
+**Traps this class of problem is known for:** Known 100 Mbps device classes (overruled only by an observed ceiling that outlasts the current speed, so a brief blip cannot condemn a 10/100 device); counter age (a stale cumulative counter); an unmanaged-switch hop hiding the real port; a wired peer newer than the speed it would be credited with (a faster device swapped out for a slower one).
 
 ## Related issues
 
@@ -78,8 +78,8 @@ Inventory: 1 ap, 1 port, 1 switch.
 
 ## Detector playbook — `wired.bad_cable`
 
-- **Signature:** rx_errors delta rate > 10/min sustained or > 0.001% of packets; OR a gigabit-capable peer negotiated at 10/100 (broken-pair downshift).
-- **Confounders to rule out:** Known 100 Mbps device classes; counter age (a stale cumulative counter); an unmanaged-switch hop hiding the real port.
+- **Signature:** rx_errors delta rate > 10/min sustained or > 0.001% of packets; OR a gigabit-capable peer negotiated at 10/100; OR a port running below a speed it held itself in the last 7 days (broken-pair downshift, rated or observed).
+- **Confounders to rule out:** Known 100 Mbps device classes (overruled only by an observed ceiling that outlasts the current speed, so a brief blip cannot condemn a 10/100 device); counter age (a stale cumulative counter); an unmanaged-switch hop hiding the real port; a wired peer newer than the speed it would be credited with (a faster device swapped out for a slower one).
 - **Fix guidance:** Reseat then replace the patch cable; re-test the run. On an uplink port this is P1: the whole segment rides it.
 
 ## STRUCTURED QUESTIONS

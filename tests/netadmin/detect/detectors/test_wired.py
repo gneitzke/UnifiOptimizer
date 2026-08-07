@@ -306,6 +306,420 @@ def test_bad_cable_downshift_ignored_when_not_gigabit_capable(repo: Repository) 
     assert BadCableDetector().evaluate(_ctx(repo)) == []
 
 
+# ---------------------------------------------------------------------- #
+# Observed-speed regression: the multi-gig arm of the downshift check.
+#
+# The absolute arm only ever fires below 1000 Mbps, which was right when gigabit
+# was the ceiling. On a 2.5G/10G port a fall to 1000 is the SAME broken-pair
+# symptom and went unreported — confirmed on a real site where a 2.5G port sat
+# at 1000 for hours between flaps and wired.bad_cable stayed silent throughout.
+#
+# The peer's own history is what makes this safe: a port that has linked at 2500
+# proves its peer can do 2500, so sitting below that is a regression. A 1G device
+# on a 2.5G port never linked at 2500, so it never trips this arm.
+# ---------------------------------------------------------------------- #
+def _seed_speeds(repo: Repository, pid: int, speeds, *, end_ts: int = NOW, step: int = 60) -> None:
+    """Walk a port's negotiated speed through ``speeds``, oldest first."""
+    start = end_ts - (len(speeds) - 1) * step
+    for i, s in enumerate(speeds):
+        repo.record_state_change(pid, "speed", s, ts=start + i * step)
+
+
+def test_bad_cable_downshift_fires_when_multigig_port_falls_to_gigabit(repo: Repository) -> None:
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, meta={"speed_caps": 1048687}, speed=None)
+    # The real flapping shape: hours at 2.5G broken by short drops, now at 1000.
+    # Time-scaled like the site it came from — a link holds its speed for stretches
+    # between flaps, so 2500 accumulates far past the minimum-hold floor.
+    _seed_speeds(repo, pid, [2500, 0, 2500, 0, 1000], step=3600)
+    seed_counter(repo, pid, "rx_errors", step=0)  # clean errors; the regression is the signal
+
+    findings = BadCableDetector().evaluate(_ctx(repo))
+    assert len(findings) == 1
+    f = findings[0]
+    assert "speed_downshift" in f.evidence["signals"]
+    assert f.evidence["negotiated_speed"] == 1000
+    assert f.evidence["observed_speed_max"] == 2500
+    assert "observed_speed_regression" in f.confounders_checked
+
+
+def test_bad_cable_downshift_ignores_gigabit_peer_that_never_linked_faster(
+    repo: Repository,
+) -> None:
+    """The false-positive guard that matters: most 2.5G ports carry 1G devices.
+
+    The 1000 must be held for a long, *qualifying* stretch — seeded as a brief
+    blip this passes for the wrong reason (the minimum-hold floor rejects it
+    before the comparison is ever reached) and would keep passing even if
+    ``neg < observed`` were mutated to ``neg <= observed``.
+    """
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, meta={"speed_caps": 1048687}, speed=None)
+    repo.record_state_change(pid, "speed", 1000, ts=NOW - 30 * 86400)
+    seed_counter(repo, pid, "rx_errors", step=0)
+
+    det = BadCableDetector()
+    ctx = _ctx(repo)
+    # The ceiling really is observed at 1000 — this is not a min-hold rejection.
+    port = next(p for p in ctx.entities(EntityType.PORT) if p.entity_id == pid)
+    assert det._observed_max_speed(ctx, port)[0] == 1000
+    assert det.evaluate(ctx) == []
+
+
+def test_bad_cable_downshift_observed_arm_stays_above_gigabit(repo: Repository) -> None:
+    # The `observed >= 1000` floor. A 100 Mbps-capable port that held 100 and now
+    # sits at 10 must not be reported through the observed arm: arm 1 cannot see
+    # it (cap < 1000) and arm 2 has no business inventing a sub-gigabit ceiling.
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, meta={"max_speed": 100}, speed=None)
+    repo.record_state_change(pid, "speed", 100, ts=NOW - 30 * 86400)
+    repo.record_state_change(pid, "speed", 10, ts=NOW - 2 * 3600)
+    seed_counter(repo, pid, "rx_errors", step=0)
+    assert BadCableDetector().evaluate(_ctx(repo)) == []
+
+
+def test_bad_cable_observed_history_overrides_the_10_100_device_class(
+    repo: Repository,
+) -> None:
+    """A measurement beats a name.
+
+    A port that held 1000 Mbps for a month proves its peer is not 10/100-by-design,
+    whatever the device is called. Suppressing on the name here would dismiss the
+    exact fault this detector exists to catch — and log a reason the evidence
+    disproves.
+    """
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, meta={"max_speed": 1000}, speed=None)
+    repo.record_state_change(pid, "speed", 1000, ts=NOW - 30 * 86400)
+    repo.record_state_change(pid, "speed", 100, ts=NOW - 2 * 3600)
+    # Resident since long before the port held 1000, so that speed is its own.
+    repo.upsert_entity(
+        Entity(
+            entity_type=EntityType.CLIENT,
+            native_id="cli:printer",
+            site_id="default",
+            name="Brother HL-L2350DW printer",
+            parent_id=sw,
+            meta={"oui": "", "is_wired": True, "sw_port": 1},
+        ),
+        ts=NOW - 40 * 86400,
+    )
+    seed_counter(repo, pid, "rx_errors", step=0)
+
+    findings = BadCableDetector().evaluate(_ctx(repo))
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.evidence["negotiated_speed"] == 100
+    assert f.evidence["observed_speed_max"] == 1000
+    assert "observed_speed_regression" in f.confounders_checked
+
+
+def test_bad_cable_10_100_class_still_suppresses_without_faster_history(
+    repo: Repository,
+) -> None:
+    # The matched negative: same printer, but the port has never run above 100.
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, meta={"max_speed": 1000}, speed=None)
+    repo.record_state_change(pid, "speed", 100, ts=NOW - 30 * 86400)
+    make_client(repo, sw_id=sw, name="Brother HL-L2350DW printer", sw_port=1)
+    seed_counter(repo, pid, "rx_errors", step=0)
+    assert BadCableDetector().evaluate(_ctx(repo)) == []
+
+
+def test_bad_cable_brief_fast_blip_does_not_overrule_the_device_class(
+    repo: Repository,
+) -> None:
+    """From a real site, and the reason the override requires *dominance*.
+
+    A G6 Turret — 10/100 by Ubiquiti's own spec, working perfectly — sat on a
+    gigabit port that blipped to 1000 six times inside one 20-minute cabling
+    event, then returned to 100 and stayed there for five days. Letting any
+    sighting of a faster link overrule the curated device-class list turns that
+    into "Cable/link fault" and sends someone to re-run cable to a healthy
+    camera. Twelve minutes of anomaly must not outvote five days of correct
+    operation; thirty days at gigabit against two hours at 100 still wins.
+    """
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, meta={"speed_caps": 1048623}, speed=None)
+    repo.record_state_change(pid, "speed", 100, ts=NOW - 6 * 86400)
+    # The 20-minute event: six short stretches at 1000, ~12 minutes in total —
+    # comfortably past the minimum-hold floor on its own.
+    t = NOW - 5 * 86400
+    for i in range(6):
+        repo.record_state_change(pid, "speed", 1000, ts=t + i * 300)
+        repo.record_state_change(pid, "speed", 0, ts=t + i * 300 + 120)
+    repo.record_state_change(pid, "speed", 100, ts=NOW - 5 * 86400 + 3600)
+    make_client(repo, sw_id=sw, name="g6-turret---mailbox", sw_port=1)
+    seed_counter(repo, pid, "rx_errors", step=0)
+
+    det = BadCableDetector()
+    ctx = _ctx(repo)
+    port = next(p for p in ctx.entities(EntityType.PORT) if p.entity_id == pid)
+    observed, _ts, held = det._observed_max_speed(ctx, port)
+    # The blip really does qualify as an observed ceiling — it is dominance,
+    # not the min-hold floor, that has to do the work here.
+    assert observed == 1000
+    assert held[100] > held[1000]
+    assert det.evaluate(ctx) == []
+
+
+def test_bad_cable_error_rate_arm_does_not_inherit_the_peer_age_confounder(
+    repo: Repository,
+) -> None:
+    """A suppressed arm must not leave its confounder on someone else's finding.
+
+    ``confounders`` is the shared list handed to every finding ``_assess``
+    produces. If the peer-age guard appends before it decides, an error-rate
+    finding ships claiming the peer predated a speed history that was in fact
+    rejected — and the LLM dossier prints every confounder key unconditionally,
+    so it reads as a trap the detector "tested and rejected".
+    """
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, meta={"speed_caps": 1048687}, speed=None)
+    repo.record_state_change(pid, "speed", 2500, ts=NOW - 30 * 86400)
+    repo.record_state_change(pid, "speed", 1000, ts=NOW - 2 * 3600)
+    make_client(repo, sw_id=sw, name="New Workstation", sw_port=1)  # first seen just now
+    seed_counter(repo, pid, "rx_errors", step=20)  # error arm fires on its own
+
+    findings = BadCableDetector().evaluate(_ctx(repo))
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.evidence["signals"] == ["error_rate"]  # downshift correctly suppressed
+    assert "peer_predates_observed_speed" not in f.confounders_checked
+    assert "observed_speed_regression" not in f.confounders_checked
+
+
+def test_bad_cable_reports_both_arms_together(repo: Repository) -> None:
+    # Errors AND a downshift on one port merge into a single finding.
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, meta={"speed_caps": 1048687}, speed=None)
+    repo.record_state_change(pid, "speed", 2500, ts=NOW - 30 * 86400)
+    repo.record_state_change(pid, "speed", 1000, ts=NOW - 2 * 3600)
+    seed_counter(repo, pid, "rx_errors", step=20)
+
+    f = BadCableDetector().evaluate(_ctx(repo))[0]
+    assert f.evidence["signals"] == ["error_rate", "speed_downshift"]
+    assert f.evidence["errors_per_min"] > 0
+    assert f.evidence["observed_speed_max"] == 2500
+
+
+def test_bad_cable_downshift_fires_on_a_clean_degradation_with_no_flapping(
+    repo: Repository,
+) -> None:
+    """The commonest shape of all, and the one a row-count check cannot see.
+
+    ``record_state_change`` writes only on change, so a port that ran at 2500 for
+    a week carries exactly ONE row saying 2500 — dated a week ago. A cable damaged
+    once, renegotiated down once, and left there produces no further 2500 rows at
+    all. Only the speed *in effect entering the window* reveals the regression.
+    """
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, meta={"speed_caps": 1048687}, speed=None)
+    repo.record_state_change(pid, "speed", 2500, ts=NOW - 30 * 86400)
+    repo.record_state_change(pid, "speed", 1000, ts=NOW - 2 * 3600)
+    seed_counter(repo, pid, "rx_errors", step=0)
+
+    findings = BadCableDetector().evaluate(_ctx(repo))
+    assert len(findings) == 1
+    assert findings[0].evidence["observed_speed_max"] == 2500
+    assert findings[0].evidence["negotiated_speed"] == 1000
+
+
+def test_bad_cable_downshift_ignores_speed_history_beyond_lookback(repo: Repository) -> None:
+    # Past the horizon, a link that has run slow for longer is simply this link's
+    # normal: it entered the window at 1000 and never held anything faster inside it.
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, meta={"speed_caps": 1048687}, speed=None)
+    repo.record_state_change(pid, "speed", 2500, ts=NOW - 60 * 86400)
+    repo.record_state_change(pid, "speed", 1000, ts=NOW - 30 * 86400)
+    seed_counter(repo, pid, "rx_errors", step=0)
+    assert BadCableDetector().evaluate(_ctx(repo)) == []
+
+
+def test_bad_cable_downshift_ignores_a_speed_held_only_for_a_moment(
+    repo: Repository,
+) -> None:
+    # A single garbled poll reading 2500 for one interval is not a ceiling.
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, meta={"speed_caps": 1048687}, speed=None)
+    repo.record_state_change(pid, "speed", 1000, ts=NOW - 30 * 86400)
+    repo.record_state_change(pid, "speed", 2500, ts=NOW - 3600 - 60)  # held 60 s
+    repo.record_state_change(pid, "speed", 1000, ts=NOW - 3600)
+    seed_counter(repo, pid, "rx_errors", step=0)
+    assert BadCableDetector().evaluate(_ctx(repo)) == []
+
+
+def test_bad_cable_downshift_suppressed_when_the_peer_is_newer_than_the_history(
+    repo: Repository,
+) -> None:
+    """Swap a 2.5G workstation for a 1G printer and the inference inverts.
+
+    The port really did hold 2500 — but not for *this* device, so crediting the
+    newcomer with it would report a perfectly healthy printer as a broken pair
+    for as long as the lookback runs.
+    """
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, meta={"speed_caps": 1048687}, speed=None)
+    repo.record_state_change(pid, "speed", 2500, ts=NOW - 30 * 86400)
+    repo.record_state_change(pid, "speed", 1000, ts=NOW - 2 * 3600)
+    # The peer on the port today first appeared an hour ago: it cannot own the 2500.
+    repo.upsert_entity(
+        Entity(
+            entity_type=EntityType.CLIENT,
+            native_id="cli:new-printer",
+            site_id="default",
+            name="Office Printer",
+            parent_id=sw,
+            meta={"oui": "", "is_wired": True, "sw_port": 1},
+        ),
+        ts=NOW - 3600,
+    )
+    seed_counter(repo, pid, "rx_errors", step=0)
+    assert BadCableDetector().evaluate(_ctx(repo)) == []
+
+
+def test_bad_cable_downshift_suppressed_by_the_newest_claimant_not_the_oldest(
+    repo: Repository,
+) -> None:
+    """A departed device's entity lingers on its old port with its old first-seen.
+
+    Taking the oldest peer would let that ghost vouch for the newcomer that
+    replaced it — precisely the swap the guard exists to catch, and it would ship
+    a confidently-worded note asserting the printer had held 2500 itself.
+    """
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, meta={"speed_caps": 1048687}, speed=None)
+    repo.record_state_change(pid, "speed", 2500, ts=NOW - 30 * 86400)
+    repo.record_state_change(pid, "speed", 1000, ts=NOW - 2 * 3600)
+    for native, name, ts in (
+        ("cli:gone-workstation", "Workstation", NOW - 300 * 86400),  # unplugged ghost
+        ("cli:new-printer", "Office Printer", NOW - 3600),  # today's occupant
+    ):
+        repo.upsert_entity(
+            Entity(
+                entity_type=EntityType.CLIENT,
+                native_id=native,
+                site_id="default",
+                name=name,
+                parent_id=sw,
+                meta={"oui": "", "is_wired": True, "sw_port": 1},
+            ),
+            ts=ts,
+        )
+    seed_counter(repo, pid, "rx_errors", step=0)
+    assert BadCableDetector().evaluate(_ctx(repo)) == []
+
+
+def test_bad_cable_downshift_survives_a_store_younger_than_the_lookback(
+    repo: Repository,
+) -> None:
+    """first_seen_ts is the ingest timestamp, not the controller's own first-seen.
+
+    On a fresh install every client is younger than a 7-day lookback. Comparing
+    peer age against the window START would read every peer as a newcomer and
+    silently disable this arm across the whole site until the database aged past
+    a week. Comparing against when the speed was actually held is immune.
+    """
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, meta={"speed_caps": 1048687}, speed=None)
+    # A four-day-old store: the port held 2500 for three days, then degraded.
+    repo.record_state_change(pid, "speed", 2500, ts=NOW - 4 * 86400)
+    repo.record_state_change(pid, "speed", 1000, ts=NOW - 3600)
+    repo.upsert_entity(
+        Entity(
+            entity_type=EntityType.CLIENT,
+            native_id="cli:workstation",
+            site_id="default",
+            name="Workstation",
+            parent_id=sw,
+            meta={"oui": "", "is_wired": True, "sw_port": 1},
+        ),
+        ts=NOW - 4 * 86400,  # first seen when the store was created
+    )
+    seed_counter(repo, pid, "rx_errors", step=0)
+
+    findings = BadCableDetector().evaluate(_ctx(repo))
+    assert len(findings) == 1
+    assert findings[0].evidence["observed_speed_max"] == 2500
+
+
+def test_bad_cable_downshift_ceiling_survives_a_hard_flapping_port(
+    repo: Repository,
+) -> None:
+    """The ceiling must not be truncated away by sheer flap volume.
+
+    A count-limited fetch drops the OLDEST rows first, which is exactly where the
+    seed lives — so the harder a link flapped, the more certainly its ceiling
+    would vanish. Fetching by window instead removes the coupling.
+    """
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, meta={"speed_caps": 1048687}, speed=None)
+    repo.record_state_change(pid, "speed", 2500, ts=NOW - 6 * 86400)
+    # Thousands of flaps between the ceiling and now.
+    ts = NOW - 3 * 86400
+    for i in range(6000):
+        repo.record_state_change(pid, "speed", 0 if i % 2 else 1000, ts=ts + i * 20)
+    repo.record_state_change(pid, "speed", 1000, ts=NOW - 60)
+    seed_counter(repo, pid, "rx_errors", step=0)
+
+    findings = BadCableDetector().evaluate(_ctx(repo))
+    assert len(findings) == 1
+    assert findings[0].evidence["observed_speed_max"] == 2500
+
+
+def test_bad_cable_downshift_fires_when_the_peer_predates_the_history(
+    repo: Repository,
+) -> None:
+    # The matched positive: same port, same degradation, but a long-resident peer.
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, meta={"speed_caps": 1048687}, speed=None)
+    repo.record_state_change(pid, "speed", 2500, ts=NOW - 30 * 86400)
+    repo.record_state_change(pid, "speed", 1000, ts=NOW - 2 * 3600)
+    repo.upsert_entity(
+        Entity(
+            entity_type=EntityType.CLIENT,
+            native_id="cli:workstation",
+            site_id="default",
+            name="Workstation",
+            parent_id=sw,
+            meta={"oui": "", "is_wired": True, "sw_port": 1},
+        ),
+        ts=NOW - 40 * 86400,
+    )
+    seed_counter(repo, pid, "rx_errors", step=0)
+
+    findings = BadCableDetector().evaluate(_ctx(repo))
+    assert len(findings) == 1
+    assert "peer_predates_observed_speed" in findings[0].confounders_checked
+    assert "observed_speed_regression" in findings[0].confounders_checked
+
+
+def test_bad_cable_downshift_skips_a_port_that_is_currently_down(repo: Repository) -> None:
+    # speed 0 is "link down", not "negotiated slow" — the flapping detector's job.
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, meta={"speed_caps": 1048687}, speed=None)
+    _seed_speeds(repo, pid, [2500, 1000, 2500, 0])
+    seed_counter(repo, pid, "rx_errors", step=0)
+    assert BadCableDetector().evaluate(_ctx(repo)) == []
+
+
 def test_bad_cable_unknown_on_low_coverage(repo: Repository) -> None:
     low_coverage(repo)
     sw = make_switch(repo)
@@ -401,6 +815,87 @@ def test_port_flapping_unknown_on_low_coverage(repo: Repository) -> None:
     pid = make_port(repo, sw_id=sw, idx=1, up=None)
     _seed_flaps(repo, pid, 6)
     assert PortFlappingDetector().evaluate(_ctx(repo)) is UNKNOWN
+
+
+# ---------------------------------------------------------------------- #
+# The sustained (daily) tier.
+#
+# The 10-minute and 1-hour tiers only see a port that is failing *fast*. A port
+# that drops twice an hour, all day, never trips either — and that is the shape
+# real marginal links take. Confirmed on a real site: a port dropped 55 times in
+# two weeks (16 in one day) and wired.port_flapping never fired once, because no
+# single 10-minute window ever held 5 transitions.
+# ---------------------------------------------------------------------- #
+def test_port_flapping_fires_on_sustained_daily_transitions(repo: Repository) -> None:
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, up=None)
+    # 16 transitions spread evenly across 24 h: ~1 per 90 min, so neither the
+    # 10-minute (>=5) nor the 1-hour (>=10) tier can possibly trip.
+    _seed_flaps(repo, pid, 16, span=86_000)
+
+    findings = PortFlappingDetector().evaluate(_ctx(repo))
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.detector_key == KEY_PORT_FLAPPING
+    assert f.evidence["transitions_short"] < 5
+    assert f.evidence["transitions_long"] < 10
+    assert f.evidence["transitions_sustained"] == 16
+    assert f.evidence["window_sustained_s"] == 86_400
+    assert f.severity is Severity.P2
+
+
+def test_port_flapping_quiet_below_sustained_threshold(repo: Repository) -> None:
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, up=None)
+    # 8 transitions = 4 drops in a day. Real links do this; it is not a fault.
+    _seed_flaps(repo, pid, 8, span=86_000)
+    assert PortFlappingDetector().evaluate(_ctx(repo)) == []
+
+
+def test_port_flapping_sustained_infra_port_is_p1(repo: Repository) -> None:
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, is_uplink=True, up=None)
+    _seed_flaps(repo, pid, 16, span=86_000)
+    assert PortFlappingDetector().evaluate(_ctx(repo))[0].severity is Severity.P1
+
+
+def test_port_flapping_title_names_the_window_that_actually_tripped(repo: Repository) -> None:
+    # The old title always quoted the 10-minute count, so a long- or sustained-tier
+    # trip rendered as "(0 transitions/10m)" — a real issue in the store reads
+    # exactly that way, and it makes a true finding look like a bug.
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, up=None)
+    _seed_flaps(repo, pid, 16, span=86_000)
+
+    title = PortFlappingDetector().evaluate(_ctx(repo))[0].title
+    assert "0 transitions" not in title
+    assert "16 transitions/24h" in title
+
+
+def test_port_flapping_short_tier_still_titles_in_minutes(repo: Repository) -> None:
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, up=None)
+    _seed_flaps(repo, pid, 6)  # 6 transitions in 10 min -> tightest tier wins
+    assert "6 transitions/10m" in PortFlappingDetector().evaluate(_ctx(repo))[0].title
+
+
+def test_port_flapping_middle_tier_titles_in_hours(repo: Repository) -> None:
+    # The 1 h tier is the one that most often produced the "(0 transitions/10m)"
+    # title bug: short_ct=0 while long_ct clears its threshold.
+    full_coverage(repo)
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, up=None)
+    _seed_flaps(repo, pid, 10, span=3500)  # 10 in an hour, none in the last 10 min
+
+    f = PortFlappingDetector().evaluate(_ctx(repo))[0]
+    assert f.evidence["transitions_short"] < 5  # short tier did not trip
+    assert f.evidence["transitions_long"] == 10
+    assert "10 transitions/1h" in f.title
 
 
 # ====================================================================== #
