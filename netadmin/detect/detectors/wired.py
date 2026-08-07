@@ -6,11 +6,13 @@ negotiated speed/duplex, link up/down history, and the ``EVT_SW_*`` event stream
 into confounder-checked :class:`~netadmin.domain.entities.Finding` objects:
 
 * :class:`BadCableDetector` (``wired.bad_cable``) — rx/tx error-rate deltas, or a
-  gigabit-capable port negotiated down to 10/100 (broken-pair downshift).
+  broken-pair downshift on either arm: **rated** (a gigabit-capable port negotiated
+  down to 10/100) or **observed** (a port running below a speed it held itself,
+  which is what carries the check past gigabit onto 2.5G/10G links).
 * :class:`DuplexMismatchDetector` (``wired.duplex_mismatch``) — half-duplex on a
   modern (>=100 Mbps) up link.
 * :class:`PortFlappingDetector` (``wired.port_flapping``) — link transitions above
-  a short/long tier; PoE-draw-to-zero between flaps flags a reboot loop; infra
+  a short/long/daily tier; PoE-draw-to-zero between flaps flags a reboot loop; infra
   (uplink) ports escalate to P1.
 * :class:`UplinkSaturationDetector` (``wired.uplink_saturation``) — uplink
   utilisation past a % of negotiated speed with rising ``tx_dropped``, checked
@@ -37,6 +39,7 @@ not yet persist) rather than fabricate a finding.
 
 from __future__ import annotations
 
+import math
 from functools import lru_cache
 from typing import Any, Iterable, Optional
 
@@ -150,11 +153,22 @@ def _known_100mbps_patterns() -> tuple[str, ...]:
 # Shared helpers
 # ---------------------------------------------------------------------- #
 def _as_int(value: Any) -> Optional[int]:
+    # OverflowError, not just TypeError/ValueError: json.loads accepts `Infinity`
+    # by default and port.meta comes straight from stored controller JSON, so
+    # int(float("inf")) is reachable from one malformed field. Uncaught it takes
+    # down the whole detector pass -- every port on the site goes unjudged
+    # because one port reported nonsense.
     if value is None:
         return None
     try:
-        return int(float(value))
+        f = float(value)
     except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f):
+        return None
+    try:
+        return int(f)
+    except (OverflowError, ValueError):
         return None
 
 
@@ -162,9 +176,10 @@ def _as_float(value: Any) -> Optional[float]:
     if value is None:
         return None
     try:
-        return float(value)
+        f = float(value)
     except (TypeError, ValueError):
         return None
+    return f if math.isfinite(f) else None
 
 
 def _as_bool(value: Any) -> Optional[bool]:
@@ -433,39 +448,234 @@ class BadCableDetector:
         switches: dict[int, Entity],
         confounders: list[str],
     ) -> Optional[dict[str, Any]]:
-        """Gigabit-capable port negotiated at 10/100, peer not a known 10/100 class."""
+        """A link running below the speed it has been proven able to reach.
+
+        Two arms, because there are two ways to prove the peer can do better:
+
+        * **Rated** — a gigabit-capable port negotiated at 10/100, peer not a
+          known 10/100 class. The port's advertised ceiling is the proof.
+        * **Observed** — a port sitting below a speed it has *itself* linked at
+          recently. The port's own history is the proof, and it is what extends
+          this check past gigabit: on a 2.5G/10G port a fall to 1000 is the same
+          broken-pair symptom, but the rated arm can never see it, since 1000 is
+          a perfectly ordinary speed for a 2.5G port carrying a 1G device. Only
+          a port that *has* run at 2500 tells us 1000 is a regression.
+        """
         cap = _as_int(port.meta.get("max_speed")) or _speed_caps_max(port.meta.get("speed_caps"))
-        if cap is None or cap < 1000:
-            return None  # cannot assert the port is gigabit-capable
         neg = _as_int(ctx.repo.current_state(port.entity_id, "speed"))
-        if neg is None or neg >= 1000 or neg <= 0:
-            return None
-        # Confounder: a peer that is 10/100 by design is not a bad cable. Only a
-        # 100 Mbps link can be explained that way -- a 10/100 device sitting at
-        # *10* is 100BASE-TX falling back, which is the broken-pair signature this
-        # arm exists to catch, so it is never explained away by device class.
+        if neg is None or neg <= 0:
+            return None  # 0/absent is "link down" — the flapping detector's beat
+
+        # Measure the port's own history FIRST, because it outranks every other
+        # signal here. A speed this link demonstrably held is proof about the peer;
+        # the rated ceiling is proof only about the switch, and the 10/100 device
+        # class list is a guess from a device *name*. Deciding arm 1 before looking
+        # would let the name-based guess veto the measurement -- a port that held
+        # 1000 Mbps for a month would be dismissed as "a known 10/100 class"
+        # because its peer happens to be called "printer".
+        observed, observed_ts, held = self._observed_max_speed(ctx, port)
+        proven_faster = (
+            observed is not None
+            and observed > neg
+            and self._peer_predates(ctx, port, switches, observed_ts)
+        )
+        # Overriding the device-class list needs more than *any* sighting of a
+        # faster link: it needs the faster speed to be what this link normally
+        # runs at. A real G6 Turret -- 10/100 by Ubiquiti's own spec, working
+        # correctly -- blipped to 1000 six times inside one 20-minute cabling
+        # event, then sat at 100 for five days. Twelve minutes of anomaly must
+        # not outvote five days of steady, correct operation and send someone to
+        # replace a healthy camera's cable. Thirty days at 1000 against two hours
+        # at 100 is a different claim entirely, and still wins.
+        dominates = proven_faster and held.get(observed, 0) > held.get(neg, 0)
+
+        # Arm 1: rated ceiling. Gigabit-capable port down at 10/100.
+        if cap is not None and cap >= 1000 and neg < 1000:
+            if not dominates and self._explained_by_peer_class(
+                ctx, port, switches, neg, cap, confounders
+            ):
+                return None
+            confounders.append("port_gigabit_capable")
+            evidence: dict[str, Any] = {"negotiated_speed": neg, "port_capable_speed": cap}
+            if proven_faster:
+                # The strongest evidence available, and on the severest downshift:
+                # this very link, with this very peer, has run faster than this.
+                confounders.append("peer_predates_observed_speed")
+                confounders.append("observed_speed_regression")
+                evidence["observed_speed_max"] = observed
+            return evidence
+
+        # Arm 2: observed ceiling. Below a speed this very port has held recently.
+        if observed is not None and observed >= 1000 and neg < observed:
+            if self._explained_by_peer_class(ctx, port, switches, neg, observed, confounders):
+                return None
+            if not proven_faster:
+                _log.info(
+                    "bad_cable: %s negotiated %s below an observed %s Mbps, downshift not "
+                    "reported -- the wired peer on this port is newer than that speed",
+                    port.native_id,
+                    neg,
+                    observed,
+                )
+                return None
+            confounders.append("peer_predates_observed_speed")
+            confounders.append("observed_speed_regression")
+            evidence = {"negotiated_speed": neg, "observed_speed_max": observed}
+            if cap is not None:
+                evidence["port_capable_speed"] = cap
+            return evidence
+        return None
+
+    def _observed_max_speed(
+        self, ctx: Any, port: Entity
+    ) -> tuple[Optional[int], Optional[int], dict[int, int]]:
+        """Highest speed this port actually *held*, when it last held it, and the
+        full held-seconds map (callers weigh one speed's dwell against another's).
+
+        Measured as time-held, not as a count of rows, and that distinction is the
+        whole detector on a cleanly-degrading link. ``record_state_change`` writes
+        only on change, so a port that ran at 2500 for a week carries exactly ONE
+        row saying 2500 -- dated a week ago. Counting rows inside the window finds
+        nothing and the degradation that follows goes unreported, which is the
+        commonest shape of all: a cable damaged once, renegotiated down once, and
+        sitting there ever since. So the value in effect *entering* the window
+        (the last row at or before its start) seeds the timeline -- and ``prune``
+        deliberately preserves that row for exactly this read.
+
+        Held time is summed across the window rather than measured as one
+        contiguous run, because a flapping link earns its ceiling in fragments:
+        the port this detector was written for reached 2.5G in bursts between
+        drops, and demanding one unbroken stretch would dismiss it. The floor
+        (``downshift_min_hold_s``) is therefore a total-exposure guard against a
+        stray poll, not a proof of stability.
+
+        Bounded by ``downshift_lookback_s``: past that horizon a link that has run
+        slow for longer is simply this link's normal, and we have no standing to
+        call it a regression. Rows are fetched BY WINDOW, never by row count -- a
+        count-limited fetch drops the oldest rows first, which is precisely where
+        the seed lives, so the harder a link flapped the more certainly its
+        ceiling would be truncated away.
+        """
+        lookback_s = int(ctx.threshold(self.key, "downshift_lookback_s", 7 * 86400))
+        min_hold_s = int(ctx.threshold(self.key, "downshift_min_hold_s", 300))
+        start = ctx.now_ts - lookback_s
+
+        rows = ctx.repo.list_state_changes(
+            start, ctx.now_ts + 1, entity_id=port.entity_id, attr="speed", limit=100_000
+        )
+        timeline: list[tuple[int, Optional[int]]] = [
+            (int(r["ts"]), _as_int(r["new_value"])) for r in rows
+        ]
+        timeline.sort(key=lambda x: x[0])
+
+        # Seed with whatever was in effect entering the window (ts <= start).
+        prior = ctx.repo.list_state_changes(
+            0, start + 1, entity_id=port.entity_id, attr="speed", limit=1
+        )
+        if prior:
+            timeline.insert(0, (start, _as_int(prior[0]["new_value"])))
+        if not timeline:
+            return None, None, {}
+
+        held: dict[int, int] = {}
+        last_at: dict[int, int] = {}
+        for i, (ts, val) in enumerate(timeline):
+            end = timeline[i + 1][0] if i + 1 < len(timeline) else ctx.now_ts
+            if val is None or val <= 0:
+                continue  # 0/absent is link-down, which holds no speed at all
+            held[val] = held.get(val, 0) + max(0, end - ts)
+            last_at[val] = max(last_at.get(val, end), end)
+
+        qualified = [s for s, dur in held.items() if dur >= min_hold_s]
+        if not qualified:
+            return None, None, held
+        best = max(qualified)
+        return best, last_at.get(best), held
+
+    def _peer_predates(
+        self,
+        ctx: Any,
+        port: Entity,
+        switches: dict[int, Entity],
+        observed_ts: Optional[int],
+    ) -> bool:
+        """True when the wired peer on this port is old enough to own the history.
+
+        The observed arm reads a speed the *port* once held and attributes it to
+        the device on that port now. Swap a 2.5G workstation for a 1G printer and
+        that inference inverts: the printer looks like a broken pair for as long
+        as the lookback runs. So a peer first seen *after the link last held that
+        speed* cannot be credited with it.
+
+        The comparison is against ``observed_ts`` -- when the speed was actually
+        held -- and not against the start of the lookback window. Those differ in
+        both directions and both are wrong: a peer present for the whole fast
+        stretch but first seen mid-window would be rejected despite having
+        demonstrably run at that speed, and on a store younger than the lookback
+        *every* peer would read as a newcomer, silently disabling this arm across
+        the entire site until the database aged past a week.
+
+        Where several peers claim one port, the NEWEST wins. A departed device's
+        entity lingers with its old ``sw_port``, so taking the oldest would let a
+        ghost vouch for the newcomer that replaced it -- the exact swap this
+        guard exists to catch.
+
+        Unknown peers (no port map, no wired client, no first-seen) return True:
+        this guard only ever *suppresses* on positive evidence of a newcomer,
+        never on absence. Note this leaves it inert on infra ports, whose peer is
+        an AP or switch rather than a client.
+        """
+        if observed_ts is None:
+            return True
         switch = switches.get(port.parent_id) if port.parent_id is not None else None
-        if switch is not None and neg == 100:
-            candidates = _peers_on_port(ctx, switch.entity_id, port)
-            if candidates:
-                confounders.append("known_100mbps_device_class")
-                match = next((c for c in candidates if _matches_known_100mbps(c)), None)
-                if match is not None:
-                    # Say so. A suppressed finding is never constructed, so the
-                    # confounder list dies with it and the operator is left with
-                    # an absence they cannot explain -- exactly the silence that
-                    # made the un-shipped device KB invisible for so long.
-                    _log.info(
-                        "bad_cable: %s negotiated %s of %s Mbps, downshift not reported "
-                        "-- peer %r is a known 10/100-by-design class",
-                        port.native_id,
-                        neg,
-                        cap,
-                        match.name,
-                    )
-                    return None
-        confounders.append("port_gigabit_capable")
-        return {"negotiated_speed": neg, "port_capable_speed": cap}
+        if switch is None:
+            return True
+        peers = _peers_on_port(ctx, switch.entity_id, port)
+        first_seen = [p.first_seen_ts for p in peers if p.first_seen_ts is not None]
+        if not first_seen:
+            return True
+        return max(int(f) for f in first_seen) <= int(observed_ts)
+
+    def _explained_by_peer_class(
+        self,
+        ctx: Any,
+        port: Entity,
+        switches: dict[int, Entity],
+        neg: int,
+        ceiling: int,
+        confounders: list[str],
+    ) -> bool:
+        """True when a peer that is 10/100 by design explains the negotiated speed.
+
+        Only a 100 Mbps link can be explained that way -- a 10/100 device sitting
+        at *10* is 100BASE-TX falling back, which is the broken-pair signature this
+        check exists to catch, so it is never explained away by device class.
+        """
+        if neg != 100:
+            return False
+        switch = switches.get(port.parent_id) if port.parent_id is not None else None
+        if switch is None:
+            return False
+        candidates = _peers_on_port(ctx, switch.entity_id, port)
+        if not candidates:
+            return False
+        confounders.append("known_100mbps_device_class")
+        match = next((c for c in candidates if _matches_known_100mbps(c)), None)
+        if match is None:
+            return False
+        # Say so. A suppressed finding is never constructed, so the confounder
+        # list dies with it and the operator is left with an absence they cannot
+        # explain -- exactly the silence that made the un-shipped device KB
+        # invisible for so long.
+        _log.info(
+            "bad_cable: %s negotiated %s of %s Mbps, downshift not reported "
+            "-- peer %r is a known 10/100-by-design class",
+            port.native_id,
+            neg,
+            ceiling,
+            match.name,
+        )
+        return True
 
 
 def _speed_caps_max(caps: Any) -> Optional[int]:
@@ -557,9 +767,16 @@ class DuplexMismatchDetector:
 # wired.port_flapping
 # ====================================================================== #
 class PortFlappingDetector:
-    """``wired.port_flapping`` — link transitions above a short/long tier.
+    """``wired.port_flapping`` — link transitions above a short/long/daily tier.
 
-    Counts recorded ``up`` transitions in a short (10 min) and long (1 h) window.
+    Counts recorded ``up`` transitions in a short (10 min), long (1 h) and
+    sustained (24 h) window. The sustained tier exists because the first two only
+    see a link that is failing *fast*: a port that drops once or twice an hour,
+    all day and all night, never puts 5 transitions in any 10-minute window and
+    so stayed invisible. That slow-burn shape is what a marginal cable, a
+    power-managed NIC or a dying USB adapter actually produces, and it is just as
+    disruptive to the person using the port — so it carries the same severity.
+
     A PoE port whose draw falls to ~0 between transitions is a powered-device
     reboot loop (recorded in evidence). Infra/uplink ports escalate to P1.
     """
@@ -573,24 +790,44 @@ class PortFlappingDetector:
             return UNKNOWN
         short_s = int(ctx.threshold(self.key, "window_short_s", 600))
         long_s = int(ctx.threshold(self.key, "window_long_s", 3600))
+        sustained_s = int(ctx.threshold(self.key, "window_sustained_s", 86400))
         n_short = int(ctx.threshold(self.key, "transitions_short", 5))
         n_long = int(ctx.threshold(self.key, "transitions_long", 10))
+        n_sustained = int(ctx.threshold(self.key, "transitions_sustained", 12))
         poe_floor = float(ctx.threshold(self.key, "poe_reboot_floor_w", 0.5))
 
         switches = _switches_by_id(ctx)
         findings: list[Finding] = []
         for port in _ports(ctx):
-            history = ctx.repo.state_history(port.entity_id, "up", limit=500)
+            # A day of transitions on a badly flapping port is still only a few
+            # hundred rows, but ask for enough that the daily count is not capped.
+            history = ctx.repo.state_history(port.entity_id, "up", limit=2000)
             short_ct = sum(1 for r in history if int(r["ts"]) >= ctx.now_ts - short_s)
             long_ct = sum(1 for r in history if int(r["ts"]) >= ctx.now_ts - long_s)
-            if short_ct < n_short and long_ct < n_long:
+            sustained_ct = sum(1 for r in history if int(r["ts"]) >= ctx.now_ts - sustained_s)
+
+            # Tightest tier that tripped wins the headline: a port doing 6 in ten
+            # minutes is a different story from one doing 16 across a day, and the
+            # title must not quote a window that did not fire (a real stored issue
+            # reads "(0 transitions/10m)", which makes a true finding look broken).
+            tier = None
+            if short_ct >= n_short:
+                tier = (short_ct, "10m")
+            elif long_ct >= n_long:
+                tier = (long_ct, "1h")
+            elif sustained_ct >= n_sustained:
+                tier = (sustained_ct, "24h")
+            if tier is None:
                 continue
+            tier_ct, tier_label = tier
 
             evidence: dict[str, Any] = {
                 "transitions_short": short_ct,
                 "transitions_long": long_ct,
+                "transitions_sustained": sustained_ct,
                 "window_short_s": short_s,
                 "window_long_s": long_s,
+                "window_sustained_s": sustained_s,
             }
             confounders = ["coverage_gated", "sustained_transition_count"]
 
@@ -612,7 +849,7 @@ class PortFlappingDetector:
                     self.key,
                     port,
                     sev,
-                    f"Port flapping: {label} ({short_ct} transitions/10m)",
+                    f"Port flapping: {label} ({tier_ct} transitions/{tier_label})",
                     evidence,
                     confounders,
                 )

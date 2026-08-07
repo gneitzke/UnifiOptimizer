@@ -292,9 +292,13 @@ _PLAYBOOKS: dict[str, Playbook] = {
     ),
     "wired.bad_cable": Playbook(
         signature="rx_errors delta rate > 10/min sustained or > 0.001% of packets; OR a "
-        "gigabit-capable peer negotiated at 10/100 (broken-pair downshift).",
-        confounders="Known 100 Mbps device classes; counter age (a stale cumulative counter); "
-        "an unmanaged-switch hop hiding the real port.",
+        "gigabit-capable peer negotiated at 10/100; OR a port running below a speed it "
+        "held itself in the last 7 days (broken-pair downshift, rated or observed).",
+        confounders="Known 100 Mbps device classes (overruled only by an observed ceiling that "
+        "outlasts the current speed, so a brief blip cannot condemn a 10/100 device); counter "
+        "age (a stale cumulative counter); an unmanaged-switch hop hiding the real port; a "
+        "wired peer newer than the speed it would be credited with (a faster device swapped "
+        "out for a slower one).",
         fix_guidance="Reseat then replace the patch cable; re-test the run. On an uplink port "
         "this is P1: the whole segment rides it.",
         evidence_fields=(
@@ -303,6 +307,7 @@ _PLAYBOOKS: dict[str, Playbook] = {
             EvidenceField("error_packet_fraction", "Errors, share of packets", percent=True),
             EvidenceField("negotiated_speed", "Negotiated speed", "Mbps"),
             EvidenceField("port_capable_speed", "Port's rated speed", "Mbps"),
+            EvidenceField("observed_speed_max", "Speed this link has held", "Mbps"),
         ),
         confounder_notes={
             "coverage_gated": _coverage_note,
@@ -326,6 +331,22 @@ _PLAYBOOKS: dict[str, Playbook] = {
                 f"Mbps against a {_n(ev.get('port_capable_speed'), 0)} Mbps ceiling, and no known "
                 "10/100 device explains it."
                 if ev.get("negotiated_speed") is not None
+                else None
+            ),
+            "peer_predates_observed_speed": lambda ev: (
+                "Peer age checked: the wired device on this port was already here before the "
+                f"link last held {_n(ev.get('observed_speed_max'), 0)} Mbps, so that speed is "
+                "this device's own history — not a faster machine that used to sit here."
+                if ev.get("observed_speed_max") is not None
+                else None
+            ),
+            "observed_speed_regression": lambda ev: (
+                f"Measured against this link's own history: it has held "
+                f"{_n(ev.get('observed_speed_max'), 0)} Mbps recently and is now at "
+                f"{_n(ev.get('negotiated_speed'), 0)} Mbps, so the peer is provably capable of "
+                "the higher speed and something on the run is holding it back. A device that "
+                "simply cannot go faster would never have linked faster."
+                if ev.get("observed_speed_max") is not None
                 else None
             ),
         },
@@ -354,26 +375,44 @@ _PLAYBOOKS: dict[str, Playbook] = {
         },
     ),
     "wired.port_flapping": Playbook(
-        signature="≥5 link transitions/10 min or ≥10/h from events; infra ports weighted higher; "
+        signature="≥5 link transitions/10 min, ≥10/h, or ≥12/24 h; infra ports weighted higher; "
         "PoE draw dropping to 0 between flaps signals a reboot loop.",
         confounders="A laptop docking/undocking; scheduled device reboots.",
         fix_guidance="Reseat cable/SFP; on a PoE reboot loop check the PoE budget and power-"
-        "cycle the port; replace the cable if errors persist.",
+        "cycle the port; replace the cable if errors persist. A port that only trips the 24 h "
+        "tier — dropping steadily around the clock rather than in bursts — is more often the "
+        "device end than the run: check NIC/adapter power management before re-cabling.",
         evidence_fields=(
             EvidenceField("transitions_short", "Transitions, short window"),
             EvidenceField("window_short_s", "Short window", duration=True),
             EvidenceField("transitions_long", "Transitions, long window"),
             EvidenceField("window_long_s", "Long window", duration=True),
+            EvidenceField("transitions_sustained", "Transitions, sustained window"),
+            EvidenceField("window_sustained_s", "Sustained window", duration=True),
             EvidenceField("poe_reboot_loop", "PoE reboot loop"),
             EvidenceField("poe_min_w", "PoE draw, min", "W"),
             EvidenceField("poe_max_w", "PoE draw, max", "W"),
         ),
         confounder_notes={
             "coverage_gated": _coverage_note,
+            # The sustained clause is guarded because issues predating that tier
+            # carry no such evidence: a resolved port_flapping issue never gets
+            # its evidence refreshed, so an unguarded f-string renders the old
+            # shape as "unknown in unknown" forever. Same contract as every other
+            # note here -- a missing key falls back, never fabricates.
             "sustained_transition_count": lambda ev: (
                 f"Sustained, not a blip: {_n(ev.get('transitions_short'), 0)} transitions in the "
-                f"last {_dur(ev.get('window_short_s'))} ({_n(ev.get('transitions_long'), 0)} in "
-                f"{_dur(ev.get('window_long_s'))})."
+                f"last {_dur(ev.get('window_short_s'))}, {_n(ev.get('transitions_long'), 0)} in "
+                f"{_dur(ev.get('window_long_s'))}"
+                + (
+                    f", {_n(ev.get('transitions_sustained'), 0)} in "
+                    f"{_dur(ev.get('window_sustained_s'))}. A link that drops steadily all day "
+                    "trips the widest window even when no single burst is fast enough for the "
+                    "others."
+                    if ev.get("transitions_sustained") is not None
+                    and ev.get("window_sustained_s") is not None
+                    else "."
+                )
             ),
             # The evidence, not the confounder key, carries the verdict: this key only
             # means PoE data existed to check, not that a reboot loop was confirmed

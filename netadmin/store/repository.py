@@ -1133,17 +1133,32 @@ class Repository:
                 "DELETE FROM poll_runs WHERE ts < ?", (raw_before,)
             ).rowcount
             events_deleted = conn.execute("DELETE FROM events WHERE ts < ?", (raw_before,)).rowcount
-            # state_changes is pruned past the raw window too, but the *latest*
-            # row per (entity, attr) is always kept even when it is older than the
-            # window: it is the current value current_state() reads back, so
-            # dropping it would erase the entity's present state (e.g. a firmware
-            # set once a year ago and never changed since). Only superseded
-            # history past the window is discarded.
+            # state_changes is pruned past the raw window too, but TWO rows per
+            # (entity, attr) are always kept even when older than the window,
+            # because both answer "what was the value at time T" for a T we still
+            # serve:
+            #
+            #   * the *latest* row -- the current value current_state() reads back,
+            #     so dropping it would erase the entity's present state (e.g. a
+            #     firmware set once a year ago and never changed since).
+            #   * the last row at or before the cutoff -- the value in effect
+            #     *entering* the retained window. Without it, any consumer
+            #     reconstructing a timeline sees an attribute that appears to
+            #     spring into existence mid-window. A port that linked at 2500
+            #     once, a year ago, and held it until last week records exactly
+            #     one 2500 row, dated a year back: prune it and the whole retained
+            #     window looks like the port has only ever run at its degraded
+            #     speed. wired.bad_cable's observed-ceiling arm reads precisely
+            #     this, and silently stops reporting without it.
+            #
+            # Both are one row per (entity, attr), so the bound stays trivial.
             state_changes_deleted = conn.execute(
                 "DELETE FROM state_changes WHERE ts < ? AND id NOT IN ("
                 "  SELECT MAX(id) FROM state_changes GROUP BY entity_id, attr"
+                ") AND id NOT IN ("
+                "  SELECT MAX(id) FROM state_changes WHERE ts < ? GROUP BY entity_id, attr"
                 ")",
-                (raw_before,),
+                (raw_before, raw_before),
             ).rowcount
         return {
             "raw": int(raw_deleted),
