@@ -1304,15 +1304,46 @@ class Repository:
             conn.execute(f"UPDATE issues SET {assignments} WHERE id=?", params)
 
     def delete_issue(self, issue_id: int) -> None:
-        """Delete an issue and its ``issue_events`` trail, in one transaction.
+        """Delete an issue and every row that references it, in one transaction.
 
         Used by the issue engine to discard an unconfirmed ``pending`` issue that
         clears before reaching M (section 7): deleting the row -- rather than
         resolving it -- keeps a later refire from reopening straight to active and
         skipping the M gate. SQL lives here, in the repository, by design (section
         4): callers reach this only through the ``delete_issue`` seam.
+
+        Every table that carries a FK to ``issues(id)`` must be cleared first, or
+        SQLite's (immediate) FK check aborts the whole delete. This bit us in
+        production: the ``correlate`` job roots an **incident** on an issue while it
+        is still pending, so when that issue later cleared unconfirmed the delete
+        hit ``FOREIGN KEY constraint failed`` and took down the entire nightly
+        detect pass (GitHub #34). ``delete_issue`` originally cleared only
+        ``issue_events``; ``incidents`` (0004), ``investigations``, and ``changes``
+        were added later and never joined the cascade. The semantics per child:
+
+        * ``incidents`` this issue **roots**: the incident's identity is that root,
+          so it goes too (its symptom members are freed, not deleted).
+        * ``incident_members``: this issue's membership in any incident is dropped.
+        * ``investigations``: an investigation of a discarded issue is moot.
+        * ``changes``: a real applied-config audit record -- detached (its
+          ``issue_id`` is nullable by design), not deleted.
+        * ``issues.reopened_from``: a later issue's lineage pointer back to this one
+          is nulled so the back-reference cannot dangle.
         """
         with self._write() as conn:
+            rooted = [
+                int(r[0])
+                for r in conn.execute(
+                    "SELECT id FROM incidents WHERE root_issue_id=?", (issue_id,)
+                ).fetchall()
+            ]
+            for inc_id in rooted:
+                conn.execute("DELETE FROM incident_members WHERE incident_id=?", (inc_id,))
+                conn.execute("DELETE FROM incidents WHERE id=?", (inc_id,))
+            conn.execute("DELETE FROM incident_members WHERE issue_id=?", (issue_id,))
+            conn.execute("DELETE FROM investigations WHERE issue_id=?", (issue_id,))
+            conn.execute("UPDATE changes SET issue_id=NULL WHERE issue_id=?", (issue_id,))
+            conn.execute("UPDATE issues SET reopened_from=NULL WHERE reopened_from=?", (issue_id,))
             conn.execute("DELETE FROM issue_events WHERE issue_id=?", (issue_id,))
             conn.execute("DELETE FROM issues WHERE id=?", (issue_id,))
 

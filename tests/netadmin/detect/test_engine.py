@@ -124,6 +124,27 @@ def test_firewall_failure_annotates_the_poll_run(repo: Repository) -> None:
     assert "1 detector(s) failed" in row["error"]
 
 
+def test_pass_level_crash_records_the_error_on_the_poll_run(repo: Repository) -> None:
+    """A *pass-level* exception (e.g. ``process_cycle`` raising, exactly as GitHub
+    #34's FK crash did) must reach ``poll_runs.error``, not only the app log. It
+    used to leave ``ok=0`` with a NULL error, because the error string was built
+    solely from the per-detector failure count, which is empty for a pass crash --
+    so the DB gave no hint why the nightly pass was failing."""
+    good = StubDetector("t.ok", Cadence.FAST, lambda ctx: [make_finding("t.ok")])
+    stack = build_stack(repo, catalog=build_catalog([entry(good)]))
+
+    def _explode(*args, **kwargs):
+        raise RuntimeError("issue engine blew up")
+
+    stack.issue_engine.process_cycle = _explode  # crash the pass after the detector loop
+    result = stack.detector_engine.run_fast(NOW)
+
+    assert result.ok is False
+    row = repo.read_poll_runs("detect_fast", NOW - 1, NOW + 1)[0]
+    assert row["ok"] == 0
+    assert "issue engine blew up" in row["error"]  # the fault reached the DB row
+
+
 # ---------------------------------------------------------------------- #
 # UNKNOWN vs clear — the crux
 # ---------------------------------------------------------------------- #

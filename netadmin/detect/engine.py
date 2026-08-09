@@ -251,6 +251,7 @@ class DetectorEngine:
         """
         started = time.monotonic()
         ok = True
+        pass_error: Optional[str] = None
         findings: list[Finding] = []
         cleared: set[str] = set()
         frozen: set[str] = set()
@@ -291,12 +292,23 @@ class DetectorEngine:
                 unknown=sorted(frozen),
                 absent=sorted(absent),
             )
-        except Exception:  # noqa: BLE001 - a pass never crashes the caller
+        except Exception as exc:  # noqa: BLE001 - a pass never crashes the caller
             ok = False
+            # Record the fault on the poll_runs row too, not only in the log. A
+            # pass-level crash leaves failed_detectors empty (it fires after the
+            # detector loop), so without this the row read ok=0 / error=NULL and the
+            # traceback lived only in the app log -- invisible to anyone reading the
+            # DB (GitHub #34).
+            pass_error = repr(exc)[:500]
             _log.exception("detection %s pass failed", cadence.value)
         duration_ms = int((time.monotonic() - started) * 1000)
         self._record_pass(
-            cadence, now, ok=ok, failed=len(failed_detectors), duration_ms=duration_ms
+            cadence,
+            now,
+            ok=ok,
+            failed=len(failed_detectors),
+            duration_ms=duration_ms,
+            error=pass_error,
         )
         return PassResult(
             cadence=cadence,
@@ -473,8 +485,12 @@ class DetectorEngine:
         ok: bool,
         failed: int,
         duration_ms: Optional[int],
+        error: Optional[str] = None,
     ) -> None:
-        error = f"{failed} detector(s) failed" if failed else None
+        # A pass-level crash (``error`` set) is the headline; the per-detector
+        # count is the fallback note when the pass itself completed.
+        if error is None and failed:
+            error = f"{failed} detector(s) failed"
         try:
             self._repo.record_poll_run(
                 job=_pass_job(cadence),

@@ -493,6 +493,136 @@ def test_delete_issue_removes_row_and_trail(repo: Repository, switch_entity_id: 
     assert repo.list_issue_events(iid) == []
 
 
+def test_delete_issue_discards_the_incident_it_roots(
+    repo: Repository, switch_entity_id: int
+) -> None:
+    """The GitHub #34 regression: ``correlate`` roots an incident on an issue while
+    it is still pending, so when that issue clears unconfirmed the discard delete
+    used to hit ``FOREIGN KEY constraint failed`` and crash the whole detect pass.
+
+    Deleting the root must succeed, take its incident (and the membership rows)
+    with it, and leave the symptom issue -- which is not being discarded -- intact.
+    """
+    root = repo.insert_issue(
+        fingerprint="fp-root",
+        detector_key="wifi.tx_power_loud",
+        severity="p3",
+        state="pending",
+        first_seen_ts=100,
+        last_seen_ts=100,
+        title="loud",
+        entity_id=switch_entity_id,
+    )
+    symptom = repo.insert_issue(
+        fingerprint="fp-sym",
+        detector_key="wifi.coverage_hole",
+        severity="p3",
+        state="pending",
+        first_seen_ts=100,
+        last_seen_ts=100,
+        title="hole",
+        entity_id=switch_entity_id,
+    )
+    inc = repo.insert_incident(
+        fingerprint="inc-1",
+        root_issue_id=root,
+        severity="p3",
+        state="open",
+        first_seen_ts=100,
+        last_seen_ts=100,
+        title="incident",
+    )
+    repo.replace_incident_members(
+        inc,
+        [
+            {"issue_id": root, "role": "root", "rule": "r", "rationale": "why"},
+            {"issue_id": symptom, "role": "symptom", "rule": "r", "rationale": "why"},
+        ],
+    )
+
+    repo.delete_issue(root)  # must not raise
+
+    assert repo.get_issue(root) is None
+    assert repo.get_incident(inc) is None  # the incident it anchored is gone
+    assert repo.list_incident_members(inc) == []  # membership rows gone with it
+    assert repo.get_issue(symptom) is not None  # a symptom issue is freed, not deleted
+
+
+def test_delete_issue_clears_every_child_reference(repo: Repository, switch_entity_id: int) -> None:
+    """Every table with a FK to ``issues(id)`` is handled by the cascade, with the
+    semantics each relationship calls for: membership in another incident is
+    dropped, an investigation is deleted, an applied change is *detached* (its audit
+    row survives with a NULL issue_id), and a later issue's ``reopened_from`` pointer
+    back to this one is nulled rather than left dangling.
+    """
+    target = repo.insert_issue(
+        fingerprint="fp-target",
+        detector_key="wired.bad_cable",
+        severity="p2",
+        state="pending",
+        first_seen_ts=100,
+        last_seen_ts=100,
+        title="t",
+        entity_id=switch_entity_id,
+    )
+    other_root = repo.insert_issue(
+        fingerprint="fp-otherroot",
+        detector_key="wifi.airtime_saturation",
+        severity="p2",
+        state="active",
+        first_seen_ts=100,
+        last_seen_ts=100,
+        title="o",
+        entity_id=switch_entity_id,
+    )
+    # target is a *symptom* member of an incident rooted elsewhere; that incident
+    # must survive, minus target's membership row.
+    inc = repo.insert_incident(
+        fingerprint="inc-other",
+        root_issue_id=other_root,
+        severity="p2",
+        state="open",
+        first_seen_ts=100,
+        last_seen_ts=100,
+        title="i",
+    )
+    repo.replace_incident_members(
+        inc,
+        [
+            {"issue_id": other_root, "role": "root", "rule": "r", "rationale": "w"},
+            {"issue_id": target, "role": "symptom", "rule": "r", "rationale": "w"},
+        ],
+    )
+    repo.insert_investigation(issue_id=target, provider="manual", dossier_md="d")
+    change_id = repo.insert_change(
+        action="set_power",
+        before={"tx": "high"},
+        after={"tx": "auto"},
+        status="applied",
+        issue_id=target,
+        entity_id=switch_entity_id,
+    )
+    later = repo.insert_issue(
+        fingerprint="fp-later",
+        detector_key="wired.bad_cable",
+        severity="p2",
+        state="pending",
+        first_seen_ts=200,
+        last_seen_ts=200,
+        title="l",
+        entity_id=switch_entity_id,
+        reopened_from=target,
+    )
+
+    repo.delete_issue(target)  # must not raise
+
+    assert repo.get_issue(target) is None
+    assert repo.get_incident(inc) is not None  # rooted elsewhere -> survives
+    assert all(m["issue_id"] != target for m in repo.list_incident_members(inc))
+    assert repo.get_change(change_id)["issue_id"] is None  # detached, not deleted
+    assert repo.get_issue(later)["reopened_from"] is None  # back-reference nulled
+
+
 # ---------------------------------------------------------------------------
 # Clear-streak resets — the count behind the "Recurring" label (Gitea #39)
 # ---------------------------------------------------------------------------
