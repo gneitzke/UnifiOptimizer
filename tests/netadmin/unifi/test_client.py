@@ -9,7 +9,11 @@ import httpx
 import pytest
 import respx
 
-from netadmin.ingest.unifi.auth import UnifiAmbiguousOutcomeError, UnifiError
+from netadmin.ingest.unifi.auth import (
+    UnifiAmbiguousOutcomeError,
+    UnifiAuthCooldownError,
+    UnifiError,
+)
 from netadmin.ingest.unifi.client import UnifiClient
 
 pytestmark = pytest.mark.asyncio
@@ -53,6 +57,28 @@ async def test_connect_is_idempotent():
     s2 = await client.connect()
     assert s1 is s2
     assert login.call_count == 1  # second connect does not re-login
+    await client.aclose()
+
+
+@respx.mock
+async def test_concurrent_auth_429_shares_retry_after_cooldown():
+    """One rejected login establishes a shared cooldown for the whole client."""
+    respx.get(OS_PROBE).mock(return_value=httpx.Response(401))
+    login = respx.post(OS_LOGIN).mock(
+        return_value=httpx.Response(429, headers={"Retry-After": "60"}, json={})
+    )
+    client = _client()
+
+    results = await asyncio.gather(*[client.connect() for _ in range(4)], return_exceptions=True)
+
+    assert login.call_count == 1
+    assert all(isinstance(exc, UnifiAuthCooldownError) for exc in results)
+    assert all(0 < exc.retry_after <= 60 for exc in results)
+
+    with pytest.raises(UnifiAuthCooldownError) as caught:
+        await client.connect()
+    assert caught.value.retry_after > 0
+    assert login.call_count == 1  # subsequent caller fails before another request
     await client.aclose()
 
 

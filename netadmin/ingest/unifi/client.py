@@ -28,8 +28,10 @@ import httpx
 from netadmin.logging import get_logger
 
 from .auth import (
+    DEFAULT_AUTH_COOLDOWN_SECONDS,
     AuthStrategy,
     UnifiAmbiguousOutcomeError,
+    UnifiAuthCooldownError,
     UnifiAuthError,
     UnifiConnectionError,
     UnifiError,
@@ -126,6 +128,12 @@ class UnifiClient:
         self._ws_strategy: Optional[AuthStrategy] = None
         self._ws_http: Optional[httpx.AsyncClient] = None
         self._auth_lock = asyncio.Lock()
+        # Authentication failures are session-wide state, just like successful
+        # authentication. The deadline is guarded by _auth_lock so callers queued
+        # behind one rejected login observe the same failure instead of each
+        # spending another controller login attempt.
+        self._auth_cooldown_until = 0.0
+        self._auth_failure_message: Optional[str] = None
         self._pace_lock = asyncio.Lock()
         self._last_request_ts = 0.0
         # Monotonic counter bumped on every successful (re)login. A request that
@@ -193,7 +201,45 @@ class UnifiClient:
         async with self._auth_lock:
             if self._strategy is not None and self._strategy.authenticated:
                 return self._strategy
-            self._strategy = await resolve_strategy(
+            return await self._connect_locked()
+
+    def _active_auth_cooldown(self) -> Optional[UnifiAuthCooldownError]:
+        """Return the shared cooldown error, if its monotonic deadline is active.
+
+        Must be called while holding :attr:`_auth_lock`.
+        """
+        remaining = self._auth_cooldown_until - time.monotonic()
+        if remaining <= 0:
+            self._auth_cooldown_until = 0.0
+            self._auth_failure_message = None
+            return None
+        return UnifiAuthCooldownError(remaining, self._auth_failure_message)
+
+    def _remember_auth_failure(self, exc: UnifiAuthError) -> None:
+        """Establish one shared quiet period after a refused auth attempt."""
+        delay = (
+            exc.retry_after
+            if isinstance(exc, UnifiAuthCooldownError)
+            else DEFAULT_AUTH_COOLDOWN_SECONDS
+        )
+        self._auth_cooldown_until = max(
+            self._auth_cooldown_until, time.monotonic() + max(0.0, delay)
+        )
+        self._auth_failure_message = (
+            exc.reason if isinstance(exc, UnifiAuthCooldownError) else str(exc)
+        )
+
+    def _clear_auth_failure(self) -> None:
+        self._auth_cooldown_until = 0.0
+        self._auth_failure_message = None
+
+    async def _connect_locked(self) -> AuthStrategy:
+        """Connect with ``_auth_lock`` held, sharing success and failure state."""
+        cooldown = self._active_auth_cooldown()
+        if cooldown is not None:
+            raise cooldown
+        try:
+            strategy = await resolve_strategy(
                 self._http,
                 host=self._host,
                 site=self._site,
@@ -201,8 +247,25 @@ class UnifiClient:
                 password=self._password,
                 api_key=self._api_key,
             )
-            self._login_epoch += 1
-            return self._strategy
+        except UnifiAuthError as exc:
+            self._remember_auth_failure(exc)
+            raise
+        self._strategy = strategy
+        self._clear_auth_failure()
+        self._login_epoch += 1
+        return strategy
+
+    async def _authenticate_locked(self, strategy: AuthStrategy, http: httpx.AsyncClient) -> None:
+        """Authenticate an existing strategy with shared cooldown handling."""
+        cooldown = self._active_auth_cooldown()
+        if cooldown is not None:
+            raise cooldown
+        try:
+            await strategy.authenticate(http)
+        except UnifiAuthError as exc:
+            self._remember_auth_failure(exc)
+            raise
+        self._clear_auth_failure()
 
     async def _relogin(self, observed_epoch: Optional[int] = None) -> None:
         """Force a fresh login on the current strategy (401 recovery).
@@ -220,10 +283,10 @@ class UnifiClient:
             if observed_epoch is not None and observed_epoch != self._login_epoch:
                 return  # someone already re-logged in for this epoch; reuse it
             if self._strategy is None:
-                await self.connect()
+                await self._connect_locked()
                 return
             self._strategy.authenticated = False
-            await self._strategy.authenticate(self._http)
+            await self._authenticate_locked(self._strategy, self._http)
             self._login_epoch += 1
 
     async def ws_strategy(self, *, force_reauth: bool = False) -> AuthStrategy:
@@ -249,7 +312,7 @@ class UnifiClient:
                 # a forced re-auth by re-running the login on that shared strategy.
                 if force_reauth:
                     self._strategy.authenticated = False
-                    await self._strategy.authenticate(self._http)
+                    await self._authenticate_locked(self._strategy, self._http)
                 return self._strategy
             if not (self._username and self._password):
                 raise UnifiAuthError(
@@ -281,7 +344,7 @@ class UnifiClient:
                 else LegacyCookieAuth
             )
             cookie = cookie_cls(self._host, self._site, self._username, self._password)
-            await cookie.authenticate(self._ws_http)
+            await self._authenticate_locked(cookie, self._ws_http)
             self._ws_strategy = cookie
             return cookie
 

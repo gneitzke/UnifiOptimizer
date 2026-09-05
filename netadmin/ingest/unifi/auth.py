@@ -29,6 +29,8 @@ import abc
 import base64
 import binascii
 import json
+import time
+from email.utils import parsedate_to_datetime
 from typing import Any, Optional
 
 import httpx
@@ -43,6 +45,11 @@ _MUTATING = frozenset({"POST", "PUT", "DELETE", "PATCH"})
 
 # UniFi OS returns this (non-standard) status on a login that needs 2FA.
 HTTP_2FA_REQUIRED = 499
+
+# A refused authentication without an explicit server cooldown still needs a
+# short client-side quiet period. Otherwise a fan-out of callers serialised by
+# the auth lock simply turns into a fan-out of failed login requests.
+DEFAULT_AUTH_COOLDOWN_SECONDS = 30.0
 
 # JWT cookie names that may carry a CSRF claim.
 _JWT_COOKIE_NAMES = ("TOKEN", "AUTH_TOKEN")
@@ -75,8 +82,34 @@ class UnifiAuthError(UnifiError):
     """Authentication was refused or could not be established."""
 
 
+class UnifiAuthCooldownError(UnifiAuthError):
+    """Authentication is rate-limited until ``retry_after`` seconds elapse."""
+
+    def __init__(self, retry_after: float, message: Optional[str] = None) -> None:
+        self.retry_after = max(0.0, float(retry_after))
+        self.reason = message or "Controller authentication is cooling down."
+        super().__init__(f"{self.reason} Retry in {self.retry_after:.1f}s.")
+
+
 class TwoFactorRequired(UnifiAuthError):
     """Login needs a 2FA token (HTTP 499). Cannot proceed non-interactively."""
+
+
+def retry_after_seconds(
+    response: httpx.Response, *, default: float = DEFAULT_AUTH_COOLDOWN_SECONDS
+) -> float:
+    """Parse HTTP ``Retry-After`` (seconds or an HTTP date) into a delay."""
+    value = response.headers.get("Retry-After")
+    if value:
+        try:
+            return max(0.0, float(value.strip()))
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(value)
+                return max(0.0, retry_at.timestamp() - time.time())
+            except (TypeError, ValueError, OverflowError):
+                pass
+    return float(default)
 
 
 # --------------------------------------------------------------------------- #
@@ -188,6 +221,10 @@ class ApiKeyAuth(AuthStrategy):
             resp = await http.get(url, headers=self.request_headers("GET"))
         except httpx.HTTPError as exc:  # pragma: no cover - transport
             raise UnifiConnectionError(f"API-key verification failed: {exc}") from exc
+        if resp.status_code == 429:
+            raise UnifiAuthCooldownError(
+                retry_after_seconds(resp), "API-key verification was rate-limited."
+            )
         if resp.status_code in (401, 403):
             raise UnifiAuthError(f"API key rejected ({resp.status_code}).")
         if resp.status_code >= 400:
@@ -231,6 +268,10 @@ class _CookieAuthBase(AuthStrategy):
         except httpx.HTTPError as exc:  # pragma: no cover - transport
             raise UnifiConnectionError(f"Login request failed: {exc}") from exc
 
+        if resp.status_code == 429:
+            raise UnifiAuthCooldownError(
+                retry_after_seconds(resp), "Controller login was rate-limited."
+            )
         if resp.status_code == HTTP_2FA_REQUIRED or self._is_2fa_body(resp):
             raise TwoFactorRequired(
                 "Controller requires a 2FA token; non-interactive login cannot proceed. "
@@ -323,6 +364,10 @@ async def _is_unifi_os(http: httpx.AsyncClient, host: str) -> bool:
         resp = await http.get(f"{host.rstrip('/')}/proxy/network/", follow_redirects=False)
     except httpx.HTTPError:
         return False
+    if resp.status_code == 429:
+        raise UnifiAuthCooldownError(
+            retry_after_seconds(resp), "Controller authentication probe was rate-limited."
+        )
     return resp.status_code in (200, 301, 302, 401, 403)
 
 
@@ -348,6 +393,10 @@ async def resolve_strategy(
         try:
             await strat.authenticate(http)
             return strat
+        except UnifiAuthCooldownError:
+            # A controller-wide rate limit is not an invalid API key and must
+            # not be followed by an immediate password-login attempt.
+            raise
         except UnifiAuthError as exc:
             logger.warning("API key present but rejected (%s); falling back to cookie.", exc)
 
@@ -368,6 +417,7 @@ __all__ = [
     "UnifiConnectionError",
     "UnifiAmbiguousOutcomeError",
     "UnifiAuthError",
+    "UnifiAuthCooldownError",
     "TwoFactorRequired",
     "AuthStrategy",
     "ApiKeyAuth",
@@ -378,4 +428,6 @@ __all__ = [
     "csrf_from_jwt",
     "csrf_from_cookies",
     "HTTP_2FA_REQUIRED",
+    "DEFAULT_AUTH_COOLDOWN_SECONDS",
+    "retry_after_seconds",
 ]
