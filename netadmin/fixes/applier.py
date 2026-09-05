@@ -13,20 +13,29 @@ row. A real apply is gated behind, in order:
 #. an injected writer -- absent it, we refuse rather than improvise;
 #. the max-N-steps / max-N-devices guard;
 #. the absolute min-RSSI rail: a step may only *remove* min-RSSI, never set it;
+#. the revertibility rail: the applier itself re-derives whether every step is
+   *genuinely* revertible under the current contract (a restorable before-state
+   whose replay the min-RSSI rail would not itself refuse) and refuses to send a
+   one-way/irreversible write, regardless of the planner's ``revertible`` flag;
 #. a precondition re-check of **every** step against freshly read live state --
-   any drift aborts the whole plan before a single call goes out.
+   any drift aborts the whole plan before a single call goes out. An empty
+   precondition is only "satisfied" when the target was actually read; a target
+   missing from the fresh snapshot is drift, never a free pass.
 
-Only past all six does it, per step: resolve the entity, write the before-state to
+Only past all gates does it, per step: resolve the entity, write the before-state to
 the ``changes`` ledger, send through the writer, and mark the row applied/failed.
 Before-state is captured first so a revert is always possible; a step's failure
-stops the plan rather than pressing on mutating.
+stops the plan rather than pressing on mutating. Apply and revert are serialized
+per target device so two operations on the same device can never interleave.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
-from typing import Any, Callable, Mapping, Optional
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Callable, Iterable, Mapping, Optional
 
 from netadmin.fixes.models import (
     ApplyResult,
@@ -87,6 +96,10 @@ class Applier:
         self.max_steps = max_steps
         self.max_devices = max_devices
         self._now_fn = now_fn or (lambda: int(time.time()))
+        # Per-device locks so a plan's apply and any revert on the same device are
+        # serialized -- concurrent mutations on one device must never interleave
+        # (C1). Keyed by the device id parsed from the endpoint.
+        self._device_locks: dict[str, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------ #
     # Dry run (default) -- pure render, no writer, no ledger
@@ -191,6 +204,12 @@ class Applier:
         # Gate 5: the absolute min-RSSI rail.
         self._assert_min_rssi_safe(plan)
 
+        # Gate 5b: the revertibility rail. The applier does not trust the planner's
+        # ``revertible`` flag -- it re-derives, per step, whether a genuine revert
+        # exists under the current contract, and refuses a one-way/irreversible
+        # write outright. Nothing that cannot be undone is ever applied.
+        self._assert_revertible(plan)
+
         # Gate 6: precondition re-check of every step -- any drift aborts the whole
         # plan before a single call is sent.
         drifted = self._precondition_drift(plan, current_state)
@@ -202,31 +221,34 @@ class Applier:
         results: list[StepResult] = []
         change_ids: list[int] = []
         applied_all = True
-        for step in plan.steps:
-            change_id = self._record_before(plan, step, now)
-            change_ids.append(change_id)
-            try:
-                write = await self._dispatch(step)
-            except Exception as exc:  # noqa: BLE001 - a transport failure is a step failure
-                self._store.update_change_status(change_id, _STATUS_FAILED)
-                results.append(StepResult(step, _STATUS_FAILED, change_id, None, str(exc)))
-                applied_all = False
-                _log.warning("fix step raised, stopping plan: %s", exc)
-                break
+        # Serialize the whole send loop against any other apply/revert touching the
+        # same device(s), so concurrent operations cannot interleave writes.
+        async with self._serialize(_endpoint_device(s.endpoint) for s in plan.steps):
+            for step in plan.steps:
+                change_id = self._record_before(plan, step, now)
+                change_ids.append(change_id)
+                try:
+                    write = await self._dispatch(step)
+                except Exception as exc:  # noqa: BLE001 - a transport failure is a step failure
+                    self._store.update_change_status(change_id, _STATUS_FAILED)
+                    results.append(StepResult(step, _STATUS_FAILED, change_id, None, str(exc)))
+                    applied_all = False
+                    _log.warning("fix step raised, stopping plan: %s", exc)
+                    break
 
-            if write.ok:
-                self._store.update_change_status(change_id, _STATUS_APPLIED)
-                results.append(StepResult(step, _STATUS_APPLIED, change_id, write))
-            else:
-                self._store.update_change_status(change_id, _STATUS_FAILED)
-                results.append(
-                    StepResult(
-                        step, _STATUS_FAILED, change_id, write, "controller returned non-2xx"
+                if write.ok:
+                    self._store.update_change_status(change_id, _STATUS_APPLIED)
+                    results.append(StepResult(step, _STATUS_APPLIED, change_id, write))
+                else:
+                    self._store.update_change_status(change_id, _STATUS_FAILED)
+                    results.append(
+                        StepResult(
+                            step, _STATUS_FAILED, change_id, write, "controller returned non-2xx"
+                        )
                     )
-                )
-                applied_all = False
-                _log.warning("fix step failed (status=%s), stopping plan", write.status_code)
-                break
+                    applied_all = False
+                    _log.warning("fix step failed (status=%s), stopping plan", write.status_code)
+                    break
 
         return ApplyResult(
             plan=plan,
@@ -266,6 +288,15 @@ class Applier:
         radio restore is requested without fresh state (the device could not be
         read) we refuse rather than restore blind -- never mutate on unverified
         state, exactly as the forward precondition re-check does.
+
+        The restore is built **fresh** from current live state (C1): only the
+        fields the original change actually touched are rolled back, layered on top
+        of every other field's current live value, so a revert can never clobber
+        unrelated work applied to the device since. If a touched field has drifted
+        to a third value (someone changed the very thing this change set), the
+        revert refuses with :class:`PreconditionDrift` and the operator must
+        re-approve the resulting payload. The send is serialized per device against
+        any concurrent apply/revert.
         """
         now = self._now_fn() if now is None else now
         row = self._store.get_change(change_id)
@@ -275,6 +306,7 @@ class Applier:
             raise FixError(f"change {change_id} already reverted")
 
         before = json.loads(row["before_json"]) if row["before_json"] else {}
+        after = json.loads(row["after_json"]) if row["after_json"] else {}
         body = before.get("body") if isinstance(before, dict) else None
         endpoint = before.get("endpoint") if isinstance(before, dict) else None
         if not body or not endpoint:
@@ -284,23 +316,94 @@ class Applier:
 
         # Re-gate a radio-config restore against fresh live state before sending.
         restore_radios = body.get("radio_table") if isinstance(body, dict) else None
+        restore_body: Mapping[str, Any] = body
         if restore_radios:
             if current_radios is None:
                 raise SafetyViolation(
                     f"revert of change {change_id} touches radio config but no fresh live "
                     "state was read; refusing to restore on unverified state"
                 )
-            self._assert_revert_min_rssi_safe(
-                change_id, restore_radios, current_radios, is_mesh_uplink
+            after_body = after.get("body") if isinstance(after, dict) else {}
+            fresh_table = self._fresh_restore_table(
+                change_id, body, after_body if isinstance(after_body, dict) else {}, current_radios
             )
+            self._assert_revert_min_rssi_safe(
+                change_id, fresh_table, current_radios, is_mesh_uplink
+            )
+            restore_body = {"radio_table": fresh_table}
 
         method = str(before.get("method") or "PUT")
-        write = await self._dispatch_raw(method, str(endpoint), body)
-        if write.ok:
-            self._store.update_change_status(change_id, _STATUS_REVERTED, reverted_ts=now)
-        else:
-            _log.warning("revert of change %s failed (status=%s)", change_id, write.status_code)
+        async with self._serialize([_endpoint_device(str(endpoint))]):
+            write = await self._dispatch_raw(method, str(endpoint), restore_body)
+            if write.ok:
+                self._store.update_change_status(change_id, _STATUS_REVERTED, reverted_ts=now)
+            else:
+                _log.warning(
+                    "revert of change %s failed (status=%s)", change_id, write.status_code
+                )
         return write
+
+    @staticmethod
+    def _fresh_restore_table(
+        change_id: int,
+        before_body: Mapping[str, Any],
+        after_body: Mapping[str, Any],
+        current_radios: Mapping[str, Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Build a revert ``radio_table`` that rolls back only the touched fields.
+
+        The original change's touched fields are those that differ between its
+        stored ``before`` and ``after`` bodies, per radio. The restore is the
+        *current live* table with only those fields set back to their before-value;
+        every other field keeps its current live value, so work applied to the
+        device after the original change survives the revert. A touched field whose
+        live value is neither the value we set nor the value we would restore has
+        been changed by someone else -- that is a conflict, and we refuse rather
+        than silently overwrite it.
+        """
+        before_radios = {
+            r.get("radio"): r for r in (before_body.get("radio_table") or []) if isinstance(r, dict)
+        }
+        after_radios = {
+            r.get("radio"): r for r in (after_body.get("radio_table") or []) if isinstance(r, dict)
+        }
+        touched: dict[Any, set[str]] = {}
+        for radio, aentry in after_radios.items():
+            bentry = before_radios.get(radio, {})
+            fields = {k for k, av in aentry.items() if bentry.get(k) != av}
+            if fields:
+                touched[radio] = fields
+
+        conflicts: list[str] = []
+        fresh: list[dict[str, Any]] = []
+        for radio_code, live_entry in current_radios.items():
+            entry = dict(live_entry)
+            for field in touched.get(radio_code, set()):
+                before_val = before_radios.get(radio_code, {}).get(field)
+                after_val = after_radios.get(radio_code, {}).get(field)
+                if field not in live_entry:
+                    conflicts.append(f"{radio_code}.{field} could not be read from live state")
+                    continue
+                live_val = live_entry.get(field)
+                if live_val != after_val and live_val != before_val:
+                    conflicts.append(
+                        f"{radio_code}.{field} is now {live_val!r}, not the {after_val!r} "
+                        "this change set"
+                    )
+                    continue
+                entry[field] = before_val
+            fresh.append(entry)
+
+        for radio_code in touched:
+            if radio_code not in current_radios:
+                conflicts.append(f"radio '{radio_code}' is no longer present in live state")
+
+        if conflicts:
+            raise PreconditionDrift(
+                f"revert of change {change_id} conflicts with newer live state "
+                f"({'; '.join(conflicts)}); re-open the fix plan and re-approve the payload"
+            )
+        return fresh
 
     # ------------------------------------------------------------------ #
     # Internals
@@ -335,24 +438,108 @@ class Applier:
             return await self._writer.post(endpoint, body)
         raise SafetyViolation(f"unsupported mutation method: {method}")
 
+    def _lock_for(self, key: str) -> asyncio.Lock:
+        lock = self._device_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._device_locks[key] = lock
+        return lock
+
+    @asynccontextmanager
+    async def _serialize(self, keys: Iterable[str]) -> AsyncIterator[None]:
+        """Hold the per-device lock(s) for ``keys`` for the duration of a mutation.
+
+        Locks are acquired in a stable sorted order so two operations touching the
+        same set of devices can never deadlock, and released in reverse. This is
+        what serializes a plan's apply against a concurrent revert on the same
+        device so their writes cannot interleave (C1).
+        """
+        ordered = sorted({k for k in keys if k})
+        locks = [self._lock_for(k) for k in ordered]
+        for lock in locks:
+            await lock.acquire()
+        try:
+            yield
+        finally:
+            for lock in reversed(locks):
+                lock.release()
+
+    def _assert_revertible(self, plan: FixPlan) -> None:
+        """Refuse to apply any step that is not genuinely revertible.
+
+        The applier does not trust ``step.revertible``: it re-derives the answer
+        from the step itself. A step is genuinely revertible only if it carries a
+        restorable before-state (a ``body`` and ``endpoint`` to replay) *and*
+        replaying that before-state would not itself be refused by the min-RSSI
+        rail. A transient command (a PoE power-cycle, ``before=None``) and a
+        min-RSSI removal (whose revert would re-enable min-RSSI, which the rail
+        forbids) are both one-way, so they are refused here -- they belong in an
+        advisory plan, surfaced as a recommendation, not executed as an
+        irreversible controller write.
+        """
+        for step in plan.steps:
+            if not self._step_genuinely_revertible(step):
+                raise SafetyViolation(
+                    f"step '{step.description}' is not genuinely revertible under the "
+                    "current contract (no restorable before-state, or its revert is barred "
+                    "by the min-RSSI rail); refusing to apply a one-way change"
+                )
+
+    @staticmethod
+    def _step_genuinely_revertible(step: FixStep) -> bool:
+        before = step.before
+        if not isinstance(before, dict):
+            return False
+        body = before.get("body")
+        endpoint = before.get("endpoint")
+        if not body or not endpoint:
+            return False
+        # Would replaying `before` re-enable or tighten min-RSSI relative to the
+        # state this step establishes (its payload)? If so, the revert would be
+        # refused by the rail, so the step is not genuinely revertible.
+        before_radios = {
+            r.get("radio"): r for r in (body.get("radio_table") or []) if isinstance(r, dict)
+        }
+        payload_radios = {
+            r.get("radio"): r
+            for r in ((step.payload or {}).get("radio_table") or [])
+            if isinstance(r, dict)
+        }
+        for radio, bentry in before_radios.items():
+            if not _truthy(bentry.get("min_rssi_enabled")):
+                continue
+            pentry = payload_radios.get(radio, {})
+            if not _truthy(pentry.get("min_rssi_enabled")):
+                return False  # revert would re-enable min-RSSI
+            bv, pv = bentry.get("min_rssi"), pentry.get("min_rssi")
+            if isinstance(bv, (int, float)) and isinstance(pv, (int, float)) and bv > pv:
+                return False  # revert would tighten an already-set floor
+        return True
+
     def _precondition_drift(
         self, plan: FixPlan, current_state: Mapping[str, Mapping[str, Any]]
     ) -> list[FixStep]:
         """Return the steps whose expected state no longer matches live state.
 
-        An empty ``expected`` always matches. A target absent from
-        ``current_state`` (we could not read it) counts as drift: we never mutate
-        on unverified state.
+        A target absent from ``current_state`` (we could not read it) counts as
+        drift: we never mutate on unverified state. Crucially this holds even when
+        ``expected`` is empty -- an empty precondition is "satisfied" only once the
+        target has actually been read. A step that reached the applier with an empty
+        precondition *because its snapshot was missing* must never sail through on
+        that emptiness; only a target that IS present with nothing left to assert
+        genuinely passes.
         """
         drifted: list[FixStep] = []
         for step in plan.steps:
             expected = step.precondition.expected
-            if not expected:
-                continue
             live = current_state.get(step.precondition.target_native_id)
             if live is None:
+                # Missing snapshot -> drift, whether or not there was anything to
+                # assert. An empty {} precondition is not a free pass.
                 drifted.append(step)
                 continue
+            if not expected:
+                continue  # read successfully, nothing left to assert -> satisfied
             # A key the live read could not produce is drift, not a match: an
             # expected value of None (a radio_table entry with no channel key)
             # must never be satisfied by the empty extract of a radio that has
@@ -440,6 +627,19 @@ class Applier:
                         f"revert of change {change_id} would tighten min-RSSI on radio "
                         f"'{radio}'; refused"
                     )
+
+
+def _endpoint_device(endpoint: str) -> str:
+    """The device id a site-relative endpoint mutates, used as the serialize key.
+
+    ``rest/device/<id>`` -> ``<id>``. Anything else (e.g. ``cmd/devmgr``) has no
+    stable device id in the path, so the endpoint itself is the key -- still a
+    correct, if coarser, serialization boundary.
+    """
+    parts = str(endpoint).strip("/").split("/")
+    if len(parts) >= 3 and parts[0] == "rest" and parts[1] == "device":
+        return parts[2]
+    return str(endpoint)
 
 
 def _truthy(value: Any) -> bool:

@@ -12,12 +12,9 @@ from netadmin.fixes.models import ActionType, plan_confirm_token
 from netadmin.fixes.planner import MAX_JOINT_CHANNEL_MOVES, plan_fix
 
 from .conftest import (
-    AP_ID,
-    AP_MAC,
     SW_MAC,
     make_ap_device,
     make_finding,
-    make_switch_device,
     port_entity,
     radio_entity,
     rf_entity,
@@ -31,7 +28,11 @@ def _radio(payload, band):
 # --------------------------------------------------------------------------- #
 # min-RSSI removal -- removal only, ever
 # --------------------------------------------------------------------------- #
-def test_min_rssi_plan_only_disables_and_preserves_other_radios(ap_device):
+def test_min_rssi_plan_is_advisory_because_removal_is_one_way(ap_device):
+    # Disabling min-RSSI is the right remediation, but re-enabling it is barred by
+    # an absolute safety rail, so the change has no genuine revert. An auto-applied
+    # fix must be reversible, so the planner surfaces it as an advisory
+    # recommendation rather than an executable (irreversible) step.
     finding = make_finding(
         "wifi.min_rssi_misconfig",
         radio_entity("ng"),
@@ -40,24 +41,12 @@ def test_min_rssi_plan_only_disables_and_preserves_other_radios(ap_device):
     )
     plan = plan_fix(finding, device=ap_device)
 
-    assert not plan.is_advisory
-    assert len(plan.steps) == 1
-    step = plan.steps[0]
-    assert step.action is ActionType.MIN_RSSI_REMOVE
-    assert step.method == "PUT"
-    assert step.endpoint == f"rest/device/{AP_ID}"
-    # The target radio is disabled; the min_rssi floor value is preserved (removal
-    # is a disable, not a rewrite), and the *other* radio is untouched.
-    ng = _radio(step.payload, "ng")
-    assert ng["min_rssi_enabled"] is False
-    assert ng["min_rssi"] == -75
-    assert _radio(step.payload, "na")["min_rssi_enabled"] is False
-    # Precondition: it must still be enabled to be worth removing.
-    assert step.precondition.expected == {"min_rssi_enabled": True}
-    assert step.precondition.target_native_id == f"{AP_MAC}:ng"
-    # Revert restores the original (enabled) table.
-    assert step.revertible is True
-    assert _radio(step.before["body"], "ng")["min_rssi_enabled"] is True
+    assert plan.is_advisory
+    assert plan.steps == []
+    assert plan.manual_action_required
+    note = (plan.advisory or "").lower()
+    assert "min-rssi" in note
+    assert "one-way" in note or "no automatic rollback" in note
 
 
 def test_min_rssi_plan_is_advisory_when_already_disabled():
@@ -69,15 +58,16 @@ def test_min_rssi_plan_is_advisory_when_already_disabled():
 
 
 def test_min_rssi_plan_never_emits_a_set_even_for_strict_floor(ap_device):
-    # The stricter-than-floor sub-case is still handled by *removal*, never by
-    # writing a looser floor -- the planner has no code path that enables min-RSSI.
+    # The stricter-than-floor sub-case is advisory too -- the planner has no code
+    # path that enables min-RSSI, and it renders no executable step at all.
     finding = make_finding(
         "wifi.min_rssi_misconfig",
         radio_entity("ng"),
         evidence={"reason": "stricter_than_floor", "min_rssi_dbm": -60, "on_mesh_ap": False},
     )
     plan = plan_fix(finding, device=ap_device)
-    assert plan.steps[0].payload["radio_table"][0]["min_rssi_enabled"] is False
+    assert plan.is_advisory
+    assert plan.steps == []
 
 
 # --------------------------------------------------------------------------- #
@@ -321,7 +311,10 @@ def test_tx_power_already_low_is_advisory():
 # --------------------------------------------------------------------------- #
 # PoE power-cycle -- reboot loop / fault only
 # --------------------------------------------------------------------------- #
-def test_poe_cycle_planned_for_reboot_loop(switch_device):
+def test_poe_cycle_for_reboot_loop_is_advisory_because_it_is_one_way(switch_device):
+    # A PoE power-cycle is a transient command with no stored before-state, so it
+    # has no genuine revert. Rather than execute an irreversible controller write,
+    # the planner surfaces it as an advisory recommendation naming the port.
     finding = make_finding(
         "wired.port_flapping",
         port_entity(5),
@@ -329,13 +322,12 @@ def test_poe_cycle_planned_for_reboot_loop(switch_device):
         evidence={"poe_reboot_loop": True, "poe_min_w": 0.0, "poe_max_w": 6.5},
     )
     plan = plan_fix(finding, device=switch_device)
-    step = plan.steps[0]
-    assert step.action is ActionType.POE_POWER_CYCLE
-    assert step.method == "POST"
-    assert step.endpoint == "cmd/devmgr"
-    assert step.payload == {"cmd": "power-cycle", "mac": SW_MAC, "port_idx": 5}
-    assert step.revertible is False  # a transient command, nothing to restore
-    assert step.before is None
+    assert plan.is_advisory
+    assert plan.steps == []
+    assert plan.manual_action_required
+    note = (plan.advisory or "").lower()
+    assert "power-cycle" in note
+    assert str(SW_MAC) in note
 
 
 def test_port_flapping_without_reboot_loop_is_advisory(switch_device):

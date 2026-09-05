@@ -220,20 +220,28 @@ class FixService:
             confirm_token=confirm_token,
             current_state=current_state,
         )
-        # Arm on "did we change the network at all", NOT on "did every step land".
-        # A multi-step plan that applies step 1 and fails step 2 reports
-        # applied=False while carrying real change_ids: the controller was written
-        # to and the ledger holds those rows. Keying arming off `applied` left that
-        # case unverified forever, which is the worst of both worlds -- a live
-        # change nothing is watching. Single-step plans are unaffected, since there
-        # applied and change_ids agree.
-        if result.change_ids and plan.issue_id is not None:
+        # Arm on "which step(s) actually landed", NOT on "was any row written".
+        # ``result.change_ids`` records EVERY attempted step, including one whose
+        # send failed (its ledger row is marked failed but the id is still there).
+        # Arming off that set credited a completely-failed apply as applied and
+        # armed a verification window nothing had earned -- a later, unrelated
+        # recovery would then be mistaken for this fix working (C6). Arm only for
+        # the changes whose write is confirmed OK, and associate the window with
+        # exactly those. A partial apply (step 1 landed, step 2 failed) still arms,
+        # because step 1 genuinely changed the network; a first-step failure does
+        # not, because nothing landed.
+        applied_change_ids = [
+            s.change_id
+            for s in result.steps
+            if s.change_id is not None and s.write is not None and s.write.ok
+        ]
+        if applied_change_ids and plan.issue_id is not None:
             self._verifier.arm(
                 plan.issue_id,
                 self._now_fn(),
                 detail={
                     "action": plan.steps[0].action.value if plan.steps else None,
-                    "change_ids": result.change_ids,
+                    "change_ids": applied_change_ids,
                     "partial": not result.applied,
                 },
             )

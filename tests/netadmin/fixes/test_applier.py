@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from netadmin.domain.types import EntityType, Severity
+from netadmin.domain.types import EntityType
 from netadmin.fixes import writer as writer_mod
 from netadmin.fixes.applier import Applier
 from netadmin.fixes.models import (
@@ -33,7 +33,7 @@ from netadmin.fixes.models import (
 from netadmin.fixes.planner import plan_fix
 from netadmin.fixes.writer import FakeControllerWriter
 
-from .conftest import AP_ID, AP_MAC, SW_MAC, make_ap_device, make_finding, radio_entity
+from .conftest import AP_ID, AP_MAC, make_ap_device, make_finding, radio_entity
 
 pytestmark = pytest.mark.asyncio
 
@@ -240,47 +240,49 @@ async def test_revert_restores_before_state(store, ap_device):
     )
     change_id = result.change_ids[0]
 
-    # Fresh live radio state (post-apply): min-RSSI unchanged by a channel fix, so
-    # restoring the original radio_table is not a min-RSSI re-enable.
+    # Fresh live radio state (post-apply): full radio entries, min-RSSI unchanged
+    # by a channel fix. The revert restores only the touched field (channel) on top
+    # of current live values.
     live_radios = {
-        "ng": {"min_rssi_enabled": True, "min_rssi": -75},
-        "na": {"min_rssi_enabled": False, "min_rssi": 0},
+        "ng": {
+            "radio": "ng",
+            "channel": 3,
+            "min_rssi_enabled": True,
+            "min_rssi": -75,
+            "tx_power_mode": "high",
+        },
+        "na": {"radio": "na", "channel": 36, "min_rssi_enabled": False, "min_rssi": 0},
     }
     revert = await applier.revert(change_id, current_radios=live_radios)
 
     assert revert.ok
-    # The revert PUT carries the ORIGINAL radio_table (channel back to 3).
+    # The revert PUT carries the ORIGINAL channel (back to 3).
     last = writer.calls[-1]
     assert last.method == "PUT"
     assert last.endpoint == f"rest/device/{AP_ID}"
-    assert last.body["radio_table"][0]["channel"] == 3
+    assert next(r for r in last.body["radio_table"] if r["radio"] == "ng")["channel"] == 3
     row = store.get_change(change_id)
     assert row["status"] == "reverted"
     assert row["reverted_ts"] is not None
 
 
-async def test_revert_of_nonrevertible_change_is_refused(store, switch_device):
-    from .conftest import port_entity
-
+async def test_revert_of_nonrevertible_change_is_refused(store):
     writer = FakeControllerWriter()
     applier = Applier(store, writer)
-    finding = make_finding(
-        "wired.port_flapping",
-        port_entity(5),
-        severity=Severity.P1,
-        evidence={"poe_reboot_loop": True},
+    # A transient command (e.g. a PoE power-cycle) stores no before-body, so it
+    # cannot be reverted. Such a change never reaches the ledger through a real
+    # apply now -- it is advisory -- but a legacy / hand-inserted row must still be
+    # refused cleanly rather than crash.
+    change_id = store.insert_change(
+        action="wired.poe_power_cycle",
+        before={"method": "POST", "endpoint": "cmd/devmgr", "body": {}},
+        after={"method": "POST", "endpoint": "cmd/devmgr", "body": {"cmd": "power-cycle"}},
+        status="applied",
+        ts=1,
     )
-    plan = plan_fix(finding, device=switch_device)
-    result = await applier.apply(
-        plan,
-        dry_run=False,
-        confirm_token=plan_confirm_token(plan),
-        current_state={f"{SW_MAC}:5": {"poe_mode": "auto"}},
-    )
-    assert result.applied is True
-    change_id = result.change_ids[0]
     with pytest.raises(FixError):
         await applier.revert(change_id)
+    assert writer.call_count == 0
 
 
 async def test_revert_unknown_change_raises(store):
@@ -292,42 +294,52 @@ async def test_revert_unknown_change_raises(store):
 # --------------------------------------------------------------------------- #
 # Revert is re-gated by the absolute min-RSSI rail (never a back door around it)
 # --------------------------------------------------------------------------- #
-def _min_rssi_remove_plan(ap_device, issue_id=None):
-    finding = make_finding(
-        "wifi.min_rssi_misconfig",
-        radio_entity("ng"),
-        evidence={"reason": "mesh_uplink_ap", "on_mesh_ap": True},
+def _insert_min_rssi_removal_change(store):
+    """Insert a ledgered min-RSSI *removal* change directly.
+
+    min-RSSI removal is advisory now (it has no genuine revert), so it never
+    reaches the ledger through a real apply. To exercise the revert rail against a
+    legacy row, we insert one by hand: ``before`` has min-RSSI enabled, ``after``
+    has it disabled -- the shape an old, applied removal left behind.
+    """
+    endpoint = f"rest/device/{AP_ID}"
+    before_body = {
+        "radio_table": [
+            {"radio": "ng", "channel": 3, "min_rssi_enabled": True, "min_rssi": -75},
+            {"radio": "na", "channel": 36, "min_rssi_enabled": False, "min_rssi": 0},
+        ]
+    }
+    after_body = {
+        "radio_table": [
+            {"radio": "ng", "channel": 3, "min_rssi_enabled": False, "min_rssi": -75},
+            {"radio": "na", "channel": 36, "min_rssi_enabled": False, "min_rssi": 0},
+        ]
+    }
+    return store.insert_change(
+        action="wifi.min_rssi_remove",
+        before={"method": "PUT", "endpoint": endpoint, "body": before_body},
+        after={"method": "PUT", "endpoint": endpoint, "body": after_body},
+        status="applied",
+        ts=1,
     )
-    return plan_fix(finding, device=ap_device, issue_id=issue_id)
-
-
-async def _apply_min_rssi_removal(store, writer):
-    """Apply a genuine min-RSSI removal; return the ledgered change id."""
-    from .conftest import make_ap_device
-
-    ap_device = make_ap_device()  # ng radio has min_rssi_enabled=True
-    applier = Applier(store, writer)
-    plan = _min_rssi_remove_plan(ap_device)
-    result = await applier.apply(
-        plan,
-        dry_run=False,
-        confirm_token=plan_confirm_token(plan),
-        current_state={f"{AP_MAC}:ng": {"min_rssi_enabled": True}},
-    )
-    assert result.applied is True
-    return applier, result.change_ids[0]
 
 
 async def test_revert_that_would_reenable_min_rssi_is_refused(store):
     # Reverting a min-RSSI *removal* would set min-RSSI back on: the invariant
     # ("only ever removed, never set") forbids it. Live state now has it off.
     writer = FakeControllerWriter()
-    applier, change_id = await _apply_min_rssi_removal(store, writer)
-    calls_after_apply = writer.call_count
+    applier = Applier(store, writer)
+    change_id = _insert_min_rssi_removal_change(store)
 
     with pytest.raises(SafetyViolation):
-        await applier.revert(change_id, current_radios={"ng": {"min_rssi_enabled": False}})
-    assert writer.call_count == calls_after_apply  # revert sent nothing
+        await applier.revert(
+            change_id,
+            current_radios={
+                "ng": {"radio": "ng", "channel": 3, "min_rssi_enabled": False, "min_rssi": 0},
+                "na": {"radio": "na", "channel": 36, "min_rssi_enabled": False, "min_rssi": 0},
+            },
+        )
+    assert writer.call_count == 0  # revert sent nothing
     assert store.get_change(change_id)["status"] != "reverted"
 
 
@@ -335,28 +347,31 @@ async def test_revert_enabling_min_rssi_on_mesh_uplink_is_refused(store):
     # Even if min-RSSI happened to be on live, restoring it on an AP that is now a
     # mesh uplink is refused outright (mesh min-RSSI is removal-only).
     writer = FakeControllerWriter()
-    applier, change_id = await _apply_min_rssi_removal(store, writer)
-    calls_after_apply = writer.call_count
+    applier = Applier(store, writer)
+    change_id = _insert_min_rssi_removal_change(store)
 
     with pytest.raises(SafetyViolation):
         await applier.revert(
             change_id,
-            current_radios={"ng": {"min_rssi_enabled": True, "min_rssi": -75}},
+            current_radios={
+                "ng": {"radio": "ng", "channel": 3, "min_rssi_enabled": True, "min_rssi": -75},
+                "na": {"radio": "na", "channel": 36, "min_rssi_enabled": False, "min_rssi": 0},
+            },
             is_mesh_uplink=True,
         )
-    assert writer.call_count == calls_after_apply
+    assert writer.call_count == 0
 
 
 async def test_revert_of_radio_config_without_live_state_is_refused(store):
     # A radio-config restore with no fresh live state read is refused rather than
     # restored blind -- never mutate on unverified state.
     writer = FakeControllerWriter()
-    applier, change_id = await _apply_min_rssi_removal(store, writer)
-    calls_after_apply = writer.call_count
+    applier = Applier(store, writer)
+    change_id = _insert_min_rssi_removal_change(store)
 
     with pytest.raises(SafetyViolation):
         await applier.revert(change_id, current_radios=None)
-    assert writer.call_count == calls_after_apply
+    assert writer.call_count == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -472,24 +487,22 @@ async def test_min_rssi_tightening_is_refused(store):
         await applier.apply(plan, dry_run=False, confirm_token=plan_confirm_token(plan))
 
 
-async def test_min_rssi_removal_passes_the_rail(store, ap_device):
-    # The genuine removal template must NOT trip the guard.
+async def test_min_rssi_removal_is_advisory_not_executed(store, ap_device):
+    # The genuine removal is surfaced as an advisory recommendation, never applied
+    # as an irreversible write (re-enabling min-RSSI is barred, so it has no revert).
     finding = make_finding(
         "wifi.min_rssi_misconfig",
         radio_entity("ng"),
         evidence={"reason": "mesh_uplink_ap", "on_mesh_ap": True},
     )
     plan = plan_fix(finding, device=ap_device)
+    assert plan.is_advisory
     writer = FakeControllerWriter()
     applier = Applier(store, writer)
-    result = await applier.apply(
-        plan,
-        dry_run=False,
-        confirm_token=plan_confirm_token(plan),
-        current_state={f"{AP_MAC}:ng": {"min_rssi_enabled": True}},
-    )
-    assert result.applied is True
-    assert writer.calls[0].body["radio_table"][0]["min_rssi_enabled"] is False
+    result = await applier.apply(plan, dry_run=False, confirm_token=plan_confirm_token(plan))
+    assert result.applied is False
+    assert result.aborted_reason == "manual_action_required"
+    assert writer.call_count == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -602,3 +615,208 @@ async def test_auto_channel_revert_body_still_says_auto(store):
     step = plan.steps[0]
     radios = {r["radio"]: r for r in step.before["body"]["radio_table"]}
     assert radios["ng"]["channel"] == "auto"
+
+
+# --------------------------------------------------------------------------- #
+# S2: the applier enforces revertibility itself; it never trusts the flag
+# --------------------------------------------------------------------------- #
+def _forged_step(*, before, payload, revertible, endpoint=f"rest/device/{AP_ID}"):
+    return FixStep(
+        action=ActionType.CHANNEL_CHANGE,
+        target_entity_type=EntityType.RADIO,
+        target_native_id=f"{AP_MAC}:ng",
+        description="forged step",
+        risk=RiskLevel.LOW,
+        method="PUT",
+        endpoint=endpoint,
+        payload=payload,
+        precondition=Precondition(target_native_id=f"{AP_MAC}:ng", expected={}),
+        before=before,
+        after={"method": "PUT", "endpoint": endpoint, "body": payload},
+        revertible=revertible,
+    )
+
+
+async def test_applier_refuses_a_transient_step_even_when_flag_lies(store):
+    # A step with no restorable before-state (a transient command) that LIES with
+    # revertible=True must still be refused by the applier -- it does not trust the
+    # planner's flag. Nothing is sent.
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+    step = _forged_step(
+        before=None, payload={"radio_table": [{"radio": "ng", "channel": 1}]}, revertible=True
+    )
+    plan = FixPlan("wired.port_flapping", f"{AP_MAC}:ng", "forged", steps=[step])
+    with pytest.raises(SafetyViolation):
+        await applier.apply(
+            plan,
+            dry_run=False,
+            confirm_token=plan_confirm_token(plan),
+            current_state={f"{AP_MAC}:ng": {"channel": 1}},
+        )
+    assert writer.call_count == 0
+    assert store.list_changes() == []
+
+
+async def test_applier_refuses_a_min_rssi_removal_step_it_cannot_revert(store):
+    # A min-RSSI *removal* step whose before re-enables min-RSSI has no genuine
+    # revert (the rail would refuse it), so the applier refuses to apply it -- even
+    # though it passes the forward min-RSSI rail and claims revertible=True.
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+    endpoint = f"rest/device/{AP_ID}"
+    step = _forged_step(
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "min_rssi_enabled": True, "min_rssi": -75}]},
+        },
+        payload={"radio_table": [{"radio": "ng", "min_rssi_enabled": False, "min_rssi": -75}]},
+        revertible=True,
+    )
+    plan = FixPlan("wifi.min_rssi_misconfig", f"{AP_MAC}:ng", "forged", steps=[step])
+    with pytest.raises(SafetyViolation):
+        await applier.apply(
+            plan,
+            dry_run=False,
+            confirm_token=plan_confirm_token(plan),
+            current_state={f"{AP_MAC}:ng": {"min_rssi_enabled": False}},
+        )
+    assert writer.call_count == 0
+
+
+async def test_empty_precondition_with_missing_snapshot_is_drift(store):
+    # An empty precondition is "satisfied" only when the target was actually read.
+    # A step whose target is absent from the fresh snapshot must NOT sail through on
+    # that emptiness -- it is drift, and nothing is sent.
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+    endpoint = f"rest/device/{AP_ID}"
+    step = _forged_step(
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 3}]},
+        },
+        payload={"radio_table": [{"radio": "ng", "channel": 1}]},
+        revertible=True,
+    )
+    plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "forged", steps=[step])
+    with pytest.raises(PreconditionDrift):
+        await applier.apply(
+            plan,
+            dry_run=False,
+            confirm_token=plan_confirm_token(plan),
+            current_state={},  # snapshot missing for the target
+        )
+    assert writer.call_count == 0
+    assert store.list_changes() == []
+
+
+# --------------------------------------------------------------------------- #
+# C1: a fresh revert restores only touched fields and refuses on conflicting drift
+# --------------------------------------------------------------------------- #
+async def test_revert_preserves_unrelated_later_changes(store, ap_device):
+    # The original change touched only the channel. Since then, someone lowered the
+    # tx-power. The revert must restore the channel WITHOUT clobbering that later,
+    # unrelated power change.
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+    plan = _channel_plan(ap_device)  # ng channel 3 -> 1
+    result = await applier.apply(
+        plan, dry_run=False, confirm_token=plan_confirm_token(plan), current_state=_state_ok()
+    )
+    change_id = result.change_ids[0]
+
+    # Live now: channel is still the applied value (1), but power was lowered later.
+    live = {
+        "ng": {
+            "radio": "ng",
+            "channel": 1,
+            "tx_power_mode": "low",  # unrelated later change
+            "min_rssi_enabled": True,
+            "min_rssi": -75,
+        },
+        "na": {"radio": "na", "channel": 36, "min_rssi_enabled": False, "min_rssi": 0},
+    }
+    revert = await applier.revert(change_id, current_radios=live)
+    assert revert.ok
+
+    sent_ng = next(r for r in writer.calls[-1].body["radio_table"] if r["radio"] == "ng")
+    assert sent_ng["channel"] == 3  # restored
+    assert sent_ng["tx_power_mode"] == "low"  # NOT clobbered back to the old "high"
+
+
+async def test_revert_refuses_when_a_touched_field_conflicts(store, ap_device):
+    # The very field the change set (channel) has since drifted to a third value:
+    # reverting would silently overwrite that newer work, so refuse and require
+    # re-approval. Nothing is sent.
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+    plan = _channel_plan(ap_device)  # ng channel 3 -> 1
+    result = await applier.apply(
+        plan, dry_run=False, confirm_token=plan_confirm_token(plan), current_state=_state_ok()
+    )
+    change_id = result.change_ids[0]
+    calls_after_apply = writer.call_count
+
+    live = {  # someone moved the channel to 11 since the fix
+        "ng": {"radio": "ng", "channel": 11, "tx_power_mode": "high"},
+        "na": {"radio": "na", "channel": 36},
+    }
+    with pytest.raises(PreconditionDrift):
+        await applier.revert(change_id, current_radios=live)
+    assert writer.call_count == calls_after_apply  # revert sent nothing
+    assert store.get_change(change_id)["status"] != "reverted"
+
+
+async def test_apply_and_revert_are_serialized_per_device(store):
+    # Two reverts on the same device must not interleave their writes: the per-
+    # device lock serializes them into [start, end, start, end], never
+    # [start, start, end, end].
+    import asyncio as _asyncio
+
+    from netadmin.fixes.models import WriteResult
+
+    class _OrderedWriter:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        async def put(self, endpoint, body):
+            self.events.append("start")
+            await _asyncio.sleep(0)
+            await _asyncio.sleep(0)
+            self.events.append("end")
+            return WriteResult(ok=True, status_code=200, data={})
+
+        async def post(self, endpoint, body):  # pragma: no cover - unused
+            return await self.put(endpoint, body)
+
+    endpoint = f"rest/device/{AP_ID}"
+
+    def _channel_change_row():
+        before = {
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 3}]},
+        }
+        after = {
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 1}]},
+        }
+        return store.insert_change(
+            action="wifi.channel_change", before=before, after=after, status="applied", ts=1
+        )
+
+    id_a, id_b = _channel_change_row(), _channel_change_row()
+    writer = _OrderedWriter()
+    applier = Applier(store, writer)
+    live = {"ng": {"radio": "ng", "channel": 1}}
+
+    await _asyncio.gather(
+        applier.revert(id_a, current_radios=live),
+        applier.revert(id_b, current_radios=live),
+    )
+
+    assert writer.events == ["start", "end", "start", "end"]
