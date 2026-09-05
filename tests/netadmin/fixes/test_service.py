@@ -244,22 +244,43 @@ def _seed_min_rssi_issue(store) -> int:
 
 
 async def test_revert_refused_when_ap_is_now_a_mesh_uplink(store):
-    # Apply a genuine min-RSSI removal, then the AP becomes a mesh uplink. Reverting
-    # would re-enable min-RSSI on the mesh uplink -- the latent-outage case. The
-    # service re-reads the (now mesh) device and the applier refuses; nothing is
-    # sent beyond the original apply.
+    # A legacy min-RSSI removal sits in the ledger (min-RSSI removal is advisory now,
+    # so it no longer applies through the service). The AP has since become a mesh
+    # uplink; reverting would re-enable min-RSSI on the mesh uplink -- the latent-
+    # outage case. The service re-reads the (now mesh) device and the applier
+    # refuses; nothing is sent.
     issue_id = _seed_min_rssi_issue(store)
-    writer = FakeControllerWriter()
-    reader = FakeDeviceReader({AP_MAC: make_ap_device()})  # ng min_rssi_enabled=True
-    svc = _service(store, reader=reader, writer=writer)
+    radio_id = store.find_entity(EntityType.RADIO, f"{AP_MAC}:ng")["entity_id"]
+    endpoint = f"rest/device/{AP_ID}"
+    change_id = store.insert_change(
+        action="wifi.min_rssi_remove",
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {
+                "radio_table": [
+                    {"radio": "ng", "channel": 3, "min_rssi_enabled": True, "min_rssi": -75},
+                    {"radio": "na", "channel": 36, "min_rssi_enabled": False, "min_rssi": 0},
+                ]
+            },
+        },
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {
+                "radio_table": [
+                    {"radio": "ng", "channel": 3, "min_rssi_enabled": False, "min_rssi": -75},
+                    {"radio": "na", "channel": 36, "min_rssi_enabled": False, "min_rssi": 0},
+                ]
+            },
+        },
+        status="applied",
+        ts=NOW,
+        issue_id=issue_id,
+        entity_id=radio_id,
+    )
 
-    dry = await svc.dry_run(issue_id)
-    result = await svc.apply(issue_id, confirm_token=dry.confirm_token)
-    assert result.applied is True
-    change_id = result.change_ids[0]
-    calls_after_apply = writer.call_count
-
-    # The AP is now a wireless (mesh) uplink and min-RSSI has been removed (off).
+    # The AP is now a wireless (mesh) uplink and min-RSSI is currently off.
     mesh_device = make_ap_device(
         radios=[
             {"radio": "ng", "channel": 3, "min_rssi_enabled": False, "min_rssi": 0},
@@ -267,11 +288,13 @@ async def test_revert_refused_when_ap_is_now_a_mesh_uplink(store):
         ]
     )
     mesh_device["uplink"] = {"type": "wireless"}
-    reader.set_device(AP_MAC, mesh_device)
+    reader = FakeDeviceReader({AP_MAC: mesh_device})
+    writer = FakeControllerWriter()
+    svc = _service(store, reader=reader, writer=writer)
 
     with pytest.raises(SafetyViolation):
         await svc.revert(change_id)
-    assert writer.call_count == calls_after_apply  # revert sent nothing
+    assert writer.call_count == 0  # revert sent nothing
     assert store.get_change(change_id)["status"] != "reverted"
 
 
@@ -430,9 +453,10 @@ async def test_band_issue_stops_at_the_failed_step_and_keeps_prior_change_ids(st
     assert svc.verification(issue_id).status is VerificationStatus.PENDING
 
 
-async def test_port_issue_still_reads_its_own_switch_for_the_precondition(store):
-    """Entity-scoped findings keep reading exactly their own device: the port's
-    live PoE mode is what the plan's precondition is built from."""
+async def test_port_issue_still_reads_its_own_switch_and_is_advisory(store):
+    """Entity-scoped findings keep reading exactly their own device. A PoE
+    reboot-loop is now surfaced as an advisory recommendation (a power-cycle is a
+    one-way command with no revert), not an executable step."""
     sw = store.upsert_entity(
         Entity(entity_type=EntityType.SWITCH, native_id=SW_MAC, name="Closet switch"), ts=NOW
     )
@@ -456,7 +480,9 @@ async def test_port_issue_still_reads_its_own_switch_for_the_precondition(store)
     dry = await svc.dry_run(issue_id)
 
     assert reader.calls == [SW_MAC]
-    assert dry.rendered[0]["precondition"]["expected"] == {"poe_mode": "auto"}
+    assert dry.rendered == []
+    assert dry.manual_action_required is True
+    assert "power-cycle" in (dry.advisory or "").lower()
 
 
 async def test_site_scoped_issue_without_a_band_is_refused_cleanly(store):
@@ -531,6 +557,31 @@ async def test_partial_apply_still_arms_verification(store):
     v = svc.verification(issue_id)
     assert v.status is VerificationStatus.PENDING, "a partial apply must still arm"
     assert v.armed_ts == NOW
+
+
+async def test_first_step_failure_is_not_credited_as_applied(store):
+    """A completely-failed apply must not arm verification or advance fix_state (C6).
+
+    The first step's write fails, so nothing landed. ``result.change_ids`` still
+    carries the attempted (failed) row, but the confirmed-successful set is empty,
+    so no window is armed -- otherwise a later, unrelated recovery would be
+    mistaken for this fix working. The ledger and the issue reflect reality.
+    """
+    issue_id = _seed_band_conflict_issue(store)
+    # The FIRST step's device rejects the write; the plan stops there.
+    writer = FakeControllerWriter(fail_on={"PUT rest/device/dev-0"})
+    svc = _service(store, reader=FakeDeviceReader(_band_devices((1, 1, 1))), writer=writer)
+
+    dry = await svc.dry_run(issue_id)
+    result = await svc.apply(issue_id, confirm_token=dry.confirm_token)
+
+    assert result.applied is False
+    statuses = [c["status"] for c in store.list_changes(issue_id=issue_id)]
+    assert "failed" in statuses
+    assert "applied" not in statuses  # nothing landed
+    issue = store.get_issue(issue_id)
+    assert issue["fix_state"] != FixState.APPLIED.value
+    assert svc.verification(issue_id).status is VerificationStatus.NOT_ARMED
 
 
 # --------------------------------------------------------------------------- #

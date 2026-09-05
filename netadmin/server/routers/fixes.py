@@ -344,8 +344,10 @@ async def revert_fix(request: Request, issue_id: int, body: RevertBody) -> dict[
     """Revert a change from this issue's ledger, restoring its before-state.
 
     404 for an unknown issue or a change that does not belong to it; 422 when the
-    change is not revertible (a transient command stores no before-state) or was
-    already reverted.
+    change is not revertible (a transient command stores no before-state), was
+    already reverted, or its restore conflicts with newer live state; 409 when the
+    resulting payload needs re-approval; 502 when the controller rejected the
+    restore write itself.
     """
     service, seams, owns, store = _service(request, for_apply=True)
     try:
@@ -356,13 +358,31 @@ async def revert_fix(request: Request, issue_id: int, body: RevertBody) -> dict[
                 detail=f"change {body.change_id} not found for issue {issue_id}",
             )
         try:
-            await service.revert(body.change_id)
+            write = await service.revert(body.change_id)
         except WriterRequired as exc:
             raise HTTPException(status_code=503, detail=str(exc))
+        except PreconditionDrift as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except (SafetyViolation, MaxStepsExceeded) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         except FixError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
     finally:
         await _close(seams, owns)
+
+    # Honor the WriteResult: a revert whose controller write did not succeed is a
+    # failure, not a success. Surfacing it as 200 would tell the operator the
+    # before-state was restored when the controller in fact rejected the write and
+    # the change still stands.
+    if not write.ok:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"revert of change {body.change_id} was rejected by the controller "
+                f"(status {write.status_code}); the change was not rolled back"
+            ),
+        )
+
     updated = store.get_change(body.change_id)
     return {
         "change": _change_dict(updated) if updated is not None else None,

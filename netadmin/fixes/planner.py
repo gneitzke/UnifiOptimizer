@@ -119,15 +119,20 @@ def plan_fix(
 def _plan_min_rssi_remove(
     finding: Finding, device: Optional[Mapping[str, Any]], issue_id: Optional[int]
 ) -> FixPlan:
-    """Remove (disable) min-RSSI on the offending radio. Removal only -- never a set.
+    """Recommend disabling min-RSSI on the offending radio -- **advisory only**.
 
-    Safe on every case the detector fires for (mesh-uplink AP, single-AP site,
-    over-strict floor): disabling only ever *stops* clients being kicked, so it can
-    never worsen coverage. Setting min-RSSI as a remediation is categorically
-    refused elsewhere; this template exists solely to turn it off.
+    Disabling min-RSSI is the right remediation on every case the detector fires
+    for (mesh-uplink AP, single-AP site, over-strict floor): it only ever *stops*
+    clients being kicked, so it can never worsen coverage. But it is a **one-way**
+    change: re-enabling min-RSSI is categorically prohibited by the applier's
+    absolute rail ("only ever removed, never set"), so there is no genuine revert.
+    An auto-applied fix must be reversible, so this template surfaces the change as
+    a recommendation for a human to make deliberately, rather than executing an
+    irreversible controller write. (Until a real revert exists, it stays advisory.)
     """
     band_code = _band_code(finding)
     dev_id, radio_table, radio = _locate_radio(device, band_code)
+    label = finding.entity.name or finding.entity.native_id
     if dev_id is None or radio is None:
         return _advisory(
             finding, issue_id, "Device radio snapshot unavailable; disable min-RSSI manually."
@@ -138,38 +143,13 @@ def _plan_min_rssi_remove(
             finding, issue_id, "min-RSSI already disabled on this radio; no change needed."
         )
 
-    new_table = copy.deepcopy(list(radio_table))
-    for entry in new_table:
-        if entry.get("radio") == band_code:
-            entry["min_rssi_enabled"] = False
-
-    endpoint = f"rest/device/{dev_id}"
-    payload = {"radio_table": new_table}
-    label = finding.entity.name or finding.entity.native_id
-    step = FixStep(
-        action=ActionType.MIN_RSSI_REMOVE,
-        target_entity_type=EntityType.RADIO,
-        target_native_id=finding.entity.native_id,
-        description=f"Disable min-RSSI on {label} (removal only).",
-        risk=RiskLevel.LOW,
-        method="PUT",
-        endpoint=endpoint,
-        payload=payload,
-        precondition=Precondition(
-            target_native_id=finding.entity.native_id,
-            expected={"min_rssi_enabled": True},
-            description="min-RSSI must still be enabled on this radio.",
-        ),
-        before={"method": "PUT", "endpoint": endpoint, "body": {"radio_table": list(radio_table)}},
-        after={"method": "PUT", "endpoint": endpoint, "body": payload},
-        revertible=True,
-    )
-    return FixPlan(
-        detector_key=finding.detector_key,
-        entity_native_id=finding.entity.native_id,
-        title=f"Remove min-RSSI on {label}",
-        steps=[step],
-        issue_id=issue_id,
+    return _advisory(
+        finding,
+        issue_id,
+        f"Disable min-RSSI on {label} to stop clients being kicked. This is a "
+        "one-way change -- re-enabling min-RSSI is prohibited by an absolute safety "
+        "rail, so there is no automatic rollback. Apply it manually from the "
+        "controller once you have confirmed it is what you want.",
     )
 
 
@@ -479,12 +459,16 @@ def _plan_tx_power_step_down(
 def _plan_poe_power_cycle(
     finding: Finding, device: Optional[Mapping[str, Any]], issue_id: Optional[int]
 ) -> FixPlan:
-    """Power-cycle a PoE port, but only for the reboot-loop / PoE-fault sub-case.
+    """Recommend a PoE port power-cycle -- **advisory only**.
 
     A flapping port whose PoE draw drops to zero between flaps is a device stuck in
-    a reboot loop -- a power-cycle is the right, reversible-by-nature nudge. A
-    flapping port with no PoE-reboot signal is a physical fault (cable/connector):
-    that is advisory, because cycling power fixes nothing a cable caused.
+    a reboot loop, and a port power-cycle is the right nudge. But a power-cycle is a
+    transient ``cmd/devmgr`` command: there is no persisted before-state to restore,
+    so it is a **one-way** controller write with no genuine revert. An auto-applied
+    fix must be reversible, so the planner surfaces the power-cycle as a
+    recommendation rather than executing an irreversible command. A flapping port
+    with no PoE-reboot signal is a physical fault (cable/connector), which is
+    advisory for a different reason: cycling power fixes nothing a cable caused.
     """
     reboot_loop = _truthy(finding.evidence.get("poe_reboot_loop"))
     poe_fault = _truthy(finding.evidence.get("poe_fault"))
@@ -504,40 +488,14 @@ def _plan_poe_power_cycle(
             "Could not resolve switch/port from the entity; power-cycle manually.",
         )
 
-    endpoint = "cmd/devmgr"
-    payload = {"cmd": "power-cycle", "mac": sw_mac, "port_idx": port_idx}
-    label = finding.entity.name or finding.entity.native_id
-    # A power-cycle is a transient command, not a persisted config change: there is
-    # no stored config to restore, so the step is not revertible (before=None).
-    expected: dict[str, Any] = {}
-    if device is not None:
-        port = _find_port(device, port_idx)
-        if port is not None and port.get("poe_mode") is not None:
-            expected = {"poe_mode": port.get("poe_mode")}
-    step = FixStep(
-        action=ActionType.POE_POWER_CYCLE,
-        target_entity_type=EntityType.PORT,
-        target_native_id=finding.entity.native_id,
-        description=f"Power-cycle PoE on {label} (port {port_idx} of {sw_mac}).",
-        risk=RiskLevel.MEDIUM,
-        method="POST",
-        endpoint=endpoint,
-        payload=payload,
-        precondition=Precondition(
-            target_native_id=finding.entity.native_id,
-            expected=expected,
-            description="Port must still be the flapping PoE port.",
-        ),
-        before=None,
-        after={"method": "POST", "endpoint": endpoint, "body": payload},
-        revertible=False,
-    )
-    return FixPlan(
-        detector_key=finding.detector_key,
-        entity_native_id=finding.entity.native_id,
-        title=f"Power-cycle PoE port {port_idx} on {sw_mac}",
-        steps=[step],
-        issue_id=issue_id,
+    return _advisory(
+        finding,
+        issue_id,
+        f"Power-cycle PoE on port {port_idx} of {sw_mac} to break the reboot loop. "
+        "A power-cycle is a transient command with no stored state to restore, so "
+        "there is no automatic rollback; issue it manually from the controller "
+        "(Devices -> port -> Power Cycle) once you have confirmed the device is "
+        "safe to bounce.",
     )
 
 
@@ -596,13 +554,6 @@ def _locate_radio(
         return None, radio_table, None
     target = next((r for r in radio_table if r.get("radio") == band_code), None)
     return str(dev_id), radio_table, target
-
-
-def _find_port(device: Mapping[str, Any], port_idx: int) -> Optional[dict[str, Any]]:
-    for port in device.get("port_table") or []:
-        if _as_int(port.get("port_idx")) == port_idx:
-            return port
-    return None
 
 
 def _split_port_native(native: str) -> tuple[Optional[str], Optional[int]]:

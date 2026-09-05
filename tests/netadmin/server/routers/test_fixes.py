@@ -237,6 +237,36 @@ async def test_apply_then_revert_restores_before_state(fix_env) -> None:
     assert ng["channel"] == 3
 
 
+async def test_revert_controller_failure_returns_502(fix_env) -> None:
+    """A revert whose restore write the controller rejects is a failure, not a 200.
+
+    The router must inspect the WriteResult and surface an explicit failure rather
+    than reporting success -- otherwise the operator is told the change was rolled
+    back when it still stands.
+    """
+    async with await _client(fix_env.app) as c:
+        plan = (await c.get(f"/api/issues/{fix_env.issue_id}/fix-plan")).json()
+        applied = (
+            await c.post(
+                f"/api/issues/{fix_env.issue_id}/fix/apply",
+                json={"confirm": True, "confirm_token": plan["confirm_token"]},
+            )
+        ).json()
+        change_id = applied["change_ids"][0]
+        # The controller now rejects the restore write.
+        fix_env.app.state.fix_seams = FixSeams(
+            reader=fix_env.reader,
+            writer=FakeControllerWriter(fail_on={f"PUT rest/device/{AP_ID}"}),
+        )
+        resp = await c.post(
+            f"/api/issues/{fix_env.issue_id}/fix/revert",
+            json={"change_id": change_id},
+        )
+    assert resp.status_code == 502
+    # The change was NOT marked reverted -- reality is preserved.
+    assert fix_env.store.get_change(change_id)["status"] == "applied"
+
+
 async def test_revert_change_not_on_issue_is_404(fix_env) -> None:
     async with await _client(fix_env.app) as c:
         resp = await c.post(
