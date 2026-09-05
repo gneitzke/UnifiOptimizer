@@ -442,13 +442,78 @@ class RecordingEndpoints:
 @pytest.mark.asyncio
 async def test_catchup_bounds_within_hours_from_cursor(repo: Repository) -> None:
     events = load_events()
-    await EventListener(FakeWs(events), repo, flush_interval=None).run()
-    # newest stored ts == 1_721_600_180; pretend "now" is 2 h later.
+    # A completed HISTORY read, not a newer live arrival, is the bounded cursor.
+    repo.record_ingest_coverage(
+        kind="event_history", scope="site", interval="retained",
+        start_ts=1_721_599_000, end_ts=1_721_600_180, status="complete",
+    )
+    # coverage end == 1_721_600_180; pretend "now" is 2 h later.
     now = 1_721_600_180 + 2 * 3600
     ep = RecordingEndpoints(events)
     await catchup_events(repo, ep, now=now)
     # gap_hours(2) + 1 + margin(1) = 4: a narrow window, not the full backlog.
     assert ep.within_hours_seen == [4]
+
+
+# --------------------------------------------------------------------------- #
+# C3/C7/R2 regressions
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_c3_catchup_recovers_gap_older_than_live_event(repo: Repository) -> None:
+    live = Event.model_validate({"_id": "live-300", "key": "EVT_X", "time": 300_000})
+    missing = Event.model_validate({"_id": "miss-200", "key": "EVT_X", "time": 200_000})
+    newer = Event.model_validate({"_id": "hist-400", "key": "EVT_X", "time": 400_000})
+    await EventListener(FakeWs([live]), repo, flush_interval=None).run()
+
+    inserted = await catchup_events(repo, FakeEndpoints([missing, live, newer]), now=400)
+
+    assert inserted == 2
+    assert {r["native_id"] for r in repo.read_events(0, 500_000)} == {
+        "miss-200", "live-300", "hist-400"
+    }
+
+
+def test_c7_duplicate_replay_fills_pre_inventory_entity(repo: Repository) -> None:
+    mac = "02:00:aa:bb:cc:88"
+    event = Event.model_validate(
+        {"_id": "late-link", "key": "EVT_WU_Connected", "time": 1_721_600_000_000, "user": mac}
+    )
+    normalizer = EventNormalizer(repo)
+    first = normalizer.normalize(event)
+    assert first is not None and first["entity_id"] is None
+    assert repo.record_events_enriching_entities([first]) == 1
+    eid = repo.upsert_entity(Entity(entity_type=EntityType.CLIENT, native_id=mac), ts=1)
+
+    replay = normalizer.normalize(event)
+    assert replay is not None and replay["entity_id"] == eid
+    assert repo.record_events_enriching_entities([replay]) == 0
+    assert repo.read_events(*FULL)[0]["entity_id"] == eid
+
+
+def test_r2_failed_flush_keeps_batch_for_retry(repo: Repository, monkeypatch: pytest.MonkeyPatch) -> None:
+    event = Event.model_validate({"_id": "flush-keep", "key": "EVT_X", "time": 1_721_600_000_000})
+    listener = EventListener(FakeWs([]), repo, flush_interval=None)
+    record = EventNormalizer(repo).normalize(event)
+    assert record is not None
+    listener._batch.append(record)
+    real = repo.record_events_enriching_entities
+    calls = 0
+
+    def locked(rows: object) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            import sqlite3
+
+            raise sqlite3.OperationalError("database is locked")
+        return real(rows)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repo, "record_events_enriching_entities", locked)
+    with pytest.raises(Exception, match="locked"):
+        listener._flush()
+    assert len(listener._batch) == 1
+    assert listener._flush() == 1
+    assert listener._batch == []
 
 
 @pytest.mark.asyncio

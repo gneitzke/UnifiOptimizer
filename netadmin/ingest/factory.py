@@ -92,6 +92,11 @@ _REPORT_ANCHOR_METRICS: dict[str, tuple[str, ...]] = {
     for scope in BACKFILL_SCOPES
 }
 
+# One process owns one paced/authenticated read client per controller/site.  It
+# is deliberately read-facing only: fix applies continue to build their explicit
+# writer seam, while previews can share the daemon's session.
+_shared_readers: dict[tuple[str, str, Optional[str], Optional[str], Optional[str]], tuple[Endpoints, UnifiClient]] = {}
+
 
 @dataclass
 class BuiltComponents:
@@ -130,6 +135,22 @@ def build_endpoints(settings: Settings) -> tuple[Endpoints, UnifiClient]:
     return Endpoints(client), client
 
 
+def get_shared_reader(settings: Settings) -> tuple[Endpoints, UnifiClient]:
+    """Return the process-shared, lazily authenticated read client (R4).
+
+    Callers must not close this client per request; its pacing and auth lock are
+    precisely what prevent a burst of fix previews from becoming a login burst.
+    Lifespan-owned ingest uses the same instance.
+    """
+    creds = settings.unifi
+    key = (str(creds.host), creds.site, creds.username, creds.password, creds.api_key)
+    shared = _shared_readers.get(key)
+    if shared is None:
+        shared = build_endpoints(settings)
+        _shared_readers[key] = shared
+    return shared
+
+
 class SupervisorTask:
     """Async start/stop wrapper that runs a :class:`WsSupervisor` as a task.
 
@@ -148,7 +169,15 @@ class SupervisorTask:
     def state(self) -> str:
         if self._task is None or self._task.done():
             return "stopped"
+        # Lifecycle compatibility for existing callers.  Health reads
+        # connection_state below, which is deliberately more precise.
         return "running"
+
+    @property
+    def connection_state(self) -> str:
+        if self._task is None or self._task.done():
+            return "stopped"
+        return str(getattr(self._sup, "state", "reconnecting"))
 
     async def start(self) -> None:
         if self._task is not None:
@@ -570,7 +599,7 @@ def build_components(
     read through. When omitted (e.g. the factory smoke test) one is built from the
     store, since the engine is I/O-free and all state lives in the store.
     """
-    endpoints, client = build_endpoints(settings)
+    endpoints, client = get_shared_reader(settings)
 
     if issue_engine is None:
         from netadmin.issues.engine import IssueEngine
@@ -599,7 +628,9 @@ def build_components(
 
     def _last_ts_by_scope() -> dict[str, Optional[int]]:
         return {
-            s: store.max_sample_ts_for_metrics(_SCOPE_TYPE[s], _REPORT_ANCHOR_METRICS[s])
+            # C4: only successful report-history coverage advances this cursor;
+            # sample maxima can leap over failed chunks.
+            s: store.latest_ingest_coverage_end(kind="report", scope=s)
             for s in BACKFILL_SCOPES
         }
 
@@ -654,4 +685,5 @@ __all__ = [
     "SupervisorTask",
     "build_components",
     "build_endpoints",
+    "get_shared_reader",
 ]

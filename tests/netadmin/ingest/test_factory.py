@@ -21,6 +21,7 @@ from netadmin.ingest.factory import (
     SupervisorTask,
     _recompute_sle_after_backfill,
     build_components,
+    get_shared_reader,
 )
 from netadmin.ingest.probes import METRIC_DNS_ANCHOR_LATENCY, METRIC_GW_RTT, ProbeSample
 from netadmin.store.repository import Repository
@@ -181,6 +182,25 @@ async def test_correlation_job_absent_when_disabled(repo: Repository) -> None:
 async def test_build_components_raises_without_credentials(repo: Repository) -> None:
     with pytest.raises(RuntimeError):
         build_components(Settings(_env_file=None), repo)
+
+
+async def test_r4_shared_reader_reuses_client_for_fix_previews(repo: Repository) -> None:
+    settings = _configured()
+    _first_ep, first = get_shared_reader(settings)
+    _second_ep, second = get_shared_reader(settings)
+    assert first is second
+
+
+async def test_r3_failed_ws_poll_degrades_otherwise_healthy_runtime(repo: Repository) -> None:
+    from netadmin.server.runtime import DaemonState, build_health
+
+    now = 10_000
+    repo.record_poll_run(job="ws", ok=False, ts=now, error="storage-failed")
+    state = DaemonState(started_ts=now - 10, ready=True)
+    health = build_health(repo, state, _configured(), now=now)
+
+    assert health["status"] == "degraded"
+    assert next(j for j in health["jobs"] if j["job"] == "ws")["status"] == "failing"
 
 
 async def test_probe_runner_noop_without_gateway(repo: Repository) -> None:
