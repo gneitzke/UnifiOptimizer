@@ -145,7 +145,9 @@ async def metrics_window(
 
     end_ts = int(end) if end is not None else int(time.time())
     start_ts = end_ts - int(seconds)
-    window = store.read_window(series_id, start_ts, end_ts, now=end_ts)
+    # ``end`` describes the historical query, not the age of data still kept
+    # locally.  Retention must always be evaluated against the current clock.
+    window = store.read_window(series_id, start_ts, end_ts, now=int(time.time()))
     buckets = downsample(window.rows, points, start_ts, end_ts)
     return {
         "entity_id": int(entity_id),
