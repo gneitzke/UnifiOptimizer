@@ -297,6 +297,42 @@ async def test_backfill_records_failure_poll_run_on_error(repo: Repository):
     assert runs[0]["source"] == "backfill"
 
 
+@pytest.mark.asyncio
+async def test_c4_retries_failed_chunk_after_later_chunk_advanced_samples(repo: Repository):
+    """A failed [600,1200) equivalent remains a coverage hole, not MAX(ts)."""
+    _ap(repo)
+    failed_start = NOW - 3600
+
+    class FailOnce(FakeEndpoints):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail = True
+
+        async def stat_report(self, interval, scope, *, start_ms, end_ms, attrs):
+            self.calls.append(
+                {"interval": interval, "scope": scope, "start_ms": start_ms, "end_ms": end_ms}
+            )
+            if self.fail and interval == FIVEMIN and start_ms == failed_start * 1000:
+                raise RuntimeError("first chunk unavailable")
+            return []
+
+    ep = FailOnce()
+    bf = Backfiller(ep, repo, scopes=("ap",), chunk_seconds={FIVEMIN: 600})
+    first = await bf.run({"ap": failed_start}, now=NOW)
+    assert first.errors == 1
+
+    # A later completed chunk may have written samples up to now in production;
+    # pass that old MAX-like cursor to prove the named failure still wins.
+    ep.calls.clear()
+    ep.fail = False
+    second = await bf.run({"ap": NOW}, now=NOW)
+
+    assert second.errors == 0
+    assert (FIVEMIN, failed_start * 1000, (failed_start + 600) * 1000) in {
+        (c["interval"], c["start_ms"], c["end_ms"]) for c in ep.calls
+    }
+
+
 def test_user_signal_maps_to_collector_rssi_metric():
     # Report "signal" (dBm) must land on the collector's canonical "rssi" series
     # (mapping.py stores Client.signal as "rssi"), never a divergent "signal".

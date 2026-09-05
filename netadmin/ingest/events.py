@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import time
 from datetime import datetime, timezone
 from time import monotonic
@@ -213,6 +214,30 @@ class EventNormalizer:
             "data": data,
         }
 
+    def reconcile_unresolved(self, *, limit: int = 500) -> int:
+        """Fill links for old events after inventory has caught up (C7).
+
+        This is intentionally a replay of the original controller payload,
+        rather than guessing from a denormalized MAC column.  It also repairs
+        WS-only deployments, where there may never be a stat/event replay.
+        """
+        repaired = 0
+        for row in self._repo.unresolved_events(limit=limit):
+            try:
+                payload = json.loads(row["data"])
+                event = Event.model_validate(payload)
+            except Exception:  # malformed retained payload is not recoverable
+                logger.warning("Cannot reconcile malformed event payload id=%s", row["id"])
+                continue
+            record = self.normalize(event)
+            if record is not None and self._repo.fill_event_entity_refs(
+                int(row["id"]),
+                entity_id=record["entity_id"],
+                related_entity_id=record["related_entity_id"],
+            ):
+                repaired += 1
+        return repaired
+
 
 def newest_stored_event_ts(repo: Repository) -> Optional[int]:
     """Timestamp (epoch s) of the most recent stored event, or None if empty.
@@ -234,31 +259,40 @@ async def catchup_events(
     since_ts: Optional[int] = None,
     now: Optional[int] = None,
 ) -> int:
-    """Pull ``stat/event`` and persist anything newer than the stored cursor.
+    """Pull ``stat/event`` and persist its retained history overlap.
 
     ``endpoints.stat_event`` already pages with ``_start`` (3000/page cap).
-    Events at or before ``since_ts`` (the newest stored event, resolved
-    automatically when not supplied) are dropped as already-captured; the
-    remainder are written in one batch. Dedupe on the native id is the real
-    guard against WS/catch-up overlap -- the cursor is only a volume trim, so an
-    event landing in the same second as the cursor is still offered to the store
-    and deduped there. Returns the number of rows actually inserted.
+    A default cursor comes only from a completed history-read coverage interval,
+    never from the newest stored event (which may be a live WS arrival).  All
+    fetched overlap is offered to identity dedupe; ``since_ts`` filters only
+    when an explicit caller supplied it as a volume constraint. Returns the
+    number of rows actually inserted.
 
     The controller fetch is **bounded**: when ``within_hours`` is not pinned by
-    the caller, it is derived from the cursor so ``stat/event`` spans only the
-    gap since the last catch-up (plus :data:`_CATCHUP_MARGIN_HOURS`), capped at
+    the caller, it is derived from completed history coverage so ``stat/event``
+    spans only the outstanding history gap (plus :data:`_CATCHUP_MARGIN_HOURS`), capped at
     :data:`_CATCHUP_MAX_WITHIN_HOURS`. Without this the periodic sweep would page
     the controller's entire retained event backlog every cycle to insert a
     handful of new rows -- ``since_ts`` only trims what is *inserted*, never what
     is *fetched* (ARCHITECTURE.md section 16: keep controller queries narrow).
-    On a fresh store with no cursor yet the first sweep is unbounded by design,
-    then self-bounds once any event is stored.
+    On a fresh store with no completed coverage yet the first sweep is unbounded
+    by design, then self-bounds once history has actually been read.
     """
     normalizer = normalizer or EventNormalizer(repo)
+    now_s = int(time.time()) if now is None else int(now)
+    explicit_cursor = since_ts is not None
+    # C3: only a completed *history read* can advance this cursor.  A newer WS
+    # arrival says nothing about whether the event log's older interval was
+    # recovered, so max_event_ts must never participate here.
+    coverage_cursor = repo.latest_ingest_coverage_end(kind="event_history", scope="site")
     if since_ts is None:
-        since_ts = newest_stored_event_ts(repo)
+        since_ts = coverage_cursor
+    coverage_start = (
+        max(0, now_s - _CATCHUP_MAX_WITHIN_HOURS * 3600)
+        if coverage_cursor is None
+        else coverage_cursor
+    )
     if within_hours is None and since_ts is not None:
-        now_s = int(time.time()) if now is None else int(now)
         gap_hours = max(0, now_s - since_ts) // 3600
         within_hours = min(_CATCHUP_MAX_WITHIN_HOURS, gap_hours + 1 + _CATCHUP_MARGIN_HOURS)
     events = await endpoints.stat_event(within_hours=within_hours, max_events=max_events)
@@ -267,10 +301,29 @@ async def catchup_events(
         record = normalizer.normalize(event)
         if record is None:
             continue
-        if since_ts is not None and record["ts"] < since_ts:
+        # An explicit cursor is an API caller's volume constraint.  The normal
+        # coverage cursor is deliberately not an insertion filter: overlap is
+        # deduped by event identity, and filtering it recreates the C3 loss.
+        if explicit_cursor and since_ts is not None and record["ts"] < since_ts:
             continue
         records.append(record)
-    inserted = repo.record_events(records)
+    inserted = repo.record_events_enriching_entities(records)
+    normalizer.reconcile_unresolved()
+    if getattr(endpoints, "_event_disabled", False):
+        # C3/R3: absence of the permitted history read is a durable,
+        # queryable unrecoverable gap, not a successful empty collection.
+        repo.record_ingest_coverage(
+            kind="event_history", scope="site", interval="retained",
+            start_ts=coverage_start, end_ts=now_s, status="unrecoverable",
+            detail="controller event-history endpoint unsupported",
+        )
+    elif max_events is None:
+        # A successful unbounded/fully-paged GET establishes coverage.  A caller
+        # capped response cannot prove the tail complete and must not move it.
+        repo.record_ingest_coverage(
+            kind="event_history", scope="site", interval="retained",
+            start_ts=coverage_start, end_ts=now_s, status="complete",
+        )
     logger.info(
         "Catch-up: %d stat/event rows fetched, %d new (cursor=%s).",
         len(events),
@@ -303,6 +356,9 @@ class EventListener:
         self._batch_size = max(1, batch_size)
         self._flush_interval = flush_interval
         self._batch: list[dict[str, Any]] = []
+        self._max_pending = max(1_000, self._batch_size * 4)
+        self._storage_error: Optional[BaseException] = None
+        self.terminal_state: Optional[str] = None
         self.written = 0
 
     def _flush(self) -> int:
@@ -314,9 +370,12 @@ class EventListener:
         """
         if not self._batch:
             return 0
-        batch = self._batch
-        self._batch = []
-        inserted = self._repo.record_events(batch)
+        batch = list(self._batch)
+        # C7's enrich-aware writer dedupes replayed events while filling links.
+        # Crucially, no buffer entry is removed until SQLite committed.
+        inserted = self._repo.record_events_enriching_entities(batch)
+        del self._batch[: len(batch)]
+        self._storage_error = None
         self.written += inserted
         return inserted
 
@@ -324,7 +383,19 @@ class EventListener:
         assert self._flush_interval is not None
         while True:
             await asyncio.sleep(self._flush_interval)
-            self._flush()
+            try:
+                self._flush()
+                self._normalizer.reconcile_unresolved()
+            except Exception as exc:  # keep the flusher alive; the batch remains queued
+                self._storage_error = exc
+                logger.exception("WS event storage flush failed; retaining %d events", len(self._batch))
+                try:
+                    self._repo.record_poll_run(
+                        job="ws", ok=False, error=f"storage-failed: {type(exc).__name__}: {exc}"[:200],
+                        source="live",
+                    )
+                except Exception:
+                    logger.exception("Could not surface WS storage failure in poll_runs")
 
     async def run(self) -> int:
         """Drain the WS generator into the store until it ends.
@@ -334,20 +405,43 @@ class EventListener:
         way out. Returns the total number of events written this run.
         """
         flusher: Optional[asyncio.Task[None]] = None
+        completed = False
         if self._flush_interval:
             flusher = asyncio.create_task(self._periodic_flush())
         try:
             async for event in self._ws.events():
                 record = self._normalizer.normalize(event)
                 if record is not None:
+                    if len(self._batch) >= self._max_pending:
+                        # A bounded queue makes sustained storage loss visible
+                        # instead of consuming unbounded RAM.  The still-pending
+                        # batch is retained for this listener instance.
+                        self._flush()
+                        if len(self._batch) >= self._max_pending:
+                            raise RuntimeError("WS event storage queue is full")
                     self._batch.append(record)
                     if len(self._batch) >= self._batch_size:
-                        self._flush()
+                        try:
+                            self._flush()
+                        except Exception as exc:
+                            self._storage_error = exc
+                            logger.exception("WS event storage flush failed; retaining batch")
+            completed = True
         finally:
             if flusher is not None:
                 flusher.cancel()
                 await asyncio.gather(flusher, return_exceptions=True)
+            # Do not discard a retained batch on a failed final flush.  Raise the
+            # failure so supervisor/health report it; a normal final flush still
+            # commits and clears exactly once.
             self._flush()
+            self._normalizer.reconcile_unresolved()
+            # The production low-level listener returns normally only when its
+            # subscription is unavailable (a requested stop is not a failure).
+            ws_stop = getattr(self._ws, "_stop", None)
+            stopped = bool(getattr(ws_stop, "is_set", lambda: False)())
+            if completed and not stopped:
+                self.terminal_state = "unsupported"
         return self.written
 
 
@@ -378,6 +472,7 @@ class WsSupervisor:
         self._max_restarts = max_restarts
         self._sleep = sleep
         self._stop = asyncio.Event()
+        self.state = "reconnecting"
 
     def stop(self) -> None:
         self._stop.set()
@@ -391,19 +486,38 @@ class WsSupervisor:
         backoff = self._backoff_base
         restarts = 0
         while not self._stop.is_set():
+            self.state = "reconnecting"
             listener = self._factory()
             self._record("started", ok=True)
             start = monotonic()
             clean = True
             error: Optional[str] = None
             try:
+                # Listener.run only returns after the subscription was entered;
+                # a quiet socket remains here and is healthy without frames.
+                self.state = "connected"
                 await listener.run()
             except asyncio.CancelledError:
+                self.state = "stopped"
                 raise
             except Exception as exc:  # noqa: BLE001 - firewall: any death is recoverable
                 clean = False
                 error = f"{type(exc).__name__}: {exc}"
+                lowered = error.lower()
+                if "storage" in lowered or "sqlite" in lowered:
+                    self.state = "storage-failed"
+                elif "auth" in lowered or "401" in lowered or "403" in lowered:
+                    self.state = "auth-failed"
+                else:
+                    self.state = "reconnecting"
                 logger.warning("WS listener died: %s", error)
+            else:
+                if getattr(listener, "terminal_state", None) == "unsupported":
+                    # The low-level listener returns cleanly only when the
+                    # controller cannot offer a usable events subscription.
+                    self.state = "unsupported"
+                    clean = False
+                    error = "unsupported"
             duration_ms = int((monotonic() - start) * 1000)
             self._record(error or "stopped", ok=clean, duration_ms=duration_ms)
 
@@ -415,6 +529,8 @@ class WsSupervisor:
                 break
             await self._sleep(backoff)
             backoff = self._backoff_base if clean else min(backoff * 2, self._backoff_max)
+        if self._stop.is_set():
+            self.state = "stopped"
 
 
 __all__ = [

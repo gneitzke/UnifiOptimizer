@@ -948,6 +948,140 @@ class Repository:
                     inserted += 1
         return inserted
 
+    # C7: Event ingestion needs to dedupe a replay without freezing the first
+    # (possibly pre-inventory) NULL entity reference forever.  This is separate
+    # from record_events because other event producers retain its insert-only
+    # dedupe contract.
+    def record_events_enriching_entities(self, events: Sequence[dict[str, Any]]) -> int:
+        """Insert events, filling missing entity references on a duplicate.
+
+        A controller event can arrive before the inventory poll that discovers
+        its client/AP.  The later stat/event copy has the same native id but can
+        resolve that entity.  Dedupe must preserve one event row *and* accept
+        that strictly-more-complete information.
+        """
+        inserted = 0
+        with self._write() as conn:
+            for ev in events:
+                native_id = ev.get("native_id")
+                if native_id is not None:
+                    existing = conn.execute(
+                        "SELECT id, entity_id, related_entity_id FROM events "
+                        "WHERE native_id=? LIMIT 1", (native_id,)
+                    ).fetchone()
+                    if existing is not None:
+                        if (
+                            (existing["entity_id"] is None and ev.get("entity_id") is not None)
+                            or (
+                                existing["related_entity_id"] is None
+                                and ev.get("related_entity_id") is not None
+                            )
+                        ):
+                            conn.execute(
+                                "UPDATE events SET "
+                                "entity_id=COALESCE(entity_id, ?), "
+                                "related_entity_id=COALESCE(related_entity_id, ?) "
+                                "WHERE id=?",
+                                (ev.get("entity_id"), ev.get("related_entity_id"), existing["id"]),
+                            )
+                        continue
+                data_json = json.dumps(ev.get("data") or {}, sort_keys=True)
+                conn.execute(
+                    "INSERT INTO events (ts, key, entity_id, related_entity_id, native_id, msg, data) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (
+                        ev["ts"], ev["key"], ev.get("entity_id"),
+                        ev.get("related_entity_id"), native_id, ev.get("msg"), data_json,
+                    ),
+                )
+                inserted += 1
+        return inserted
+
+    # C7: the event listener periodically replays these rows through its
+    # normalizer after inventory discovers their MACs.
+    def unresolved_events(self, *, limit: int = 500) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT id, data FROM events WHERE entity_id IS NULL OR related_entity_id IS NULL "
+            "ORDER BY ts, id LIMIT ?",
+            (max(1, limit),),
+        ).fetchall()
+
+    # C7: fill only absent references; an event's original attribution is never
+    # overwritten by a later, potentially less-specific controller payload.
+    def fill_event_entity_refs(
+        self, event_id: int, *, entity_id: Optional[int], related_entity_id: Optional[int]
+    ) -> bool:
+        if entity_id is None and related_entity_id is None:
+            return False
+        with self._write() as conn:
+            cur = conn.execute(
+                "UPDATE events SET entity_id=COALESCE(entity_id, ?), "
+                "related_entity_id=COALESCE(related_entity_id, ?) "
+                "WHERE id=? AND (entity_id IS NULL OR related_entity_id IS NULL)",
+                (entity_id, related_entity_id, event_id),
+            )
+            return cur.rowcount > 0
+
+    # C3/C4: completed controller-history coverage is distinct from the newest
+    # live arrival/sample.  The table is deliberately narrow and additive: it
+    # can be created safely for existing databases without changing any shared
+    # repository method or migration contract.
+    def _ensure_ingest_coverage(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS ingest_coverage ("
+            "kind TEXT NOT NULL, scope TEXT NOT NULL, interval TEXT NOT NULL, "
+            "start_ts INTEGER NOT NULL, end_ts INTEGER NOT NULL, "
+            "status TEXT NOT NULL, detail TEXT, updated_ts INTEGER NOT NULL, "
+            "PRIMARY KEY (kind, scope, interval, start_ts, end_ts))"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ingest_coverage_lookup "
+            "ON ingest_coverage(kind, scope, interval, status, start_ts, end_ts)"
+        )
+
+    # C3/C4: record the exact history interval only after its GET completed.
+    def record_ingest_coverage(
+        self, *, kind: str, scope: str, interval: str, start_ts: int, end_ts: int,
+        status: str, detail: Optional[str] = None,
+    ) -> None:
+        if end_ts <= start_ts:
+            return
+        with self._write() as conn:
+            self._ensure_ingest_coverage(conn)
+            conn.execute(
+                "INSERT INTO ingest_coverage "
+                "(kind, scope, interval, start_ts, end_ts, status, detail, updated_ts) "
+                "VALUES (?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(kind, scope, interval, start_ts, end_ts) DO UPDATE SET "
+                "status=excluded.status, detail=excluded.detail, updated_ts=excluded.updated_ts",
+                (kind, scope, interval, start_ts, end_ts, status, detail, _now()),
+            )
+
+    # C4: failed report chunks remain first-class holes and are retried even
+    # after a later successful chunk advances sample timestamps.
+    def failed_ingest_coverage(
+        self, *, kind: str, scope: str, interval: Optional[str] = None
+    ) -> list[sqlite3.Row]:
+        self._ensure_ingest_coverage(self._conn)
+        clauses = ["kind=?", "scope=?", "status='failed'"]
+        params: list[Any] = [kind, scope]
+        if interval is not None:
+            clauses.append("interval=?")
+            params.append(interval)
+        return self._conn.execute(
+            "SELECT * FROM ingest_coverage WHERE " + " AND ".join(clauses) +
+            " ORDER BY start_ts, end_ts", params
+        ).fetchall()
+
+    # C4: this is a coverage cursor, never a proxy derived from samples.
+    def latest_ingest_coverage_end(self, *, kind: str, scope: str) -> Optional[int]:
+        self._ensure_ingest_coverage(self._conn)
+        row = self._conn.execute(
+            "SELECT MAX(end_ts) AS end_ts FROM ingest_coverage "
+            "WHERE kind=? AND scope=? AND status='complete'", (kind, scope)
+        ).fetchone()
+        return None if row is None or row["end_ts"] is None else int(row["end_ts"])
+
     def read_events(
         self,
         start_ts: int,

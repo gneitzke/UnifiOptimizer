@@ -329,31 +329,67 @@ class Backfiller:
             hourly_retention_s=self._hourly_retention_s,
         )
         attrs = [attr for attr, _metric, _kind in REPORT_METRICS[scope]]
+        # C4: an unsuccessful GET is a named hole, not something a later sample
+        # timestamp can erase.  Retry it before the normal incremental tail.
+        chunks: list[tuple[str, int, int]] = []
+        seen: set[tuple[str, int, int]] = set()
+        for failed in self._repo.failed_ingest_coverage(kind="report", scope=scope):
+            interval = str(failed["interval"])
+            c_lo, c_hi = int(failed["start_ts"]), int(failed["end_ts"])
+            # The controller cannot recover history beyond this run's retention;
+            # preserve that fact explicitly rather than making a futile request.
+            retention_floor = now - (
+                self._fivemin_retention_s if interval == FIVEMIN else self._hourly_retention_s
+            )
+            if c_hi <= retention_floor:
+                self._repo.record_ingest_coverage(
+                    kind="report", scope=scope, interval=interval,
+                    start_ts=c_lo, end_ts=c_hi, status="unrecoverable",
+                    detail="controller report retention elapsed before retry",
+                )
+                continue
+            key = (interval, max(c_lo, retention_floor), c_hi)
+            chunks.append(key)
+            seen.add(key)
         for interval, window in plan.items():
             if window is None:
                 continue
             lo, hi = window
             for c_lo, c_hi in chunk_window(lo, hi, self._chunk_s[interval]):
-                res.windows += 1
-                try:
-                    await self._fetch_chunk(interval, scope, c_lo, c_hi, attrs, res)
-                except Exception as exc:  # noqa: BLE001 - firewall per chunk
-                    res.errors += 1
-                    self._repo.record_poll_run(
-                        job=job_name(interval, scope),
-                        ok=False,
-                        ts=c_hi,
-                        error=f"{type(exc).__name__}: {exc}"[:200],
-                        source="backfill",
-                    )
-                    logger.warning(
-                        "backfill %s.%s [%d,%d) failed: %s",
-                        interval,
-                        scope,
-                        c_lo,
-                        c_hi,
-                        exc,
-                    )
+                if (interval, c_lo, c_hi) not in seen:
+                    chunks.append((interval, c_lo, c_hi))
+                    seen.add((interval, c_lo, c_hi))
+
+        for interval, c_lo, c_hi in sorted(chunks, key=lambda c: (c[1], c[2], c[0])):
+            res.windows += 1
+            try:
+                await self._fetch_chunk(interval, scope, c_lo, c_hi, attrs, res)
+                self._repo.record_ingest_coverage(
+                    kind="report", scope=scope, interval=interval,
+                    start_ts=c_lo, end_ts=c_hi, status="complete",
+                )
+            except Exception as exc:  # noqa: BLE001 - firewall per chunk
+                res.errors += 1
+                self._repo.record_ingest_coverage(
+                    kind="report", scope=scope, interval=interval,
+                    start_ts=c_lo, end_ts=c_hi, status="failed",
+                    detail=f"{type(exc).__name__}: {exc}"[:200],
+                )
+                self._repo.record_poll_run(
+                    job=job_name(interval, scope),
+                    ok=False,
+                    ts=c_hi,
+                    error=f"{type(exc).__name__}: {exc}"[:200],
+                    source="backfill",
+                )
+                logger.warning(
+                    "backfill %s.%s [%d,%d) failed: %s",
+                    interval,
+                    scope,
+                    c_lo,
+                    c_hi,
+                    exc,
+                )
         return res
 
     async def _fetch_chunk(
