@@ -22,6 +22,8 @@ from __future__ import annotations
 from typing import Any, Mapping, Optional, Protocol, runtime_checkable
 
 from netadmin.fixes.models import WriteResult
+from netadmin.ingest.unifi.auth import UnifiAmbiguousOutcomeError
+from netadmin.ingest.unifi.client import envelope_error
 from netadmin.logging import get_logger
 
 __all__ = [
@@ -89,14 +91,38 @@ class RealControllerWriter:
 
     async def _send(self, method: str, endpoint: str, body: Mapping[str, Any]) -> WriteResult:
         _log.info("controller mutation: %s %s", method, endpoint)
-        resp = await self._client.request(method, endpoint, json_body=dict(body))
+        # allow_mutation=True: this is the single sanctioned controller-mutation
+        # seam, so it is the only caller permitted past the client's GET-only gate
+        # (S1). The client will not auto-retry this on an ambiguous transport
+        # failure (C2) -- it raises instead, and we surface the ambiguity below.
+        try:
+            resp = await self._client.request(
+                method, endpoint, json_body=dict(body), allow_mutation=True
+            )
+        except UnifiAmbiguousOutcomeError as exc:
+            # Lost response: the mutation may or may not have landed. Never report
+            # success and never retry -- the caller keeps the before-state and
+            # reconciles the live state via a GET read before any further attempt.
+            _log.warning("ambiguous mutation outcome: %s %s: %s", method, endpoint, exc)
+            return WriteResult(
+                ok=False, status_code=None, data={"ambiguous": True, "error": str(exc)}
+            )
+
         status = getattr(resp, "status_code", None)
-        ok = status is not None and 200 <= int(status) < 300
         data: Any = None
         try:
             data = resp.json()
-        except Exception:  # noqa: BLE001 - a non-JSON body still yields a status verdict
+        except Exception:  # noqa: BLE001 - a non-JSON body cannot confirm success
             data = None
+
+        http_ok = status is not None and 200 <= int(status) < 300
+        # A mutation counts as confirmed success ONLY when the HTTP status is 2xx,
+        # the body is a JSON envelope we could parse, AND that envelope does not
+        # report an error (R1). An HTML/non-JSON body, or a 200 carrying
+        # ``meta.rc="error"``, is not a confirmed success -- it is a failure.
+        confirmed_json = isinstance(data, dict)
+        envelope_ok = confirmed_json and envelope_error(data) is None
+        ok = http_ok and envelope_ok
         return WriteResult(ok=ok, status_code=status, data=data)
 
 

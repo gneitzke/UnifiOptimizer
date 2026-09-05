@@ -27,7 +27,14 @@ import httpx
 
 from netadmin.logging import get_logger
 
-from .auth import AuthStrategy, UnifiAuthError, UnifiConnectionError, UnifiError, resolve_strategy
+from .auth import (
+    AuthStrategy,
+    UnifiAmbiguousOutcomeError,
+    UnifiAuthError,
+    UnifiConnectionError,
+    UnifiError,
+    resolve_strategy,
+)
 
 logger = get_logger("ingest.unifi.client")
 
@@ -40,6 +47,27 @@ _RETRYABLE_EXC = (
     httpx.PoolTimeout,
     httpx.RemoteProtocolError,
 )
+
+
+def envelope_error(payload: Any) -> Optional[str]:
+    """Return the UniFi error message when the classic envelope reports failure.
+
+    The classic UniFi envelope is ``{"meta": {"rc": "ok"|"error", "msg": ...},
+    "data": [...]}``. An explicit ``meta.rc == "error"`` is a failure regardless
+    of the HTTP status: the controller answers ``200`` with an error envelope
+    (e.g. ``api.err.InvalidObject``) and the transport looks healthy. Shared by
+    the read path (:meth:`UnifiClient._parse`) and the write path
+    (:meth:`netadmin.fixes.writer.RealControllerWriter._send`) so a read never
+    returns rows and a write never reports success on an envelope that says the
+    operation failed (the R1 finding). Returns ``None`` when there is no explicit
+    error to report (``rc`` absent or ``ok``, or a non-dict body).
+    """
+    if not isinstance(payload, dict):
+        return None
+    meta = payload.get("meta")
+    if isinstance(meta, dict) and str(meta.get("rc", "")).strip().lower() == "error":
+        return str(meta.get("msg") or "api.err (unspecified)")
+    return None
 
 
 class UnifiClient:
@@ -78,10 +106,17 @@ class UnifiClient:
         if not verify_ssl:
             self._suppress_insecure_warning()
 
+        # follow_redirects=False is a security rail (S4): the REST client carries
+        # the controller credential (X-API-KEY header, or the session cookie). httpx
+        # replays request headers across a redirect, so a redirect to another origin
+        # -- easy to induce when TLS verification is disabled for self-signed certs --
+        # would forward that credential off-controller. We never chase redirects on
+        # an authenticated controller request; a 3xx surfaces as a response the
+        # caller can inspect, and no secret leaves the controller origin.
         self._http = httpx.AsyncClient(
             verify=verify_ssl,
             timeout=timeout,
-            follow_redirects=True,
+            follow_redirects=False,
         )
         self._strategy: Optional[AuthStrategy] = None
         # A separate cookie strategy + its own http client for the events
@@ -238,7 +273,7 @@ class UnifiClient:
             # pure API-key. Reads its cookies via :attr:`ws_cookies`.
             if self._ws_http is None:
                 self._ws_http = httpx.AsyncClient(
-                    verify=self._verify_ssl, timeout=self._http.timeout, follow_redirects=True
+                    verify=self._verify_ssl, timeout=self._http.timeout, follow_redirects=False
                 )
             cookie_cls = (
                 UnifiOsCookieAuth
@@ -297,12 +332,36 @@ class UnifiClient:
         *,
         params: Optional[dict[str, Any]] = None,
         json_body: Optional[Any] = None,
+        allow_mutation: bool = False,
     ) -> httpx.Response:
-        """Issue an authenticated request to a site endpoint with retries.
+        """Issue an authenticated request to a site endpoint.
 
         ``endpoint`` is a site-relative path such as ``stat/device`` or
         ``stat/report/hourly.ap``; the strategy resolves the full URL.
+
+        This is the collector transport boundary and it enforces the GET-only
+        contract (S1): routine collection may issue **only** idempotent GETs.
+        A non-GET verb is refused unless the caller sets ``allow_mutation=True``,
+        which exactly one production object does -- the approved fix writer
+        (:class:`netadmin.fixes.writer.RealControllerWriter`), the single seam
+        allowed to change the controller. Any other non-GET is a contract
+        violation and raises :class:`UnifiError` before a socket opens.
+
+        Retry policy is method-aware (C2). GETs are idempotent, so a transport
+        error or a retryable 5xx is retried with backoff. A mutation is **never**
+        auto-retried on an ambiguous transport failure: a lost response could
+        otherwise dispatch the same write several times. Such a mutation raises
+        :class:`UnifiAmbiguousOutcomeError` after a single attempt so the caller
+        keeps the before-state and reconciles via a GET before trying again.
         """
+        method_u = method.upper()
+        idempotent = method_u == "GET"
+        if not idempotent and not allow_mutation:
+            raise UnifiError(
+                f"GET-only contract: refusing {method_u} {endpoint}. The collector is "
+                "read-only; only the approved fix writer may issue a controller mutation."
+            )
+
         strategy = await self.connect()
         url = strategy.api_url(self._host, self._site, endpoint)
         # The epoch we authenticated under; the 401 guard uses it so a burst of
@@ -319,14 +378,22 @@ class UnifiClient:
                     method, url, params=params, json=json_body, headers=headers
                 )
             except _RETRYABLE_EXC as exc:
+                if not idempotent:
+                    # Ambiguous outcome on a mutation: do NOT retry (C2). The write
+                    # may already have landed; retrying could apply it again.
+                    raise UnifiAmbiguousOutcomeError(
+                        f"{method_u} {endpoint} outcome unknown "
+                        f"({type(exc).__name__}: {exc}); not retried. Reconcile "
+                        "controller state via GET before any further attempt."
+                    ) from exc
                 if attempt >= self._max_retries:
                     raise UnifiConnectionError(
-                        f"{method} {endpoint} failed after {attempt + 1} attempts: {exc}"
+                        f"{method_u} {endpoint} failed after {attempt + 1} attempts: {exc}"
                     ) from exc
                 delay = self._backoff(attempt)
                 logger.warning(
                     "%s %s transport error (%s); retry %d in %.1fs",
-                    method,
+                    method_u,
                     endpoint,
                     type(exc).__name__,
                     attempt + 1,
@@ -339,17 +406,26 @@ class UnifiClient:
             strategy.capture(resp, self._http.cookies)
 
             if resp.status_code == 401 and not relogged:
-                logger.info("%s %s -> 401; re-logging in once.", method, endpoint)
+                # A 401 is an unambiguous rejection: the request was not applied,
+                # so a single re-login and retry is safe even for a mutation.
+                logger.info("%s %s -> 401; re-logging in once.", method_u, endpoint)
                 relogged = True
                 await self._relogin(login_epoch)
                 login_epoch = self._login_epoch  # adopt whichever login now stands
                 continue
 
-            if resp.status_code in _RETRYABLE_STATUS and attempt < self._max_retries:
+            # Retryable 5xx: only GETs are retried. A mutation that draws a 5xx is
+            # a definite server-side failure (a received response, not a lost one),
+            # so it is surfaced to the caller as a non-2xx outcome, never retried.
+            if (
+                idempotent
+                and resp.status_code in _RETRYABLE_STATUS
+                and attempt < self._max_retries
+            ):
                 delay = self._backoff(attempt)
                 logger.warning(
                     "%s %s -> %d; retry %d in %.1fs",
-                    method,
+                    method_u,
                     endpoint,
                     resp.status_code,
                     attempt + 1,
@@ -364,23 +440,20 @@ class UnifiClient:
     # ------------------------------------------------------------------ #
     # JSON helpers (classic UniFi envelope: {"meta": {...}, "data": [...]})
     # ------------------------------------------------------------------ #
+    # There is deliberately no ``post_json`` / ``post_data`` helper: the collector
+    # is GET-only (S1), so a read helper that POSTs would be a contract violation
+    # waiting to be called. The one legitimate controller mutation path is the fix
+    # writer, which calls :meth:`request` directly with ``allow_mutation=True``.
     async def get_json(
         self, endpoint: str, params: Optional[dict[str, Any]] = None
     ) -> dict[str, Any]:
         resp = await self.request("GET", endpoint, params=params)
         return self._parse(resp, endpoint)
 
-    async def post_json(self, endpoint: str, body: Optional[Any] = None) -> dict[str, Any]:
-        resp = await self.request("POST", endpoint, json_body=body if body is not None else {})
-        return self._parse(resp, endpoint)
-
     async def get_data(
         self, endpoint: str, params: Optional[dict[str, Any]] = None
     ) -> list[dict[str, Any]]:
         return self._data(await self.get_json(endpoint, params))
-
-    async def post_data(self, endpoint: str, body: Optional[Any] = None) -> list[dict[str, Any]]:
-        return self._data(await self.post_json(endpoint, body))
 
     def _parse(self, resp: httpx.Response, endpoint: str) -> dict[str, Any]:
         if resp.status_code in (401, 403):
@@ -393,6 +466,12 @@ class UnifiClient:
             raise UnifiError(f"{endpoint} returned non-JSON response") from exc
         if not isinstance(data, dict):
             raise UnifiError(f"{endpoint} returned unexpected JSON shape")
+        # An explicit error envelope is a failure even on HTTP 200 (R1). Without
+        # this, a ``{"meta":{"rc":"error"},"data":[]}`` body would quietly parse to
+        # zero rows and read as an empty-but-healthy result.
+        err = envelope_error(data)
+        if err is not None:
+            raise UnifiError(f"{endpoint} -> {err}")
         return data
 
     @staticmethod
@@ -403,4 +482,4 @@ class UnifiClient:
         return [data] if data else []
 
 
-__all__ = ["UnifiClient"]
+__all__ = ["UnifiClient", "envelope_error"]
