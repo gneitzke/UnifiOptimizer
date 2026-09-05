@@ -120,8 +120,28 @@ def test_firewall_failure_annotates_the_poll_run(repo: Repository) -> None:
     catalog = build_catalog([entry(StubDetector("t.bad", Cadence.FAST, _boom))])
     build_stack(repo, catalog=catalog).detector_engine.run_fast(NOW)
     row = repo.read_poll_runs("detect_fast", NOW - 1, NOW + 1)[0]
-    assert row["ok"] == 1  # the pass itself completed
+    # Q2: a pass that ran a crashed detector is not a clean success -- the
+    # recorded flag must say ok=0, not 1, or health masks the crash.
+    assert row["ok"] == 0
     assert "1 detector(s) failed" in row["error"]
+
+
+def test_failed_detector_marks_the_recorded_pass_not_ok(repo: Repository) -> None:
+    """Q2: an isolated detector crash still runs the other detectors (PassResult.ok
+    stays True -- the pass survived), but the *recorded* health flag must be ok=0
+    with the explanatory error, so health never counts a pass with a crashed
+    detector as a success."""
+    bad = StubDetector("t.bad", Cadence.FAST, _boom)
+    good = StubDetector("t.good", Cadence.FAST, lambda ctx: [make_finding("t.good")])
+    catalog = build_catalog([entry(bad), entry(good)])
+    result = build_stack(repo, catalog=catalog).detector_engine.run_fast(NOW)
+
+    assert result.ok is True  # isolation preserved: the pass itself survived
+    assert result.failed_detectors == ["t.bad"]
+    row = repo.read_poll_runs("detect_fast", NOW - 1, NOW + 1)[0]
+    assert row["ok"] == 0  # but the recorded health flag is NOT a clean success
+    assert "1 detector(s) failed" in row["error"]
+    assert _open_issue(repo, "t.good") is not None  # the good detector still landed
 
 
 def test_pass_level_crash_records_the_error_on_the_poll_run(repo: Repository) -> None:

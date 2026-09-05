@@ -1082,6 +1082,59 @@ class Repository:
         ).fetchone()
         return None if row is None or row["end_ts"] is None else int(row["end_ts"])
 
+    # B4: event-source observation coverage as a fraction of a detector window,
+    # read from the completed ``ingest_coverage`` intervals the event catch-up
+    # records (``kind='event_history'``).  This is the honest event-feed gap
+    # signal: a broken WebSocket / stat/event feed stops advancing these
+    # intervals, so a detector window drifts past the last recorded coverage and
+    # the fraction falls -- it is NEVER inferred from the presence or absence of
+    # event rows (that exact conflation is the B4 false-clear bug).  Read-only,
+    # additive: it touches only the C3/C4 ledger table and no shared method.
+    def observed_event_coverage(
+        self,
+        start_ts: int,
+        end_ts: int,
+        *,
+        kind: str = "event_history",
+        scope: str = "site",
+    ) -> float:
+        """Fraction in ``[0, 1]`` of ``[start_ts, end_ts)`` covered by *completed*
+        event-source reads.
+
+        Overlapping/adjacent complete intervals are merged so double-counting
+        cannot push the fraction over 1.0; only the portion inside the window
+        counts. Returns ``0.0`` for a non-positive window (or when nothing is
+        recorded), which a detector treats as an event-feed gap -> UNKNOWN.
+        """
+        if end_ts <= start_ts:
+            return 0.0
+        self._ensure_ingest_coverage(self._conn)
+        rows = self._conn.execute(
+            "SELECT start_ts, end_ts FROM ingest_coverage "
+            "WHERE kind=? AND scope=? AND status='complete' "
+            "AND end_ts>? AND start_ts<? ORDER BY start_ts, end_ts",
+            (kind, scope, start_ts, end_ts),
+        ).fetchall()
+        covered = 0
+        merged_start: Optional[int] = None
+        merged_end: Optional[int] = None
+        for row in rows:
+            seg_start = max(int(row["start_ts"]), start_ts)
+            seg_end = min(int(row["end_ts"]), end_ts)
+            if seg_end <= seg_start:
+                continue
+            if merged_end is None:
+                merged_start, merged_end = seg_start, seg_end
+            elif seg_start <= merged_end:
+                if seg_end > merged_end:
+                    merged_end = seg_end
+            else:
+                covered += merged_end - merged_start  # type: ignore[operator]
+                merged_start, merged_end = seg_start, seg_end
+        if merged_end is not None:
+            covered += merged_end - merged_start  # type: ignore[operator]
+        return min(1.0, covered / (end_ts - start_ts))
+
     def read_events(
         self,
         start_ts: int,

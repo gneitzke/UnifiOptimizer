@@ -491,6 +491,13 @@ class DetectorEngine:
         # count is the fallback note when the pass itself completed.
         if error is None and failed:
             error = f"{failed} detector(s) failed"
+            # Q2: a pass that ran a crashed detector is NOT a clean success. The
+            # recorded health flag must say so, or ``poll_runs`` counts a pass with
+            # an isolated detector failure as ok=1 and health masks the crash.
+            # Per-detector isolation is unchanged (the other detectors still ran,
+            # and PassResult.ok stays True to say the pass itself survived); only
+            # this recorded flag is corrected.
+            ok = False
         try:
             self._repo.record_poll_run(
                 job=_pass_job(cadence),
