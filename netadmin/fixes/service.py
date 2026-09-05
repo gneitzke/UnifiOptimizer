@@ -78,23 +78,40 @@ def build_fix_seams(settings: Any, *, for_apply: bool) -> "FixSeams":
     """
     from netadmin.fixes.reader import RealDeviceReader
     from netadmin.fixes.writer import RealControllerWriter
-    from netadmin.ingest.factory import build_endpoints
+    from netadmin.ingest.factory import build_endpoints, get_shared_reader
 
-    endpoints, client = build_endpoints(settings)
+    if for_apply:
+        # Mutations get a fresh, request-owned client we tear down afterwards.
+        endpoints, client = build_endpoints(settings)
+        writer: Optional[RealControllerWriter] = RealControllerWriter(client)
+
+        async def _close() -> None:
+            for name in ("aclose", "close"):
+                fn = getattr(client, name, None)
+                if fn is not None:
+                    result = fn()
+                    if hasattr(result, "__await__"):
+                        await result
+                    return
+
+        closer: Callable[[], Any] = _close
+    else:
+        # R4: read-only previews reuse the daemon-owned shared client so
+        # repeated previews don't each open a new authenticated session
+        # (which defeated shared pacing and could burst controller logins).
+        # The shared client's lifecycle belongs to ingest -> closer is a no-op.
+        endpoints, client = get_shared_reader(settings)
+        writer = None
+
+        async def _noop() -> None:
+            return None
+
+        closer = _noop
+
     _ = endpoints  # the reader talks to the client directly (raw stat/device)
     reader = RealDeviceReader(client)
-    writer = RealControllerWriter(client) if for_apply else None
 
-    async def _close() -> None:
-        for name in ("aclose", "close"):
-            fn = getattr(client, name, None)
-            if fn is not None:
-                result = fn()
-                if hasattr(result, "__await__"):
-                    await result
-                return
-
-    return FixSeams(reader=reader, writer=writer, closer=_close)
+    return FixSeams(reader=reader, writer=writer, closer=closer)
 
 
 class IssueNotFound(FixError):

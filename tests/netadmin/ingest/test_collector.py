@@ -409,7 +409,9 @@ async def test_alarms_job_ok_when_console_has_no_alarm_route(repo):
         def __init__(self):
             self.calls = 0
 
-        async def post_data(self, endpoint, body=None):
+        async def get_data(self, endpoint, params=None):
+            # list/alarm is now issued as a GET (GET-only contract, S1); the
+            # console still answers 400 api.err.InvalidObject -> route absent.
             self.calls += 1
             raise UnifiError(
                 f'{endpoint} -> 400: {{"meta":{{"rc":"error","msg":"api.err.InvalidObject"}}}}'
