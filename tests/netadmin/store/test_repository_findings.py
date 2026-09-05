@@ -214,6 +214,57 @@ def test_read_window_single_tier_labels_unchanged(repo: Repository, switch_entit
     assert repo.read_window(sid, now - 730 * day, now - 729 * day, now=now).tier == "daily"
 
 
+def test_read_window_assigns_hour_boundary_to_hourly_without_overlap_or_gap(
+    repo: Repository, switch_entity_id: int
+) -> None:
+    """The hourly rollup owns the complete hour containing the raw cutoff."""
+    sid = repo.intern_series(switch_entity_id, "rx_errors")
+    now = 30 * DAY_SECONDS + 3_630  # nominal raw cutoff is inside hour [3600, 7200)
+    repo.counter_max_gap_s = 5_000
+    repo.record_samples(
+        [
+            SampleReading(switch_entity_id, "rx_errors", 3_600, 0.0),  # counter seed
+            SampleReading(switch_entity_id, "rx_errors", 3_610, 10.0),
+            SampleReading(switch_entity_id, "rx_errors", 3_640, 30.0),
+            SampleReading(switch_entity_id, "rx_errors", 7_210, 50.0),
+        ]
+    )
+
+    repo.prune(now=now)
+    result = repo.read_window(sid, 3_600, 8_000, now=now)
+
+    assert result.tier == "stitched"
+    # The first hourly bucket owns +10 and +20; only the post-seam +20 stays raw.
+    assert [(row["ts"], row["value"]) for row in result.rows] == [(3_600, 30.0), (7_210, 20.0)]
+
+
+def test_read_window_assigns_day_boundary_to_daily_without_overlap_or_gap(
+    repo: Repository, switch_entity_id: int
+) -> None:
+    """The daily rollup owns the complete day containing the hourly cutoff."""
+    sid = repo.intern_series(switch_entity_id, "rx_errors")
+    repo.counter_max_gap_s = 100_000
+    now = 548 * DAY_SECONDS + DAY_SECONDS + 3_630
+    repo.record_samples(
+        [
+            SampleReading(switch_entity_id, "rx_errors", DAY_SECONDS, 0.0),  # seed
+            SampleReading(switch_entity_id, "rx_errors", DAY_SECONDS + 10, 10.0),
+            SampleReading(switch_entity_id, "rx_errors", DAY_SECONDS + 2 * HOUR_SECONDS + 10, 30.0),
+            SampleReading(switch_entity_id, "rx_errors", 2 * DAY_SECONDS + 10, 70.0),
+        ]
+    )
+
+    repo.prune(now=now)
+    result = repo.read_window(sid, DAY_SECONDS, 2 * DAY_SECONDS + HOUR_SECONDS, now=now)
+
+    assert result.tier == "stitched"
+    # Day one is one daily total (+10, +20); day two remains an hourly +40.
+    assert [(row["ts"], row["value"]) for row in result.rows] == [
+        (DAY_SECONDS, 30.0),
+        (2 * DAY_SECONDS, 40.0),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Finding 5: series interning rides the sample transaction; rollback is clean
 # ---------------------------------------------------------------------------

@@ -121,6 +121,17 @@ def _day_bucket(ts: int) -> int:
     return ts - (ts % DAY_SECONDS)
 
 
+def _next_bucket(ts: int, bucket_seconds: int) -> int:
+    """First bucket edge at or after ``ts``.
+
+    Retention seams assign a complete coarser bucket to the coarser tier.  A
+    ceiling (rather than a floor) keeps a bucket that straddles the nominal
+    retention age out of the finer tier, where it would otherwise overlap its
+    rollup aggregate.
+    """
+    return ((ts + bucket_seconds - 1) // bucket_seconds) * bucket_seconds
+
+
 @dataclass
 class SampleReading:
     """One metric reading handed to :meth:`Repository.record_samples`.
@@ -844,8 +855,13 @@ class Repository:
         single tier when only one was used, else ``"stitched"``.
         """
         now = _now() if now is None else now
-        raw_floor = now - self.retention_raw_days * DAY_SECONDS
-        hourly_floor = now - self.retention_hourly_days * DAY_SECONDS
+        # Rollups are addressed by bucket *start*, so a seam inside a bucket
+        # cannot safely split ownership.  Give that whole bucket to the
+        # coarser tier and start the finer tier at its next bucket edge.  prune()
+        # uses these same edges, keeping retained rows and read selection in
+        # lockstep.
+        raw_floor = _next_bucket(now - self.retention_raw_days * DAY_SECONDS, HOUR_SECONDS)
+        hourly_floor = _next_bucket(now - self.retention_hourly_days * DAY_SECONDS, DAY_SECONDS)
 
         rows: list[dict[str, Any]] = []
         tiers_used: list[str] = []
@@ -1256,13 +1272,15 @@ class Repository:
         table. One transaction.
         """
         now = _now() if now is None else now
-        raw_before = (
-            now - self.retention_raw_days * DAY_SECONDS if raw_before is None else raw_before
+        raw_before = _next_bucket(
+            now - self.retention_raw_days * DAY_SECONDS if raw_before is None else raw_before,
+            HOUR_SECONDS,
         )
-        hourly_before = (
+        hourly_before = _next_bucket(
             now - self.retention_hourly_days * DAY_SECONDS
             if hourly_before is None
-            else hourly_before
+            else hourly_before,
+            DAY_SECONDS,
         )
         with self._write() as conn:
             raw_deleted = conn.execute("DELETE FROM samples WHERE ts < ?", (raw_before,)).rowcount
