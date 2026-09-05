@@ -154,6 +154,14 @@ class FlakyClientDetector:
         window_s = int(ctx.threshold(self.key, "window_s", 3600))
         if ctx.coverage(window_s, "fast_sta") < COVERAGE_MIN:
             return UNKNOWN  # a poll gap hides both disconnects and attribution data
+        # B4: a healthy client poll does NOT prove the event feed ran. This
+        # verdict is built entirely from disconnect *events*; if the event source
+        # (WebSocket / stat/event) had a coverage gap over the window, aged-out
+        # events read as "no disconnects" and a real, still-open flaky-client
+        # issue would be false-cleared. Freeze (UNKNOWN) until event-source
+        # coverage is sufficient -- clearing/fix-verification stays frozen.
+        if ctx.event_coverage(window_s) < COVERAGE_MIN:
+            return UNKNOWN
 
         threshold = float(ctx.threshold(self.key, "weighted_threshold", 5.0))
         default_weight = float(ctx.threshold(self.key, "default_weight", 0.5))

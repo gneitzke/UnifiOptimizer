@@ -23,11 +23,19 @@ from netadmin.detect.detectors.client import (
     FlakyClientDetector,
     KnownPathologyDetector,
 )
+from netadmin.detect.catalog import build_catalog
 from netadmin.detect.engine import UNKNOWN
 from netadmin.domain.entities import Entity
-from netadmin.domain.types import EntityType, Severity
+from netadmin.domain.types import EntityType, FixState, IssueState, Severity
+from netadmin.issues.models import EngineConfig
 from netadmin.store.repository import Repository, SampleReading
-from tests.netadmin.detect.support import FakeBaselines, seed_coverage
+from tests.netadmin.detect.support import (
+    FakeBaselines,
+    build_stack,
+    entry,
+    seed_coverage,
+    seed_event_coverage,
+)
 
 NOW = 4_000_000
 
@@ -108,6 +116,7 @@ def _disconnect(repo: Repository, client_id: int, ap_id: int, ts: int, *, reason
 # ====================================================================== #
 def test_flaky_fires_and_attributes_ap_fault(repo: Repository) -> None:
     seed_coverage(repo, job="fast_sta", now=NOW, window_s=3600, interval_s=60)
+    seed_event_coverage(repo, now=NOW, window_s=3600)  # healthy event feed
     ap = _ap(repo, "ap-1", "ap-lobby")
     # 3 clients, each with many pathological disconnects on the same AP -> ap_fault.
     for i in range(3):
@@ -126,6 +135,7 @@ def test_flaky_fires_and_attributes_ap_fault(repo: Repository) -> None:
 
 def test_flaky_device_attribution_many_aps(repo: Repository) -> None:
     seed_coverage(repo, job="fast_sta", now=NOW, window_s=3600, interval_s=60)
+    seed_event_coverage(repo, now=NOW, window_s=3600)  # healthy event feed
     ap1, ap2 = _ap(repo, "ap-1"), _ap(repo, "ap-2")
     cid = _client(repo, mac="dd:1", ap_id=ap1)
     for k in range(4):
@@ -141,11 +151,81 @@ def test_flaky_confounder_benign_roams_suppressed(repo: Repository) -> None:
     # Reason code 8 (leaving BSS) is benign roam churn: weighted down so a mobile
     # client that roams a lot never reads as flaky.
     seed_coverage(repo, job="fast_sta", now=NOW, window_s=3600, interval_s=60)
+    seed_event_coverage(repo, now=NOW, window_s=3600)  # healthy event feed
     ap = _ap(repo, "ap-1")
     cid = _client(repo, mac="ee:1", ap_id=ap)
     for k in range(20):
         _disconnect(repo, cid, ap, NOW - 100 - k * 10, reason=8)
     assert FlakyClientDetector().evaluate(_ctx(repo)) == []
+
+
+# ====================================================================== #
+# client.flaky — B4: event-feed gaps must not false-clear event-based issues
+# ====================================================================== #
+def test_flaky_unknown_when_event_feed_gap_despite_healthy_poll(repo: Repository) -> None:
+    """B4(a): client polling is healthy and the disconnect events have aged out,
+    but the event feed had a coverage gap over the window. The verdict is built
+    from events, so returning ``[]`` here would false-clear a real open issue.
+    The detector must return UNKNOWN (freeze), not a clean empty list."""
+    seed_coverage(repo, job="fast_sta", now=NOW, window_s=3600, interval_s=60)
+    # No event coverage recorded -> the event source was NOT observed this window.
+    ap = _ap(repo, "ap-1")
+    _client(repo, mac="bb:1", ap_id=ap)  # client present, but its disc events aged out
+    assert FlakyClientDetector().evaluate(_ctx(repo)) is UNKNOWN
+
+
+def test_flaky_clears_when_event_feed_healthy_and_events_gone(repo: Repository) -> None:
+    """B4(b): with the event feed observed across the window and the disconnects
+    genuinely gone, the detector returns a clean ``[]`` -> a real clear. Event
+    coverage gates freezing, it does not block a legitimate resolution."""
+    seed_coverage(repo, job="fast_sta", now=NOW, window_s=3600, interval_s=60)
+    seed_event_coverage(repo, now=NOW, window_s=3600)  # healthy event feed, no events
+    ap = _ap(repo, "ap-1")
+    _client(repo, mac="bb:2", ap_id=ap)
+    assert FlakyClientDetector().evaluate(_ctx(repo)) == []
+
+
+def test_event_feed_gap_does_not_verify_a_flaky_fix(repo: Repository) -> None:
+    """B4(c): an applied fix must NOT be credited/greenlit while the event feed
+    was down. A real flaky-client issue fires and a fix is applied; later the
+    event feed has a coverage gap (client polling still healthy, disconnects aged
+    out). Driven through the real engine + issue lifecycle, the clean-looking pass
+    must FREEZE (UNKNOWN) -- the issue stays ACTIVE and the fix stays APPLIED,
+    never resolved-and-VERIFIED on missing event data."""
+    t1 = NOW
+    catalog = build_catalog([entry(FlakyClientDetector(), ceiling=Severity.P2)])
+    stack = build_stack(
+        repo, catalog=catalog, issue_config=EngineConfig(default_m=1, default_k=1)
+    )
+
+    # Phase 1: healthy feed + real disconnects -> the issue fires and goes ACTIVE.
+    seed_coverage(repo, job="fast_sta", now=t1, window_s=3600, interval_s=60)
+    seed_event_coverage(repo, now=t1, window_s=3600)
+    ap = _ap(repo, "ap-1")
+    cid = _client(repo, mac="gg:1", ap_id=ap)
+    for k in range(6):
+        _disconnect(repo, cid, ap, t1 - 100 - k * 10, reason=1)
+    stack.detector_engine.run_window(t1)
+    issue = [r for r in repo.list_issues(open_only=True) if r["detector_key"] == KEY_FLAKY][0]
+    assert issue["state"] == IssueState.ACTIVE.value
+    stack.issue_engine.apply_fix(int(issue["id"]), t1)  # arm the 48 h verification window
+
+    # Phase 2: event-feed gap. fast_sta healthy at t2; NO event coverage recorded
+    # for the new window; the disconnects have aged out. The client is still on
+    # the air (re-seen), so this is a feed gap, not a departure.
+    t2 = t1 + 3600
+    seed_coverage(repo, job="fast_sta", now=t2, window_s=3600, interval_s=60)
+    repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="gg:1", site_id="default", parent_id=ap),
+        ts=t2,
+    )  # keep last_seen fresh -> not "departed"
+    stack.detector_engine.run_window(t2)
+    stack.detector_engine.run_window(t2)  # even repeated clean-looking passes must not clear
+
+    still = [r for r in repo.list_issues(open_only=True) if r["detector_key"] == KEY_FLAKY]
+    assert len(still) == 1, "the issue was false-cleared during the event-feed gap"
+    assert still[0]["state"] == IssueState.ACTIVE.value  # frozen, not resolving/resolved
+    assert still[0]["fix_state"] != FixState.VERIFIED.value  # fix NOT credited on missing data
 
 
 def test_flaky_unknown_on_low_coverage(repo: Repository) -> None:

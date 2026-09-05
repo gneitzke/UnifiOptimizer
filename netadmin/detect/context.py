@@ -254,6 +254,26 @@ class DetectorContext:
         start_ts = self.now_ts - int(window_seconds)
         return self.repo.expected_coverage(job, start_ts, self.now_ts, interval_s, source="live")
 
+    # B4: event-source coverage is a *separate* honest gap signal from client-poll
+    # coverage above.  ``coverage(window, "fast_sta")`` measures whether the client
+    # poll ran; it says nothing about whether the event feed (WebSocket /
+    # stat/event) was up.  An event-based verdict (built from disconnect/roam
+    # *events*) must gate on THIS, or an aged-out window on a broken feed reads as
+    # "no events" and false-clears a real, still-open issue.
+    def event_coverage(self, window_seconds: int) -> float:
+        """Fraction in ``[0, 1]`` of the window the event source was observed for.
+
+        Measured from the ingest coverage ledger's completed event-history reads
+        (``repo.observed_event_coverage``), never inferred from whether event rows
+        exist. A detector whose verdict comes from events must return the engine's
+        ``UNKNOWN`` sentinel when this reads under :data:`COVERAGE_MIN`, freezing
+        (not clearing) its issues while the event feed had a gap.
+        """
+        if window_seconds <= 0:
+            return 0.0
+        start_ts = self.now_ts - int(window_seconds)
+        return self.repo.observed_event_coverage(start_ts, self.now_ts)
+
     # ------------------------------------------------------------------ #
     # Tunables
     # ------------------------------------------------------------------ #
