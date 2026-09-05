@@ -618,8 +618,10 @@ def test_incident_of_one_resolves_when_issue_resolves(topo: TopologyBuilder) -> 
     assert inc.resolved_ts == NOW + 60
 
 
-def test_symptom_resolving_shrinks_but_keeps_incident_open(topo: TopologyBuilder) -> None:
-    """One symptom clears while the root persists: incident stays, membership shrinks."""
+def test_symptom_resolving_preserves_history_and_keeps_incident_open(
+    topo: TopologyBuilder,
+) -> None:
+    """One symptom clears while the root persists: incident history stays intact."""
     ap = topo.add(1, "ap", name="AP-Garage-Mesh")
     client = topo.add(2, "client", parent_id=ap, name="Thermostat")
     issues = [
@@ -642,7 +644,38 @@ def test_symptom_resolving_shrinks_but_keeps_incident_open(topo: TopologyBuilder
     assert incidents[0].id == inc_id
     assert incidents[0].state == IncidentState.OPEN
     member_ids = {m.issue_id for m in _members(store, inc_id)}
-    assert member_ids == {10, 11}  # the resolved client dropped out
+    assert member_ids == {10, 11, 12}  # C5: the resolved client remains in history
+
+
+def test_c5_closed_incident_retains_resolved_symptom_and_current_severity(
+    topo: TopologyBuilder,
+) -> None:
+    ap = topo.add(1, "ap", name="AP-Garage-Mesh")
+    root = make_issue(
+        10, "wifi.mesh_uplink", ap, first_seen_ts=T, severity=Severity.P3
+    )
+    symptom = make_issue(
+        11, "net.coverage_hole", ap, first_seen_ts=T + 10, severity=Severity.P1
+    )
+    store = InMemoryCorrelationStore([root, symptom], topo.build())
+    engine = CorrelationEngine(store)
+
+    engine.run(NOW)
+    inc_id = store.all_incidents()[0].id
+    symptom.state = IssueState.RESOLVED
+    store.set_issues([root, symptom])
+    engine.run(NOW + 100)
+
+    current = store.all_incidents()[0]
+    assert current.severity is Severity.P3, "cleared P1 symptom must not pin live severity"
+    assert {m.issue_id for m in _members(store, inc_id)} == {10, 11}
+
+    root.state = IssueState.RESOLVED
+    store.set_issues([root, symptom])
+    engine.run(NOW + 200)
+    closed = store.all_incidents()[0]
+    assert closed.state == IncidentState.RESOLVED
+    assert {m.issue_id for m in _members(store, inc_id)} == {10, 11}
 
 
 def test_root_resolves_while_symptom_persists_keeps_incident_open(

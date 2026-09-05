@@ -1145,6 +1145,12 @@ class Repository:
             (job, start_ts, end_ts),
         ).fetchall()
 
+    # CLI doctor: enumerate the jobs actually represented in the local store.
+    def list_poll_jobs(self) -> list[str]:
+        """Distinct recorded poll job names, in stable order."""
+        rows = self._conn.execute("SELECT DISTINCT job FROM poll_runs ORDER BY job").fetchall()
+        return [str(row["job"]) for row in rows]
+
     def expected_coverage(
         self,
         job: str,
@@ -2437,6 +2443,50 @@ class Repository:
                     (incident_id, m["issue_id"], m["role"], m["rule"], m["rationale"]),
                 )
 
+    # C5: correlation history is append-only; unlike replace_incident_members,
+    # this reconciles the *current* set while retaining every prior member.
+    def reconcile_incident_members(
+        self, incident_id: int, members: Sequence[dict[str, Any]], *, ts: int
+    ) -> None:
+        """Persist current membership without erasing the incident's history.
+
+        Newly-seen members receive ``joined_ts``.  Current members are reopened
+        (``cleared_ts=NULL``) and refresh their audit explanation; members absent
+        from this pass remain stored and receive their first ``cleared_ts``.
+        """
+        current_ids = [int(m["issue_id"]) for m in members]
+        with self._write() as conn:
+            for m in members:
+                conn.execute(
+                    "INSERT INTO incident_members "
+                    "(incident_id, issue_id, role, rule, rationale, joined_ts, cleared_ts) "
+                    "VALUES (?,?,?,?,?,?,NULL) "
+                    "ON CONFLICT(incident_id, issue_id) DO UPDATE SET "
+                    "role=excluded.role, rule=excluded.rule, rationale=excluded.rationale, "
+                    "cleared_ts=NULL",
+                    (
+                        incident_id,
+                        m["issue_id"],
+                        m["role"],
+                        m["rule"],
+                        m["rationale"],
+                        ts,
+                    ),
+                )
+            if current_ids:
+                placeholders = ",".join("?" for _ in current_ids)
+                conn.execute(
+                    "UPDATE incident_members SET cleared_ts=COALESCE(cleared_ts, ?) "
+                    f"WHERE incident_id=? AND issue_id NOT IN ({placeholders})",
+                    [ts, incident_id, *current_ids],
+                )
+            else:
+                conn.execute(
+                    "UPDATE incident_members SET cleared_ts=COALESCE(cleared_ts, ?) "
+                    "WHERE incident_id=?",
+                    (ts, incident_id),
+                )
+
     def list_incident_members(self, incident_id: int) -> list[sqlite3.Row]:
         """Members of an incident, root first (role ordering), then by issue id."""
         return self._conn.execute(
@@ -2444,6 +2494,16 @@ class Repository:
             "ORDER BY CASE role WHEN 'root' THEN 0 ELSE 1 END, issue_id",
             (incident_id,),
         ).fetchall()
+
+    # C5: distinguish the current association from the historical member rows.
+    def current_incident_issue_ids(self, incident_id: int) -> set[int]:
+        """Issue ids currently attached to an incident (cleared history excluded)."""
+        rows = self._conn.execute(
+            "SELECT issue_id FROM incident_members "
+            "WHERE incident_id=? AND cleared_ts IS NULL",
+            (incident_id,),
+        ).fetchall()
+        return {int(row["issue_id"]) for row in rows}
 
     def incident_id_for_issue(self, issue_id: int) -> Optional[int]:
         """The open incident an issue currently belongs to, if any.
@@ -2454,7 +2514,8 @@ class Repository:
         row = self._conn.execute(
             "SELECT im.incident_id AS incident_id FROM incident_members im "
             "JOIN incidents i ON i.id = im.incident_id "
-            "WHERE im.issue_id=? AND i.state != 'resolved' LIMIT 1",
+            "WHERE im.issue_id=? AND im.cleared_ts IS NULL "
+            "AND i.state != 'resolved' LIMIT 1",
             (issue_id,),
         ).fetchone()
         return None if row is None else int(row["incident_id"])
@@ -2486,7 +2547,8 @@ class Repository:
             "(SELECT COUNT(*) FROM incident_members im2 WHERE im2.incident_id = i.id) "
             "  AS incident_member_count "
             "FROM incident_members im JOIN incidents i ON i.id = im.incident_id "
-            f"WHERE i.state != 'resolved' AND im.issue_id IN ({placeholders})",
+            f"WHERE i.state != 'resolved' AND im.cleared_ts IS NULL "
+            f"AND im.issue_id IN ({placeholders})",
             ids,
         ).fetchall()
         return {int(r["issue_id"]): r for r in rows}
@@ -2510,4 +2572,23 @@ class Repository:
         counts = {i: 0 for i in ids}
         for r in rows:
             counts[int(r["incident_id"])] = int(r["n"])
+        return counts
+
+    # C5: current symptom counts are deliberately separate from historical
+    # member counts, which keep resolved incidents visible as genuine incidents.
+    def incident_open_symptom_counts(self, incident_ids: Iterable[int]) -> dict[int, int]:
+        """Currently-attached symptom count per incident (cleared history excluded)."""
+        ids = [int(i) for i in dict.fromkeys(incident_ids) if i is not None]
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            "SELECT incident_id, COUNT(*) AS n FROM incident_members "
+            "WHERE role='symptom' AND cleared_ts IS NULL "
+            f"AND incident_id IN ({placeholders}) GROUP BY incident_id",
+            ids,
+        ).fetchall()
+        counts = {i: 0 for i in ids}
+        for row in rows:
+            counts[int(row["incident_id"])] = int(row["n"])
         return counts
