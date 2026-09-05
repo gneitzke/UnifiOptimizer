@@ -296,6 +296,21 @@ def map_device(device: Device, ts: int, *, site_id: str = "default") -> Mapping:
         dev_tracked["overheating"] = device.overheating
     if device.uplink is not None and device.uplink.type is not None:
         dev_tracked["uplink_type"] = device.uplink.type
+    # Physical wired-feeder identity, straight off the GET stat/device ``uplink``
+    # block: which upstream device (``uplink_mac``) and remote switch port
+    # (``uplink_remote_port``) this device hangs off. Persisted in meta -- a
+    # near-static topology fact, like the PoE ceiling above -- so the correlation
+    # layer can rebuild the feeder graph (switch/port -> downstream device) the
+    # ``FEEDS`` rules need. Kept deliberately distinct from ``parent_id``
+    # containment: a switch *feeds* the AP it uplinks, it is not the AP's parent.
+    # Derived only from data already in the polled payload; no extra controller
+    # call. Was never recorded, so the whole wired-feeder correlation class was
+    # dead in production (Gitea #B6).
+    if device.uplink is not None:
+        if device.uplink.uplink_mac:
+            dev_meta["uplink_mac"] = device.uplink.uplink_mac
+        if device.uplink.uplink_remote_port is not None:
+            dev_meta["uplink_remote_port"] = device.uplink.uplink_remote_port
     inv.append(
         EntityRecord(
             entity=Entity(

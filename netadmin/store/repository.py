@@ -2322,6 +2322,62 @@ class Repository:
             (site,),
         ).fetchall()
 
+    def feeder_edges(self, *, site_id: Optional[str] = None) -> list[tuple[int, int]]:
+        """Physical wired-feeder edges ``(feeder_entity_id, fed_entity_id)``.
+
+        Distinct from ``parent_id`` containment: a device is *contained* in its
+        site but *fed* by the upstream switch/port it hangs off. Reconstructed
+        from the ``uplink_mac`` / ``uplink_remote_port`` the ingest layer records
+        in each device's meta (the GET ``stat/device`` ``uplink`` block) -- no
+        controller call, and no schema of its own.
+
+        For every device that reports an uplink, up to two edges *into* that
+        device are emitted:
+
+        * from the upstream **switch** device (``native_id == uplink_mac``) --
+          this roots switch-scoped faults such as ``wired.broadcast_storm``;
+        * from that switch **port** (``native_id == "<uplink_mac>:<port>"``),
+          when the remote port is known -- this roots port-scoped faults
+          (``wired.port_flapping`` / ``wired.bad_cable`` / ``wired.stp_loop``).
+
+        Edges whose feeder is not (yet) an entity in this site are skipped, so a
+        half-ingested inventory yields fewer edges rather than dangling ones.
+        """
+        site = site_id or self.site_id
+        rows = self._conn.execute(
+            "SELECT entity_id, native_id, meta FROM entities WHERE site_id=?",
+            (site,),
+        ).fetchall()
+        id_by_native: dict[str, int] = {}
+        uplink_by_id: dict[int, tuple[str, Optional[int]]] = {}
+        for row in rows:
+            native_id = row["native_id"]
+            if native_id is not None:
+                id_by_native[native_id] = int(row["entity_id"])
+            try:
+                meta = json.loads(row["meta"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(meta, dict):
+                continue
+            feeder_mac = meta.get("uplink_mac")
+            if feeder_mac:
+                uplink_by_id[int(row["entity_id"])] = (
+                    str(feeder_mac),
+                    meta.get("uplink_remote_port"),
+                )
+
+        edges: list[tuple[int, int]] = []
+        for fed_id, (feeder_mac, remote_port) in uplink_by_id.items():
+            switch_id = id_by_native.get(feeder_mac)
+            if switch_id is not None and switch_id != fed_id:
+                edges.append((switch_id, fed_id))
+            if remote_port is not None:
+                port_id = id_by_native.get(f"{feeder_mac}:{remote_port}")
+                if port_id is not None and port_id != fed_id:
+                    edges.append((port_id, fed_id))
+        return edges
+
     def get_incident(self, incident_id: int) -> Optional[sqlite3.Row]:
         return self._conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
 

@@ -239,6 +239,44 @@ def test_device_meta_carries_mesh_enabled_from_mesh_sta_vap_enabled():
     assert "mesh_enabled" not in dev2.entity.meta
 
 
+def test_device_meta_carries_uplink_feeder_identity():
+    """Gitea #B6: the physical feeder identity (which switch/port a device hangs
+    off) comes straight from the GET ``stat/device`` ``uplink`` block. It must
+    land in device meta so ``Repository.feeder_edges`` can rebuild the feeder
+    graph the FEEDS rules need -- it was never recorded, so that rule class was
+    dead in production."""
+    dev = make_device(
+        mac="aa:bb:cc:dd:ee:20",
+        type="uap",
+        uplink={"uplink_mac": "aa:bb:cc:dd:ee:01", "uplink_remote_port": 5, "type": "wire"},
+    )
+    rec = next(r for r in map_device(dev, TS).inventory if r.entity.entity_type is EntityType.AP)
+    assert rec.entity.meta["uplink_mac"] == "aa:bb:cc:dd:ee:01"
+    assert rec.entity.meta["uplink_remote_port"] == 5
+
+
+def test_device_meta_omits_uplink_identity_when_absent():
+    """No uplink block (or a wireless uplink with no remote port) must not
+    fabricate the keys -- feeder_edges would otherwise invent a phantom edge."""
+    no_uplink = make_device(mac="aa:bb:cc:dd:ee:21", type="usw")
+    rec = next(
+        r for r in map_device(no_uplink, TS).inventory if r.entity.entity_type is EntityType.SWITCH
+    )
+    assert "uplink_mac" not in rec.entity.meta
+    assert "uplink_remote_port" not in rec.entity.meta
+
+    wireless = make_device(
+        mac="aa:bb:cc:dd:ee:22",
+        type="uap",
+        uplink={"uplink_mac": "aa:bb:cc:dd:ee:30", "type": "wireless"},
+    )
+    rec2 = next(
+        r for r in map_device(wireless, TS).inventory if r.entity.entity_type is EntityType.AP
+    )
+    assert rec2.entity.meta["uplink_mac"] == "aa:bb:cc:dd:ee:30"
+    assert "uplink_remote_port" not in rec2.entity.meta
+
+
 def test_uplink_type_tracked_when_present(stat_devices):
     ap = stat_devices[0]
     rec = map_device(ap, TS).inventory[0]
