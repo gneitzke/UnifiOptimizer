@@ -1,7 +1,6 @@
 import { useState } from 'react';
 import {
   AlertTriangle,
-  Check,
   CheckCircle2,
   RotateCcw,
   Wrench,
@@ -22,6 +21,8 @@ import {
   type FixPlanStep,
   type FixVerification,
 } from '../shared/api';
+import { ChangeStatusPill } from '../shared/changeStatus';
+import { normalizeChangeStatus } from '../shared/changeStatusMeta';
 import { humanizeKey } from '../shared/format';
 import { usePageAsync } from '../shared/hooks';
 
@@ -69,19 +70,20 @@ function valueText(v: unknown): string {
   return String(v);
 }
 
-function StepDiff({ step }: { step: FixPlanStep }) {
-  const entries = Object.entries(step.diff ?? {});
-  const changes = entries.filter(([, d]) => d.after !== null && d.after !== undefined);
-  if (changes.length === 0) return null;
+/** Shared before → after row renderer for both a fix plan's declared diff
+ * (`FixPlanStep.diff`) and an already-applied change's raw before/after
+ * objects (used by the revert-confirmation diff below). */
+function DiffRows({ entries }: { entries: { key: string; before: unknown; after: unknown }[] }) {
+  if (entries.length === 0) return null;
   return (
     <div className="flex flex-col gap-0.5 mt-1.5">
-      {changes.map(([attr, d]) => (
+      {entries.map((d) => (
         <div
-          key={attr}
+          key={d.key}
           className="grid font-mono items-baseline"
           style={{ gridTemplateColumns: 'minmax(90px,auto) 1fr', gap: 8, fontSize: 12 }}
         >
-          <span style={{ color: 'var(--fg-muted)' }}>{humanizeKey(attr)}</span>
+          <span style={{ color: 'var(--fg-muted)' }}>{humanizeKey(d.key)}</span>
           <span>
             <span style={{ color: 'var(--fg-subtle)', textDecoration: 'line-through' }}>
               {valueText(d.before)}
@@ -93,6 +95,26 @@ function StepDiff({ step }: { step: FixPlanStep }) {
       ))}
     </div>
   );
+}
+
+function StepDiff({ step }: { step: FixPlanStep }) {
+  const entries = Object.entries(step.diff ?? {})
+    .filter(([, d]) => d.after !== null && d.after !== undefined)
+    .map(([key, d]) => ({ key, before: d.before, after: d.after }));
+  return <DiffRows entries={entries} />;
+}
+
+/** What reverting `change` would restore: current (`after`) → the state
+ * captured before the fix ran (`before`). Only attributes that actually
+ * differ are shown. */
+function revertDiffEntries(change: FixChange): { key: string; before: unknown; after: unknown }[] {
+  const keys = new Set([
+    ...Object.keys(change.before ?? {}),
+    ...Object.keys(change.after ?? {}),
+  ]);
+  return Array.from(keys)
+    .filter((k) => change.after?.[k] !== change.before?.[k])
+    .map((k) => ({ key: k, before: change.after?.[k], after: change.before?.[k] }));
 }
 
 function StepRow({ step, first }: { step: FixPlanStep; first: boolean }) {
@@ -153,32 +175,50 @@ function VerificationBadge({ v }: { v: FixVerification }) {
   );
 }
 
+/** Whether it's meaningful to revert this row right now. Not while a send is
+ * still in flight (`applying`), not when nothing reached the device
+ * (`failed`), and not when it's already back to its prior state
+ * (`reverted`). An `unknown` (ambiguous) send is deliberately still
+ * revertible — restoring the captured `before` values is idempotent and safe
+ * whether or not the original send actually landed, which makes revert the
+ * safe move for exactly the state that's uncertain. */
+function canRevert(change: FixChange): boolean {
+  if (!change.revertible) return false;
+  const status = normalizeChangeStatus(change.status);
+  return status === 'applied' || status === 'unknown';
+}
+
 function AppliedChange({
   change,
   verification,
+  stepLabel,
   onRevert,
   busy,
 }: {
   change: FixChange;
   verification: FixVerification;
-  onRevert: (id: number) => void;
+  stepLabel: string | null;
+  onRevert: (change: FixChange) => void;
   busy: boolean;
 }) {
-  const reverted = change.status === 'reverted';
+  const status = normalizeChangeStatus(change.status);
+  const showVerification = status === 'applied';
   return (
     <div
       className="flex items-center justify-between gap-3 py-2.5"
       style={{ borderTop: '1px solid var(--hairline)' }}
     >
-      <div className="flex flex-col gap-0.5 min-w-0">
-        <div className="flex items-center gap-2">
-          <Check size={14} style={{ color: reverted ? 'var(--fg-subtle)' : 'var(--sev-healthy)' }} />
+      <div className="flex flex-col gap-1 min-w-0">
+        <div className="flex items-center gap-2 flex-wrap">
           <span className="t-body" style={{ color: 'var(--fg)' }}>
             {humanizeKey(change.action)}
           </span>
-          <span className="t-micro" style={{ color: 'var(--fg-subtle)' }}>
-            {reverted ? 'reverted' : 'applied'}
-          </span>
+          {stepLabel && (
+            <span className="t-micro" style={{ color: 'var(--fg-subtle)' }}>
+              {stepLabel}
+            </span>
+          )}
+          <ChangeStatusPill status={change.status} />
         </div>
         {/* Which device this row touched. A joint band re-plan ledgers one change
             per radio moved, so without the name every card reads identically and
@@ -188,16 +228,38 @@ function AppliedChange({
             {change.entity_name || change.entity_native_id}
           </span>
         )}
-        {!reverted && <VerificationBadge v={verification} />}
+        {status === 'unknown' && (
+          <span className="t-micro" style={{ color: 'var(--sev-p3)' }}>
+            The controller didn't confirm this send reached the device. Verify it directly, or
+            revert to restore the known prior state.
+          </span>
+        )}
+        {showVerification && <VerificationBadge v={verification} />}
       </div>
-      {!reverted && change.revertible && (
-        <Button variant="secondary" size="sm" disabled={busy} onClick={() => onRevert(change.id)}>
+      {canRevert(change) && (
+        <Button variant="secondary" size="sm" disabled={busy} onClick={() => onRevert(change)}>
           <RotateCcw size={13} />
           Revert
         </Button>
       )}
     </div>
   );
+}
+
+/** Replaces the old unconditional "you can revert it" promise with copy that
+ * matches this specific plan's actual revertibility (audit U1) — a plan can
+ * mix a config write (revertible) with a transient command like a client
+ * kick (not). */
+function revertibilityCopy(plan: FixPlanResponse): string {
+  const total = plan.steps.length;
+  const revertibleCount = plan.steps.filter((s) => s.revertible).length;
+  if (total === 0 || revertibleCount === total) {
+    return 'This sends the change now. The prior state of each step is captured first, so you can review and revert it afterward.';
+  }
+  if (revertibleCount === 0) {
+    return 'This sends the change now. These are transient commands with no prior state to restore — there will be nothing to revert afterward.';
+  }
+  return `This sends the change now. ${revertibleCount} of ${total} step${total === 1 ? '' : 's'} capture prior state and can be reverted afterward; the rest are transient commands.`;
 }
 
 function ConfirmModal({
@@ -239,8 +301,7 @@ function ConfirmModal({
               Apply this fix to the controller?
             </h3>
             <p className="t-secondary mt-0.5" style={{ color: 'var(--fg-muted)' }}>
-              This sends the change now. The current state is captured first, so you
-              can revert it from the change ledger.
+              {revertibilityCopy(plan)}
             </p>
           </div>
         </div>
@@ -267,6 +328,97 @@ function ConfirmModal({
           <Button variant="primary" size="sm" disabled={busy} onClick={onConfirm}>
             <Wrench size={13} />
             {busy ? 'Applying…' : 'Apply fix now'}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** "Revert should open a current diff for approval rather than implying an
+ * automatic guaranteed rollback" (audit U1): clicking Revert never fires the
+ * write directly. It opens this modal showing exactly what will change —
+ * current values reverting to the state captured before the fix ran — and
+ * only sends on explicit confirmation, the same pattern the apply flow uses. */
+function RevertConfirmModal({
+  change,
+  busy,
+  error,
+  onCancel,
+  onConfirm,
+}: {
+  change: FixChange;
+  busy: boolean;
+  error: string | null;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const entries = revertDiffEntries(change);
+  const status = normalizeChangeStatus(change.status);
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      style={{ background: 'color-mix(in srgb, black 45%, transparent)' }}
+      onClick={onCancel}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Confirm revert"
+    >
+      <div
+        className="w-full rounded-card flex flex-col gap-4 p-5"
+        style={{
+          maxWidth: 520,
+          background: 'var(--elevated)',
+          border: '1px solid var(--hairline)',
+          boxShadow: 'var(--shadow-elevated)',
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start gap-2.5">
+          <RotateCcw size={18} style={{ color: 'var(--fg-muted)', marginTop: 2, flexShrink: 0 }} />
+          <div>
+            <h3 className="t-section" style={{ color: 'var(--fg)' }}>
+              Revert {humanizeKey(change.action).toLowerCase()}?
+            </h3>
+            <p className="t-secondary mt-0.5" style={{ color: 'var(--fg-muted)' }}>
+              {status === 'unknown'
+                ? 'This send was never confirmed. Reverting restores the state captured before it, regardless of whether it reached the device.'
+                : 'This sends the values captured before the fix ran, right now. Nothing else on the device changes.'}
+            </p>
+          </div>
+        </div>
+
+        <div
+          className="rounded-control p-3 flex flex-col"
+          style={{ background: 'var(--canvas)', border: '1px solid var(--hairline)' }}
+        >
+          {(change.entity_name || change.entity_native_id) && (
+            <span className="t-caption mb-1" style={{ color: 'var(--fg-muted)' }}>
+              {change.entity_name || change.entity_native_id}
+            </span>
+          )}
+          {entries.length > 0 ? (
+            <DiffRows entries={entries} />
+          ) : (
+            <span className="t-caption" style={{ color: 'var(--fg-subtle)' }}>
+              No prior values were captured for this change to compare.
+            </span>
+          )}
+        </div>
+
+        {error && (
+          <span className="t-caption" style={{ color: 'var(--sev-p1)' }}>
+            {error}
+          </span>
+        )}
+
+        <div className="flex items-center justify-end gap-2">
+          <Button variant="ghost" size="sm" disabled={busy} onClick={onCancel}>
+            Cancel
+          </Button>
+          <Button variant="primary" size="sm" disabled={busy} onClick={onConfirm}>
+            <RotateCcw size={13} />
+            {busy ? 'Reverting…' : 'Revert this change'}
           </Button>
         </div>
       </div>
@@ -305,21 +457,35 @@ function AppliedChangesList({
 }: {
   changes: FixChange[];
   verification: FixVerification;
-  onRevert: (id: number) => void;
+  onRevert: (change: FixChange) => void;
   busy: boolean;
   bordered: boolean;
 }) {
   if (changes.length === 0) return null;
+  // Per-step results (audit U1): a multi-device / multi-radio plan ledgers one
+  // row per step, so a reader needs to know it's reading a sequence rather
+  // than an unordered pile. `step_index`/`step_count` are optional — fall back
+  // to position-in-list when the backend hasn't sent them yet.
+  const isMultiStep = changes.length > 1;
   return (
     <div
       className="flex flex-col pt-1"
       style={bordered ? { borderTop: '1px solid var(--hairline)' } : undefined}
     >
       <span className="t-micro mt-2 mb-0.5" style={{ color: 'var(--fg-subtle)' }}>
-        Applied changes
+        {isMultiStep ? `Applied changes · ${changes.length} steps` : 'Applied changes'}
       </span>
-      {changes.map((c) => (
-        <AppliedChange key={c.id} change={c} verification={verification} onRevert={onRevert} busy={busy} />
+      {changes.map((c, i) => (
+        <AppliedChange
+          key={c.id}
+          change={c}
+          verification={verification}
+          stepLabel={
+            isMultiStep ? `Step ${c.step_index ?? i + 1} of ${c.step_count ?? changes.length}` : null
+          }
+          onRevert={onRevert}
+          busy={busy}
+        />
       ))}
     </div>
   );
@@ -401,7 +567,19 @@ function FixPlanPreview({
     setBusy(true);
     setApplyError(null);
     try {
-      await applyFix(issueId, plan.confirm_token);
+      const resp = await applyFix(issueId, plan.confirm_token);
+      // A response can come back with applied === false (aborted mid-plan) or
+      // with a mix of per-step outcomes even when the request itself
+      // succeeded — don't treat a 2xx as "it worked" without checking
+      // (audit U1). The per-change ledger below still renders the accurate
+      // per-step status either way; this just keeps the modal open with the
+      // reason when the send didn't go the way the confirm implied it would.
+      if (!resp.applied) {
+        setApplyError(resp.aborted_reason ?? 'The apply did not complete. Nothing further was sent.');
+        reload();
+        onApplied();
+        return;
+      }
       setModalOpen(false);
       reload();
       onApplied();
@@ -485,6 +663,7 @@ export function ProposedFix({
     usePageAsync<FixHistoryResponse>(() => getFixHistory(issueId), [issueId]);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [revertTarget, setRevertTarget] = useState<FixChange | null>(null);
 
   if (historyLoading && !history) {
     return <Skeleton className="h-24 w-full" />;
@@ -509,6 +688,7 @@ export function ProposedFix({
       await revertFix(issueId, changeId);
       reloadHistory();
       onChanged();
+      setRevertTarget(null);
     } catch (e) {
       setActionError((e as Error).message || 'Revert failed');
     } finally {
@@ -533,15 +713,31 @@ export function ProposedFix({
       <AppliedChangesList
         changes={appliedChanges}
         verification={history.verification}
-        onRevert={doRevert}
+        onRevert={(change) => {
+          setActionError(null);
+          setRevertTarget(change);
+        }}
         busy={busy}
         bordered={isOpen}
       />
 
-      {actionError && (
+      {actionError && !revertTarget && (
         <span className="t-caption" style={{ color: 'var(--sev-p1)' }}>
           {actionError}
         </span>
+      )}
+
+      {revertTarget && (
+        <RevertConfirmModal
+          change={revertTarget}
+          busy={busy}
+          error={actionError}
+          onCancel={() => {
+            setRevertTarget(null);
+            setActionError(null);
+          }}
+          onConfirm={() => doRevert(revertTarget.id)}
+        />
       )}
     </div>
   );
