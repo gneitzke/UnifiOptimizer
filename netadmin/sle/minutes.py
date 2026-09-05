@@ -816,7 +816,20 @@ class SleMinutesJob:
         changes = self.repo.list_state_changes(
             start, end, entity_id=client_id, attr="ap_mac", limit=10_000
         )
-        current = self._ap_id_for_native(opening[0]["new_value"]) if opening else None
+        if opening:
+            current = self._ap_id_for_native(opening[0]["new_value"])
+        elif not changes and not self.repo.list_state_changes(
+            end, 1 << 62, entity_id=client_id, attr="ap_mac", limit=1
+        ):
+            # No ap_mac history anywhere for this client: it never roamed, so its
+            # samples belong to its current (only-ever) parent AP. This restores
+            # the common no-roam case without reintroducing the post-roam
+            # mis-attribution B5 fixes -- that only triggers when a roam was
+            # actually recorded, in which case a change exists and this branch
+            # is skipped in favour of the as-of resolution above/below.
+            current = self._current_parent_ap(client_id)
+        else:
+            current = None
         since = start
         intervals: list[tuple[int, int, Optional[int]]] = []
         for row in reversed(changes):  # list_state_changes is newest-first
@@ -828,6 +841,21 @@ class SleMinutesJob:
         if end > since:
             intervals.append((since, end, current))
         return intervals
+
+    def _current_parent_ap(self, client_id: int) -> Optional[int]:
+        """The client's current parent, iff it is an AP.
+
+        Used only as the attachment for a client with *no* recorded ap_mac
+        history at all (it never roamed). A wired client parented to a switch
+        resolves to ``None`` -- coverage does not apply there.
+        """
+        row = self.repo.get_entity(client_id)
+        if row is None or row["parent_id"] is None:
+            return None
+        parent = self.repo.get_entity(int(row["parent_id"]))
+        if parent is None or parent["entity_type"] != EntityType.AP.value:
+            return None
+        return int(parent["entity_id"])
 
     def _ap_id_for_native(self, value: Any) -> Optional[int]:
         """Resolve a recorded AP native id without consulting client inventory."""

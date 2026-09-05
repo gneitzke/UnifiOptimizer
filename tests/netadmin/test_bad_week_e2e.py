@@ -137,6 +137,18 @@ class Site:
             for job in ("fast_device", "fast_sta"):
                 for ts in range(NOW - 25 * 3600, NOW + 1, 60):
                     self.repo.record_poll_run(job=job, ok=True, ts=ts)
+        # The event feed was up across the same window (a good week), so the
+        # event-source coverage ledger spans it. Event-based detectors (e.g.
+        # client.flaky) gate on this so a dead feed can't falsely clear an issue
+        # (B4); the live pipeline records it as WS/catch-up reads land.
+        self.repo.record_ingest_coverage(
+            kind="event_history",
+            scope="site",
+            interval="retained",
+            start_ts=NOW - 25 * 3600,
+            end_ts=NOW,
+            status="complete",
+        )
 
     def degrading_cable(self) -> None:
         # rx_errors ramp: a sparse low history, a dense high tail in the last 15 min.
