@@ -4,13 +4,22 @@ Only the endpoints the daemon actually consumes are wrapped here; the write set
 (Phase 4) and the unofficial v2 endpoints are deliberately absent. Every method
 returns parsed pydantic models from :mod:`netadmin.ingest.unifi.models`.
 
+The collector is GET-only (S1): every read here is issued as an idempotent GET,
+its query carried on the URL. Some routes are, on some firmware, only served over
+POST; under the literal GET-only contract those are reported UNAVAILABLE (the
+method degrades to ``[]`` and latches off for the session) rather than POSTed to.
+The controller is never mutated from this module -- the sole mutation seam is the
+approved fix writer.
+
 UniFi API conventions encoded here:
 
 * ``stat/device``, ``stat/sta``, ``stat/health`` are GETs.
-* ``stat/report/{interval}.{scope}`` is a POST with ``{attrs, start, end}`` in
-  **milliseconds**.
-* ``stat/event`` is a POST paged with ``_start`` / ``_limit`` (3000/page cap).
-* ``stat/session`` is a POST with **seconds** timestamps.
+* ``stat/report/{interval}.{scope}`` carries ``{attrs, start, end}`` in
+  **milliseconds** as GET query params; unavailable if the console will not serve
+  it over GET.
+* ``stat/event`` is paged with ``_start`` / ``_limit`` (3000/page cap) as GET
+  query params.
+* ``stat/session`` carries **seconds** timestamps as GET query params.
 * ``stat/rogueap`` uses ``within`` (hours); ``stat/anomalies`` uses a ms window.
 * ``rest/wlanconf`` is a GET. It is a *read* of the WLAN config, not a write --
   the read-only posture holds (a write would be a PUT/POST to the same route).
@@ -45,16 +54,17 @@ EVENT_PAGE_CAP = 3000
 # Candidate event-log endpoints, tried in order (LIVE-VALIDATED QUIRK).
 #
 # The classic ``stat/event`` route has been REMOVED on this UniFi OS console
-# (Network 9.x): it answers EVERY method and body form -- GET, POST, with or
-# without ``_start`` / ``_limit`` / ``within`` -- with ``404 api.err.NotFound``.
-# The surviving route on such consoles is ``list/event`` (confirmed present: it
-# returns ``400 api.err.InvalidObject`` to an empty body rather than a 404, i.e.
-# the route exists but validates its body). Legacy / self-hosted controllers
-# still serve ``stat/event``. We probe in order, stick to the first that answers,
-# and -- when NONE is usable -- log once and return ``[]`` so catch-up degrades to
-# the live WebSocket instead of throwing every poll cycle (the daemon bug this
-# fixes). ``list/alarm`` and ``stat/anomalies`` remain the separate alarm/anomaly
-# feeds (ARCHITECTURE.md 5.1); they are not substitutes for the EVT_* stream.
+# (Network 9.x): it answers a GET read with ``404 api.err.NotFound``. The
+# surviving route on such consoles is ``list/event`` (confirmed present: it
+# returns ``400 api.err.InvalidObject`` to a bad query rather than a 404, i.e.
+# the route exists but validates its params). Legacy / self-hosted controllers
+# still serve ``stat/event``. We probe in order over GET only (the GET-only
+# contract, S1 -- a route that answers only over POST is treated as absent),
+# stick to the first that answers, and -- when NONE is usable -- log once and
+# return ``[]`` so catch-up degrades to the live WebSocket instead of throwing
+# every poll cycle (the daemon bug this fixes). ``list/alarm`` and
+# ``stat/anomalies`` remain the separate alarm/anomaly feeds (ARCHITECTURE.md
+# 5.1); they are not substitutes for the EVT_* stream.
 _EVENT_ENDPOINTS: tuple[str, ...] = ("stat/event", "list/event")
 
 # ``meta.msg`` markers meaning "this route/body is not usable on this console" ->
@@ -103,6 +113,12 @@ class Endpoints:
         # Sticky "this console has no usable alarm read route" latch; see
         # :meth:`list_alarm`. Reset on process restart, which re-probes.
         self._alarm_disabled: bool = False
+        # Sticky "this console will not serve this source over GET" latches (S1):
+        # the source is reported UNAVAILABLE rather than POSTed to. Reset on
+        # process restart, which re-probes. See the respective methods.
+        self._report_disabled: bool = False
+        self._session_disabled: bool = False
+        self._rogueap_disabled: bool = False
 
     # --------------------------------------------------------------- #
     # 60 s cadence
@@ -135,11 +151,12 @@ class Endpoints:
 
         Endpoint selection is a LIVE-VALIDATED QUIRK (see :data:`_EVENT_ENDPOINTS`
         for the full note): this console removed ``stat/event`` (hard 404
-        ``api.err.NotFound`` for every method/body), so the method probes the
-        candidates in order, GET-then-POST per page, sticks to the first that
-        answers, and if none is usable logs once and returns ``[]`` -- catch-up
-        then rides on the live WebSocket rather than raising every poll cycle.
-        Both verbs are read-only (section 5.1 read set).
+        ``api.err.NotFound``), so the method probes the candidates in order via
+        GET (the GET-only contract, S1), sticks to the first that answers, and if
+        none is usable logs once and returns ``[]`` -- catch-up then rides on the
+        live WebSocket rather than raising every poll cycle. A source that only
+        answers over POST on this console is treated as absent (unavailable), not
+        POSTed to.
         """
         if self._event_disabled:
             return []
@@ -181,28 +198,21 @@ class Endpoints:
         within_hours: Optional[int],
         max_events: Optional[int],
     ) -> list[Event]:
-        """Page one event endpoint with ``_start`` (GET first, POST fallback).
+        """Page one event endpoint with ``_start``/``_limit`` as GET query params.
 
-        Once GET fails on a page the method sticks to POST for the remaining
-        pages rather than re-eating the same failure each page. A terminal
-        ``UnifiError`` (both verbs failed) propagates to :meth:`stat_event`,
-        which decides fall-through vs. surface via :func:`_route_absent`.
+        GET only: the paging params ride the query string (S1 -- the collector is
+        read-only and never POSTs). A ``UnifiError`` (route absent, or the console
+        only serves this over POST -- which the GET-only contract will not do)
+        propagates to :meth:`stat_event`, which decides fall-through to the next
+        candidate vs. surface via :func:`_route_absent`.
         """
         events: list[Event] = []
         start = 0
-        use_get = True
         while True:
             body: dict[str, Any] = {"_start": start, "_limit": EVENT_PAGE_CAP}
             if within_hours is not None:
                 body["within"] = within_hours
-            if use_get:
-                try:
-                    rows = await self._c.get_data(endpoint, body)
-                except UnifiError:
-                    use_get = False
-                    rows = await self._c.post_data(endpoint, body)
-            else:
-                rows = await self._c.post_data(endpoint, body)
+            rows = await self._c.get_data(endpoint, body)
             events.extend(Event.model_validate(r) for r in rows)
             if len(rows) < EVENT_PAGE_CAP:
                 break
@@ -232,11 +242,25 @@ class Endpoints:
             )
         if scope not in REPORT_SCOPES:
             raise ValueError(f"scope must be one of {sorted(REPORT_SCOPES)}, got {scope!r}")
+        if self._report_disabled:
+            return []
         selected = attrs if attrs is not None else DEFAULT_REPORT_ATTRS[scope]
         if "time" not in selected:
             selected = [*selected, "time"]
-        body = {"attrs": selected, "start": start_ms, "end": end_ms}
-        rows = await self._c.post_data(f"stat/report/{interval}.{scope}", body)
+        params = {"attrs": selected, "start": start_ms, "end": end_ms}
+        try:
+            rows = await self._c.get_data(f"stat/report/{interval}.{scope}", params)
+        except UnifiError as exc:
+            if not _route_absent(exc):
+                raise
+            self._report_disabled = True
+            logger.warning(
+                "stat/report is not served over GET on this console (%s); reports "
+                "unavailable for this session under the GET-only contract -- the "
+                "collector never POSTs to the controller.",
+                exc,
+            )
+            return []
         return [ReportRow.model_validate(r) for r in rows]
 
     async def stat_report_5min(
@@ -269,16 +293,54 @@ class Endpoints:
         end_s: int,
         type_: str = "all",
     ) -> list[Session]:
-        """``stat/session`` for one client. ``start_s``/``end_s`` are seconds."""
-        body = {"mac": mac, "type": type_, "start": start_s, "end": end_s}
-        rows = await self._c.post_data("stat/session", body)
+        """``stat/session`` for one client. ``start_s``/``end_s`` are seconds.
+
+        GET-only (S1): the query rides the URL. A console that will not serve
+        sessions over GET reports the source unavailable (``[]``, latched off for
+        the session) rather than being POSTed to.
+        """
+        if self._session_disabled:
+            return []
+        params = {"mac": mac, "type": type_, "start": start_s, "end": end_s}
+        try:
+            rows = await self._c.get_data("stat/session", params)
+        except UnifiError as exc:
+            if not _route_absent(exc):
+                raise
+            self._session_disabled = True
+            logger.warning(
+                "stat/session is not served over GET on this console (%s); per-client "
+                "session forensics unavailable for this session under the GET-only "
+                "contract -- the collector never POSTs to the controller.",
+                exc,
+            )
+            return []
         return [Session.model_validate(r) for r in rows]
 
     # --------------------------------------------------------------- #
     # neighbor / anomaly signals
     # --------------------------------------------------------------- #
     async def stat_rogueap(self, *, within_hours: int = 24) -> list[RogueAp]:
-        rows = await self._c.post_data("stat/rogueap", {"within": within_hours})
+        """``stat/rogueap`` neighbor scan (GET-only, S1).
+
+        A console that will not serve rogue-AP scans over GET reports the source
+        unavailable (``[]``, latched off) rather than being POSTed to.
+        """
+        if self._rogueap_disabled:
+            return []
+        try:
+            rows = await self._c.get_data("stat/rogueap", {"within": within_hours})
+        except UnifiError as exc:
+            if not _route_absent(exc):
+                raise
+            self._rogueap_disabled = True
+            logger.warning(
+                "stat/rogueap is not served over GET on this console (%s); rogue-AP "
+                "scan unavailable for this session under the GET-only contract -- the "
+                "collector never POSTs to the controller.",
+                exc,
+            )
+            return []
         return [RogueAp.model_validate(r) for r in rows]
 
     async def rest_wlanconf(self) -> list[Wlan]:
@@ -302,9 +364,10 @@ class Endpoints:
         """``list/alarm`` -- controller alarms (LIVE-VALIDATED QUIRK).
 
         Some UniFi OS consoles no longer serve any classic alarm read route: this
-        one answers ``400 api.err.InvalidObject`` to our POST *and* to a bare GET
-        carrying no payload at all, so no body shape can satisfy it -- the same
-        removal already documented for ``stat/event`` (see :data:`_EVENT_ENDPOINTS`).
+        one answers ``400 api.err.InvalidObject`` to the GET read (and would to any
+        query shape), so the route is gone -- the same removal already documented
+        for ``stat/event`` (see :data:`_EVENT_ENDPOINTS`). GET-only (S1): a route
+        that would answer only over POST is treated as absent, never POSTed to.
         When that happens we log once, latch off for the session and return ``[]``:
         alarms are a supplementary feed (the live WebSocket carries the events), and
         a permanently failing job would hold ``/api/health`` at ``degraded`` forever,
@@ -315,7 +378,7 @@ class Endpoints:
         if self._alarm_disabled:
             return []
         try:
-            rows = await self._c.post_data("list/alarm", {"archived": archived})
+            rows = await self._c.get_data("list/alarm", {"archived": archived})
         except UnifiError as exc:
             if not _route_absent(exc):
                 raise

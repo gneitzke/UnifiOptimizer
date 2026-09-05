@@ -122,3 +122,63 @@ async def test_real_writer_reports_non_2xx_as_not_ok():
     assert res.ok is False
     assert res.status_code == 400
     await client.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# C2 -- the writer's mutation must NEVER be auto-retried on a lost response.
+# The reproduction: one synthetic POST whose response is lost previously fanned
+# out to FOUR dispatches (any of which could hit the live network). It must now
+# dispatch exactly once and report an ambiguous, NOT-ok outcome so the caller
+# keeps the before-state and reconciles via GET.
+# --------------------------------------------------------------------------- #
+@respx.mock
+async def test_ambiguous_mutation_dispatches_once_and_is_not_ok():
+    _mock_login()
+    route = respx.post(f"{API}/cmd/devmgr").mock(side_effect=httpx.ReadTimeout("lost response"))
+    client = UnifiClient(
+        host=HOST, site=SITE, username="u", password="p", min_request_interval=0.0, max_retries=3
+    )
+    await client.connect()
+    writer = RealControllerWriter(client)
+
+    res = await writer.post("cmd/devmgr", {"cmd": "power-cycle", "mac": "x", "port_idx": 5})
+
+    assert route.call_count == 1  # exactly one dispatch -- no 4x fan-out to the network
+    assert res.ok is False  # never reported as success
+    assert res.status_code is None
+    assert res.data.get("ambiguous") is True
+    await client.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# R1 -- an explicit UniFi error envelope is a failure even on HTTP 200, and a
+# non-JSON/HTML mutation response is not a confirmed success.
+# --------------------------------------------------------------------------- #
+@respx.mock
+async def test_error_envelope_is_not_success_despite_http_200():
+    _mock_login()
+    respx.put(f"{API}/rest/device/dev123").mock(
+        return_value=httpx.Response(
+            200, json={"meta": {"rc": "error", "msg": "api.err.InvalidObject"}, "data": []}
+        )
+    )
+    client = await _client()
+    writer = RealControllerWriter(client)
+    res = await writer.put("rest/device/dev123", {"radio_table": []})
+    assert res.ok is False  # HTTP 200 must not override the error envelope
+    assert res.status_code == 200
+    await client.aclose()
+
+
+@respx.mock
+async def test_non_json_mutation_response_is_not_confirmed_success():
+    _mock_login()
+    respx.post(f"{API}/cmd/devmgr").mock(
+        return_value=httpx.Response(200, text="<html>gateway</html>")
+    )
+    client = await _client()
+    writer = RealControllerWriter(client)
+    res = await writer.post("cmd/devmgr", {"cmd": "power-cycle"})
+    assert res.ok is False  # an HTML/non-JSON body cannot confirm the mutation
+    assert res.status_code == 200
+    await client.aclose()

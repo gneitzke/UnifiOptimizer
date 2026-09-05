@@ -101,17 +101,20 @@ async def test_stat_sta_and_health_parse():
 
 @respx.mock
 async def test_stat_report_parses_and_sends_ms_window():
+    # GET-only contract (S1): the report window/attrs ride the query string.
     _mock_login()
-    route = respx.post(f"{API}/stat/report/hourly.ap").mock(
+    route = respx.get(f"{API}/stat/report/hourly.ap").mock(
         return_value=httpx.Response(200, json=load_fixture("stat_report_hourly_ap.json"))
     )
     client, ep = await _endpoints()
     rows = await ep.stat_report_hourly("ap", start_ms=1_000, end_ms=2_000, attrs=["bytes"])
     assert rows
-    body = json.loads(route.calls.last.request.content)
-    assert body["start"] == 1_000 and body["end"] == 2_000
-    assert "time" in body["attrs"]  # auto-appended
-    assert "bytes" in body["attrs"]
+    params = route.calls.last.request.url.params
+    assert params["start"] == "1000" and params["end"] == "2000"
+    attrs = params.get_list("attrs")
+    assert "time" in attrs  # auto-appended
+    assert "bytes" in attrs
+    assert route.calls.last.request.method == "GET"  # never a POST
     await client.aclose()
 
 
@@ -168,25 +171,30 @@ async def test_stat_event_parses_synthetic_event_fixture():
 
 
 @respx.mock
-async def test_stat_event_falls_back_to_post_on_get_404():
-    # UniFi OS consoles answer GET; older controllers only accept POST. When GET
-    # 404s (api.err.NotFound), the wrapper falls back to the documented POST
-    # read-query. Regression guard for the live CloudKey Gen2 finding.
+async def test_stat_event_get_404_falls_through_without_posting():
+    # GET-only contract (S1): the old GET->POST fallback is gone. A GET 404 on
+    # stat/event must fall THROUGH to the next candidate (list/event) over GET and
+    # must NEVER POST -- a route that would answer only over POST is treated as
+    # absent. Regression guard that the collector issues no controller POST.
     _mock_login()
-    get_route = respx.get(f"{API}/stat/event").mock(
+    get_se = respx.get(f"{API}/stat/event").mock(
         return_value=httpx.Response(
             404, json={"meta": {"rc": "error", "msg": "api.err.NotFound"}, "data": []}
         )
     )
-    post_route = respx.post(f"{API}/stat/event").mock(
+    post_se = respx.post(f"{API}/stat/event").mock(
         return_value=httpx.Response(200, json={"data": [{"key": "EVT_Z", "_id": "z"}]})
+    )
+    get_le = respx.get(f"{API}/list/event").mock(
+        return_value=httpx.Response(200, json={"data": [{"key": "EVT_LE", "_id": "le"}]})
     )
     client, ep = await _endpoints()
     events = await ep.stat_event(within_hours=24)
-    assert [e.key for e in events] == ["EVT_Z"]
-    assert get_route.called and post_route.called
-    body = json.loads(post_route.calls.last.request.content)
-    assert body["_start"] == 0 and body["within"] == 24
+    assert [e.key for e in events] == ["EVT_LE"]  # fell through over GET
+    assert get_se.called and get_le.called
+    assert not post_se.called  # GET-only: no POST fallback
+    params = get_le.calls.last.request.url.params
+    assert params["_start"] == "0" and params["within"] == "24"
     await client.aclose()
 
 
@@ -197,24 +205,23 @@ _INVALID = {"meta": {"rc": "error", "msg": "api.err.InvalidObject"}, "data": []}
 @respx.mock
 async def test_stat_event_falls_through_to_list_event_when_stat_absent():
     # LIVE-VALIDATED QUIRK: this UniFi OS console removed stat/event (hard 404
-    # api.err.NotFound for GET *and* POST); the surviving route is list/event.
-    # The wrapper must fall through to it and then stick to it.
+    # api.err.NotFound over GET); the surviving route is list/event. The wrapper
+    # must fall through to it over GET (S1 -- no POST) and then stick to it.
     _mock_login()
     get_se = respx.get(f"{API}/stat/event").mock(return_value=httpx.Response(404, json=_NOTFOUND))
-    post_se = respx.post(f"{API}/stat/event").mock(return_value=httpx.Response(404, json=_NOTFOUND))
     le = respx.get(f"{API}/list/event").mock(
         return_value=httpx.Response(200, json={"data": [{"key": "EVT_LE", "_id": "le1"}]})
     )
     client, ep = await _endpoints()
     events = await ep.stat_event(within_hours=24)
     assert [e.key for e in events] == ["EVT_LE"]
-    assert get_se.called and post_se.called and le.called
+    assert get_se.called and le.called
 
     # Sticky: the discovered endpoint is reused; stat/event is not re-probed.
-    se_calls = get_se.call_count + post_se.call_count
+    se_calls = get_se.call_count
     events2 = await ep.stat_event(within_hours=24)
     assert [e.key for e in events2] == ["EVT_LE"]
-    assert get_se.call_count + post_se.call_count == se_calls  # no re-probe
+    assert get_se.call_count == se_calls  # no re-probe
     assert le.call_count == 2
     await client.aclose()
 
@@ -233,18 +240,20 @@ async def test_stat_event_all_endpoints_absent_degrades_to_empty():
     client, ep = await _endpoints()
 
     assert await ep.stat_event(within_hours=2) == []
-    total = sum(r.call_count for r in (get_se, post_se, get_le, post_le))
-    assert total >= 2  # probed both candidates
+    total = sum(r.call_count for r in (get_se, get_le))
+    assert total >= 2  # probed both candidates over GET
+    assert not (post_se.called or post_le.called)  # GET-only: no POST
 
     assert await ep.stat_event(within_hours=2) == []  # short-circuits, no HTTP
-    assert sum(r.call_count for r in (get_se, post_se, get_le, post_le)) == total
+    assert sum(r.call_count for r in (get_se, get_le)) == total
     await client.aclose()
 
 
 @respx.mock
 async def test_stat_session_uses_seconds():
+    # GET-only contract (S1): the query rides the URL.
     _mock_login()
-    route = respx.post(f"{API}/stat/session").mock(
+    route = respx.get(f"{API}/stat/session").mock(
         return_value=httpx.Response(200, json={"data": [{"mac": "02:00:00:00:00:01"}]})
     )
     client, ep = await _endpoints()
@@ -252,25 +261,28 @@ async def test_stat_session_uses_seconds():
         "02:00:00:00:00:01", start_s=1_600_000_000, end_s=1_600_003_600
     )
     assert sessions
-    body = json.loads(route.calls.last.request.content)
-    assert body["start"] == 1_600_000_000  # seconds, not ms
-    assert body["mac"] == "02:00:00:00:00:01"
-    assert body["type"] == "all"
+    params = route.calls.last.request.url.params
+    assert params["start"] == "1600000000"  # seconds, not ms
+    assert params["mac"] == "02:00:00:00:00:01"
+    assert params["type"] == "all"
+    assert route.calls.last.request.method == "GET"
     await client.aclose()
 
 
 @respx.mock
 async def test_stat_rogueap_within_and_alarm():
+    # GET-only contract (S1): both reads are GETs with query params.
     _mock_login()
-    rogue = respx.post(f"{API}/stat/rogueap").mock(
+    rogue = respx.get(f"{API}/stat/rogueap").mock(
         return_value=httpx.Response(200, json={"data": [{"bssid": "02:00:00:00:00:aa"}]})
     )
-    respx.post(f"{API}/list/alarm").mock(
+    respx.get(f"{API}/list/alarm").mock(
         return_value=httpx.Response(200, json={"data": [{"key": "EVT_A", "archived": False}]})
     )
     client, ep = await _endpoints()
     assert await ep.stat_rogueap(within_hours=48)
-    assert json.loads(rogue.calls.last.request.content)["within"] == 48
+    assert rogue.calls.last.request.url.params["within"] == "48"
+    assert rogue.calls.last.request.method == "GET"
     alarms = await ep.list_alarm()
     assert alarms[0].key == "EVT_A"
     await client.aclose()
@@ -278,13 +290,12 @@ async def test_stat_rogueap_within_and_alarm():
 
 @respx.mock
 async def test_list_alarm_absent_route_degrades_and_latches_off():
-    # LIVE-VALIDATED QUIRK: this console rejects list/alarm with 400
-    # api.err.InvalidObject for our POST *and* for a bare GET carrying no payload,
-    # so no body shape can satisfy it -- the alarm read route is gone. A job that
-    # fails every cycle would pin /api/health at degraded forever, so degrade to
-    # [] and stop asking for the rest of the session.
+    # LIVE-VALIDATED QUIRK: this console rejects the list/alarm GET with 400
+    # api.err.InvalidObject -- the alarm read route is gone. A job that fails every
+    # cycle would pin /api/health at degraded forever, so degrade to [] and stop
+    # asking for the rest of the session.
     _mock_login()
-    route = respx.post(f"{API}/list/alarm").mock(return_value=httpx.Response(400, json=_INVALID))
+    route = respx.get(f"{API}/list/alarm").mock(return_value=httpx.Response(400, json=_INVALID))
     client, ep = await _endpoints()
 
     assert await ep.list_alarm() == []
@@ -301,7 +312,7 @@ async def test_list_alarm_notfound_route_degrades_to_empty():
     # A console that removed the route outright (404) degrades the same way as
     # one that keeps it and rejects every body (400).
     _mock_login()
-    respx.post(f"{API}/list/alarm").mock(return_value=httpx.Response(404, json=_NOTFOUND))
+    respx.get(f"{API}/list/alarm").mock(return_value=httpx.Response(404, json=_NOTFOUND))
     client, ep = await _endpoints()
     assert await ep.list_alarm() == []
     await client.aclose()
@@ -312,7 +323,7 @@ async def test_list_alarm_server_error_still_raises():
     # Only the route-absent markers degrade. A real outage must still fail the
     # job loudly and must not latch the feed off for the session.
     _mock_login()
-    route = respx.post(f"{API}/list/alarm").mock(
+    route = respx.get(f"{API}/list/alarm").mock(
         return_value=httpx.Response(500, json={"meta": {"rc": "error", "msg": "boom"}})
     )
     client, ep = await _endpoints(max_retries=0)

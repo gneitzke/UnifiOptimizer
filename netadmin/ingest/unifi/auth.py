@@ -58,6 +58,19 @@ class UnifiConnectionError(UnifiError):
     """Controller unreachable / transport failure."""
 
 
+class UnifiAmbiguousOutcomeError(UnifiError):
+    """A non-idempotent (mutating) request's outcome is unknown.
+
+    Raised when a mutation's response is lost to a transport failure
+    (timeout/connect/read/protocol error): the controller may or may not have
+    applied it. Unlike a GET, the request is **not** auto-retried -- a lost
+    response must never silently fire the same mutation again (see the C2
+    finding: one lost POST produced four dispatches). The caller keeps the
+    recorded before-state and must reconcile the live state via a GET read
+    before any further approved attempt.
+    """
+
+
 class UnifiAuthError(UnifiError):
     """Authentication was refused or could not be established."""
 
@@ -353,6 +366,7 @@ async def resolve_strategy(
 __all__ = [
     "UnifiError",
     "UnifiConnectionError",
+    "UnifiAmbiguousOutcomeError",
     "UnifiAuthError",
     "TwoFactorRequired",
     "AuthStrategy",

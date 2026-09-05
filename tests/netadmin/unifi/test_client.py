@@ -9,7 +9,7 @@ import httpx
 import pytest
 import respx
 
-from netadmin.ingest.unifi.auth import UnifiError
+from netadmin.ingest.unifi.auth import UnifiAmbiguousOutcomeError, UnifiError
 from netadmin.ingest.unifi.client import UnifiClient
 
 pytestmark = pytest.mark.asyncio
@@ -19,6 +19,7 @@ SITE = "default"
 OS_PROBE = f"{HOST}/proxy/network/"
 OS_LOGIN = f"{HOST}/api/auth/login"
 DEVICE = f"{HOST}/proxy/network/api/s/{SITE}/stat/device"
+HEALTH = f"{HOST}/proxy/network/api/s/{SITE}/stat/health"
 
 
 def _client(**kw) -> UnifiClient:
@@ -192,14 +193,17 @@ async def test_envelope_unwrapping():
 
 
 @respx.mock
-async def test_csrf_echoed_on_post():
+async def test_csrf_echoed_on_mutation():
+    # GET-only contract (S1): the collector never POSTs, so CSRF echoing is now
+    # exercised on the one permitted non-GET path -- an approved mutation
+    # (allow_mutation=True). UniFi OS requires X-CSRF-Token on every mutating verb.
     _mock_login(csrf="echo-me")
-    report = respx.post(f"{HOST}/proxy/network/api/s/{SITE}/stat/report/hourly.ap").mock(
-        return_value=httpx.Response(200, json={"data": []})
+    cmd = respx.post(f"{HOST}/proxy/network/api/s/{SITE}/cmd/devmgr").mock(
+        return_value=httpx.Response(200, json={"meta": {"rc": "ok"}, "data": []})
     )
     client = _client()
-    await client.post_data("stat/report/hourly.ap", {"attrs": ["time"]})
-    assert report.calls.last.request.headers["X-CSRF-Token"] == "echo-me"
+    await client.request("POST", "cmd/devmgr", json_body={"cmd": "x"}, allow_mutation=True)
+    assert cmd.calls.last.request.headers["X-CSRF-Token"] == "echo-me"
     await client.aclose()
 
 
@@ -274,4 +278,115 @@ async def test_ws_strategy_api_key_only_degrades_with_guidance():
     await client.connect()
     with pytest.raises(UnifiAuthError, match="username and password"):
         await client.ws_strategy()
+    await client.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# S1 -- GET-only contract enforced at the collector transport boundary.
+# The collector may issue ONLY idempotent GETs; the sole permitted non-GET is an
+# approved mutation (allow_mutation=True), which exactly one object sets -- the
+# fix writer. A non-GET without that flag is refused before a socket opens.
+# --------------------------------------------------------------------------- #
+@respx.mock
+async def test_request_refuses_non_get_without_allow_mutation():
+    _mock_login()
+    post_route = respx.post(DEVICE).mock(return_value=httpx.Response(200, json={"data": []}))
+    put_route = respx.put(DEVICE).mock(return_value=httpx.Response(200, json={"data": []}))
+    client = _client()
+    await client.connect()
+
+    for verb in ("POST", "PUT", "DELETE", "PATCH"):
+        with pytest.raises(UnifiError, match="GET-only contract"):
+            await client.request(verb, "stat/device", json_body={"x": 1})
+    # Nothing was ever dispatched: the refusal happens before the socket.
+    assert not post_route.called and not put_route.called
+    await client.aclose()
+
+
+@respx.mock
+async def test_request_allows_get_and_approved_mutation():
+    # The escape hatch works for the writer: allow_mutation=True lets a POST through.
+    _mock_login()
+    respx.get(DEVICE).mock(return_value=httpx.Response(200, json={"data": []}))
+    cmd = respx.post(f"{HOST}/proxy/network/api/s/{SITE}/cmd/devmgr").mock(
+        return_value=httpx.Response(200, json={"meta": {"rc": "ok"}, "data": []})
+    )
+    client = _client()
+    assert await client.get_data("stat/device") == []
+    resp = await client.request("POST", "cmd/devmgr", json_body={"cmd": "x"}, allow_mutation=True)
+    assert resp.status_code == 200 and cmd.called
+    await client.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# C2 -- mutations are never auto-retried on an ambiguous (lost-response)
+# transport failure. One lost POST must produce exactly ONE dispatch, not four.
+# --------------------------------------------------------------------------- #
+@respx.mock
+async def test_mutation_not_retried_on_ambiguous_transport_error():
+    _mock_login()
+    route = respx.post(f"{HOST}/proxy/network/api/s/{SITE}/cmd/devmgr").mock(
+        side_effect=httpx.ReadTimeout("lost response")
+    )
+    client = _client(max_retries=3)
+    with pytest.raises(UnifiAmbiguousOutcomeError, match="outcome unknown"):
+        await client.request("POST", "cmd/devmgr", json_body={"cmd": "x"}, allow_mutation=True)
+    assert route.call_count == 1  # exactly one dispatch -- no 4x fan-out
+    await client.aclose()
+
+
+@respx.mock
+async def test_get_still_retried_on_transport_error():
+    # The C2 fix must not break GET retries: a GET recovers after transient errors.
+    _mock_login()
+    route = respx.get(DEVICE).mock(
+        side_effect=[
+            httpx.ReadTimeout("boom"),
+            httpx.ReadTimeout("boom"),
+            httpx.Response(200, json={"data": [{"ok": 1}]}),
+        ]
+    )
+    client = _client(max_retries=3)
+    assert await client.get_data("stat/device") == [{"ok": 1}]
+    assert route.call_count == 3
+    await client.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# S4 -- the controller credential (X-API-KEY) is never forwarded across a
+# cross-origin redirect. follow_redirects=False keeps the secret on-controller.
+# --------------------------------------------------------------------------- #
+@respx.mock
+async def test_api_key_not_forwarded_on_cross_origin_redirect():
+    respx.get(HEALTH).mock(return_value=httpx.Response(200, json={"data": []}))  # key verify
+    device = respx.get(DEVICE).mock(
+        return_value=httpx.Response(302, headers={"Location": "https://evil.test/steal"})
+    )
+    evil = respx.get("https://evil.test/steal").mock(return_value=httpx.Response(200, json={}))
+
+    client = _client(api_key="KEY123")
+    await client.connect()
+    resp = await client.request("GET", "stat/device")
+
+    assert resp.status_code == 302  # redirect surfaced, not chased
+    assert not evil.called  # the other origin was never contacted
+    # The API key rode the on-controller request, and only that one.
+    assert device.calls.last.request.headers.get("X-API-KEY") == "KEY123"
+    await client.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# R1 -- an explicit error envelope is a failure even on HTTP 200 (read side).
+# --------------------------------------------------------------------------- #
+@respx.mock
+async def test_error_envelope_fails_despite_http_200():
+    _mock_login()
+    respx.get(DEVICE).mock(
+        return_value=httpx.Response(
+            200, json={"meta": {"rc": "error", "msg": "api.err.InvalidObject"}, "data": []}
+        )
+    )
+    client = _client()
+    with pytest.raises(UnifiError, match="api.err.InvalidObject"):
+        await client.get_data("stat/device")  # must NOT read as an empty-but-ok result
     await client.aclose()
