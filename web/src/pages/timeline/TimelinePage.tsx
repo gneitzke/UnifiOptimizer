@@ -79,6 +79,20 @@ export default function TimelinePage() {
     return { coverageStart: start, coverageLabel: label };
   }, [events, capped, health.data, nowTs]);
 
+  // Internal collection gaps (audit U2): outages inside the window, not the
+  // leading pre-monitoring boundary above. Optional/assumed backend field —
+  // `health.collection_gaps` doesn't exist yet, so this degrades to "no gaps
+  // shown" rather than guessing an outage from event silence (a network can
+  // be genuinely quiet; inferring a gap from that would be the exact mistake
+  // this item exists to prevent).
+  const internalGaps = useMemo(
+    () =>
+      (health.data?.collection_gaps ?? [])
+        .filter((g) => g.end_ts > nowTs - spec.seconds && g.start_ts < nowTs)
+        .map((g) => ({ start: g.start_ts, end: g.end_ts, reason: g.reason })),
+    [health.data, nowTs, spec.seconds],
+  );
+
   const listEventsForView = useMemo((): NetEvent[] => {
     if (selected != null && buckets[selected]) {
       return eventsInBucket(events, buckets[selected], families);
@@ -304,6 +318,7 @@ export default function TimelinePage() {
             asOf={exactLocal(fetchedAt)}
             coverageStart={coverageStart}
             coverageLabel={coverageLabel}
+            internalGaps={internalGaps}
           />
         )}
         {capped && !loading && !error && (

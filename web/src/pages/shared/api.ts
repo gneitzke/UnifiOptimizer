@@ -267,6 +267,10 @@ export interface IncidentSummary {
   member_count: number;
   symptom_count: number;
   root: IncidentRootRef | null;
+  /** Client-axis minutes attributed to this incident across its lifetime —
+   * the impact story, not just its duration (audit U3). Optional/assumed: not
+   * yet emitted by the backend. */
+  affected_client_minutes?: number | null;
 }
 
 export interface IncidentListResponse {
@@ -284,6 +288,16 @@ export interface IncidentMember {
   role: IncidentRole;
   rule: string;
   rationale: string;
+  /** When this issue joined / left the incident's membership, if it ever left
+   * (e.g. re-attributed to a different root). Optional/assumed — not yet
+   * emitted; membership history is omitted rather than guessed at when absent
+   * (audit U3). */
+  joined_ts?: number | null;
+  left_ts?: number | null;
+  /** Concrete evidence backing the causal link named by `rule`/`rationale` —
+   * e.g. correlated timestamps, shared entity, a metric threshold crossed.
+   * Optional/assumed; falls back to `rule` + `rationale` alone when absent. */
+  evidence?: string[] | null;
 }
 
 export interface IncidentDetailResponse {
@@ -642,7 +656,11 @@ export interface FixChange {
   ts: number;
   issue_id: number | null;
   action: string;
-  status: 'applied' | 'reverted' | 'failed' | string;
+  /** `applying` (send in flight) and `unknown` (an ambiguous send — the
+   * request may or may not have reached the device) join the original
+   * `applied` / `failed` / `reverted` (audit U1). `(string & {})` keeps the
+   * known literals as editor suggestions while accepting any daemon value. */
+  status: 'applying' | 'applied' | 'failed' | 'unknown' | 'reverted' | (string & {});
   reverted_ts: number | null;
   before: Record<string, unknown>;
   after: Record<string, unknown>;
@@ -652,6 +670,12 @@ export interface FixChange {
   entity_id: number | null;
   entity_name: string | null;
   entity_native_id: string | null;
+  /** 1-based position within a multi-step plan, and the plan's total step
+   * count — lets a multi-device fix render "Step 2 of 3" instead of an
+   * unordered pile of rows (audit U1). Optional/assumed: not yet emitted;
+   * falls back to the row's position in `changes`. */
+  step_index?: number | null;
+  step_count?: number | null;
 }
 
 export interface FixPlanResponse {

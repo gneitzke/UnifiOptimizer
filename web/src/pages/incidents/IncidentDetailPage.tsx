@@ -128,7 +128,14 @@ export function IncidentDetailPage() {
     return <Navigate to={`/issues/${incident.root_issue_id}`} replace />;
   }
 
-  const durSecs = Math.max(0, now - incident.first_seen_ts);
+  // Stop the clock at resolution (audit U3): before this fix, a resolved
+  // incident kept computing duration against `now` and rendering "Ongoing"
+  // forever — the whole point of resolving is that it's over. A resolved
+  // incident with no `resolved_ts` on an older payload falls back to `now`
+  // rather than crashing on a null subtraction.
+  const isResolved = incident.state === 'resolved';
+  const endTs = isResolved ? (incident.resolved_ts ?? now) : now;
+  const durSecs = Math.max(0, endTs - incident.first_seen_ts);
 
   // An incident counts as suppressed for the bulk toggle only when every member
   // is suppressed now — the same all-members rule the incidents list uses to drop
@@ -148,6 +155,11 @@ export function IncidentDetailPage() {
           <div className="flex flex-col gap-3 min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
               <SeverityPill severity={incident.severity} />
+              {/* Reuses the issue lifecycle pill's resolved/active convention
+                  (gray+check vs. severity-tinted) so an incident's status
+                  reads with the same vocabulary as every issue row (audit
+                  U5) — never a second gray-vs-green scheme invented here. */}
+              <StatePill state={isResolved ? 'resolved' : 'active'} severity={incident.severity} />
               <span className="t-caption" style={{ color: 'var(--fg-subtle)' }}>
                 {symptoms.length} related symptom{symptoms.length === 1 ? '' : 's'}
               </span>
@@ -161,8 +173,24 @@ export function IncidentDetailPage() {
               </p>
             )}
             <span className="t-secondary" style={{ color: 'var(--fg)' }}>
-              Ongoing {formatDurationLong(durSecs)} · first seen{' '}
+              {/* The clock stops at resolution (audit U3): a resolved incident
+                  reports how long it LASTED, not an "Ongoing" count still
+                  climbing against the current time. */}
+              {isResolved ? 'Lasted' : 'Ongoing'} {formatDurationLong(durSecs)} · first seen{' '}
               <RelativeTime ts={incident.first_seen_ts} mode="relative" />
+              {isResolved && incident.resolved_ts && (
+                <>
+                  {' · resolved '}
+                  <RelativeTime ts={incident.resolved_ts} mode="relative" />
+                </>
+              )}
+              {incident.affected_client_minutes != null && (
+                <>
+                  {' · ~'}
+                  {Math.round(incident.affected_client_minutes)} client-minute
+                  {Math.round(incident.affected_client_minutes) === 1 ? '' : 's'} affected
+                </>
+              )}
             </span>
           </div>
 
@@ -335,7 +363,41 @@ function MemberItem({
           {member.role === 'symptom' && member.rationale && (
             <p className="t-caption" style={{ color: 'var(--fg-muted)' }}>
               {member.rationale}
+              {member.rule && (
+                <span style={{ color: 'var(--fg-subtle)' }}> — matched by {member.rule}</span>
+              )}
             </p>
+          )}
+          {/* Concrete evidence for the causal link (audit U3), beyond the one-line
+              rationale — omitted entirely rather than padded out when the backend
+              hasn't sent it (optional/assumed field). */}
+          {member.evidence && member.evidence.length > 0 && (
+            <ul className="flex flex-col gap-0.5 pl-3.5" style={{ listStyle: 'disc' }}>
+              {member.evidence.map((e, i) => (
+                <li key={i} className="t-caption" style={{ color: 'var(--fg-subtle)' }}>
+                  {e}
+                </li>
+              ))}
+            </ul>
+          )}
+          {/* Membership history (audit U3): when this issue joined the
+              incident, and — for one re-attributed elsewhere — when it left.
+              Optional/assumed fields; a member with neither renders nothing
+              extra here, same as today. */}
+          {(member.joined_ts != null || member.left_ts != null) && (
+            <span className="t-micro" style={{ color: 'var(--fg-subtle)' }}>
+              {member.joined_ts != null && (
+                <>
+                  Joined <RelativeTime ts={member.joined_ts} mode="relative" />
+                </>
+              )}
+              {member.left_ts != null && (
+                <>
+                  {member.joined_ts != null ? ' · ' : ''}
+                  Left <RelativeTime ts={member.left_ts} mode="relative" />
+                </>
+              )}
+            </span>
           )}
         </div>
       </div>
