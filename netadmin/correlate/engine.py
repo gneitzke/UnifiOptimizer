@@ -217,7 +217,8 @@ class CorrelationEngine:
             if inc.root_issue_id in open_by_id:
                 continue  # root still open -> recomputed fresh on the normal path
             members = self.store.get_incident_members(inc.id)
-            surviving = {m.issue_id for m in members if m.issue_id in open_by_id}
+            current_ids = self._current_member_ids(inc.id, members)
+            surviving = {issue_id for issue_id in current_ids if issue_id in open_by_id}
             if surviving:
                 retained.append((inc, members, surviving))
                 retained_issue_ids |= surviving
@@ -266,7 +267,7 @@ class CorrelationEngine:
                 incident = prev
 
             assert incident.id is not None
-            self.store.replace_incident_members(
+            self._reconcile_members(
                 incident.id,
                 [
                     IncidentMember(
@@ -278,13 +279,14 @@ class CorrelationEngine:
                     )
                     for m in comp.members
                 ],
+                now=now,
             )
             live.append(incident)
 
         # Keep retained incidents open: root resolved, ≥1 symptom still active.
-        # The incident keeps its identity and age; membership shrinks to the root
-        # (shown resolved) plus the surviving open symptoms; severity drops to the
-        # worst still-open member.
+        # The incident keeps its identity and age. Historical membership stays in
+        # storage (the resolved root included), while the current set contains only
+        # surviving symptoms; severity drops to the worst still-open member.
         for inc, members, surviving in retained:
             produced_fingerprints.add(inc.fingerprint)
             inc.state = IncidentState.OPEN
@@ -298,8 +300,8 @@ class CorrelationEngine:
             inc.resolved_ts = None
             inc.severity = max_severity([open_by_id[i].severity for i in surviving])
             self.store.update_incident(inc)
-            kept = [m for m in members if m.role == IncidentRole.ROOT or m.issue_id in surviving]
-            self.store.replace_incident_members(
+            kept = [m for m in members if m.issue_id in surviving]
+            self._reconcile_members(
                 inc.id,  # type: ignore[arg-type]
                 [
                     IncidentMember(
@@ -311,6 +313,7 @@ class CorrelationEngine:
                     )
                     for m in kept
                 ],
+                now=now,
             )
             live.append(inc)
 
@@ -323,8 +326,57 @@ class CorrelationEngine:
             inc.state = IncidentState.RESOLVED
             inc.resolved_ts = now
             self.store.update_incident(inc)
+            assert inc.id is not None
+            self._reconcile_members(inc.id, [], now=now)
 
         return live
+
+    def _reconcile_members(
+        self, incident_id: int, current: list[IncidentMember], *, now: Timestamp
+    ) -> None:
+        """C5: persist current membership while retaining its historical union.
+
+        The concrete SQLite repository exposes the timestamp-aware additive
+        method without changing the legacy delete-based API used elsewhere.  The
+        in-memory protocol fakes intentionally stay small, so their fallback
+        stores the same historical union (timestamps themselves are a persistence
+        concern covered by store tests).
+        """
+        target = getattr(self.store, "reconcile_incident_members", None)
+        if target is None:
+            target = getattr(getattr(self.store, "_store", None), "reconcile_incident_members", None)
+        if callable(target):
+            target(
+                incident_id,
+                [
+                    {
+                        "issue_id": member.issue_id,
+                        "role": member.role,
+                        "rule": member.rule,
+                        "rationale": member.rationale,
+                    }
+                    for member in current
+                ],
+                ts=now,
+            )
+            return
+
+        historical = {m.issue_id: m for m in self.store.get_incident_members(incident_id)}
+        historical.update({m.issue_id: m for m in current})
+        self.store.replace_incident_members(incident_id, list(historical.values()))
+
+    def _current_member_ids(
+        self, incident_id: int, historical: list[IncidentMember]
+    ) -> set[int]:
+        """C5: read the current subset when timestamp-aware persistence supports it."""
+        target = getattr(self.store, "current_incident_issue_ids", None)
+        if target is None:
+            target = getattr(
+                getattr(self.store, "_store", None), "current_incident_issue_ids", None
+            )
+        if callable(target):
+            return set(target(incident_id))
+        return {member.issue_id for member in historical}
 
     # ------------------------------------------------------------------ #
     # Grouping

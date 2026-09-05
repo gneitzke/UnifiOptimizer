@@ -235,6 +235,50 @@ def test_engine_end_to_end_over_real_store(repo: Repository) -> None:
     assert again[0]["id"] == inc["id"]
 
 
+def test_c5_member_history_has_joined_and_cleared_timestamps(repo: Repository) -> None:
+    ap = _ap(repo, "aa:bb:cc:00:00:01", "AP-History")
+    root = _issue(
+        repo, fp="history-root", key="wifi.mesh_uplink", entity_id=ap, state="active", sev="p3"
+    )
+    symptom = _issue(
+        repo,
+        fp="history-symptom",
+        key="net.coverage_hole",
+        entity_id=ap,
+        state="active",
+        sev="p1",
+        ts=TS + 10,
+    )
+    engine = CorrelationEngine(StoreCorrelationRepository(repo))
+    engine.run(TS + 100)
+    incident = repo.list_incidents(open_only=True)[0]
+    inc_id = int(incident["id"])
+
+    repo.update_issue(symptom, state="resolved", resolved_ts=TS + 200)
+    engine.run(TS + 300)
+    members = {int(row["issue_id"]): row for row in repo.list_incident_members(inc_id)}
+    assert set(members) == {root, symptom}
+    assert members[symptom]["joined_ts"] == TS + 100
+    assert members[symptom]["cleared_ts"] == TS + 300
+    assert repo.get_incident(inc_id)["severity"] == "p3"
+    assert repo.incident_member_counts([inc_id])[inc_id] == 2
+    assert repo.incident_open_symptom_counts([inc_id])[inc_id] == 0
+    assert repo.current_incident_issue_ids(inc_id) == {root}
+    assert repo.incident_id_for_issue(symptom) is None
+
+    repo.update_issue(root, state="resolved", resolved_ts=TS + 350)
+    engine.run(TS + 400)
+    closed = repo.get_incident(inc_id)
+    members = {int(row["issue_id"]): row for row in repo.list_incident_members(inc_id)}
+    assert closed["state"] == IncidentState.RESOLVED
+    assert members[root]["cleared_ts"] == TS + 400
+    assert members[symptom]["cleared_ts"] == TS + 300
+    assert repo.incident_member_counts([inc_id])[inc_id] == 2
+    assert repo.incident_open_symptom_counts([inc_id])[inc_id] == 0
+    assert repo.current_incident_issue_ids(inc_id) == set()
+    assert [row["id"] for row in repo.list_incidents(genuine_only=True)] == [inc_id]
+
+
 # --------------------------------------------------------------------------- #
 # Genuine-incident predicate (Gitea #21): "incident" is a presentation-tier
 # word reserved for 2+ member groups; the engine's incident-of-one bookkeeping

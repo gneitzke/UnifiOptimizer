@@ -406,6 +406,48 @@ async def test_connect_happy_path_writes_secrets_returns_token_starts_ingest(
     assert status["controller_connected"] is True
 
 
+async def test_s3_concurrent_connect_has_one_commit_one_token_and_one_ingest(
+    setup_app: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two bootstrap requests cannot both cross the validation/commit boundary."""
+    validations = 0
+    commits: list[dict[str, str]] = []
+    starts = 0
+
+    async def validate(**_kwargs: Any) -> None:
+        nonlocal validations
+        validations += 1
+        await asyncio.sleep(0.02)
+        return None
+
+    def persist(updates: dict[str, str], **_kwargs: Any) -> None:
+        commits.append(dict(updates))
+
+    async def hot_start(_app: Any) -> None:
+        nonlocal starts
+        starts += 1
+
+    monkeypatch.setattr(setup_mod, "_validate_credential", validate)
+    monkeypatch.setattr(setup_mod, "write_secrets", persist)
+    monkeypatch.setattr(setup_mod, "_hot_start", hot_start)
+
+    async with await _client(setup_app) as c:
+        first, second = await asyncio.gather(
+            c.post("/api/setup/connect", json={"host": HOST, "api_key": "key-one"}),
+            c.post("/api/setup/connect", json={"host": HOST, "api_key": "key-two"}),
+        )
+
+    winner = first if first.status_code == 200 else second
+    loser = second if first.status_code == 200 else first
+    assert winner.status_code == 200
+    assert set(winner.json()) == {"ok", "ui_token"}
+    assert loser.status_code == 409
+    assert "ui_token" not in loser.json()
+    assert validations == 1
+    assert len(commits) == 1
+    assert starts == 1
+
+
 async def test_connect_accepts_username_password(
     setup_app: Any, secrets_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

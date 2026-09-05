@@ -30,6 +30,7 @@ Security invariants (ARCHITECTURE.md 18, reviewed):
 
 from __future__ import annotations
 
+import asyncio
 from secrets import token_urlsafe
 from typing import Any, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -68,6 +69,21 @@ _PROBE_ENDPOINT = "stat/device"
 _PROBE_TIMEOUT_S = 8.0
 # CSPRNG token size for a minted UI access token (bytes of entropy).
 _TOKEN_BYTES = 32
+
+
+def _bootstrap_lock(app: Any) -> asyncio.Lock:
+    """Return the one setup-commit lock owned by this application instance.
+
+    The lock is created lazily because the app factory deliberately owns all
+    long-lived state, while this router can also be imported by small unit-test
+    apps.  No await occurs between the attribute check and assignment, so two
+    requests on the same event loop cannot create competing locks.
+    """
+    lock = getattr(app.state, "setup_bootstrap_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        app.state.setup_bootstrap_lock = lock
+    return lock
 
 
 # --------------------------------------------------------------------------- #
@@ -378,7 +394,8 @@ async def setup_connect(request: Request, body: ConnectBody) -> Any:
     app = request.app
     settings: Settings = app.state.settings
 
-    # (1) Setup can never overwrite a live config -- re-check and 409.
+    # Fast rejection for the normal already-configured case.  This is only an
+    # optimisation; the lock-protected checks below are the security boundary.
     if is_configured(settings):
         return _error(
             409,
@@ -416,44 +433,67 @@ async def setup_connect(request: Request, body: ConnectBody) -> Any:
 
     host = _normalize_host(host)
 
-    # (2) Validate with a READ-ONLY probe; on failure write nothing.
-    failure = await _validate_credential(
-        host=host, site=site, api_key=api_key, username=username, password=password
-    )
-    if failure is not None:
-        return _error(400, failure[0], failure[1])
+    # S3: serialize the complete bootstrap transaction.  In particular, token
+    # minting and secrets persistence must not race: only the request that wins
+    # this lock can ever receive the one-time UI token.
+    async with _bootstrap_lock(app):
+        if is_configured(settings):
+            return _error(
+                409,
+                "already_configured",
+                "This install is already configured. Change the controller credential "
+                "in data/secrets.env instead.",
+            )
 
-    # (3) Persist the credential to secrets.env (600, atomic, other keys preserved).
-    updates: dict[str, str] = {"UNIFI_HOST": host, "UNIFI_SITE": site}
-    if api_key:
-        updates["UNIFI_API_KEY"] = api_key
-    else:
-        updates["UNIFI_USERNAME"] = username  # type: ignore[assignment]
-        updates["UNIFI_PASSWORD"] = password  # type: ignore[assignment]
+        # (2) Validate with a READ-ONLY probe; on failure write nothing.
+        failure = await _validate_credential(
+            host=host, site=site, api_key=api_key, username=username, password=password
+        )
+        if failure is not None:
+            return _error(400, failure[0], failure[1])
 
-    # (4) Mint the UI token if none exists (here it never does -- we 409'd otherwise).
-    ui_token = settings.api_token or token_urlsafe(_TOKEN_BYTES)
-    if not settings.api_token:
+        # Re-check after the await as a defence-in-depth invariant.  The lock is
+        # application-local, while settings may also be configured by another
+        # in-process path during credential validation.
+        if is_configured(settings):
+            return _error(
+                409,
+                "already_configured",
+                "This install is already configured. Change the controller credential "
+                "in data/secrets.env instead.",
+            )
+
+        # (3) Persist the credential to secrets.env (600, atomic, other keys preserved).
+        updates: dict[str, str] = {"UNIFI_HOST": host, "UNIFI_SITE": site}
+        if api_key:
+            updates["UNIFI_API_KEY"] = api_key
+        else:
+            updates["UNIFI_USERNAME"] = username  # type: ignore[assignment]
+            updates["UNIFI_PASSWORD"] = password  # type: ignore[assignment]
+
+        # (4) Mint the UI token.  Under the lock it can have exactly one winner.
+        ui_token = token_urlsafe(_TOKEN_BYTES)
         updates["NETADMIN_API_TOKEN"] = ui_token
 
-    write_secrets(updates, path=app.state.secrets_path or _config.SECRETS_ENV)
+        write_secrets(updates, path=app.state.secrets_path or _config.SECRETS_ENV)
 
-    # Apply to live settings so status / auth / ingest see the new config at once.
-    _apply_credentials(
-        settings,
-        host=host,
-        site=site,
-        api_key=api_key,
-        username=username,
-        password=password,
-        token=ui_token,
-    )
+        # Apply to live settings so status / auth / ingest see the new config at once.
+        _apply_credentials(
+            settings,
+            host=host,
+            site=site,
+            api_key=api_key,
+            username=username,
+            password=password,
+            token=ui_token,
+        )
 
-    # (5) Hot-start ingest in the running process (no restart).
-    await _hot_start(app)
+        # (5) Hot-start ingest before releasing the bootstrap lock.  A losing
+        # request therefore cannot start a second scheduler.
+        await _hot_start(app)
 
-    # The UI token is returned exactly once, by design. The UniFi key never is.
-    return {"ok": True, "ui_token": ui_token}
+        # The UI token is returned exactly once, by design. The UniFi key never is.
+        return {"ok": True, "ui_token": ui_token}
 
 
 __all__ = ["router", "is_configured"]
