@@ -428,6 +428,84 @@ async def test_w13a5_get_close_error_keeps_existing_behavior():
     await client.aclose()
 
 
+# --------------------------------------------------------------------------- #
+# #w15a-1: a cleanup error raised INSIDE the request await -- e.g. the response
+# stream's ``aclose()`` raising a bare ``RuntimeError`` AFTER the controller already
+# delivered its ``meta.rc=ok`` bytes -- is NOT a httpx transport/close/decode type
+# and so slipped past every enumerated except AND past ``_finish_mutation`` (which
+# only guards processing AFTER the await returns). It escaped ``request()``
+# unclassified; the applier then recorded a clean 'failed' and a REPLAY dispatched a
+# SECOND PUT. For a MUTATION the WHOLE response lifecycle -- dispatch, read, the
+# context-manager exit / ``aclose`` / cleanup -- must be inside the single-dispatch
+# ambiguity guard: any such exception is AMBIGUOUS, exactly one dispatch, never
+# replayable-failed. A clean success still applies; a GET keeps its behavior.
+# --------------------------------------------------------------------------- #
+@respx.mock
+async def test_w15a1_mutation_aclose_runtimeerror_is_ambiguous_single_dispatch():
+    from unittest.mock import patch
+
+    _mock_login()
+    put = f"{HOST}/proxy/network/api/s/{SITE}/rest/device/abc"
+    # The controller ANSWERS with a healthy meta.rc=ok body; the failure is purely
+    # in finishing/closing the stream AFTER those success bytes were received.
+    route = respx.put(put).mock(
+        return_value=httpx.Response(200, json={"meta": {"rc": "ok"}, "data": [{"_id": "x"}]})
+    )
+    client = _client(max_retries=3)
+    await client.connect()  # log in now, so the aclose patch only bites the mutation
+
+    async def boom(self):  # response.aclose() raises during cleanup, inside the await
+        raise RuntimeError("stream aclose blew up during response cleanup")
+
+    with patch.object(httpx.Response, "aclose", boom):
+        with pytest.raises(UnifiAmbiguousOutcomeError):
+            await client.request("PUT", "rest/device/abc", json_body={"x": 1}, allow_mutation=True)
+    # Exactly ONE dispatch -- the write was never replayed as a clean 'failed'.
+    assert route.call_count == 1
+    await client.aclose()
+
+
+@respx.mock
+async def test_w15a1_clean_mutation_success_still_applies():
+    # Control: with no cleanup fault, a normal meta.rc=ok mutation returns the
+    # response for the writer's envelope classification -- the new guard adds no
+    # false ambiguity to a healthy write.
+    _mock_login()
+    put = f"{HOST}/proxy/network/api/s/{SITE}/rest/device/abc"
+    route = respx.put(put).mock(
+        return_value=httpx.Response(200, json={"meta": {"rc": "ok"}, "data": [{"_id": "x"}]})
+    )
+    client = _client(max_retries=3)
+    resp = await client.request("PUT", "rest/device/abc", json_body={"x": 1}, allow_mutation=True)
+    assert resp.status_code == 200
+    assert resp.json()["meta"]["rc"] == "ok"
+    assert route.call_count == 1
+    await client.aclose()
+
+
+@respx.mock
+async def test_w15a1_get_aclose_runtimeerror_keeps_existing_behavior():
+    # Symmetric: a bare RuntimeError finishing a GET's response propagates unchanged
+    # (never laundered into a mutation-only ambiguous outcome). GET reads are
+    # unaffected by the mutation single-dispatch rule.
+    from unittest.mock import patch
+
+    _mock_login()
+    respx.get(DEVICE).mock(
+        return_value=httpx.Response(200, json={"meta": {"rc": "ok"}, "data": []})
+    )
+    client = _client(max_retries=3)
+    await client.connect()
+
+    async def boom(self):
+        raise RuntimeError("stream aclose blew up during response cleanup")
+
+    with patch.object(httpx.Response, "aclose", boom):
+        with pytest.raises(RuntimeError):
+            await client.request("GET", "stat/device")
+    await client.aclose()
+
+
 @respx.mock
 async def test_genuine_empty_list_read_is_complete():
     # The control: a real ``{"meta":{"rc":"ok"},"data":[]}`` (and a bare

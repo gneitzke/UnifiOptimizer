@@ -591,6 +591,32 @@ class UnifiClient:
                 attempt += 1
                 await asyncio.sleep(delay)
                 continue
+            except Exception as exc:  # noqa: BLE001 - structural single-dispatch guard
+                # #w15a-1 (STRUCTURAL, not enumerate-more): the request bytes were
+                # DISPATCHED and the exception surfaced from WITHIN the request/response
+                # await ITSELF -- e.g. a ``RuntimeError`` (or any non-enumerated error)
+                # raised while httpx finishes the response, closing/``aclose``-ing the
+                # stream AFTER the controller already delivered its ``meta.rc=ok`` bytes.
+                # Such an exception is neither a pre-send transport error nor a body
+                # read/decode error, so it slipped past ``_RETRYABLE_EXC`` /
+                # ``_POST_SEND_READ_EXC`` and past ``_finish_mutation`` (which only
+                # guards processing AFTER the await returns) and escaped ``request``
+                # unclassified -- the applier then recorded a clean 'failed' and a
+                # REPLAY dispatched a SECOND PUT. For a MUTATION the ENTIRE response
+                # lifecycle (dispatch, read, context-manager exit / ``aclose`` / cleanup)
+                # is now inside the single-dispatch ambiguity guard: any exception here
+                # that is NOT a parsed definitive rejection means the write may have
+                # landed, so it is AMBIGUOUS -- single dispatch, never a clean 'failed',
+                # never replayed. A GET re-raises unchanged (an idempotent read the
+                # caller safely re-issues).
+                if not idempotent:
+                    raise UnifiAmbiguousOutcomeError(
+                        f"{method_u} {endpoint} outcome unknown while finishing the "
+                        f"response ({type(exc).__name__}: {exc}); the request was "
+                        "dispatched and the write may have landed. Not retried. "
+                        "Reconcile controller state via GET before any further attempt."
+                    ) from exc
+                raise
 
             # ---- post-send response processing (capture / parse / close) ----
             # #w14a-1 (STRUCTURAL, not enumerate-more): the request bytes are now

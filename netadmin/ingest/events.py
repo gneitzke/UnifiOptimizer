@@ -224,9 +224,25 @@ class EventNormalizer:
             # entity is not in inventory yet, entity_id resolves None and the event
             # persists with a null entity; reconcile_unresolved re-links it once the
             # device poll creates the port (the same late-link path clients use).
-            port_idx = _field(event, "port")
-            if port_idx is None:
-                port_idx = _field(event, "port_idx")
+            # #4/#w15a-4: a port index is a PORT ONLY when it is a genuine integer.
+            # Follow the normalizer's source precedence (``port`` then ``port_idx``),
+            # then accept the chosen value only when it is a real ``int`` and NOT a
+            # ``bool``. A ``bool`` (``port: true``) would otherwise stringify to
+            # ``"<sw>:True"`` while the repository's resolvability SQL renders the
+            # same JSON boolean as ``"<sw>:1"`` (SQLite coerces bool -> 1): the two
+            # native_ids DISAGREE, so with a real integer port 1 present the row reads
+            # as forever-"resolvable" against the wrong entity, never actually fills,
+            # floats to the head of the reconcile window and STARVES newer repairable
+            # events. A non-integer/bool/garbage port is NOT a port-scoped event -- it
+            # is attributed to the SWITCH, exactly and consistently with the SQL, so
+            # normalizer-stored and SQL-derived port native_ids are byte-identical for
+            # every ACCEPTED (integer) port value.
+            port_raw = _field(event, "port")
+            if port_raw is None:
+                port_raw = _field(event, "port_idx")
+            port_idx = (
+                port_raw if isinstance(port_raw, int) and not isinstance(port_raw, bool) else None
+            )
             if key in _PORT_SCOPED_SW_EVENT_KEYS and port_idx is not None:
                 port_nid = f"{sw_mac}:{port_idx}"
                 return (
@@ -386,24 +402,26 @@ async def catchup_events(
         coverage_start = max(coverage_start, since_ts)
     try:
         events = await endpoints.stat_event(within_hours=within_hours, max_events=max_events)
-    except (UnifiError, httpx.HTTPError) as exc:
-        # BUG#6 / #w14a-3: the event read FAILED -- either the controller answered
-        # without a well-formed success payload (a ``UnifiError``: error envelope /
-        # unrecognized body / auth failure), OR a raw transport/response exception
-        # surfaced that is NOT a ``UnifiError`` (an ``httpx.HTTPError`` such as
-        # ``CloseError``/``DecodingError`` on the GET -- these propagate unwrapped
-        # from the client for an idempotent read). Catching ONLY ``UnifiError`` let
-        # such a non-UnifiError read failure propagate leaving the coverage ledger
-        # EMPTY: the window was neither recorded complete NOR failed, so it was
-        # silently never retried nor observed. Both classes of read failure are the
-        # same thing here -- the requested window was NOT read. This is NOT a
-        # successful empty collection: it says nothing about the requested window, so
-        # coverage must NOT be credited for it. Record the window as a first-class
-        # FAILED hole
-        # (queryable, retried on the next sweep -- never counted by
-        # ``observed_event_coverage``, which unions only 'complete' spans) instead
-        # of the bogus 'complete' the empty-default fabricated, then re-raise so the
+    except Exception as exc:  # noqa: BLE001 - record the hole for ANY read/parse failure
+        # BUG#6 / #w14a-3 / #w15a-3: the event read/parse FAILED. The window was NOT
+        # read, so coverage must NOT be credited for it -- record a first-class FAILED
+        # hole (queryable, retried on the next sweep -- never counted by
+        # ``observed_event_coverage``, which unions only 'complete' spans) instead of
+        # the bogus 'complete' the empty-default fabricated, then RE-RAISE so the
         # collector's per-job firewall marks this poll failed rather than clean.
+        #
+        # #w15a-3: the except MUST catch ANY exception, not an enumerated subset. It
+        # previously caught only ``(UnifiError, httpx.HTTPError)`` -- but the read/parse
+        # can raise exceptions in NEITHER class and leave the coverage ledger EMPTY
+        # (neither complete NOR failed, silently never retried nor observed):
+        #   * ``httpx.CookieConflict`` -- a ``RequestError``, NOT an ``HTTPError``
+        #     subclass, so it slipped through entirely; and
+        #   * ``pydantic.ValidationError`` -- raised when a malformed ``stat/event``
+        #     row fails :class:`Event` validation during response parsing
+        #     (endpoints.py), likewise not an ``HTTPError``.
+        # Whatever the exception, the requested window was not read; a durable FAILED
+        # hole is the correct, uniform outcome. This never swallows -- it always
+        # re-raises after recording so the firewall still sees the poll as failed.
         repo.record_ingest_coverage(
             kind="event_history", scope="site", interval="retained",
             start_ts=coverage_start, end_ts=now_s, status="failed",
