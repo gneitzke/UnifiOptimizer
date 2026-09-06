@@ -1036,31 +1036,63 @@ class Repository:
 
     # C7: the event listener periodically replays these rows through its
     # normalizer after inventory discovers their MACs.  The selection must return
-    # only *repairable* rows: a bare ``entity_id IS NULL OR related_entity_id IS
-    # NULL`` also matches ordinary AP / switch / gateway events, whose scope has
-    # NO related entity at all -- their ``related_entity_id`` is permanently NULL,
-    # not pending.  Left in, those unrepairable rows are re-selected every pass
-    # and, being oldest, permanently fill the ``LIMIT`` window and starve later
-    # client events whose from-AP has since been discovered (the C7 starvation
-    # bug).  A row is genuinely repairable only when either:
-    #   * ``entity_id IS NULL`` -- the primary entity (client or device) has not
-    #     resolved yet and may now exist in inventory; or
-    #   * ``related_entity_id IS NULL`` AND the resolved primary is a CLIENT --
-    #     the only scope that carries a related (from-)AP that can still resolve.
-    # Device-scoped events with a resolved primary and a NULL related are terminal
-    # and are excluded, so they can never crowd out repairable client events.
+    # only *repairable* rows -- and "repairable" means the payload actually
+    # carries an identity that could fill the missing reference.  Two earlier,
+    # looser filters both starved newer history:
+    #   * a bare ``entity_id IS NULL OR related_entity_id IS NULL`` also matches
+    #     ordinary AP / switch / gateway events, whose scope has NO related entity
+    #     at all; and
+    #   * even ``related_entity_id IS NULL AND en.entity_type='client'`` still
+    #     matches client events whose payload names NO from-AP/switch -- there is
+    #     nothing to resolve from, so they can NEVER resolve, yet being oldest they
+    #     permanently fill the ``LIMIT`` window and starve later, genuinely
+    #     repairable rows (the P2 starvation bug).
+    # The fix makes fair progress by parking rows with no resolvable identity: a
+    # row is selected only when the payload names a candidate MAC for the column
+    # that is still NULL.  Concretely a row is repairable when either:
+    #   * ``entity_id IS NULL`` AND the payload carries a primary MAC
+    #     (``user``/``client``/``ap``/``sw``/``gw``) that could resolve to the
+    #     primary entity once inventory catches up; or
+    #   * ``related_entity_id IS NULL`` AND the resolved primary is a CLIENT AND
+    #     the payload carries a from-AP / switch MAC (``ap_from``/``ap``/``sw``).
+    # A pending row whose named MAC is not yet in inventory is still selected (its
+    # identity exists in the payload and may resolve later); only rows that name no
+    # identity for their missing column are parked, so they cannot crowd out
+    # repairable rows.  Device-scoped events with a resolved primary and a NULL
+    # related name no related identity and are likewise excluded -- terminal, not
+    # pending.  The payload keys are the controller's own event fields (``ap``,
+    # ``ap_from``, ``user``, ...), the same ones the normalizer resolves from, so
+    # this parks by identity presence rather than guessing from a denormalized
+    # column.
     def unresolved_events(self, *, limit: int = 500) -> list[sqlite3.Row]:
         return self._conn.execute(
             "SELECT ev.id AS id, ev.data AS data FROM events ev "
             "LEFT JOIN entities en ON en.entity_id = ev.entity_id "
-            "WHERE ev.entity_id IS NULL "
-            "   OR (ev.related_entity_id IS NULL AND en.entity_type = 'client') "
+            "WHERE (ev.entity_id IS NULL AND ("
+            "        json_extract(ev.data, '$.user')   IS NOT NULL "
+            "     OR json_extract(ev.data, '$.client') IS NOT NULL "
+            "     OR json_extract(ev.data, '$.ap')     IS NOT NULL "
+            "     OR json_extract(ev.data, '$.sw')     IS NOT NULL "
+            "     OR json_extract(ev.data, '$.gw')     IS NOT NULL)) "
+            "   OR (ev.related_entity_id IS NULL AND en.entity_type = 'client' AND ("
+            "        json_extract(ev.data, '$.ap_from') IS NOT NULL "
+            "     OR json_extract(ev.data, '$.ap')      IS NOT NULL "
+            "     OR json_extract(ev.data, '$.sw')      IS NOT NULL)) "
             "ORDER BY ev.ts, ev.id LIMIT ?",
             (max(1, limit),),
         ).fetchall()
 
     # C7: fill only absent references; an event's original attribution is never
     # overwritten by a later, potentially less-specific controller payload.
+    #
+    # The return value must be an HONEST enrichment signal: True only when a
+    # previously-NULL column was actually filled with a non-NULL value.  The WHERE
+    # therefore matches a NULL column only when the *offered* value for it is
+    # non-NULL -- otherwise a row whose ``related_entity_id`` stays NULL (offered
+    # None) would still match ``related_entity_id IS NULL``, report ``rowcount>0``,
+    # and be counted as a repair though COALESCE changed nothing.  That double
+    # counted every re-attempted-but-unresolvable row on every pass (the P2
+    # dishonest-count bug).  Now rowcount>0 iff at least one column was enriched.
     def fill_event_entity_refs(
         self, event_id: int, *, entity_id: Optional[int], related_entity_id: Optional[int]
     ) -> bool:
@@ -1070,8 +1102,10 @@ class Repository:
             cur = conn.execute(
                 "UPDATE events SET entity_id=COALESCE(entity_id, ?), "
                 "related_entity_id=COALESCE(related_entity_id, ?) "
-                "WHERE id=? AND (entity_id IS NULL OR related_entity_id IS NULL)",
-                (entity_id, related_entity_id, event_id),
+                "WHERE id=? AND ("
+                "     (entity_id IS NULL AND ? IS NOT NULL) "
+                "  OR (related_entity_id IS NULL AND ? IS NOT NULL))",
+                (entity_id, related_entity_id, event_id, entity_id, related_entity_id),
             )
             return cur.rowcount > 0
 
