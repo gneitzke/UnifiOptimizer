@@ -627,17 +627,23 @@ class Applier:
                 )
             else:
                 # A DEFINITIVE failure (non-2xx / meta.rc=error): the restore did not
-                # land, so roll the interim 'reverting' back to the change's PRIOR
-                # state -- NOT unconditionally to 'applied' (#w10a-3). A rejected
-                # RESTORE proves only that the restore failed; it says NOTHING about
-                # whether the ORIGINAL apply succeeded. If the apply was confirmed
-                # ('applied'), it stays 'applied' and is legitimately retryable. But if
-                # the apply outcome was itself never confirmed ('unknown'), promoting
-                # it to 'applied' here would fabricate certainty the system never had --
-                # upgrading an uncertain apply into a confirmed one via a revert
-                # rejection. An uncertain apply must stay 'unknown'; only a genuinely
-                # 'applied' change rolls back to 'applied'.
-                restored = _STATUS_UNKNOWN if prior_status == _STATUS_UNKNOWN else _STATUS_APPLIED
+                # land, so roll the interim 'reverting' back to the change's ACTUAL
+                # PRIOR state -- NEVER unconditionally to 'applied' (#w10a-3 / #w12a-4).
+                # A rejected RESTORE proves only that the restore failed; it says
+                # NOTHING about whether the ORIGINAL apply succeeded. ONLY a change that
+                # was genuinely 'applied' (a confirmed successful mutation) rolls back
+                # to 'applied' -- it legitimately still stands and is retryable. Every
+                # other prior status is preserved verbatim: an 'unknown' apply stays
+                # 'unknown' (promoting it would fabricate a confirmation the system
+                # never had), a 'failed' stays 'failed' and an 'applying' stays
+                # 'applying' (neither ever confirmed a mutation, so a revert rejection
+                # must not promote them into a confirmed 'applied' change). The revert-
+                # eligibility recheck already refuses 'failed'/'applying' before any
+                # dispatch (:meth:`_assert_revertible_status`), so in practice only
+                # 'applied'/'unknown' reach here; preserving the prior status verbatim
+                # is the defence in depth that guarantees no non-applied change is ever
+                # promoted to 'applied' by a rejected restore.
+                restored = _STATUS_APPLIED if prior_status == _STATUS_APPLIED else prior_status
                 self._store.update_change_status(change_id, restored)
                 _log.warning(
                     "revert of change %s failed (status=%s); left status=%s "
@@ -744,6 +750,16 @@ class Applier:
         ``reverting`` is let through (a concurrent revert may still be in flight and may
         yet resolve), because the authoritative re-check happens once the device lock is
         actually held. The terminal states are always refused, lock or not.
+
+        #w12a-4: a revert is only meaningful for a change that CONFIRMED a mutation. A
+        'failed' apply made NO confirmed change on the controller, so there is nothing
+        to restore -- reverting it would dispatch a bogus mutation and (on rejection)
+        previously fabricated an 'applied' row. An 'applying' apply is an in-flight /
+        interrupted forward mutation whose own outcome is not yet known; reverting it
+        would race that unresolved write. Both are refused up front, with no dispatch,
+        so only a genuine 'applied' change (or an 'unknown' one -- an ambiguous apply
+        that may have landed and is legitimately restorable) is revertible. This mirrors
+        the apply-replay guard, which likewise refuses to act over an unresolved change.
         """
         if status == _STATUS_REVERTED:
             raise FixError(f"change {change_id} already reverted")
@@ -756,6 +772,18 @@ class Applier:
             raise FixError(
                 f"change {change_id} revert is already in flight or was interrupted mid-send; "
                 "its outcome is unknown -- not replaying, reconcile the live state via a read first"
+            )
+        if status == _STATUS_FAILED:
+            raise FixError(
+                f"change {change_id} is 'failed' -- the apply confirmed no mutation, so there "
+                "is nothing to revert; refusing to dispatch a restore for a change that never "
+                "landed"
+            )
+        if status == _STATUS_APPLYING:
+            raise FixError(
+                f"change {change_id} is 'applying' -- the forward apply is in flight or was "
+                "interrupted and its outcome is unconfirmed; refusing to revert over an "
+                "unresolved mutation, reconcile the live state via a read first"
             )
 
     @staticmethod

@@ -214,6 +214,62 @@ async def test_mutation_401_is_not_replayed_and_is_ambiguous():
     await client.aclose()
 
 
+# --------------------------------------------------------------------------- #
+# #w12a-1: a mutation 401 must classify by its ENVELOPE, not blanket-ambiguous.
+# A 401 carrying a PARSED controller rejection (meta.rc=error) is a DEFINITIVE
+# rejection the controller confirmed -- it must surface as such (the response is
+# returned for the writer's normal classification), NOT laundered into ambiguous,
+# and STILL never re-dispatched (single dispatch, no re-login). Only a 401 with no
+# parseable rejection envelope stays ambiguous. Both PUT and POST reproduce.
+# --------------------------------------------------------------------------- #
+@respx.mock
+@pytest.mark.parametrize("verb", ["PUT", "POST"])
+async def test_mutation_401_with_parsed_rejection_is_definitive_single_dispatch(verb):
+    respx.get(OS_PROBE).mock(return_value=httpx.Response(401))
+    login = respx.post(OS_LOGIN).mock(
+        return_value=httpx.Response(200, headers={"X-CSRF-Token": "c"}, json={})
+    )
+    url = f"{HOST}/proxy/network/api/s/{SITE}/rest/device/abc"
+    rejection = {"meta": {"rc": "error", "msg": "api.err.LoginRequired"}, "data": []}
+    route = getattr(respx, verb.lower())(url).mock(
+        return_value=httpx.Response(401, json=rejection)
+    )
+    client = _client()
+    # A DEFINITIVE rejection: request() does NOT raise ambiguous -- it returns the
+    # 401 response so the writer's envelope classification reports a definitive
+    # ok=False rejection (the applier then resolves it as a clean 'failed', leaving
+    # no unresolved mutation blocking later work).
+    resp = await client.request(verb, "rest/device/abc", json_body={"x": 1}, allow_mutation=True)
+    assert resp.status_code == 401
+    from netadmin.ingest.unifi.client import envelope_error
+
+    assert envelope_error(resp.json()) is not None  # the writer will see the rejection
+    assert route.call_count == 1  # single dispatch -- the write is never replayed
+    assert login.call_count == 1  # no re-login on a mutation 401
+    await client.aclose()
+
+
+@respx.mock
+@pytest.mark.parametrize("verb", ["PUT", "POST"])
+async def test_mutation_401_unparseable_stays_ambiguous_single_dispatch(verb):
+    # No parseable rejection envelope (an HTML/junk 401): the session was dropped and
+    # the write may or may not have landed -- genuinely AMBIGUOUS, single dispatch.
+    respx.get(OS_PROBE).mock(return_value=httpx.Response(401))
+    login = respx.post(OS_LOGIN).mock(
+        return_value=httpx.Response(200, headers={"X-CSRF-Token": "c"}, json={})
+    )
+    url = f"{HOST}/proxy/network/api/s/{SITE}/rest/device/abc"
+    route = getattr(respx, verb.lower())(url).mock(
+        return_value=httpx.Response(401, text="<html>session lost</html>")
+    )
+    client = _client()
+    with pytest.raises(UnifiAmbiguousOutcomeError):
+        await client.request(verb, "rest/device/abc", json_body={"x": 1}, allow_mutation=True)
+    assert route.call_count == 1  # single dispatch -- never replayed
+    assert login.call_count == 1  # no re-login on a mutation 401
+    await client.aclose()
+
+
 @respx.mock
 async def test_get_401_still_relogs_in_and_retries():
     # The GET path is unchanged: a 401 re-logs in once and re-dispatches (idempotent).
@@ -247,13 +303,63 @@ async def test_gentle_pacing_spaces_requests():
 
 @respx.mock
 async def test_envelope_unwrapping():
+    # #w12a-2: a well-formed read is a ``data`` field that is an ACTUAL LIST. A
+    # single dict body (``{"data": {...}}``) is NOT a list, so it is no longer a
+    # valid read -- it must raise, not be silently wrapped into one row. Likewise a
+    # success envelope with NO ``data`` (``{"meta":{"rc":"ok"}}``) is not a read of
+    # zero rows: rc=ok without a real data list is not a valid read and must raise.
     _mock_login()
     client = _client()
     respx.get(DEVICE).mock(return_value=httpx.Response(200, json={"data": {"single": 1}}))
-    assert await client.get_data("stat/device") == [{"single": 1}]
+    with pytest.raises(UnifiError, match="not a list"):
+        await client.get_data("stat/device")
 
     respx.get(DEVICE).mock(return_value=httpx.Response(200, json={"meta": {"rc": "ok"}}))
+    with pytest.raises(UnifiError, match="well-formed data list"):
+        await client.get_data("stat/device")
+
+    # A genuine empty-but-successful read still succeeds: a real (empty) list.
+    respx.get(DEVICE).mock(return_value=httpx.Response(200, json={"meta": {"rc": "ok"}, "data": []}))
     assert await client.get_data("stat/device") == []
+    await client.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# #w12a-2: a malformed successful-LOOKING read must FAIL (raise UnifiError), so a
+# caller like event catch-up records a failed hole rather than crediting 1.0
+# 'complete' coverage over a window it never actually read. A read is well-formed
+# ONLY with an actual ``data`` list AND (if meta present) meta.rc == "ok".
+# --------------------------------------------------------------------------- #
+@respx.mock
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"meta": {"rc": "ok"}},                       # rc=ok but NO data list
+        {"rc": "ok", "data": None},                   # data present but null
+        {"rc": "ok", "data": False},                  # data present but false
+        {"meta": {"rc": "pending"}, "data": []},      # a real list but meta.rc != ok
+    ],
+    ids=["rc-ok-no-data", "data-null", "data-false", "rc-pending"],
+)
+async def test_malformed_successful_looking_read_raises(body):
+    _mock_login()
+    client = _client()
+    respx.get(DEVICE).mock(return_value=httpx.Response(200, json=body))
+    with pytest.raises(UnifiError):
+        await client.get_data("stat/device")
+    await client.aclose()
+
+
+@respx.mock
+async def test_genuine_empty_list_read_is_complete():
+    # The control: a real ``{"meta":{"rc":"ok"},"data":[]}`` (and a bare
+    # ``{"data":[...]}``) still read as a completed, empty-or-populated result.
+    _mock_login()
+    client = _client()
+    respx.get(DEVICE).mock(return_value=httpx.Response(200, json={"meta": {"rc": "ok"}, "data": []}))
+    assert await client.get_data("stat/device") == []
+    respx.get(DEVICE).mock(return_value=httpx.Response(200, json={"data": [{"ok": 1}]}))
+    assert await client.get_data("stat/device") == [{"ok": 1}]
     await client.aclose()
 
 

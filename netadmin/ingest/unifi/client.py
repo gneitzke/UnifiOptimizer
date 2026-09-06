@@ -511,14 +511,38 @@ class UnifiClient:
                 if not idempotent:
                     # C2: a mutation that draws a 401 must NEVER be re-dispatched.
                     # Re-logging in and replaying the request would send the write a
-                    # SECOND time, and a 401 does not prove the first attempt was
-                    # rejected before it landed -- the session could have been
-                    # invalidated after the controller accepted the change. Only a
-                    # GET (idempotent) may be re-dispatched after a re-login. Surface
-                    # an ambiguous outcome WITHOUT a second dispatch so the caller
-                    # keeps the before-state and reconciles via a GET.
+                    # SECOND time, so a single dispatch is preserved regardless of the
+                    # classification below -- we never ``continue`` here.
+                    #
+                    # #w12a-1: the OUTCOME classification must still honour the
+                    # response envelope, exactly as the writer's own classification
+                    # does. A 401 carrying a PARSED controller rejection
+                    # (``meta.rc=error``) is a DEFINITIVE failure the controller
+                    # confirmed -- the write was rejected, not left in doubt -- so it
+                    # must surface as a definitive rejection, NOT be laundered into
+                    # "ambiguous". Return the response unchanged so the writer's
+                    # unified classification sees ``envelope_error`` and reports a
+                    # definitive ``ok=False`` rejection (which the applier resolves as
+                    # a clean 'failed', leaving no unresolved mutation). Only a 401
+                    # whose body carries NO parseable rejection envelope is genuinely
+                    # AMBIGUOUS: the session was dropped and the write may or may not
+                    # have landed -- surface that WITHOUT a second dispatch so the
+                    # caller keeps the before-state and reconciles via a GET.
+                    try:
+                        body = resp.json()
+                    except ValueError:
+                        body = None
+                    if envelope_error(body) is not None:
+                        logger.warning(
+                            "%s %s -> 401 with a parsed rejection envelope; definitive "
+                            "failure (single dispatch, not re-dispatched, not ambiguous).",
+                            method_u,
+                            endpoint,
+                        )
+                        return resp
                     logger.warning(
-                        "%s %s -> 401 on a mutation; not re-dispatched (ambiguous).",
+                        "%s %s -> 401 on a mutation with no parseable rejection; "
+                        "not re-dispatched (ambiguous).",
                         method_u,
                         endpoint,
                     )
@@ -592,29 +616,45 @@ class UnifiClient:
         err = envelope_error(data)
         if err is not None:
             raise UnifiError(f"{endpoint} -> {err}")
-        # BUG#6 (positive-proof of a real read): a 200 body only counts as a
-        # successful read when it POSITIVELY presents a well-formed success
-        # payload -- either a ``data`` field (the list, or the single-object form
-        # the API also uses) or an explicit ``meta.rc == "ok"``. A body that
-        # presents NEITHER -- e.g. an error envelope like
-        # ``{"error": "upstream unavailable"}`` the transport happened to answer
-        # 200 for -- is NOT a successful empty read. Previously :meth:`_data`
-        # defaulted a missing ``data`` key to ``[]``, so such a body parsed to
-        # zero rows and read as empty-but-healthy; event catch-up then credited
-        # ``event_history`` coverage for a window it never actually read, defeating
-        # every detector coverage gate. Mirror the positive-proof principle used
-        # for the error envelope: absent positive proof of success, this is a
-        # FAILED/UNAVAILABLE read and must raise, not return empty.
-        has_data = isinstance(data.get("data"), (list, dict))
+        # BUG#6 / #w12a-2 (positive-proof of a real read): a 200 body counts as a
+        # well-formed SUCCESSFUL read ONLY when it POSITIVELY presents the classic
+        # UniFi success shape -- a ``data`` field that is an ACTUAL LIST (a real,
+        # present list; possibly empty) AND, when a ``meta`` envelope is present, an
+        # explicit ``meta.rc == "ok"``. Nothing weaker is a successful read:
+        #
+        #   * ``{"meta":{"rc":"ok"}}`` with NO ``data`` -- a success envelope over
+        #     no rows is not a read of zero rows; the payload the caller reads is
+        #     simply absent. rc=ok WITHOUT a real data list is NOT a valid read.
+        #   * ``{"data":null}`` / ``{"data":false}`` -- ``data`` present but not a
+        #     list; a null/false body is not an empty successful read.
+        #   * ``{"meta":{"rc":"pending"},...}`` (or any meta.rc other than "ok") --
+        #     a pending/other envelope is NOT a completed read even with ``data:[]``.
+        #
+        # Previously this accepted ``has_data OR rc_ok`` and :meth:`_data` defaulted
+        # a missing/falsy ``data`` to ``[]``, so every one of the bodies above parsed
+        # to zero rows and read as empty-but-healthy; event catch-up then credited
+        # ``event_history`` coverage (status 'complete', 1.0) for a window it never
+        # actually read, defeating every detector coverage gate. Absent POSITIVE
+        # proof of a real read this is a FAILED/UNAVAILABLE read and must raise, so
+        # catch-up records a FAILED hole rather than fabricated coverage. A genuine
+        # ``{"meta":{"rc":"ok"},"data":[]}`` (or a bare ``{"data":[...]}``) still
+        # reads as complete -- normal reads (stat/device etc.) are unaffected.
+        data_field = data.get("data")
+        data_is_list = isinstance(data_field, list)
         meta = data.get("meta")
-        rc_ok = (
-            isinstance(meta, dict)
-            and str(meta.get("rc", "")).strip().lower() == "ok"
+        meta_present = isinstance(meta, dict)
+        meta_ok = (
+            meta_present and str(meta.get("rc", "")).strip().lower() == "ok"
         )
-        if not has_data and not rc_ok:
-            detail = data.get("error") or data.get("message") or "no success payload"
+        if not data_is_list or (meta_present and not meta_ok):
+            detail = data.get("error") or data.get("message") or (
+                f"data is {type(data_field).__name__}, not a list"
+                if not data_is_list
+                else f"meta.rc={meta.get('rc')!r} (not ok)"
+            )
             raise UnifiError(
-                f"{endpoint} -> unrecognized response (no data/meta.rc=ok): {detail}"
+                f"{endpoint} -> unrecognized response (no well-formed data list / "
+                f"meta.rc=ok): {detail}"
             )
         return data
 

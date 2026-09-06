@@ -2406,3 +2406,95 @@ async def test_w10a3_rejected_revert_of_applied_change_stays_applied(store):
 
     assert write.ok is False
     assert store.get_change(change_id)["status"] == "applied"
+
+
+# --------------------------------------------------------------------------- #
+# #w12a-4: a rejected REVERT must never fabricate an 'applied' change.
+# Repro (unmodified channel planner): a rejected apply leaves 'failed'; a
+# cancelled apply leaves 'applying'. NEITHER confirmed a mutation, so neither is
+# revertible -- the revert is refused UP FRONT (no dispatch), and the prior status
+# is preserved verbatim. Before the fix, revert was permitted on 'failed'/'applying'
+# and the rejection branch promoted EVERY non-'unknown' prior status to 'applied',
+# turning a change that never landed into a confirmed one.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("prior", ["failed", "applying"])
+async def test_w12a4_revert_of_unconfirmed_change_is_refused_no_promotion(store, prior):
+    from netadmin.fixes.models import FixError
+
+    endpoint = f"rest/device/{AP_ID}"
+    change_id = store.insert_change(
+        action="wifi.channel_change",
+        before={"method": "PUT", "endpoint": endpoint,
+                "body": {"radio_table": [{"radio": "ng", "channel": 3}]}},
+        after={"method": "PUT", "endpoint": endpoint,
+               "body": {"radio_table": [{"radio": "ng", "channel": 1}]}},
+        status=prior,  # a change that NEVER confirmed a mutation
+        ts=1,
+    )
+
+    class _RejectingWriter:
+        def __init__(self):
+            self.calls = 0
+
+        async def put(self, ep, body):  # pragma: no cover - must never be reached
+            self.calls += 1
+            return WriteResult(ok=False, status_code=400, data={"error": "rejected"})
+
+        async def post(self, ep, body):  # pragma: no cover - unused
+            return await self.put(ep, body)
+
+    writer = _RejectingWriter()
+    applier = Applier(store, writer)
+    live = {"ng": {"radio": "ng", "channel": 1}}
+    # The revert is refused before any dispatch -- there is no confirmed change to
+    # restore ('failed') / the forward apply is still unresolved ('applying').
+    with pytest.raises(FixError):
+        await applier.revert(change_id, current_radios=live)
+    assert writer.calls == 0  # nothing dispatched
+    # And, crucially, the change was NOT promoted to 'applied': it keeps its status.
+    assert store.get_change(change_id)["status"] == prior
+
+
+async def test_w12a4_rejected_revert_of_applied_change_still_stays_applied(store):
+    # Control (defense in depth): a genuinely CONFIRMED apply whose revert is rejected
+    # DOES roll back to 'applied' -- it legitimately still stands and is retryable.
+    from netadmin.fixes.models import WriteResult as _WR
+
+    endpoint = f"rest/device/{AP_ID}"
+    change_id = store.insert_change(
+        action="wifi.channel_change",
+        before={"method": "PUT", "endpoint": endpoint,
+                "body": {"radio_table": [{"radio": "ng", "channel": 3}]}},
+        after={"method": "PUT", "endpoint": endpoint,
+               "body": {"radio_table": [{"radio": "ng", "channel": 1}]}},
+        status="applied",
+        ts=1,
+    )
+
+    class _RejectingWriter:
+        async def put(self, ep, body):
+            return _WR(ok=False, status_code=400, data={"error": "rejected"})
+
+        async def post(self, ep, body):  # pragma: no cover - unused
+            return await self.put(ep, body)
+
+    applier = Applier(store, _RejectingWriter())
+    live = {"ng": {"radio": "ng", "channel": 1}}
+    write = await applier.revert(change_id, current_radios=live)
+    assert write.ok is False
+    assert store.get_change(change_id)["status"] == "applied"
+
+
+async def test_w12a4_assert_revertible_status_refuses_failed_and_applying():
+    # Unit-level defense in depth: the eligibility gate itself refuses 'failed' and
+    # 'applying' (both pre-lock and under-lock), while 'applied'/'unknown' pass.
+    from netadmin.fixes.models import FixError
+
+    for bad in ("failed", "applying"):
+        with pytest.raises(FixError):
+            Applier._assert_revertible_status(1, bad)
+        with pytest.raises(FixError):
+            Applier._assert_revertible_status(1, bad, allow_in_flight=True)
+    # A confirmed apply and an ambiguous apply remain revertible (no raise).
+    Applier._assert_revertible_status(1, "applied")
+    Applier._assert_revertible_status(1, "unknown")
