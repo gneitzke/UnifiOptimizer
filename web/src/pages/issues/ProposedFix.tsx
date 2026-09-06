@@ -179,10 +179,13 @@ function VerificationBadge({ v }: { v: FixVerification }) {
 /** Whether it's meaningful to revert this row right now. Not while a send is
  * still in flight (`applying`), not when nothing reached the device
  * (`failed`), and not when it's already back to its prior state
- * (`reverted`). An `unknown` (ambiguous) send is deliberately still
+ * (`reverted`). An `unknown` (ambiguous apply) send is deliberately still
  * revertible — restoring the captured `before` values is idempotent and safe
  * whether or not the original send actually landed, which makes revert the
- * safe move for exactly the state that's uncertain. */
+ * safe move for exactly the state that's uncertain. A `revert_unknown` row
+ * (the REVERT itself was ambiguous) must NOT offer Revert again: the backend
+ * permanently refuses to retry a revert on that row, so the button would only
+ * promise an action that can never succeed. */
 function canRevert(change: FixChange): boolean {
   if (!change.revertible) return false;
   const status = normalizeChangeStatus(change.status);
@@ -233,6 +236,13 @@ function AppliedChange({
           <span className="t-micro" style={{ color: 'var(--sev-p3)' }}>
             The controller didn't confirm this send reached the device. Verify it directly, or
             revert to restore the known prior state.
+          </span>
+        )}
+        {status === 'revert_unknown' && (
+          <span className="t-micro" style={{ color: 'var(--sev-p3)' }}>
+            Revert outcome uncertain — the controller didn't confirm the rollback, so this change
+            may or may not still be in place. Verify on the device; it can't be reverted again from
+            here.
           </span>
         )}
         {showVerification && <VerificationBadge v={verification} />}

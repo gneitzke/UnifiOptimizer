@@ -658,9 +658,21 @@ export interface FixChange {
   action: string;
   /** `applying` (send in flight) and `unknown` (an ambiguous send — the
    * request may or may not have reached the device) join the original
-   * `applied` / `failed` / `reverted` (audit U1). `(string & {})` keeps the
-   * known literals as editor suggestions while accepting any daemon value. */
-  status: 'applying' | 'applied' | 'failed' | 'unknown' | 'reverted' | (string & {});
+   * `applied` / `failed` / `reverted` (audit U1). `revert_unknown` is the
+   * mirror-image terminal-uncertain state for a REVERT: the rollback write
+   * was dispatched but its outcome was never confirmed, so the backend
+   * permanently refuses to retry a revert on this row (`applier.py`
+   * `_assert_revertible_status`) — the UI must not offer Revert for it.
+   * `(string & {})` keeps the known literals as editor suggestions while
+   * accepting any daemon value. */
+  status:
+    | 'applying'
+    | 'applied'
+    | 'failed'
+    | 'unknown'
+    | 'reverted'
+    | 'revert_unknown'
+    | (string & {});
   reverted_ts: number | null;
   before: Record<string, unknown>;
   after: Record<string, unknown>;

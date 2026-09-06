@@ -15,7 +15,11 @@ import { CHANGE_STATUS_META, normalizeChangeStatus, type ChangeStatus } from './
  * `unknown` (an ambiguous send) is deliberately tinted like a caution state
  * (amber, the same tone the app already uses for "stale"/"medium risk") rather
  * than neutral gray — an ambiguous outcome asks for attention, it isn't a
- * settled fact the way "reverted" is.
+ * settled fact the way "reverted" is. `revert_unknown` (an ambiguous REVERT —
+ * the rollback itself was never confirmed, and the backend permanently
+ * refuses to retry it) shares that same caution tone but keeps its own label
+ * and icon, so a reader can tell an uncertain apply from an uncertain revert
+ * at a glance instead of both collapsing into one "Unknown" pill.
  */
 
 const ICON: Record<ChangeStatus, React.ReactNode> = {
@@ -24,6 +28,7 @@ const ICON: Record<ChangeStatus, React.ReactNode> = {
   failed: <X size={12} strokeWidth={2.5} />,
   unknown: <CircleHelp size={12} strokeWidth={2.5} />,
   reverted: <RotateCcw size={12} strokeWidth={2.5} />,
+  revert_unknown: <CircleHelp size={12} strokeWidth={2.5} />,
 };
 
 export function ChangeStatusPill({

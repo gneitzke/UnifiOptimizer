@@ -316,9 +316,18 @@ export interface ChangeRecord {
   /** `applying` (in flight) and `unknown` (an ambiguous send — the request may
    * or may not have reached the device) joined `applied` / `failed` /
    * `reverted` so a send outcome is never rendered as a false binary (audit
-   * U1/U4). `(string & {})` keeps these as editor-visible suggestions while
+   * U1/U4). `revert_unknown` is the mirror state for a REVERT whose outcome
+   * was never confirmed — the backend permanently refuses to retry reverting
+   * that row. `(string & {})` keeps these as editor-visible suggestions while
    * still accepting any value an older or newer daemon reports. */
-  status: 'applying' | 'applied' | 'failed' | 'unknown' | 'reverted' | (string & {});
+  status:
+    | 'applying'
+    | 'applied'
+    | 'failed'
+    | 'unknown'
+    | 'reverted'
+    | 'revert_unknown'
+    | (string & {});
   reverted_ts: number | null;
   entity: EntityRef | null;
   before: Record<string, unknown>;
