@@ -704,3 +704,68 @@ async def test_r2_pending_batch_survives_storage_blip_and_restart(
     stored = repo.read_events(0, 2_000_000_000)
     assert len(stored) == N
     assert {r["native_id"] for r in stored} == {f"e{i}" for i in range(N)}
+
+
+@pytest.mark.asyncio
+async def test_r2_pending_survives_when_health_accounting_also_fails(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R2 residual (P1): the terminal health-accounting write must never strand
+    buffered events. The old code wrote ``_record(terminal)`` BEFORE rescuing the
+    dead listener's pending batch, so when BOTH the event store AND the poll_runs
+    accounting write raise OperationalError, the accounting raise propagated out
+    of the loop and the rescue was skipped -> 0 rescued / N stranded. The prior
+    1000-event test passed because it failed ONLY event writes, not accounting.
+    """
+    N = 7
+    events = [
+        Event.model_validate({"_id": f"s{i}", "key": "EVT_X", "time": 1_721_600_000_000 + i})
+        for i in range(N)
+    ]
+
+    real_store = repo.record_events_enriching_entities
+    real_poll = repo.record_poll_run
+    storage = {"down": True}
+
+    def flaky_store(rows: object) -> int:
+        if storage["down"]:
+            import sqlite3
+
+            raise sqlite3.OperationalError("database is locked")
+        return real_store(rows)  # type: ignore[arg-type]
+
+    def flaky_poll(**kwargs: object) -> None:
+        # Health accounting fails for the SAME outage that kills event writes.
+        if storage["down"]:
+            import sqlite3
+
+            raise sqlite3.OperationalError("database is locked")
+        return real_poll(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repo, "record_events_enriching_entities", flaky_store)
+    monkeypatch.setattr(repo, "record_poll_run", flaky_poll)
+
+    attempt = {"n": 0}
+
+    def factory() -> EventListener:
+        attempt["n"] += 1
+        if attempt["n"] == 1:
+            return EventListener(FakeWs(events), repo, flush_interval=None, batch_size=100)
+        return EventListener(FakeWs([]), repo, flush_interval=None)
+
+    sup: WsSupervisor
+
+    async def fake_sleep(delay: float) -> None:
+        # The outage clears during the backoff after the first death.
+        storage["down"] = False
+        if attempt["n"] >= 2:
+            sup.stop()
+
+    sup = WsSupervisor(factory, repo, backoff_base=0.0, max_restarts=5, sleep=fake_sleep)
+    await asyncio.wait_for(sup.run(), timeout=5.0)
+
+    # 0 stranded: every buffered event is persisted despite the accounting write
+    # failing in lockstep with the event store during the outage.
+    stored = repo.read_events(0, 2_000_000_000)
+    assert len(stored) == N
+    assert {r["native_id"] for r in stored} == {f"s{i}" for i in range(N)}
