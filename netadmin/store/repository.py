@@ -1142,19 +1142,37 @@ class Repository:
         #         SWITCH(sw). ``ap`` present but not yet in inventory does NOT fall
         #         through to ``sw`` -- so a row whose only in-inventory MAC is its
         #         switch, while it names an (absent) ap, is NOT resolvable.
+        #
+        # D3 (empty-string-as-absent): the normalizer tests each MAC field for
+        # PYTHON TRUTHINESS (``if ap_mac:`` / ``if not mac``), so an EMPTY STRING is
+        # treated as ABSENT -- ap="" is SKIPPED and precedence falls through to sw.
+        # A bare ``json_extract(...) IS NOT NULL`` disagrees: json_extract of a key
+        # whose value is "" returns the empty string, which is NOT NULL, so the SQL
+        # would treat an empty ap as PRESENT, pick the (never-resolvable) ap branch,
+        # and PARK a row the normalizer would have resolved via its switch. Every
+        # candidate MAC is therefore read through ``NULLIF(x, '')`` so an empty
+        # string collapses to NULL/absent EXACTLY as the normalizer sees it (a
+        # missing key already yields NULL, so both map to absent identically). The
+        # normalizer does NOT strip whitespace -- ``" "`` is truthy in Python -- so
+        # this deliberately does NOT ``TRIM``: whitespace-only stays PRESENT on both
+        # sides, keeping the two predicates byte-for-byte aligned.
+        def _mac(path: str) -> str:
+            return f"NULLIF(json_extract(ev.data,'{path}'),'')"
+
+        user_or_client = f"COALESCE({_mac('$.user')}, {_mac('$.client')})"
+        ap_from_or_ap = f"COALESCE({_mac('$.ap_from')}, {_mac('$.ap')})"
         resolvable = (
             "CASE"
             # primary reference fillable
             "  WHEN ev.entity_id IS NULL AND ("
             "    CASE"
-            "      WHEN COALESCE(json_extract(ev.data,'$.user'),"
-            "                    json_extract(ev.data,'$.client')) IS NOT NULL"
+            f"      WHEN {user_or_client} IS NOT NULL"
             "        THEN ecli.entity_id IS NOT NULL"
-            "      WHEN json_extract(ev.data,'$.ap') IS NOT NULL"
+            f"      WHEN {_mac('$.ap')} IS NOT NULL"
             "        THEN eap.entity_id IS NOT NULL"
-            "      WHEN json_extract(ev.data,'$.sw') IS NOT NULL"
+            f"      WHEN {_mac('$.sw')} IS NOT NULL"
             "        THEN esw.entity_id IS NOT NULL"
-            "      WHEN json_extract(ev.data,'$.gw') IS NOT NULL"
+            f"      WHEN {_mac('$.gw')} IS NOT NULL"
             "        THEN egw.entity_id IS NOT NULL"
             "      ELSE 0"
             "    END) THEN 1"
@@ -1163,14 +1181,13 @@ class Repository:
             # candidate. A row is resolvable ONLY when the SPECIFIC MAC the
             # normalizer would consult for this NULL column is already in inventory.
             "  WHEN ev.related_entity_id IS NULL"
-            "   AND COALESCE(json_extract(ev.data,'$.user'),"
-            "               json_extract(ev.data,'$.client')) IS NOT NULL"
+            f"   AND {user_or_client} IS NOT NULL"
             "    THEN CASE"
             "      WHEN ev.key LIKE '%Roam%'"
             "        THEN (CASE WHEN eapf.entity_id IS NOT NULL THEN 1 ELSE 0 END)"
-            "      WHEN json_extract(ev.data,'$.ap') IS NOT NULL"
+            f"      WHEN {_mac('$.ap')} IS NOT NULL"
             "        THEN (CASE WHEN eap.entity_id IS NOT NULL THEN 1 ELSE 0 END)"
-            "      WHEN json_extract(ev.data,'$.sw') IS NOT NULL"
+            f"      WHEN {_mac('$.sw')} IS NOT NULL"
             "        THEN (CASE WHEN esw.entity_id IS NOT NULL THEN 1 ELSE 0 END)"
             "      ELSE 0"
             "    END"
@@ -1184,27 +1201,25 @@ class Repository:
             "  FROM events ev"
             "  LEFT JOIN entities en ON en.entity_id = ev.entity_id"
             "  LEFT JOIN entities ecli ON ecli.site_id=? AND ecli.entity_type='client'"
-            "       AND ecli.native_id = COALESCE(json_extract(ev.data,'$.user'),"
-            "                                      json_extract(ev.data,'$.client'))"
+            f"       AND ecli.native_id = {user_or_client}"
             "  LEFT JOIN entities eap ON eap.site_id=? AND eap.entity_type='ap'"
-            "       AND eap.native_id = json_extract(ev.data,'$.ap')"
+            f"       AND eap.native_id = {_mac('$.ap')}"
             "  LEFT JOIN entities esw ON esw.site_id=? AND esw.entity_type='switch'"
-            "       AND esw.native_id = json_extract(ev.data,'$.sw')"
+            f"       AND esw.native_id = {_mac('$.sw')}"
             "  LEFT JOIN entities egw ON egw.site_id=? AND egw.entity_type='gateway'"
-            "       AND egw.native_id = json_extract(ev.data,'$.gw')"
+            f"       AND egw.native_id = {_mac('$.gw')}"
             "  LEFT JOIN entities eapf ON eapf.site_id=? AND eapf.entity_type='ap'"
-            "       AND eapf.native_id = COALESCE(json_extract(ev.data,'$.ap_from'),"
-            "                                     json_extract(ev.data,'$.ap'))"
+            f"       AND eapf.native_id = {ap_from_or_ap}"
             "  WHERE (ev.entity_id IS NULL AND ("
-            "          json_extract(ev.data, '$.user')   IS NOT NULL"
-            "       OR json_extract(ev.data, '$.client') IS NOT NULL"
-            "       OR json_extract(ev.data, '$.ap')     IS NOT NULL"
-            "       OR json_extract(ev.data, '$.sw')     IS NOT NULL"
-            "       OR json_extract(ev.data, '$.gw')     IS NOT NULL))"
+            f"          {_mac('$.user')}   IS NOT NULL"
+            f"       OR {_mac('$.client')} IS NOT NULL"
+            f"       OR {_mac('$.ap')}     IS NOT NULL"
+            f"       OR {_mac('$.sw')}     IS NOT NULL"
+            f"       OR {_mac('$.gw')}     IS NOT NULL))"
             "     OR (ev.related_entity_id IS NULL AND en.entity_type = 'client' AND ("
-            "          json_extract(ev.data, '$.ap_from') IS NOT NULL"
-            "       OR json_extract(ev.data, '$.ap')      IS NOT NULL"
-            "       OR json_extract(ev.data, '$.sw')      IS NOT NULL))"
+            f"          {_mac('$.ap_from')} IS NOT NULL"
+            f"       OR {_mac('$.ap')}      IS NOT NULL"
+            f"       OR {_mac('$.sw')}      IS NOT NULL))"
             ") "
             "SELECT id, data FROM cand "
             "WHERE resolvable = 1 OR attempts < ? "

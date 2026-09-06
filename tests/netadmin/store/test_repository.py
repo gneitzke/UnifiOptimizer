@@ -1679,3 +1679,122 @@ def test_unresolved_events_degrades_when_table_absent(tmp_db_path: Path) -> None
     # Must not raise -- returns nothing, the read path degrades safely.
     assert rw.unresolved_events(limit=500) == []
     rw.close()
+
+
+# ---------------------------------------------------------------------------
+# D3: empty-string precedence must match the normalizer's TRUTHINESS, not the
+# SQL IS NOT NULL presence test. The normalizer treats an empty MAC string as
+# ABSENT (``if ap_mac:`` / ``if not mac`` -- "" is falsy), skips it, and falls
+# through to the next source. A predicate that reads json_extract(...)=="" as
+# PRESENT picks a never-resolvable branch and permanently parks a row the
+# normalizer would have repaired via its next source. Every candidate MAC is
+# read through NULLIF(x,'') so "" folds to absent exactly as Python sees it
+# (and, matching the normalizer, whitespace-only is NOT stripped -> stays
+# present on both sides).
+# ---------------------------------------------------------------------------
+def test_reconcile_empty_ap_resolves_via_switch_not_parked(repo: Repository) -> None:
+    """D3: a client event carrying ap="" (empty string) and a real ``sw`` must be
+    treated as resolvable-via-SWITCH -- the normalizer skips the empty ap and uses
+    the switch. The prior predicate read the empty ap as PRESENT, marked the row
+    not-resolvable, and after the attempt budget was spent only ``resolvable=1``
+    could re-admit it -- which the empty-ap predicate never yielded, so the row
+    stayed parked forever even once the switch appeared: 0 repairs, ref NULL.
+    The fix folds "" to absent, so the switch resolves the row and it is repaired
+    (not permanently parked)."""
+    from netadmin.ingest.events import EventNormalizer
+    from netadmin.store.repository import _EVENT_RECONCILE_MAX_ATTEMPTS
+
+    client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500
+    )
+    # ap is present-but-EMPTY; sw names a real switch not yet in inventory.
+    ev = repo.record_event(
+        ts=1000, key="EVT_WU_Disconnected", entity_id=client, related_entity_id=None,
+        native_id="emptyap", data={"key": "EVT_WU_Disconnected", "time": 1000 * 1000,
+                                   "user": "cli:mac", "ap": "", "sw": "sw:mac"},
+    )
+
+    # While the switch is absent the row is still a candidate (it may yet resolve),
+    # and a reconcile makes no false repair.
+    assert ev in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+    assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 0
+
+    # The attempt budget is spent while the switch is still absent -> parked out of
+    # the oldest-first window. Only ``resolvable=1`` can re-admit it after this.
+    for _ in range(_EVENT_RECONCILE_MAX_ATTEMPTS):
+        repo.bump_event_reconcile_attempts([ev])
+    assert ev not in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+
+    # The switch appears. The empty ap must NOT block resolution: the row becomes
+    # resolvable-via-switch, is re-admitted despite the spent budget, and repaired.
+    sw = repo.upsert_entity(
+        Entity(entity_type=EntityType.SWITCH, native_id="sw:mac"), ts=9000
+    )
+    assert ev in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+    assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 1
+    row = repo._conn.execute(
+        "SELECT related_entity_id FROM events WHERE id=?", (ev,)
+    ).fetchone()
+    assert row["related_entity_id"] == sw
+
+
+def test_reconcile_precedence_present_ap_beats_switch(repo: Repository) -> None:
+    """D3 (precedence intact): a NON-empty ap still wins over sw, exactly as the
+    normalizer's ``if ap_mac: ... elif sw_mac:`` ordering. The related reference
+    must resolve to the AP, never the switch, when both are present and in
+    inventory. NULLIF only collapses the empty string; it must not disturb the
+    single-winner precedence for a genuinely-present ap."""
+    from netadmin.ingest.events import EventNormalizer
+
+    client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500
+    )
+    ap = repo.upsert_entity(Entity(entity_type=EntityType.AP, native_id="ap:mac"), ts=500)
+    sw = repo.upsert_entity(
+        Entity(entity_type=EntityType.SWITCH, native_id="sw:mac"), ts=500
+    )
+    ev = repo.record_event(
+        ts=1000, key="EVT_WU_Disconnected", entity_id=client, related_entity_id=None,
+        native_id="presentap", data={"key": "EVT_WU_Disconnected", "time": 1000 * 1000,
+                                     "user": "cli:mac", "ap": "ap:mac", "sw": "sw:mac"},
+    )
+
+    assert ev in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+    assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 1
+    row = repo._conn.execute(
+        "SELECT related_entity_id FROM events WHERE id=?", (ev,)
+    ).fetchone()
+    # AP wins; the switch is never consulted for the related reference.
+    assert row["related_entity_id"] == ap
+    assert row["related_entity_id"] != sw
+
+
+def test_reconcile_all_empty_macs_is_not_a_candidate(repo: Repository) -> None:
+    """D3 (all-empty parks): a row whose every candidate MAC is an EMPTY STRING
+    names nothing the normalizer could resolve (all sources are falsy/skipped), so
+    it must NOT be selected at all -- empty folds to absent identically to a
+    missing key. Before the fix the IS NOT NULL predicate read the empty strings as
+    present and admitted a row that can never resolve; the fix excludes it, and a
+    reconcile repairs nothing."""
+    from netadmin.ingest.events import EventNormalizer
+
+    client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500
+    )
+    # Related-scoped all-empty: client resolved, related NULL, ap/sw both empty.
+    rel_ev = repo.record_event(
+        ts=1000, key="EVT_WU_Disconnected", entity_id=client, related_entity_id=None,
+        native_id="allempty-rel", data={"key": "EVT_WU_Disconnected", "time": 1000 * 1000,
+                                        "user": "cli:mac", "ap": "", "sw": ""},
+    )
+    # Primary-scoped all-empty: entity NULL, every primary MAC empty.
+    prim_ev = repo.record_event(
+        ts=1100, key="EVT_WU_Disconnected", entity_id=None, related_entity_id=None,
+        native_id="allempty-prim", data={"key": "EVT_WU_Disconnected", "time": 1100 * 1000,
+                                         "user": "", "ap": "", "sw": "", "gw": ""},
+    )
+
+    selected = {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+    assert rel_ev not in selected
+    assert prim_ev not in selected
+    assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 0
