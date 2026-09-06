@@ -1830,3 +1830,238 @@ async def test_concurrent_reverts_first_ambiguous_blocks_the_second_from_replayi
     assert "already" in str(refused[0]) or "unknown" in str(refused[0]) or "ambiguous" in str(refused[0])
     # The row is terminal-uncertain, not 'reverted' and not plain 'applied'.
     assert store.get_change(change_id)["status"] == "revert_unknown"
+
+
+# --------------------------------------------------------------------------- #
+# Verifier round 8: the merged operation actually dispatched -- not the plan-time
+# payload -- is what gets validated against fresh live and judged for revertibility.
+# --------------------------------------------------------------------------- #
+class _RecordingLiveWriter:
+    """A writer that records each PUT body and reports success."""
+
+    def __init__(self) -> None:
+        self.puts: list[dict] = []
+
+    async def put(self, ep, body):
+        from netadmin.fixes.models import WriteResult
+
+        self.puts.append(body)
+        return WriteResult(ok=True, status_code=200, data={"meta": {}})
+
+    async def post(self, ep, body):  # pragma: no cover - unused
+        return await self.put(ep, body)
+
+
+async def test_round8_1_delta_field_diverging_from_live_is_drift(store):
+    # #1: the payload changes channel 3->1 AND bundles a tx-power delta (high->medium),
+    # but the precondition only asserts the channel. Fresh live still has channel 3
+    # (precondition holds) but tx-power is LOW -- a concurrent change. Merge-at-dispatch
+    # would layer the medium delta straight onto live and silently clobber that LOW.
+    # Binding every SENT delta field to its before-value catches the divergence and
+    # refuses (PreconditionDrift); nothing is dispatched.
+    endpoint = f"rest/device/{AP_ID}"
+    step = FixStep(
+        action=ActionType.CHANNEL_CHANGE,
+        target_entity_type=EntityType.RADIO,
+        target_native_id=f"{AP_MAC}:ng",
+        description="channel + bundled power delta",
+        risk=RiskLevel.MEDIUM,
+        method="PUT",
+        endpoint=endpoint,
+        payload={"radio_table": [{"radio": "ng", "channel": 1, "tx_power_mode": "medium"}]},
+        precondition=_radio_pre(f"{AP_MAC}:ng", {"channel": 3}),  # channel-only
+        before={"method": "PUT", "endpoint": endpoint,
+                "body": {"radio_table": [{"radio": "ng", "channel": 3, "tx_power_mode": "high"}]}},
+        after={"method": "PUT", "endpoint": endpoint,
+               "body": {"radio_table": [{"radio": "ng", "channel": 1, "tx_power_mode": "medium"}]}},
+        revertible=True,
+    )
+    plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "bundle", steps=[step])
+    writer = _RecordingLiveWriter()
+    applier = Applier(store, writer)
+    live = {"ng": {"radio": "ng", "channel": 3, "tx_power_mode": "low"}}  # power drifted to LOW
+
+    async def _reader():
+        cur = {f"{AP_MAC}:ng": {"channel": 3}}  # channel precondition still holds
+        full = {AP_ID: {k: dict(v) for k, v in live.items()}}
+        return cur, full, set()
+
+    with pytest.raises(PreconditionDrift):
+        await applier.apply(
+            plan, dry_run=False, confirm_token=plan_confirm_token(plan), state_reader=_reader
+        )
+    assert writer.puts == []  # refused before any dispatch
+
+
+async def test_round8_2_unchanged_top_level_field_not_resent_over_live(store):
+    # #2: an UNCHANGED top-level field (disabled == before) rides along in the payload.
+    # Live has disabled=True (a concurrent change). A whole-device PUT that re-sent
+    # disabled=False would clobber that AND escape rollback (revert restores only
+    # radio_table). The dispatched body must NOT carry an unchanged top-level field the
+    # step never intends to change; it is dropped, so live's disabled is untouched.
+    endpoint = f"rest/device/{AP_ID}"
+    step = FixStep(
+        action=ActionType.CHANNEL_CHANGE,
+        target_entity_type=EntityType.RADIO,
+        target_native_id=f"{AP_MAC}:ng",
+        description="channel move, incidental disabled=False",
+        risk=RiskLevel.MEDIUM,
+        method="PUT",
+        endpoint=endpoint,
+        payload={"radio_table": [{"radio": "ng", "channel": 1}], "disabled": False},
+        precondition=_radio_pre(f"{AP_MAC}:ng", {"channel": 3}),
+        before={"method": "PUT", "endpoint": endpoint,
+                "body": {"radio_table": [{"radio": "ng", "channel": 3}], "disabled": False}},
+        after={"method": "PUT", "endpoint": endpoint,
+               "body": {"radio_table": [{"radio": "ng", "channel": 1}], "disabled": False}},
+        revertible=True,
+    )
+    plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "toplevel", steps=[step])
+    writer = _RecordingLiveWriter()
+    applier = Applier(store, writer)
+    live = {"ng": {"radio": "ng", "channel": 3}}  # radio-level live; device 'disabled' is True out-of-band
+
+    async def _reader():
+        cur = {f"{AP_MAC}:ng": {"channel": 3}}
+        full = {AP_ID: {k: dict(v) for k, v in live.items()}}
+        return cur, full, set()
+
+    result = await applier.apply(
+        plan, dry_run=False, confirm_token=plan_confirm_token(plan), state_reader=_reader
+    )
+    assert result.applied is True
+    dispatched = writer.puts[0]
+    assert "disabled" not in dispatched  # the unchanged top-level field was NOT re-sent over live
+    assert next(r for r in dispatched["radio_table"] if r["radio"] == "ng")["channel"] == 1
+
+
+async def test_round8_3_merged_reverse_min_rssi_on_mesh_refused_up_front(store):
+    # #3: the plan captured min-RSSI DISABLED. Fresh live has since ENABLED it, and the
+    # AP is now a mesh uplink. The merged table this apply dispatches carries that live
+    # min-RSSI=on; an immediate revert (restoring the channel onto that merged table)
+    # would re-assert min-RSSI on a mesh uplink, which the rail bars. Validating the
+    # reverse against the MERGED op (not the stale payload) refuses the apply UP FRONT.
+    endpoint = f"rest/device/{AP_ID}"
+    step = FixStep(
+        action=ActionType.CHANNEL_CHANGE,
+        target_entity_type=EntityType.RADIO,
+        target_native_id=f"{AP_MAC}:ng",
+        description="channel move; plan captured min-RSSI off",
+        risk=RiskLevel.MEDIUM,
+        method="PUT",
+        endpoint=endpoint,
+        payload={"radio_table": [{"radio": "ng", "channel": 1, "min_rssi_enabled": False, "min_rssi": 0}]},
+        precondition=_radio_pre(f"{AP_MAC}:ng", {"channel": 3}),
+        before={"method": "PUT", "endpoint": endpoint,
+                "body": {"radio_table": [{"radio": "ng", "channel": 3, "min_rssi_enabled": False, "min_rssi": 0}]}},
+        after={"method": "PUT", "endpoint": endpoint,
+               "body": {"radio_table": [{"radio": "ng", "channel": 1, "min_rssi_enabled": False, "min_rssi": 0}]}},
+        revertible=True,
+    )
+    plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "merged-reverse", steps=[step])
+    writer = _RecordingLiveWriter()
+    applier = Applier(store, writer)
+    # Live: min-RSSI re-enabled since the plan, and the AP is now a mesh uplink.
+    live = {"ng": {"radio": "ng", "channel": 3, "min_rssi_enabled": True, "min_rssi": -75}}
+
+    async def _reader():
+        cur = {f"{AP_MAC}:ng": {"channel": 3}}
+        full = {AP_ID: {k: dict(v) for k, v in live.items()}}
+        return cur, full, {AP_ID}  # mesh uplink
+
+    with pytest.raises(SafetyViolation):
+        await applier.apply(
+            plan, dry_run=False, confirm_token=plan_confirm_token(plan), state_reader=_reader
+        )
+    assert writer.puts == []  # never applied something whose merged form can't be reverted
+    assert store.list_changes() == []
+
+
+async def test_round8_10_revert_restores_a_field_the_change_deleted(store):
+    # #10: the ledgered change's DISPATCHED after DROPPED a field (tx_power_mode) from a
+    # SURVIVING radio -- before ng={channel:3, tx_power_mode:high}, after ng={channel:1}.
+    # Iterating only after-fields missed the deletion, so a naive revert restored the
+    # channel, left tx_power_mode absent, and still marked the row 'reverted'. The revert
+    # must restore the deleted field too (a complete inverse), not a partial rollback.
+    endpoint = f"rest/device/{AP_ID}"
+    change_id = store.insert_change(
+        action="wifi.channel_change",
+        before={"method": "PUT", "endpoint": endpoint,
+                "body": {"radio_table": [{"radio": "ng", "channel": 3, "tx_power_mode": "high"}]}},
+        after={"method": "PUT", "endpoint": endpoint,
+               "body": {"radio_table": [{"radio": "ng", "channel": 1}]}},  # tx_power_mode dropped
+        status="applied",
+        ts=1,
+    )
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+    live = {"ng": {"radio": "ng", "channel": 1}}  # tx_power_mode absent, consistent with the after
+
+    revert = await applier.revert(change_id, current_radios=live)
+    assert revert.ok
+    sent_ng = next(r for r in writer.calls[-1].body["radio_table"] if r["radio"] == "ng")
+    assert sent_ng["channel"] == 3  # touched field restored
+    assert sent_ng["tx_power_mode"] == "high"  # the DELETED field restored too (not left absent)
+    assert store.get_change(change_id)["status"] == "reverted"
+
+
+async def test_round8_5_cancelled_mid_send_revert_blocks_replay(store):
+    # #5: cancel revert A after its writer sent the PUT but before it returned. Without a
+    # durable in-flight marker the row stayed 'applied' and revert B replayed the
+    # mutation (a second PUT). Recording 'reverting' UNDER THE LOCK before the dispatch
+    # returns makes a cancelled-mid-send revert leave a state that blocks B: exactly ONE
+    # dispatch, and B refuses rather than replaying.
+    import asyncio as _asyncio
+
+    from netadmin.fixes.models import WriteResult
+
+    endpoint = f"rest/device/{AP_ID}"
+    change_id = store.insert_change(
+        action="wifi.channel_change",
+        before={"method": "PUT", "endpoint": endpoint,
+                "body": {"radio_table": [{"radio": "ng", "channel": 3}]}},
+        after={"method": "PUT", "endpoint": endpoint,
+               "body": {"radio_table": [{"radio": "ng", "channel": 1}]}},
+        status="applied",
+        ts=1,
+    )
+    parked = _asyncio.Event()
+    release = _asyncio.Event()  # never set -- holds the in-flight write open
+
+    class _HangingWriter:
+        def __init__(self) -> None:
+            self.puts = 0
+
+        async def put(self, ep, body):
+            self.puts += 1
+            parked.set()  # the PUT has been "sent"
+            await release.wait()  # park before returning
+            return WriteResult(ok=True, status_code=200, data={"meta": {}})
+
+        async def post(self, ep, body):  # pragma: no cover - unused
+            return await self.put(ep, body)
+
+    writer = _HangingWriter()
+    applier = Applier(store, writer)
+    live = {"ng": {"radio": "ng", "channel": 1}}
+
+    async def _reader():
+        return {k: dict(v) for k, v in live.items()}, False
+
+    task_a = _asyncio.create_task(applier.revert(change_id, state_reader=_reader))
+    await _asyncio.wait_for(parked.wait(), timeout=1)  # A dispatched the PUT and parked
+
+    assert writer.puts == 1
+    # The row was durably marked 'reverting' BEFORE the dispatch returned.
+    assert store.get_change(change_id)["status"] == "reverting"
+
+    task_a.cancel()
+    with pytest.raises(_asyncio.CancelledError):
+        await task_a
+
+    # Revert B must NOT replay: it re-reads the durable 'reverting' status under the
+    # lock and refuses, treating the interrupted revert as uncertain (not retryable).
+    with pytest.raises(FixError):
+        await applier.revert(change_id, state_reader=_reader)
+    assert writer.puts == 1  # exactly one dispatch, never replayed
+    assert store.get_change(change_id)["status"] == "reverting"
