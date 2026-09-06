@@ -1667,6 +1667,105 @@ def test_wrong_precedence_mac_is_not_resolvable_and_does_not_starve(
     assert still_null == 500
 
 
+def test_stp_absent_port_does_not_starve_and_resolves_when_port_appears(
+    repo: Repository,
+) -> None:
+    """Finding #4 (STP routing): a port-scoped switch event (EVT_SW_StpPortBlocking)
+    is attributed by the normalizer to the PORT entity (native_id "<sw>:<port>"),
+    NOT the switch. The old predicate flagged such a row resolvable merely because
+    the SWITCH exists, so 500 STP events for an ABSENT port floated to the head of
+    the LIMIT window (resolvable-first) and starved a newer, genuinely-repairable
+    client event: it got ZERO repairs and its ref stayed NULL. The precedence-
+    faithful predicate consults the PORT, so a port-not-yet-present STP row is
+    correctly NOT-yet-resolvable (parked, not starving) -- and becomes resolvable
+    exactly when its port entity appears, repairing all 500."""
+    from netadmin.ingest.events import EventNormalizer
+
+    # The switch IS in inventory (so each STP row's related=switch is already set at
+    # ingest, exactly as normalize() would). Its PORT is NOT yet present, so the
+    # primary entity (the port) cannot resolve.
+    sw = repo.upsert_entity(
+        Entity(entity_type=EntityType.SWITCH, native_id="sw:mac"), ts=500
+    )
+    for i in range(500):
+        repo.record_event(
+            ts=1000 + i, key="EVT_SW_StpPortBlocking", entity_id=None,
+            related_entity_id=sw, native_id=f"stp-{i}",
+            data={"key": "EVT_SW_StpPortBlocking", "time": (1000 + i) * 1000,
+                  "sw": "sw:mac", "port": 7},
+        )
+    # A newer, genuinely repairable client event whose AP IS in inventory.
+    new_client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli-new:mac"), ts=8000
+    )
+    new_ap = repo.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="ap-new:mac"), ts=8000
+    )
+    newer_ev = repo.record_event(
+        ts=9000, key="EVT_WU_Connected", entity_id=new_client,
+        related_entity_id=None, native_id="newev",
+        data={"key": "EVT_WU_Connected", "time": 9000 * 1000,
+              "user": "cli-new:mac", "ap": "ap-new:mac"},
+    )
+
+    # (a) LIMIT exactly the flood size: under the old predicate all 501 rows were
+    # "resolvable" (switch exists) and ordered by ts, so the newest (ts=9000) fell
+    # off the 500-row window and was starved. Now the 500 STP rows are NOT
+    # resolvable, so the one truly-resolvable row leads the window.
+    selected = repo.unresolved_events(limit=500)
+    assert int(selected[0]["id"]) == newer_ev
+
+    repaired = EventNormalizer(repo).reconcile_unresolved(limit=500)
+    assert repaired == 1
+    assert repo._conn.execute(
+        "SELECT related_entity_id FROM events WHERE id=?", (newer_ev,)
+    ).fetchone()["related_entity_id"] == new_ap
+    # The STP rows' primary entity (the port) is still unresolved -- parked, not
+    # falsely counted as repaired.
+    stp_null = repo._conn.execute(
+        "SELECT COUNT(*) AS n FROM events WHERE entity_id IS NULL "
+        "AND native_id LIKE 'stp-%'"
+    ).fetchone()["n"]
+    assert stp_null == 500
+
+    # (b) The missing PORT finally appears (native_id "<sw_mac>:<port_idx>", exactly
+    # how ingest/mapping.py keys ports). Every STP row is now resolvable and repairs
+    # to the port on the next pass.
+    port = repo.upsert_entity(
+        Entity(entity_type=EntityType.PORT, native_id="sw:mac:7"), ts=9500
+    )
+    repaired_now = EventNormalizer(repo).reconcile_unresolved(limit=500)
+    assert repaired_now == 500
+    filled = repo._conn.execute(
+        "SELECT COUNT(*) AS n FROM events WHERE entity_id=? AND native_id LIKE 'stp-%'",
+        (port,),
+    ).fetchone()["n"]
+    assert filled == 500
+
+
+def test_switch_scoped_event_still_resolves_on_the_switch(repo: Repository) -> None:
+    """Finding #4 guard: a switch-scoped event that merely CARRIES a port field
+    (EVT_SW_PoeOverload) is NOT in the port-scoped set, so the normalizer routes it
+    to the SWITCH. The predicate must key off the event KEY, not the presence of a
+    ``port`` field -- so this row resolves on the switch (not a phantom port)."""
+    from netadmin.ingest.events import EventNormalizer
+
+    sw = repo.upsert_entity(
+        Entity(entity_type=EntityType.SWITCH, native_id="sw:mac"), ts=500
+    )
+    ev = repo.record_event(
+        ts=1000, key="EVT_SW_PoeOverload", entity_id=None, related_entity_id=None,
+        native_id="poe", data={"key": "EVT_SW_PoeOverload", "time": 1000 * 1000,
+                               "sw": "sw:mac", "port": 3},
+    )
+    # Resolvable now (the switch exists), so it is selected and repaired to the switch.
+    assert ev in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+    assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 1
+    assert repo._conn.execute(
+        "SELECT entity_id FROM events WHERE id=?", (ev,)
+    ).fetchone()["entity_id"] == sw
+
+
 def test_unresolved_events_degrades_when_table_absent(tmp_db_path: Path) -> None:
     """Finding #9: on a database whose ``events`` table is absent (dropped, or a
     query-only replica that never provisioned it) the reconcile read must degrade
