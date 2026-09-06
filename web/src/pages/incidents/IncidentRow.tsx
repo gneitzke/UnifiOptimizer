@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ChevronRight, ChevronDown } from 'lucide-react';
 import { SeverityPill, SeverityGlyph } from '../../components/ui/SeverityPill';
@@ -32,6 +32,49 @@ export function IncidentRow({
 }) {
   const [expanded, setExpanded] = useState(false);
   const [symptoms, setSymptoms] = useState<IncidentMember[] | null>(null);
+  // C5 (round 16): the detail fetch is cached per-row, but the parent polls
+  // every 30s and preserves this row's component identity by incident id — so
+  // a poll that changes current membership left the cached `symptoms` stale
+  // (still carrying a now-cleared member as current:true) while the "+N
+  // related" count above read the fresh `incident.symptom_count`. Tracking
+  // the CURRENT count the cache was fetched at, and refetching whenever it
+  // drifts from the live prop, keeps the cache honest without refetching on
+  // every poll when membership hasn't actually changed.
+  //
+  // C5 (round 18): count alone misses a membership REPLACEMENT at a constant
+  // count (symptom A clears, symptom B joins in the same reconcile pass —
+  // `member_count`/`symptom_count` doesn't move).
+  //
+  // C5 (round 19): `last_seen_ts` was the round-18 proxy for that, but it is a
+  // `max`-fold over member evidence (`engine._reconcile`), so a replacement
+  // whose NEW member's evidence is OLDER than the incident's high-water mark
+  // never advances it — the row never refetches (adversarial verifier round 19,
+  // real feeder-port swap: current symptoms went 2 -> 3 while (count,
+  // last_seen_ts) stayed (1, 1300)). The list payload now carries `member_sig`,
+  // a signature of the CURRENT member id SET independent of evidence freshness
+  // (backend `_member_sig`): it changes iff membership changes and is stable
+  // otherwise. That is the authoritative membership-change signal, so the cache
+  // key keys on it (last_seen_ts is kept only as a belt-and-braces companion for
+  // an older daemon whose payload omits `member_sig`).
+  const [symptomsFetchedAt, setSymptomsFetchedAt] = useState<{
+    count: number;
+    seen: number;
+    sig: string | undefined;
+  } | null>(null);
+  // C5 (round 17): tracks the signature a fetch most recently FAILED at,
+  // distinct from `symptomsFetchedAt` (which now only ever records a SUCCESS
+  // — see `fetchSymptoms` below). This exists purely to stop the passive
+  // in-place effect from spinning: without it, a persistently-failing fetch
+  // would leave `stale` true forever, and the effect would refire the moment
+  // `loadingSymptoms` flips back to false, forever. A manual expand
+  // (`toggle`) ignores this and always retries, matching "retry on next user
+  // expand"; it's only the automatic effect that backs off once a given
+  // signature has already failed.
+  const [symptomsFailedAt, setSymptomsFailedAt] = useState<{
+    count: number;
+    seen: number;
+    sig: string | undefined;
+  } | null>(null);
   const [loadingSymptoms, setLoadingSymptoms] = useState(false);
 
   const isGroup = incident.symptom_count > 0;
@@ -39,22 +82,84 @@ export function IncidentRow({
   const headTitle = root?.title ?? incident.title;
   const href = isGroup ? `/incidents/${incident.id}` : `/issues/${incident.root_issue_id}`;
   const ongoing = `ongoing ${formatDuration(now - incident.first_seen_ts)}`;
+  const currentSignature = {
+    count: incident.symptom_count,
+    seen: incident.last_seen_ts,
+    sig: incident.member_sig,
+  };
+  const stale =
+    symptoms !== null &&
+    (symptomsFetchedAt === null ||
+      symptomsFetchedAt.count !== currentSignature.count ||
+      symptomsFetchedAt.seen !== currentSignature.seen ||
+      symptomsFetchedAt.sig !== currentSignature.sig);
+  const failedAtCurrent =
+    symptomsFailedAt !== null &&
+    symptomsFailedAt.count === currentSignature.count &&
+    symptomsFailedAt.seen === currentSignature.seen &&
+    symptomsFailedAt.sig === currentSignature.sig;
+
+  async function fetchSymptoms() {
+    setLoadingSymptoms(true);
+    const atSignature = currentSignature;
+    try {
+      const detail = await getIncident(incident.id);
+      setSymptoms(detail.symptoms);
+      // Only a SUCCESSFUL fetch validates the cache for this signature. A
+      // failed fetch must NOT record `symptomsFetchedAt` — doing so would
+      // mark an empty/stale `symptoms` as satisfied for the current
+      // signature, so a transient failure permanently hid real symptoms even
+      // after the server recovered (no retry on collapse/re-expand or the
+      // in-place staleness effect below, since `stale` would already read
+      // false).
+      setSymptomsFetchedAt(atSignature);
+      setSymptomsFailedAt(null);
+    } catch {
+      // Leave `symptomsFetchedAt` untouched so `stale` stays true (or
+      // `symptoms` stays null on a first-ever attempt) — the row keeps
+      // retrying on the next expand or the next time the signature changes
+      // again. Record the failed signature separately so the passive effect
+      // below (not the user-driven `toggle`) can stop retrying a signature
+      // that's already known to fail, avoiding a busy loop.
+      setSymptoms([]);
+      setSymptomsFailedAt(atSignature);
+    } finally {
+      setLoadingSymptoms(false);
+    }
+  }
 
   async function toggle() {
     const next = !expanded;
     setExpanded(next);
-    if (next && symptoms === null && !loadingSymptoms) {
-      setLoadingSymptoms(true);
-      try {
-        const detail = await getIncident(incident.id);
-        setSymptoms(detail.symptoms);
-      } catch {
-        setSymptoms([]);
-      } finally {
-        setLoadingSymptoms(false);
-      }
+    if (next && !loadingSymptoms && (symptoms === null || stale)) {
+      await fetchSymptoms();
     }
   }
+
+  // Membership can change out from under an already-expanded row (the
+  // dashboard polls every 30s and keeps this component mounted across
+  // refreshes) — including a REPLACEMENT that leaves `symptom_count`
+  // unchanged (C5 round 18/19), which `stale` now catches via `member_sig`
+  // (the authoritative membership signal; `last_seen_ts` a fallback).
+  // Refetch in place so the open list stays in agreement with the fresh
+  // signature instead of waiting for a collapse/re-expand that may never
+  // come. Skips a signature that has already failed (`failedAtCurrent`) so a
+  // persistently-failing fetch retries only on the next user expand or the
+  // next signature change, rather than spinning every render.
+  useEffect(() => {
+    if (expanded && stale && !loadingSymptoms && !failedAtCurrent) {
+      void fetchSymptoms();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    expanded,
+    stale,
+    loadingSymptoms,
+    failedAtCurrent,
+    incident.symptom_count,
+    incident.last_seen_ts,
+    incident.member_sig,
+  ]);
 
   return (
     <li style={{ borderTop: '1px solid var(--hairline)' }}>
@@ -91,26 +196,38 @@ export function IncidentRow({
 
       {isGroup && expanded && (
         <ul className="flex flex-col pb-2 pl-6" style={{ gap: 2 }}>
-          {loadingSymptoms && symptoms === null ? (
+          {symptoms === null || (loadingSymptoms && stale) ? (
             <Skeleton className="h-5 w-2/3" />
           ) : (
-            (symptoms ?? []).map((m) => (
-              <li key={m.issue.id} className="flex items-center gap-2 py-1">
-                <SeverityGlyph severity={m.issue.severity} size={10} />
-                <Link
-                  to={`/issues/${m.issue.id}`}
-                  className="t-caption truncate hover:underline"
-                  style={{ color: 'var(--fg-muted)' }}
-                >
-                  {m.issue.title}
-                </Link>
-                {m.entity && (
-                  <span className="t-micro truncate" style={{ color: 'var(--fg-subtle)' }}>
-                    · <EntityLink entity={m.entity} muted />
-                  </span>
-                )}
-              </li>
-            ))
+            // C5: `getIncident` returns the incident's full historical symptom
+            // list, but the "+N related" count above is `incident.symptom_count`
+            // — the backend's CURRENT-membership count (cleared_ts IS NULL),
+            // same source IncidentDetailPage's header uses. Filtering this list
+            // to `current !== false` (mirroring IncidentDetailPage's
+            // `currentMembers`) keeps the expanded list in agreement with that
+            // count instead of listing cleared/former symptoms as if they were
+            // still part of the incident. `current !== false` treats an older
+            // payload without the flag as current, matching api.ts's
+            // optional-field contract.
+            (symptoms ?? [])
+              .filter((m) => m.current !== false)
+              .map((m) => (
+                <li key={m.issue.id} className="flex items-center gap-2 py-1">
+                  <SeverityGlyph severity={m.issue.severity} size={10} />
+                  <Link
+                    to={`/issues/${m.issue.id}`}
+                    className="t-caption truncate hover:underline"
+                    style={{ color: 'var(--fg-muted)' }}
+                  >
+                    {m.issue.title}
+                  </Link>
+                  {m.entity && (
+                    <span className="t-micro truncate" style={{ color: 'var(--fg-subtle)' }}>
+                      · <EntityLink entity={m.entity} muted />
+                    </span>
+                  )}
+                </li>
+              ))
           )}
         </ul>
       )}

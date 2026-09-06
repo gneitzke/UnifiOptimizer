@@ -286,10 +286,18 @@ polls, detects, tracks, and scores continuously.
 netadmin daemon                 # binds 127.0.0.1:8765 by default
 netadmin status                 # hit a running daemon's /api/health
 netadmin status --json          # ...and print the raw health payload
+netadmin doctor --offline       # store-only health check; no controller contact
 ```
 
 Healthy status shows `status: ok`, collector jobs green with resetting poll
 ages, `websocket.state: running`, and `backfill: done`.
+
+`doctor --offline` needs no running daemon and never touches the controller: it
+inspects the local database (present and migratable, schema version), whether
+credentials are configured, the age of the last successful poll per collector, and
+any detected collection gaps, and exits non-zero when something is degraded — so it
+works in a cron check or a container healthcheck. Add `--json` for a machine-readable
+report on stdout.
 
 ### Tech visit (on demand)
 
@@ -598,6 +606,7 @@ path is exercised against mocks and dry-run rendering only.
 
 ## Documentation
 
+- [`CHANGELOG.md`](CHANGELOG.md): what changed in each release.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): the full design. Data model,
   detector catalog, issue engine, SLE model, fix engine, the whole spine.
 - [`docs/HOW_IT_WORKS.md`](docs/HOW_IT_WORKS.md): a plain-language, hand-drawn

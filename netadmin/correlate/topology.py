@@ -15,12 +15,14 @@ The parent/child edges are the ones the store already models on
 * gateway is site-level (no parent)
 
 Wired-uplink edges (which *device* a switch port or upstream device feeds) are
-**not** persisted by the current ingest layer, so :attr:`TopologyIndex.uplinks`
-is empty in production and the ``FEEDS`` relation stays dormant there. That is
-deliberate and conservative: section 17 would rather emit no correlation than a
-wrong one, and a rule that cannot resolve a concrete edge simply does not fire.
-Tests (and a future ingest that records uplink topology) populate the edges
-explicitly to exercise the wired-feeds-a-device rules.
+rebuilt by :meth:`netadmin.store.repository.Repository.feeder_edges` from the
+uplink identity (``uplink_mac`` / ``uplink_remote_port``) the ingest layer
+records in device meta, and passed in as ``uplinks``. They stay strictly
+separate from the parent/child containment above: a switch *feeds* the AP it
+uplinks, it is not the AP's parent. A rule that still cannot resolve a concrete
+edge simply does not fire (section 17 would rather emit no correlation than a
+wrong one). Tests populate the edges directly to exercise the
+wired-feeds-a-device rules.
 """
 
 from __future__ import annotations

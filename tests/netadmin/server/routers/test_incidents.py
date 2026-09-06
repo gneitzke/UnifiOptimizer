@@ -240,6 +240,115 @@ async def test_incident_drops_only_when_all_members_suppressed(
     assert body["suppressed_excluded"] == 1
 
 
+async def test_c5_cleared_member_excluded_from_counts_and_list_suppression(
+    incident_app, incident_store
+) -> None:
+    """C5 residual: a symptom that CLEARS must drop out of the detail headline
+    counts, and must not keep a fully-suppressed *current* incident visible."""
+    import time as _t
+
+    inc_id = incident_store.incident_id_for_issue(incident_store.root_id)
+    assert inc_id is not None
+    # Reconcile to root-only membership -> the symptom is cleared (kept as history).
+    incident_store.reconcile_incident_members(
+        inc_id,
+        [{"issue_id": incident_store.root_id, "role": "root", "rule": "", "rationale": ""}],
+        ts=int(_t.time()),
+    )
+    async with await _client(incident_app) as c:
+        detail = (await c.get(f"/api/incidents/{inc_id}")).json()["incident"]
+        # Counts reflect CURRENT membership (root only), not the historical 2/1.
+        assert detail["member_count"] == 1
+        assert detail["symptom_count"] == 0
+    # The cleared symptom is unsuppressed, but it is no longer a current member,
+    # so suppressing the only current member (root) must drop the incident.
+    _suppress(incident_store, incident_store.root_id)
+    async with await _client(incident_app) as c:
+        body = (await c.get("/api/incidents")).json()
+    detectors = {i["root"]["detector_key"] for i in body["incidents"]}
+    assert "wifi.mesh_uplink" not in detectors
+
+
+async def test_c5_member_sig_tracks_membership_replacement_not_evidence(
+    incident_app, incident_store
+) -> None:
+    """C5 (round 19): the list card's ``member_sig`` must change when a current
+    member is REPLACED at constant count -- even when the replacement's evidence
+    is OLDER than the incident's ``last_seen_ts`` high-water mark, so it does not
+    advance -- and stay byte-stable across polls when membership is unchanged.
+
+    Reproduces the adversarial verifier's real feeder-port swap: the (count,
+    last_seen_ts) signature the round-18 fix keyed on stayed constant while the
+    current-member SET changed, so the dashboard row never refetched. ``member_sig``
+    is derived from the current member id set alone, with no evidence timestamp in
+    it, so it is the honest membership-change signal.
+    """
+    import time as _t
+
+    inc_id = incident_store.incident_id_for_issue(incident_store.root_id)
+    assert inc_id is not None
+
+    # Baseline: two polls with no membership change -> identical member_sig, and
+    # the incident is the seeded 2-member (root + 1 symptom) group.
+    async with await _client(incident_app) as c:
+        card1 = next(
+            i for i in (await c.get("/api/incidents")).json()["incidents"] if i["id"] == inc_id
+        )
+        card2 = next(
+            i for i in (await c.get("/api/incidents")).json()["incidents"] if i["id"] == inc_id
+        )
+    assert card1["symptom_count"] == 1
+    assert card1["member_sig"]  # present and non-empty
+    assert card1["member_sig"] == card2["member_sig"]  # stable across unchanged polls
+    seen_before = int(card1["last_seen_ts"])
+    sig_before = card1["member_sig"]
+
+    # A feeder-port swap: the old symptom clears, a NEW symptom joins in the same
+    # reconcile pass. Its evidence is deliberately OLDER than the incident's
+    # last_seen_ts high-water mark, so a max-fold signal would not move.
+    ap_id = int(incident_store.get_issue(incident_store.root_id)["entity_id"])
+    new_symptom = incident_store.insert_issue(
+        fingerprint="cov-hole-2",
+        detector_key="net.coverage_hole",
+        severity="p2",
+        state="active",
+        first_seen_ts=BASE + 300,
+        last_seen_ts=BASE + 400,  # OLDER than the incident's BASE+600 high-water mark
+        title="Coverage hole on Back Porch (feeder B)",
+        entity_id=ap_id,
+    )
+    incident_store.reconcile_incident_members(
+        inc_id,
+        [
+            {"issue_id": incident_store.root_id, "role": "root", "rule": "", "rationale": ""},
+            {
+                "issue_id": new_symptom,
+                "role": "symptom",
+                "rule": "same_device",
+                "rationale": "same AP",
+            },
+        ],
+        ts=int(_t.time()),
+    )
+
+    async with await _client(incident_app) as c:
+        card3 = next(
+            i for i in (await c.get("/api/incidents")).json()["incidents"] if i["id"] == inc_id
+        )
+    # Constant count, non-advancing last_seen_ts -- the round-18 proxy is blind here.
+    assert card3["symptom_count"] == 1
+    assert int(card3["last_seen_ts"]) == seen_before
+    # ...but the membership SET changed, so member_sig MUST change -> row refetches.
+    assert card3["member_sig"] != sig_before
+
+    # And it is stable again once membership settles.
+    async with await _client(incident_app) as c:
+        card4 = next(
+            i for i in (await c.get("/api/incidents")).json()["incidents"] if i["id"] == inc_id
+        )
+    assert card4["member_sig"] == card3["member_sig"]
+
+
 # --- bulk incident suppress / unsuppress (Gitea #50) ------------------------- #
 
 
@@ -355,3 +464,153 @@ async def test_bulk_suppress_moves_no_measured_number(incident_app, incident_sto
     # Byte-identical: nothing measured moved.
     assert after_report == before_report
     assert after_offenders == before_offenders
+
+
+# --- C5: current vs. historical membership (verifier follow-up) ------------- #
+#
+# Membership is append-only (a member gets ``joined_ts`` and, once it clears,
+# ``cleared_ts`` -- it is never deleted). These tests build an incident whose
+# symptom clears (resolves) while its root stays open, exactly like
+# tests/netadmin/store/test_incidents.py::test_c5_member_history_has_joined_and_cleared_timestamps,
+# then check that the router's list/detail/suppress surfaces treat only the
+# CURRENT member set as the incident's present state.
+
+
+async def _seed_and_clear_symptom(settings, tmp_db_path) -> tuple[Repository, int, int, int]:
+    """A mesh root + coverage-hole symptom, correlated, then the symptom
+    resolves and a second correlation pass clears it while the root stays open
+    and the incident (retained under its own identity, §17) stays open too.
+    Returns ``(store, incident_id, root_issue_id, symptom_issue_id)``."""
+    store = Repository.open(tmp_db_path, site_id=settings.site_id)
+    ap = store.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="02:00:00:00:00:07", name="Cleared Porch"),
+        ts=BASE,
+    )
+    root = store.insert_issue(
+        fingerprint="mesh-root-clear",
+        detector_key="wifi.mesh_uplink",
+        severity="p2",
+        state="active",
+        first_seen_ts=BASE,
+        last_seen_ts=BASE + 600,
+        title="Weak mesh backhaul on Cleared Porch",
+        entity_id=ap,
+    )
+    symptom = store.insert_issue(
+        fingerprint="cov-hole-clear",
+        detector_key="net.coverage_hole",
+        severity="p2",
+        state="active",
+        first_seen_ts=BASE + 300,
+        last_seen_ts=BASE + 600,
+        title="Coverage hole on Cleared Porch",
+        entity_id=ap,
+    )
+    engine = CorrelationEngine(StoreCorrelationRepository(store))
+    engine.run(BASE + 900)
+    inc_id = int(store.list_incidents(open_only=True)[0]["id"])
+    # Sanity: freshly correlated, both members are current and the historical
+    # union already equals the current set (2).
+    assert store.current_incident_issue_ids(inc_id) == {root, symptom}
+
+    store.update_issue(symptom, state="resolved", resolved_ts=BASE + 700)
+    engine.run(BASE + 1000)  # the reconcile pass that stamps cleared_ts
+
+    assert store.current_incident_issue_ids(inc_id) == {root}  # symptom cleared
+    assert store.incident_member_counts([inc_id])[inc_id] == 2  # historical union kept
+    return store, inc_id, root, symptom
+
+
+async def test_list_member_and_symptom_counts_reflect_current_state(settings, tmp_db_path) -> None:
+    """(c) The list card's member_count/symptom_count must be the incident's
+    PRESENT state (root only, once its symptom cleared) — not the historical
+    union of 2 that keeps it eligible as a "genuine" incident."""
+    store, inc_id, _root, _symptom = await _seed_and_clear_symptom(settings, tmp_db_path)
+    app = create_app(settings=settings, store=store, components=DaemonComponents())
+    async with await _client(app) as c:
+        body = (await c.get("/api/incidents")).json()
+    # Still a genuine incident (historical union is 2 -- Repository.is_genuine_incident
+    # deliberately uses the historical count), but its card now reads as
+    # root-only, which is its true present state.
+    card = next(i for i in body["incidents"] if int(i["id"]) == inc_id)
+    assert card["member_count"] == 1
+    assert card["symptom_count"] == 0
+    store.close()
+
+
+async def test_detail_distinguishes_current_from_cleared_members(settings, tmp_db_path) -> None:
+    """(a) The detail view must expose joined_ts/left_ts and mark the cleared
+    symptom as no-longer-current, while the still-open root stays current."""
+    store, inc_id, root, symptom = await _seed_and_clear_symptom(settings, tmp_db_path)
+    app = create_app(settings=settings, store=store, components=DaemonComponents())
+    async with await _client(app) as c:
+        body = (await c.get(f"/api/incidents/{inc_id}")).json()
+
+    assert body["root"]["issue"]["id"] == root
+    assert body["root"]["current"] is True
+    assert body["root"]["joined_ts"] is not None
+    assert body["root"]["left_ts"] is None
+
+    assert len(body["symptoms"]) == 1  # the cleared symptom still tells its part
+    sym = body["symptoms"][0]
+    assert sym["issue"]["id"] == symptom
+    assert sym["current"] is False
+    assert sym["joined_ts"] is not None
+    assert sym["left_ts"] == BASE + 1000  # stamped by the reconcile pass that cleared it
+    store.close()
+
+
+async def test_bulk_suppress_only_mutes_current_members(settings, tmp_db_path) -> None:
+    """(b) Suppressing this incident must not mute its cleared symptom -- only
+    the root, which is still current, gets muted. Before the fix this iterated
+    the full historical member list and muted the cleared symptom too."""
+    store, inc_id, root, symptom = await _seed_and_clear_symptom(settings, tmp_db_path)
+    app = create_app(settings=settings, store=store, components=DaemonComponents())
+    async with await _client(app) as c:
+        resp = await c.post(f"/api/incidents/{inc_id}/suppress", json={})
+        assert resp.status_code == 200
+        assert resp.json() == {"incident_id": inc_id, "count": 1}  # root only
+
+        root_detail = (await c.get(f"/api/issues/{root}")).json()
+        assert root_detail["issue"]["suppressed_ts"] is not None
+
+        symptom_detail = (await c.get(f"/api/issues/{symptom}")).json()
+        assert symptom_detail["issue"]["suppressed_ts"] is None  # untouched
+    store.close()
+
+
+async def test_issue_surface_symptom_count_is_current_not_historical(
+    settings, tmp_db_path
+) -> None:
+    """Finding #11 (C5): after a symptom clears, the incident CARD reports 0
+    symptoms (its present state) but the ISSUE surface -- both the root's detail
+    ``GET /api/issues/{root}`` incident brief and the ``GET /api/issues`` list's
+    ``incident_brief`` -- was reporting 1, because it derived the count from the
+    append-only historical member union (``incident_member_count - 1``) rather
+    than current membership. The two surfaces must agree: current symptoms == 0.
+    """
+    store, inc_id, root, _symptom = await _seed_and_clear_symptom(settings, tmp_db_path)
+    app = create_app(settings=settings, store=store, components=DaemonComponents())
+    async with await _client(app) as c:
+        # The incident card: present state, root-only, 0 symptoms.
+        card = next(
+            i for i in (await c.get("/api/incidents")).json()["incidents"]
+            if int(i["id"]) == inc_id
+        )
+        assert card["symptom_count"] == 0
+
+        # The root issue detail's incident brief must MATCH the card, not report
+        # the stale historical count of 1.
+        detail = (await c.get(f"/api/issues/{root}")).json()
+        assert detail["incident"] is not None
+        assert detail["incident"]["id"] == inc_id
+        assert detail["incident"]["symptom_count"] == 0
+
+        # The issues list's incident_brief on the root must agree too. The group
+        # is still genuine (historical union of 2 keeps is_genuine_incident true),
+        # so the brief is present -- and now reads 0 current symptoms.
+        issues = (await c.get("/api/issues")).json()["issues"]
+        root_row = next(i for i in issues if int(i["id"]) == root)
+        assert root_row["incident_brief"] is not None
+        assert root_row["incident_brief"]["symptom_count"] == 0
+    store.close()

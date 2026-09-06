@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
+import httpx
 import pytest
+import respx
 
 from netadmin.domain.entities import Entity
 from netadmin.domain.types import EntityType
@@ -25,6 +28,10 @@ from netadmin.ingest.events import (
 )
 from netadmin.ingest.unifi.models import Event
 from netadmin.store.repository import Repository
+from netadmin.detect.context import DetectorContext, EVENT_COVERAGE_MIN
+from netadmin.detect.detectors.client import FlakyClientDetector
+from netadmin.detect.engine import UNKNOWN
+from tests.netadmin.detect.support import FakeBaselines, seed_coverage
 
 FIXTURE = Path(__file__).parents[1] / "unifi" / "fixtures" / "stat_event.json"
 
@@ -146,10 +153,96 @@ def test_roam_entity_is_client_related_is_from_ap(repo: Repository) -> None:
 
 
 def test_switch_event_resolves_to_switch(repo: Repository) -> None:
+    # EVT_SW_PoeOverload names a port in its message but is a switch-BUDGET event
+    # that wired.poe_budget queries at SWITCH scope, so it stays switch-attributed
+    # even though it carries port=5. (Guards against blanket port-rerouting.)
     rec = EventNormalizer(repo).normalize(event_by_key("EVT_SW_PoeOverload"))
     assert rec is not None
     assert rec["entity_id"] == entity_id(repo, EntityType.SWITCH, SWITCH_MAC)
     assert rec["related_entity_id"] is None
+
+
+def test_stp_port_event_resolves_to_port_entity(repo: Repository) -> None:
+    """#4: a PORT-scoped switch event (STP port-blocking) with switch mac + port
+    idx is attributed to the PORT entity (native_id "<sw_mac>:<idx>"), related to
+    the parent switch -- so the port-scoped wired.stp_loop detector's port-id
+    comparison matches. Previously it resolved to the switch and the rule was dead.
+    """
+    port_nid = f"{SWITCH_MAC}:5"
+    pid = repo.upsert_entity(
+        Entity(entity_type=EntityType.PORT, native_id=port_nid, name="p5"), ts=1_000_000
+    )
+    ev = Event.model_validate(
+        {"_id": "stp-x", "key": "EVT_SW_StpPortBlocking", "time": 1_721_600_000_000,
+         "sw": SWITCH_MAC, "port": 5}
+    )
+    rec = EventNormalizer(repo).normalize(ev)
+    assert rec is not None
+    assert rec["entity_id"] == pid
+    assert rec["related_entity_id"] == entity_id(repo, EntityType.SWITCH, SWITCH_MAC)
+    assert rec["native_id"] == "stp-x"
+
+
+def test_stp_port_event_null_entity_when_port_absent_then_reconciles(repo: Repository) -> None:
+    """When the port entity is not in inventory yet, the STP event persists with a
+    null entity (tolerated, not dropped) and reconcile links it once the port is
+    created -- the same late-link path client events use.
+    """
+    ev = Event.model_validate(
+        {"_id": "stp-late", "key": "EVT_SW_StpPortBlocking", "time": 1_721_600_000_000,
+         "sw": SWITCH_MAC, "port": 7}
+    )
+    norm = EventNormalizer(repo)
+    rec = norm.normalize(ev)
+    assert rec is not None and rec["entity_id"] is None  # port 7 not created yet
+    assert repo.record_event(**rec) is not None
+    # Inventory catches up; reconcile fills the link.
+    pid = repo.upsert_entity(
+        Entity(entity_type=EntityType.PORT, native_id=f"{SWITCH_MAC}:7", name="p7"), ts=1_000_000
+    )
+    norm.reconcile_unresolved()
+    rows = repo.read_events(*FULL)
+    linked = [r for r in rows if r["key"] == "EVT_SW_StpPortBlocking"]
+    assert linked and int(linked[0]["entity_id"]) == pid
+
+
+def test_w15a4_bool_port_is_not_a_port_index_routes_to_switch(repo: Repository) -> None:
+    """#w15a-4: a non-integer/bool ``port`` (``port: true``) is NOT a port index.
+
+    ``str(True)`` -> ``"True"`` would build native_id ``"<sw>:True"`` while the
+    repository's resolvability SQL renders the same JSON boolean as ``"<sw>:1"``
+    (SQLite coerces bool -> 1). The two native_ids DISAGREE, so with a real integer
+    port 1 present the row is falsely "resolvable" against the wrong entity, never
+    fills, and starves newer events. The fix: a bool/garbage port is attributed to
+    the SWITCH (consistently with the SQL), never routed to a bogus port entity.
+    """
+    ev = Event.model_validate(
+        {"_id": "stp-bool", "key": "EVT_SW_StpPortBlocking",
+         "time": 1_721_600_000_000, "sw": SWITCH_MAC, "port": True}
+    )
+    rec = EventNormalizer(repo).normalize(ev)
+    assert rec is not None
+    # Attributed to the SWITCH (entity present in inventory), NOT a "<sw>:True" port
+    # entity (which never exists) -- so entity_id resolves, related is None.
+    assert rec["entity_id"] == entity_id(repo, EntityType.SWITCH, SWITCH_MAC)
+    assert rec["related_entity_id"] is None
+
+
+def test_w15a4_int_port_still_routes_to_port_entity(repo: Repository) -> None:
+    """Control for #w15a-4: a genuine INTEGER port index still routes to the PORT
+    entity, native_id ``"<sw>:<idx>"`` -- byte-identical to what the SQL derives."""
+    port_nid = f"{SWITCH_MAC}:1"
+    pid = repo.upsert_entity(
+        Entity(entity_type=EntityType.PORT, native_id=port_nid, name="p1"), ts=1_000_000
+    )
+    ev = Event.model_validate(
+        {"_id": "stp-int1", "key": "EVT_SW_StpPortBlocking",
+         "time": 1_721_600_000_000, "sw": SWITCH_MAC, "port": 1}
+    )
+    rec = EventNormalizer(repo).normalize(ev)
+    assert rec is not None
+    assert rec["entity_id"] == pid
+    assert rec["related_entity_id"] == entity_id(repo, EntityType.SWITCH, SWITCH_MAC)
 
 
 def test_ap_event_resolves_to_ap(repo: Repository) -> None:
@@ -346,10 +439,15 @@ async def test_supervisor_restarts_with_capped_backoff(repo: Repository) -> None
 
     rows = repo.read_poll_runs("ws", *FULL)
     started = [r for r in rows if r["error"] == "started"]
-    failed = [r for r in rows if r["ok"] == 0]
+    # #w20a-1: an exceptional death now ALSO records a durable coverage break
+    # (error='unusable', ok=0), so the listener-death rows are the ok=0 rows that
+    # are NOT breaks -- filter the break rows out before counting the deaths.
+    breaks = [r for r in rows if r["error"] == "unusable"]
+    failed = [r for r in rows if r["ok"] == 0 and r["error"] != "unusable"]
     clean = [r for r in rows if r["error"] == "stopped" and r["ok"] == 1]
     assert len(started) == 3  # one per attempt
     assert len(failed) == 2  # the two RuntimeErrors
+    assert len(breaks) == 2  # each exceptional death severs coverage durably
     assert len(clean) == 1  # the clean third run
     assert all("RuntimeError" in r["error"] for r in failed)
 
@@ -442,13 +540,78 @@ class RecordingEndpoints:
 @pytest.mark.asyncio
 async def test_catchup_bounds_within_hours_from_cursor(repo: Repository) -> None:
     events = load_events()
-    await EventListener(FakeWs(events), repo, flush_interval=None).run()
-    # newest stored ts == 1_721_600_180; pretend "now" is 2 h later.
+    # A completed HISTORY read, not a newer live arrival, is the bounded cursor.
+    repo.record_ingest_coverage(
+        kind="event_history", scope="site", interval="retained",
+        start_ts=1_721_599_000, end_ts=1_721_600_180, status="complete",
+    )
+    # coverage end == 1_721_600_180; pretend "now" is 2 h later.
     now = 1_721_600_180 + 2 * 3600
     ep = RecordingEndpoints(events)
     await catchup_events(repo, ep, now=now)
     # gap_hours(2) + 1 + margin(1) = 4: a narrow window, not the full backlog.
     assert ep.within_hours_seen == [4]
+
+
+# --------------------------------------------------------------------------- #
+# C3/C7/R2 regressions
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_c3_catchup_recovers_gap_older_than_live_event(repo: Repository) -> None:
+    live = Event.model_validate({"_id": "live-300", "key": "EVT_X", "time": 300_000})
+    missing = Event.model_validate({"_id": "miss-200", "key": "EVT_X", "time": 200_000})
+    newer = Event.model_validate({"_id": "hist-400", "key": "EVT_X", "time": 400_000})
+    await EventListener(FakeWs([live]), repo, flush_interval=None).run()
+
+    inserted = await catchup_events(repo, FakeEndpoints([missing, live, newer]), now=400)
+
+    assert inserted == 2
+    assert {r["native_id"] for r in repo.read_events(0, 500_000)} == {
+        "miss-200", "live-300", "hist-400"
+    }
+
+
+def test_c7_duplicate_replay_fills_pre_inventory_entity(repo: Repository) -> None:
+    mac = "02:00:aa:bb:cc:88"
+    event = Event.model_validate(
+        {"_id": "late-link", "key": "EVT_WU_Connected", "time": 1_721_600_000_000, "user": mac}
+    )
+    normalizer = EventNormalizer(repo)
+    first = normalizer.normalize(event)
+    assert first is not None and first["entity_id"] is None
+    assert repo.record_events_enriching_entities([first]) == 1
+    eid = repo.upsert_entity(Entity(entity_type=EntityType.CLIENT, native_id=mac), ts=1)
+
+    replay = normalizer.normalize(event)
+    assert replay is not None and replay["entity_id"] == eid
+    assert repo.record_events_enriching_entities([replay]) == 0
+    assert repo.read_events(*FULL)[0]["entity_id"] == eid
+
+
+def test_r2_failed_flush_keeps_batch_for_retry(repo: Repository, monkeypatch: pytest.MonkeyPatch) -> None:
+    event = Event.model_validate({"_id": "flush-keep", "key": "EVT_X", "time": 1_721_600_000_000})
+    listener = EventListener(FakeWs([]), repo, flush_interval=None)
+    record = EventNormalizer(repo).normalize(event)
+    assert record is not None
+    listener._batch.append(record)
+    real = repo.record_events_enriching_entities
+    calls = 0
+
+    def locked(rows: object) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            import sqlite3
+
+            raise sqlite3.OperationalError("database is locked")
+        return real(rows)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repo, "record_events_enriching_entities", locked)
+    with pytest.raises(Exception, match="locked"):
+        listener._flush()
+    assert len(listener._batch) == 1
+    assert listener._flush() == 1
+    assert listener._batch == []
 
 
 @pytest.mark.asyncio
@@ -458,3 +621,2151 @@ async def test_catchup_unbounded_only_when_no_cursor(repo: Repository) -> None:
     ep = RecordingEndpoints([])
     await catchup_events(repo, ep)
     assert ep.within_hours_seen == [None]
+
+
+# --------------------------------------------------------------------------- #
+# C3: recorded coverage must be clamped to the window actually fetched. A
+# bounded 1 h fetch must NOT book coverage for the untouched day behind it.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_c3_bounded_fetch_clamps_recorded_coverage(repo: Repository) -> None:
+    now = 1_721_700_000
+    day_ago = now - 24 * 3600
+    # A stale completed coverage cursor a day in the past (the catch-up baseline).
+    repo.record_ingest_coverage(
+        kind="event_history", scope="site", interval="retained",
+        start_ts=day_ago - 3600, end_ts=day_ago, status="complete",
+    )
+    # A caller-pinned 1 h bounded fetch (empty result is fine: coverage is what
+    # we assert, not inserts).
+    await catchup_events(repo, FakeEndpoints([]), within_hours=1, now=now)
+
+    # The last hour we actually read is fully covered...
+    assert repo.observed_event_coverage(now - 3600, now) == 1.0
+    # ...but the preceding day we did NOT read must not be reported covered.
+    # (The bug recorded [cursor .. now] complete, making this 1.0.)
+    assert repo.observed_event_coverage(now - 12 * 3600, now - 2 * 3600) == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# #w16a-3 / #w16a-4: a read window is 'complete' only if its events were read AND
+# normalized AND persisted. A normalize/store failure records a FAILED hole (not
+# nothing); an unusable-but-read event records a NOT-complete (partial) window.
+# --------------------------------------------------------------------------- #
+def _coverage_rows(repo: Repository) -> list[Any]:
+    return repo._conn.execute(
+        "SELECT start_ts, end_ts, status, detail FROM ingest_coverage "
+        "WHERE kind='event_history' AND scope='site' ORDER BY start_ts, end_ts"
+    ).fetchall()
+
+
+class _RaisingNormalizer(EventNormalizer):
+    """A normalizer whose entity-resolution READ raises a transient storage error,
+    modelling a ``sqlite3.OperationalError`` during normalize (#w16a-3)."""
+
+    def normalize(self, event: Event) -> Optional[dict[str, Any]]:
+        raise sqlite3.OperationalError("database is locked")
+
+
+@pytest.mark.asyncio
+async def test_w16a3_normalize_storage_error_records_failed_hole(repo: Repository) -> None:
+    """#w16a-3: a storage error during NORMALIZE (an entity lookup) runs OUTSIDE
+    the old HTTP-read guard. Pre-fix it re-raised leaving ``ingest_coverage`` EMPTY
+    for the window -- neither complete NOR failed, silently never retried nor
+    observed. The window was READ but could not be normalized/persisted, so it must
+    record a durable FAILED hole and re-raise (so the collector firewall marks the
+    poll failed)."""
+    now = 1_721_700_000
+    ev = Event.model_validate({"_id": "x1", "key": "EVT_X", "time": now * 1000})
+    with pytest.raises(sqlite3.OperationalError):
+        await catchup_events(
+            repo, FakeEndpoints([ev]), normalizer=_RaisingNormalizer(repo), now=now
+        )
+    rows = _coverage_rows(repo)
+    # A durable FAILED hole was recorded (not the empty ledger the bug left) ...
+    assert len(rows) == 1
+    assert rows[0]["status"] == "failed"
+    assert "normalize/store failed" in (rows[0]["detail"] or "")
+    # ... and a failed hole is never credited as observed coverage.
+    assert repo.observed_event_coverage(now - 3600, now) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_w16a4_unusable_event_window_not_complete(repo: Repository) -> None:
+    """#w16a-4: a read HTTP-200 window whose event is UNUSABLE (has _id/key/ap but
+    NO usable timestamp -> normalize returns None) was silently skipped and then the
+    whole window credited 'complete' with ZERO stored events -- fabricating
+    observed-empty history that lets detectors false-clear. The window must instead
+    be recorded NOT complete (a partial hole), so coverage is not credited."""
+    now = 1_721_700_000
+    unusable = Event.model_validate(
+        {"_id": "lost1", "key": "EVT_AP_Lost", "ap": "02:00:99:99:99:99"}  # no time/datetime
+    )
+    inserted = await catchup_events(repo, FakeEndpoints([unusable]), now=now)
+    assert inserted == 0
+    # Nothing was stored...
+    assert repo.read_events(0, now + 1) == []
+    rows = _coverage_rows(repo)
+    # ...and the window is NOT credited complete -- it is a partial hole.
+    assert len(rows) == 1
+    assert rows[0]["status"] == "partial"
+    assert repo.observed_event_coverage(now - 3600, now) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_w16a4_empty_read_still_records_complete(repo: Repository) -> None:
+    """#w16a-4 control: a genuinely EMPTY successful read (data=[], nothing to
+    drop) is still real observed-empty history and MUST record complete."""
+    now = 1_721_700_000
+    await catchup_events(repo, FakeEndpoints([]), now=now)
+    rows = _coverage_rows(repo)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "complete"
+    # A complete empty read credits the window as observed.
+    assert repo.observed_event_coverage(now - 3600, now) == 1.0
+
+
+def test_w16a5_out_of_range_int_port_routes_to_switch(repo: Repository) -> None:
+    """#w16a-5 (normalizer half): an out-of-SQLite-signed-range integer port is NOT
+    a valid port index. Accepting it builds native_id ``"<sw>:9223372036854775808"``
+    while the SQL renders the same value as a FLOAT (``"<sw>:9.2...e+18"``) -- a
+    permanent native_id desync. The bound rejects it (routes to the SWITCH), exactly
+    and consistently with the SQL, so it is never accepted-then-mismatched."""
+    ev = Event.model_validate(
+        {"_id": "stp-huge", "key": "EVT_SW_StpPortBlocking",
+         "time": 1_721_600_000_000, "sw": SWITCH_MAC, "port": 9223372036854775808}
+    )
+    rec = EventNormalizer(repo).normalize(ev)
+    assert rec is not None
+    # Routed to the SWITCH (present in inventory), NOT a bogus huge-port entity.
+    assert rec["entity_id"] == entity_id(repo, EntityType.SWITCH, SWITCH_MAC)
+    assert rec["related_entity_id"] is None
+    assert rec["native_id"] == "stp-huge"
+
+
+# --------------------------------------------------------------------------- #
+# R3: supervisor/health state must reflect the ACTUAL socket state, reported up
+# from the listener -- never assumed because a task exists.
+# --------------------------------------------------------------------------- #
+class _ScriptedWs:
+    """A ws-layer double that drives ``on_state`` through a scripted sequence."""
+
+    def __init__(self, states: list[str]) -> None:
+        self._states = states
+        self.on_state = None  # set by the events.EventListener wrapper
+        self._stop = SimpleNamespaceStop()
+
+    async def events(self):  # async generator that yields no events
+        for state in self._states:
+            if self.on_state is not None:
+                self.on_state(state)
+        return
+        yield  # pragma: no cover - marks this an async generator
+
+    def stop(self) -> None:  # pragma: no cover - parity
+        self._stop.set()
+
+
+class SimpleNamespaceStop:
+    def __init__(self) -> None:
+        self._set = False
+
+    def set(self) -> None:  # pragma: no cover - parity
+        self._set = True
+
+    def is_set(self) -> bool:
+        return self._set
+
+
+@pytest.mark.asyncio
+async def test_r3_events_listener_relays_socket_state(repo: Repository) -> None:
+    # The events-layer listener must forward the ws socket's state changes to the
+    # supervisor hook (on_connection_state) and cache the latest.
+    ws = _ScriptedWs(["connected", "reconnecting"])
+    listener = EventListener(ws, repo, flush_interval=None)
+    seen: list[str] = []
+    listener.on_connection_state = seen.append
+    await listener.run()
+    assert seen == ["connected", "reconnecting"]
+    assert listener.connection_state == "reconnecting"
+
+
+@pytest.mark.asyncio
+async def test_r3_supervisor_never_connected_without_handshake(repo: Repository) -> None:
+    # A listener whose run never reports a handshake must leave the supervisor
+    # "reconnecting" -- NOT "connected" (the bug pre-declared connected).
+    observed: list[str] = []
+    sup: WsSupervisor
+
+    class _NeverHandshake:
+        def __init__(self) -> None:
+            self.on_connection_state = None
+            self.terminal_state = None
+
+        async def run(self) -> int:
+            observed.append(sup.state)  # supervisor state while a task exists, pre-handshake
+            sup.stop()
+            return 0
+
+    async def fake_sleep(delay: float) -> None:  # pragma: no cover - stop ends first
+        pass
+
+    sup = WsSupervisor(lambda: _NeverHandshake(), repo, backoff_base=0.0, sleep=fake_sleep)
+    await asyncio.wait_for(sup.run(), timeout=2.0)
+    assert observed == ["reconnecting"]  # never "connected"
+
+
+@pytest.mark.asyncio
+async def test_r3_supervisor_state_flips_connected_then_reconnecting(repo: Repository) -> None:
+    # A handshake then a mid-run disconnect must move the supervisor connected ->
+    # reconnecting, driven by the listener's callbacks.
+    seen: list[str] = []
+    sup: WsSupervisor
+
+    class _Flaky:
+        def __init__(self) -> None:
+            self.on_connection_state = None
+            self.terminal_state = None
+
+        async def run(self) -> int:
+            self.on_connection_state("connected")
+            seen.append(sup.state)
+            self.on_connection_state("reconnecting")
+            seen.append(sup.state)
+            sup.stop()
+            return 0
+
+    async def fake_sleep(delay: float) -> None:  # pragma: no cover - stop ends first
+        pass
+
+    sup = WsSupervisor(lambda: _Flaky(), repo, backoff_base=0.0, sleep=fake_sleep)
+    await asyncio.wait_for(sup.run(), timeout=2.0)
+    assert seen == ["connected", "reconnecting"]
+
+
+# --------------------------------------------------------------------------- #
+# R2: buffered-but-uncommitted events must survive a listener restart. A storage
+# blip that kills the listener then recovers must not drop the pending batch --
+# WS events have no stat/event recovery source.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_r2_pending_batch_survives_storage_blip_and_restart(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    N = 1000
+    events = [
+        Event.model_validate({"_id": f"e{i}", "key": "EVT_X", "time": 1_721_600_000_000 + i})
+        for i in range(N)
+    ]
+
+    real = repo.record_events_enriching_entities
+    storage = {"down": True}
+
+    def flaky(rows: object) -> int:
+        if storage["down"]:
+            import sqlite3
+
+            raise sqlite3.OperationalError("database is locked")
+        return real(rows)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repo, "record_events_enriching_entities", flaky)
+
+    attempt = {"n": 0}
+
+    def factory() -> EventListener:
+        attempt["n"] += 1
+        if attempt["n"] == 1:
+            # First listener buffers all N, but every flush fails: it dies with
+            # the whole batch uncommitted.
+            return EventListener(FakeWs(events), repo, flush_interval=None, batch_size=100)
+        # Later listeners have nothing new to add.
+        return EventListener(FakeWs([]), repo, flush_interval=None)
+
+    sup: WsSupervisor
+
+    async def fake_sleep(delay: float) -> None:
+        # Storage recovers during the backoff after the first death; stop once the
+        # supervisor has had a restart to drain the rescued batch.
+        storage["down"] = False
+        if attempt["n"] >= 2:
+            sup.stop()
+
+    sup = WsSupervisor(factory, repo, backoff_base=0.0, max_restarts=5, sleep=fake_sleep)
+    await asyncio.wait_for(sup.run(), timeout=5.0)
+
+    # Every buffered event is eventually persisted -- zero loss across the blip +
+    # listener replacement (the bug persisted ZERO of the 1000).
+    stored = repo.read_events(0, 2_000_000_000)
+    assert len(stored) == N
+    assert {r["native_id"] for r in stored} == {f"e{i}" for i in range(N)}
+
+
+# --------------------------------------------------------------------------- #
+# P1 (queue-OVERFLOW boundary): the event that trips the ``_max_pending`` guard
+# must not be lost when the capacity-triggered flush raises. With N one past the
+# bound, the old code consumed the boundary event, ran the at-capacity flush
+# (which raised, storage down), and dropped that one event BEFORE it was ever
+# appended -- so rescue recovered N-1, permanently losing the last event that has
+# no stat/event recovery source. All N must persist across the blip + restart.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_p1_overflow_boundary_event_survives_storage_blip_and_restart(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 1001 with batch_size=100 -> _max_pending == max(1000, 400) == 1000, so the
+    # last event (e1000) is the one that trips the overflow guard while storage
+    # is down. Before the fix this event alone was stranded.
+    N = 1001
+    events = [
+        Event.model_validate({"_id": f"e{i}", "key": "EVT_X", "time": 1_721_600_000_000 + i})
+        for i in range(N)
+    ]
+
+    real = repo.record_events_enriching_entities
+    storage = {"down": True}
+
+    def flaky(rows: object) -> int:
+        if storage["down"]:
+            import sqlite3
+
+            raise sqlite3.OperationalError("database is locked")
+        return real(rows)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repo, "record_events_enriching_entities", flaky)
+
+    attempt = {"n": 0}
+
+    def factory() -> EventListener:
+        attempt["n"] += 1
+        if attempt["n"] == 1:
+            # Every flush fails: the first listener overflows its bounded queue
+            # while storage is down and dies with the WHOLE batch uncommitted --
+            # including the boundary event that trips ``_max_pending``.
+            return EventListener(FakeWs(events), repo, flush_interval=None, batch_size=100)
+        return EventListener(FakeWs([]), repo, flush_interval=None)
+
+    sup: WsSupervisor
+
+    async def fake_sleep(delay: float) -> None:
+        storage["down"] = False
+        if attempt["n"] >= 2:
+            sup.stop()
+
+    sup = WsSupervisor(factory, repo, backoff_base=0.0, max_restarts=5, sleep=fake_sleep)
+    await asyncio.wait_for(sup.run(), timeout=5.0)
+
+    # Zero loss: all 1001 persist, INCLUDING the overflow-boundary event e1000,
+    # and no rescued record is left stranded on the supervisor.
+    stored = repo.read_events(0, 2_000_000_000)
+    assert len(stored) == N
+    assert {r["native_id"] for r in stored} == {f"e{i}" for i in range(N)}
+    assert "e1000" in {r["native_id"] for r in stored}
+    assert sup._pending == []
+
+
+# --------------------------------------------------------------------------- #
+# P1 (normalize-READ blip): normalize() does entity-resolution DB READS, and a
+# WS event is appended to the batch only AFTER a successful normalize. A transient
+# storage read error during that lookup raised straight out of the consumer loop,
+# dropping the just-consumed event on the floor -- it never reached the batch the
+# supervisor rescues, and a WS event has NO stat/event recovery source. The event
+# must instead be retained and, once the read recovers, normalized and persisted:
+# zero silently lost. A genuinely malformed payload may still be dropped.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_p1_normalize_read_blip_retains_and_recovers_event(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    N = 5
+    events = [
+        Event.model_validate(
+            {
+                "_id": f"n{i}",
+                "key": "EVT_WU_Connected",
+                "time": 1_721_600_000_000 + i,
+                "user": CLIENT_MAC,  # forces an entity-resolution lookup
+            }
+        )
+        for i in range(N)
+    ]
+
+    # The FIRST entity lookup during normalization raises (a transient read blip);
+    # every later lookup succeeds. Mirrors the verifier exactly.
+    real_find = repo.find_entity
+    calls = {"n": 0}
+
+    def flaky_find(etype: EntityType, mac: str) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_find(etype, mac)
+
+    monkeypatch.setattr(repo, "find_entity", flaky_find)
+
+    listener = EventListener(FakeWs(events), repo, flush_interval=None, batch_size=100)
+    # Must NOT raise out: the read blip is recoverable, not fatal.
+    await listener.run()
+
+    # Zero loss: the event whose first lookup blipped is retained, re-normalized
+    # once the read recovers, and persisted with all the rest.
+    stored = repo.read_events(0, 2_000_000_000)
+    assert len(stored) == N
+    assert {r["native_id"] for r in stored} == {f"n{i}" for i in range(N)}
+    # Nothing stranded in the raw retry buffer.
+    assert listener.pending_raw_records() == []
+
+
+@pytest.mark.asyncio
+async def test_r2_pending_survives_when_health_accounting_also_fails(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R2 residual (P1): the terminal health-accounting write must never strand
+    buffered events. The old code wrote ``_record(terminal)`` BEFORE rescuing the
+    dead listener's pending batch, so when BOTH the event store AND the poll_runs
+    accounting write raise OperationalError, the accounting raise propagated out
+    of the loop and the rescue was skipped -> 0 rescued / N stranded. The prior
+    1000-event test passed because it failed ONLY event writes, not accounting.
+    """
+    N = 7
+    events = [
+        Event.model_validate({"_id": f"s{i}", "key": "EVT_X", "time": 1_721_600_000_000 + i})
+        for i in range(N)
+    ]
+
+    real_store = repo.record_events_enriching_entities
+    real_poll = repo.record_poll_run
+    storage = {"down": True}
+
+    def flaky_store(rows: object) -> int:
+        if storage["down"]:
+            import sqlite3
+
+            raise sqlite3.OperationalError("database is locked")
+        return real_store(rows)  # type: ignore[arg-type]
+
+    def flaky_poll(**kwargs: object) -> None:
+        # Health accounting fails for the SAME outage that kills event writes.
+        if storage["down"]:
+            import sqlite3
+
+            raise sqlite3.OperationalError("database is locked")
+        return real_poll(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repo, "record_events_enriching_entities", flaky_store)
+    monkeypatch.setattr(repo, "record_poll_run", flaky_poll)
+
+    attempt = {"n": 0}
+
+    def factory() -> EventListener:
+        attempt["n"] += 1
+        if attempt["n"] == 1:
+            return EventListener(FakeWs(events), repo, flush_interval=None, batch_size=100)
+        return EventListener(FakeWs([]), repo, flush_interval=None)
+
+    sup: WsSupervisor
+
+    async def fake_sleep(delay: float) -> None:
+        # The outage clears during the backoff after the first death.
+        storage["down"] = False
+        if attempt["n"] >= 2:
+            sup.stop()
+
+    sup = WsSupervisor(factory, repo, backoff_base=0.0, max_restarts=5, sleep=fake_sleep)
+    await asyncio.wait_for(sup.run(), timeout=5.0)
+
+    # 0 stranded: every buffered event is persisted despite the accounting write
+    # failing in lockstep with the event store during the outage.
+    stored = repo.read_events(0, 2_000_000_000)
+    assert len(stored) == N
+    assert {r["native_id"] for r in stored} == {f"s{i}" for i in range(N)}
+
+
+# --------------------------------------------------------------------------- #
+# P1 (SUSTAINED total storage failure): the rescued pending buffer must not grow
+# without bound. The old supervisor appended each dead listener's retained batch
+# to ``_pending`` and started another listener with NO aggregate ceiling, so with
+# storage continuously down and an unlimited producer the aggregate grew 1001,
+# 2002, 3003, 4004, 5005, 6006, ... until the process OOM'd and lost EVERYTHING.
+# A system-wide cap must bound memory, count the (bounded, observable) loss, and
+# still flush every retained survivor once storage returns.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_p1_sustained_storage_failure_bounds_aggregate_pending(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cap = 2500
+    per_listener = 1001  # each listener overflows its own _max_pending (1000)
+    restarts_under_outage = 6
+
+    real = repo.record_events_enriching_entities
+    storage = {"down": True}
+
+    def flaky(rows: object) -> int:
+        if storage["down"]:
+            import sqlite3
+
+            raise sqlite3.OperationalError("database is locked")
+        return real(rows)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repo, "record_events_enriching_entities", flaky)
+
+    attempt = {"n": 0}
+
+    def factory() -> EventListener:
+        attempt["n"] += 1
+        n = attempt["n"]
+        # Unique ids per restart so nothing dedupes across attempts and every
+        # produced event is a distinct row we could, in principle, lose.
+        events = [
+            Event.model_validate(
+                {
+                    "_id": f"a{n}-e{i}",
+                    "key": "EVT_X",
+                    "time": 1_721_600_000_000 + n * 10_000 + i,
+                }
+            )
+            for i in range(per_listener)
+        ]
+        # storage is down -> this listener overflows its bounded queue and dies
+        # with the WHOLE batch uncommitted, which the supervisor rescues.
+        return EventListener(FakeWs(events), repo, flush_interval=None, batch_size=100)
+
+    sup: WsSupervisor
+    sizes: list[int] = []
+
+    async def fake_sleep(delay: float) -> None:
+        # Snapshot the aggregate pending after each death's rescue+clamp.
+        sizes.append(len(sup._pending))
+        if attempt["n"] >= restarts_under_outage:
+            storage["down"] = False  # outage clears; final drain can now persist
+            sup.stop()
+
+    sup = WsSupervisor(
+        factory,
+        repo,
+        backoff_base=0.0,
+        backoff_max=0.0,
+        max_restarts=50,
+        pending_max=cap,
+        sleep=fake_sleep,
+    )
+    await asyncio.wait_for(sup.run(), timeout=10.0)
+
+    # Aggregate pending stayed BOUNDED -- it never grew 1001, 2002, 3003, ...
+    assert max(sizes) <= cap
+    assert sizes != [per_listener * (i + 1) for i in range(len(sizes))]
+    # The loss is counted and exposed (not silent). Total produced is conserved:
+    # survivors persisted + dropped == everything the producer emitted.
+    produced = per_listener * restarts_under_outage
+    assert sup.dropped > 0
+    # Nothing stranded: once storage recovered the final drain persisted the whole
+    # bounded survivor set, and _pending is empty.
+    assert sup._pending == []
+    stored = repo.read_events(0, 2_000_000_000)
+    assert len(stored) == cap  # exactly the bounded survivors persisted
+    assert len(stored) + sup.dropped == produced
+
+
+# --------------------------------------------------------------------------- #
+# B4 (positive-liveness redesign): event-source coverage is credited only across
+# spans carrying WS liveness HEARTBEATS, never through end_ts on a still-open
+# 'connected' row. These tests exercise the heartbeat mechanism end to end.
+# --------------------------------------------------------------------------- #
+def _seed_beats(listener: EventListener, start: int, end: int, *, step: int = 60) -> None:
+    """Drive the listener's own heartbeat writer across ``[start, end]``.
+
+    Goes through ``_maybe_heartbeat`` (not the repo directly) so the test proves
+    the listener-side gate: heartbeats land only while ``connection_state`` is
+    ``connected``. Both endpoints are guaranteed a beat.
+    """
+    t = start
+    while t < end:
+        listener._maybe_heartbeat(now=t)
+        listener._last_heartbeat_ts = None  # allow the next explicit beat
+        t += step
+    listener._maybe_heartbeat(now=end)
+
+
+def test_maybe_heartbeat_only_writes_while_connected(repo: Repository) -> None:
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=0.0)
+    # Not connected -> no positive evidence, no beat.
+    listener.connection_state = "reconnecting"
+    listener._maybe_heartbeat(now=1_000)
+    assert [r for r in repo.read_poll_runs("ws", 0, 10_000) if r["error"] == "heartbeat"] == []
+    # Connected -> a beat is recorded.
+    listener.connection_state = "connected"
+    listener._maybe_heartbeat(now=1_001)
+    beats = [r for r in repo.read_poll_runs("ws", 0, 10_000) if r["error"] == "heartbeat"]
+    assert len(beats) == 1 and int(beats[0]["ok"]) == 1
+
+
+def test_a_shutdown_stops_heartbeats_downtime_not_covered(repo: Repository) -> None:
+    """B4(a): a NORMAL SHUTDOWN cancels the listener with NO 'disconnected' close
+    row. The heartbeats simply stop, so coverage ends at the last beat and the
+    post-shutdown downtime is NOT credited -- unlike the old code, which ran a
+    dangling 'connected' interval through end_ts (a false 100%)."""
+    now = 8_000_000
+    start = now - 3600
+    shutdown = start + 300  # feed shut down 300 s into the hour
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=0.0)
+    listener.connection_state = "connected"
+    _seed_beats(listener, start, shutdown, step=60)
+    # Shutdown: the flusher is cancelled, beats stop. Deliberately write NO
+    # 'disconnected'/close row -- correctness must not depend on one.
+    cov = repo.observed_event_coverage(start, now)
+    assert cov == pytest.approx(300 / 3600, abs=0.02)  # only the observed span
+    assert cov < EVENT_COVERAGE_MIN  # -> the detector FREEZES, not clears
+
+
+def test_a_flaky_not_falsely_cleared_after_shutdown(repo: Repository) -> None:
+    """B4(a) end to end: client polling is healthy and the disconnect events have
+    aged out, but the WS feed SHUT DOWN partway through the window (heartbeats
+    stopped, no close row). A restart must not read the downtime as 'observed' and
+    false-clear a real client.flaky issue -- the detector must FREEZE (UNKNOWN)."""
+    now = 8_500_000
+    start = now - 3600
+    seed_coverage(repo, job="fast_sta", now=now, window_s=3600, interval_s=60)
+    ap = repo.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="ap-flaky", site_id="default"), ts=now
+    )
+    repo.upsert_entity(
+        Entity(
+            entity_type=EntityType.CLIENT, native_id="cc:flaky", site_id="default",
+            parent_id=ap, first_seen_ts=now - 100_000,
+        ),
+        ts=now,
+    )
+    # Feed observed only the first 300 s, then shut down. No disconnect events
+    # remain (aged out). Event coverage is far below the floor.
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=0.0)
+    listener.connection_state = "connected"
+    _seed_beats(listener, start, start + 300, step=60)
+    ctx = DetectorContext(
+        repo=repo, baselines=FakeBaselines(), now_ts=now, site_id="default", settings=None
+    )
+    assert FlakyClientDetector().evaluate(ctx) is UNKNOWN
+
+
+def test_w16a1_flaky_freezes_when_disconnects_sever_heartbeat_bridge(
+    repo: Repository,
+) -> None:
+    """#w16a-1 end to end (B4 re-opening): a feed CONNECTED ~32 s out of every 90 s
+    (beats at c+0, c+30) and DISCONNECTED the other ~58 s (a recorded disconnect at
+    c+32) must read as mostly UNCOVERED so a real client.flaky issue FREEZES.
+
+    The last beat of a cycle (c+30) and the first of the next (c+90) are only 60 s
+    apart -- inside the 75 s cadence bridge -- so the pure-cadence bridge joined
+    them and fabricated ~98% coverage over a feed that was down most of the time,
+    false-clearing the issue. The disconnect-aware bridge severs at c+32, so
+    coverage (~0.33) stays far below the floor and the detector returns UNKNOWN."""
+    now = 8_500_000
+    start = now - 3600
+    seed_coverage(repo, job="fast_sta", now=now, window_s=3600, interval_s=60)
+    ap = repo.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="ap-flaky", site_id="default"), ts=now
+    )
+    repo.upsert_entity(
+        Entity(
+            entity_type=EntityType.CLIENT, native_id="cc:flaky", site_id="default",
+            parent_id=ap, first_seen_ts=now - 100_000,
+        ),
+        ts=now,
+    )
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=0.0)
+    listener.connection_state = "connected"
+    c = start
+    while c < now:
+        listener._maybe_heartbeat(now=c)
+        listener._last_heartbeat_ts = None
+        listener._maybe_heartbeat(now=c + 30)
+        listener._last_heartbeat_ts = None
+        # The supervisor records the socket drop between the two beats.
+        repo.record_poll_run(job="ws", ok=True, ts=c + 32, error="disconnected", source="live")
+        c += 90
+    cov = repo.observed_event_coverage(start, now)
+    assert cov < 0.5
+    assert cov < EVENT_COVERAGE_MIN
+    ctx = DetectorContext(
+        repo=repo, baselines=FakeBaselines(), now_ts=now, site_id="default", settings=None
+    )
+    assert FlakyClientDetector().evaluate(ctx) is UNKNOWN
+
+
+def _trailing_failures(repo: Repository, job: str) -> int:
+    """Mirror runtime._job_health: trailing consecutive non-ok poll_runs for a job."""
+    rows = repo.read_poll_runs(job, 0, 2_000_000_000)
+    n = 0
+    for r in reversed(rows):
+        if int(r["ok"]) == 1:
+            break
+        n += 1
+    return n
+
+
+def test_b_failed_then_recovered_flush_reopens_coverage_and_health(repo: Repository) -> None:
+    """B4 new-bug: a failed periodic flush closes coverage/health (an ok=0
+    storage-failed ws row), but a successful retry never reopened it under the old
+    close-event design -- a connected socket with a committed event and empty
+    queue read 0 coverage and 'failing' health. With positive liveness, the
+    recovered flush resumes heartbeats: coverage reopens and the trailing failure
+    clears."""
+    now = 7_000_000
+    start = now - 3600
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=0.0)
+    listener.connection_state = "connected"
+    # Healthy, connected-and-draining span up to shortly before the stall.
+    _seed_beats(listener, start, start + 3480, step=60)
+    # A flush tick fails: storage-failed (ok=0) surfaces, NO heartbeat this tick.
+    repo.record_poll_run(job="ws", ok=False, ts=start + 3500, error="storage-failed: locked", source="live")
+    # While the failure is the latest ws row, health is 'failing'.
+    assert _trailing_failures(repo, "ws") > 0
+    # Flushing RECOVERS: the connected socket commits + empties its queue, so the
+    # next ticks heartbeat again (the gap start+3480 -> start+3540 is under the
+    # bridge bound, so coverage is continuous).
+    listener._maybe_heartbeat(now=start + 3540)
+    listener._last_heartbeat_ts = None
+    listener._maybe_heartbeat(now=now - 1)
+    # Coverage reopened -- effectively full across the window (not 0, not frozen).
+    cov = repo.observed_event_coverage(start, now)
+    assert cov >= EVENT_COVERAGE_MIN
+    # Health cleared: a fresh successful ws heartbeat is now the latest row.
+    assert _trailing_failures(repo, "ws") == 0
+
+
+@pytest.mark.asyncio
+async def test_c_periodic_flush_heartbeats_while_connected_and_covers(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B4(c): a genuinely healthy, connected, draining feed reads fully covered.
+    Drive the REAL periodic-flush loop; while connected it must emit a steady
+    stream of liveness heartbeats (empty queue included), yielding continuous
+    coverage across their span."""
+    import netadmin.ingest.events as evmod
+
+    calls = {"n": 0}
+
+    def fake_time() -> float:
+        # Spread successive heartbeats 10 s apart (distinct, chainable) so the
+        # loop's real sub-ms sleeps do not collapse them onto one second.
+        calls["n"] += 1
+        return 6_000_000 + calls["n"] * 10
+
+    monkeypatch.setattr(evmod.time, "time", fake_time)
+
+    listener = EventListener(FakeWs([]), repo, flush_interval=0.001, heartbeat_interval=1.0)
+    listener.connection_state = "connected"
+    task = asyncio.create_task(listener._periodic_flush())
+
+    async def until_three_beats() -> None:
+        while len([r for r in repo.read_poll_runs("ws", 0, 10_000_000) if r["error"] == "heartbeat"]) < 3:
+            await asyncio.sleep(0.001)
+
+    try:
+        await asyncio.wait_for(until_three_beats(), timeout=3.0)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    beats = [r for r in repo.read_poll_runs("ws", 0, 10_000_000) if r["error"] == "heartbeat"]
+    assert len(beats) >= 3
+    lo, hi = int(beats[0]["ts"]), int(beats[-1]["ts"])
+    # The span between the first and last beat is continuously covered.
+    assert repo.observed_event_coverage(lo, hi + 1) > 0.9
+
+
+def test_d_real_gap_still_freezes(repo: Repository) -> None:
+    """B4(d): a real gap (feed down / not draining) leaves a coverage hole ->
+    UNKNOWN. Two short heartbeat bursts with a long dead middle do not chain, so
+    coverage stays far below the floor."""
+    now = 9_000_000
+    start = now - 3600
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=0.0)
+    listener.connection_state = "connected"
+    _seed_beats(listener, start, start + 240, step=60)   # early burst
+    # ... feed dead for most of the hour (no beats) ...
+    _seed_beats(listener, now - 240, now - 1, step=60)   # late burst
+    cov = repo.observed_event_coverage(start, now)
+    assert cov < EVENT_COVERAGE_MIN
+    assert cov < 0.2
+
+
+# --------------------------------------------------------------------------- #
+# D2 (normalization-read outage earns no false coverage): a WS event consumed off
+# the socket whose entity-resolution READ is still failing sits RETAINED RAW,
+# unprocessed. ``_drain_pending_raw`` swallows the read error and ``_flush``
+# returns an empty batch, so the periodic loop used to emit a HEARTBEAT anyway --
+# crediting observed coverage across a span of UNPROCESSED history. An event-based
+# detector then reads that span as observed and can false-clear a live issue (the
+# B4 harm). A heartbeat (positive liveness = connected AND draining successfully)
+# must NOT fire while a raw event is stuck; coverage ends at the last truly-drained
+# beat and resumes once the read recovers and the raw buffer empties.
+# --------------------------------------------------------------------------- #
+def test_d2_no_heartbeat_while_raw_event_pending_renormalization(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    real_find = repo.find_entity
+
+    def locked_find(etype: EntityType, mac: str) -> Any:
+        raise sqlite3.OperationalError("database is locked")
+
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=0.0)
+    listener.connection_state = "connected"
+
+    # One consumed-but-unnormalized event is retained RAW because its entity read
+    # blipped (exactly as the consumer loop does on a transient read error).
+    ev = Event.model_validate(
+        {"_id": "d2", "key": "EVT_WU_Connected", "time": 1_721_600_000_000, "user": CLIENT_MAC}
+    )
+    listener._pending_raw.append(ev)
+
+    # The read stays down across the whole [100, 160] span. Each tick flushes
+    # (raw stays stuck) then tries to beat.
+    monkeypatch.setattr(repo, "find_entity", locked_find)
+    for t in (100, 130, 160):
+        listener._flush()  # drains raw -> still stuck, keeps _storage_error set
+        listener._maybe_heartbeat(now=t)
+        listener._last_heartbeat_ts = None  # remove rate-limit as the only guard
+
+    beats = [r for r in repo.read_poll_runs("ws", 0, 10_000) if r["error"] == "heartbeat"]
+    assert beats == []  # NO positive liveness while a raw event is unprocessed
+    # The unprocessed span is NOT credited as observed -> detectors freeze there.
+    assert repo.observed_event_coverage(100, 161) == 0.0
+    assert listener._pending_raw  # still stuck
+
+    # Reads recover: the raw event re-normalizes, the buffer empties, and the very
+    # next tick resumes heartbeats.
+    monkeypatch.setattr(repo, "find_entity", real_find)
+    listener._flush()
+    assert listener._pending_raw == []
+    assert listener._storage_error is None
+    listener._maybe_heartbeat(now=200)
+    beats = [r for r in repo.read_poll_runs("ws", 0, 10_000) if r["error"] == "heartbeat"]
+    assert len(beats) == 1 and int(beats[0]["ts"]) == 200
+    # The retained event itself was persisted once the read came back.
+    assert {r["native_id"] for r in repo.read_events(0, 2_000_000_000)} == {"d2"}
+
+
+# --------------------------------------------------------------------------- #
+# #w17a-2 (unusable-event drop earns no false coverage): a WS event the parser
+# consumes but ``normalize`` judges structurally UNUSABLE (returns None -- e.g. a
+# disconnect with NO usable timestamp) is dropped. Pre-fix the drop recorded no
+# loss and did not invalidate liveness, so the periodic flusher kept emitting its
+# 'healthy drain' heartbeat -- crediting observed coverage across a span where
+# usable events were being discarded, which lets an event-based detector treat the
+# span as observed and false-clear a live issue. A heartbeat asserts "connected AND
+# draining USABLE events successfully"; a tick that dropped an unusable event must
+# WITHHOLD it, so the drop span reads UNcovered and detectors freeze there.
+# --------------------------------------------------------------------------- #
+def _unusable_event(i: int) -> Event:
+    # _id/key/ap present but NO usable timestamp -> ``normalize`` returns None (see
+    # test_w16a4_unusable_event_window_not_complete for the catch-up half).
+    return Event.model_validate(
+        {"_id": f"lost{i}", "key": "EVT_AP_Lost", "ap": "02:00:99:99:99:99"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_w17a2_unusable_ws_events_store_nothing_and_count_as_dropped(
+    repo: Repository,
+) -> None:
+    """#w17a-2 (real parser+consumer): 120 missing-timestamp events drained through
+    the real listener store NOTHING and are ALL counted as unusable drops -- the
+    signal the flusher uses to withhold its liveness heartbeat."""
+    listener = EventListener(
+        FakeWs([_unusable_event(i) for i in range(120)]), repo, flush_interval=None
+    )
+    written = await listener.run()
+    assert written == 0
+    assert repo.read_events(0, 2_000_000_000) == []
+    assert listener._unusable_dropped_since_beat == 120
+
+
+def test_w17a2_unusable_drops_suppress_heartbeat_and_freeze(repo: Repository) -> None:
+    """#w17a-2: a flush tick that DROPPED an unusable event emits NO heartbeat, so
+    an hour of missing-timestamp disconnects earns ZERO coverage and client.flaky
+    FREEZES (UNKNOWN). Pre-fix the flusher heartbeated every tick regardless of the
+    drop, fabricating ~full coverage over an unobserved span."""
+    now = 3_300_000
+    start = now - 3600
+    seed_coverage(repo, job="fast_sta", now=now, window_s=3600, interval_s=60)
+    ap = repo.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="ap-uw", site_id="default"), ts=now
+    )
+    repo.upsert_entity(
+        Entity(
+            entity_type=EntityType.CLIENT, native_id="cc:uw", site_id="default",
+            parent_id=ap, first_seen_ts=now - 100_000,
+        ),
+        ts=now,
+    )
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=0.0)
+    listener.connection_state = "connected"
+    # Every 30 s the consumer dropped an unusable event this period (as the real run
+    # loop increments the counter -- see the test above). Each flush tick then tries
+    # to beat and must be SUPPRESSED because the period was not cleanly drained.
+    t = start
+    while t < now:
+        listener._unusable_dropped_since_beat += 1  # a drop happened this period
+        listener._flush()                            # empty batch, nothing to store
+        listener._maybe_heartbeat(now=t)
+        listener._last_heartbeat_ts = None           # rate limit is not the guard here
+        t += 30
+    beats = [r for r in repo.read_poll_runs("ws", 0, 10_000_000) if r["error"] == "heartbeat"]
+    assert beats == []  # NO positive liveness while usable events were being dropped
+    assert repo.observed_event_coverage(start, now) == 0.0
+    ctx = DetectorContext(
+        repo=repo, baselines=FakeBaselines(), now_ts=now, site_id="default", settings=None
+    )
+    assert FlakyClientDetector().evaluate(ctx) is UNKNOWN
+
+
+def test_w17a2_clean_ticks_still_heartbeat_and_cover(repo: Repository) -> None:
+    """#w17a-2 control: with NO unusable drops, the connected-and-draining feed
+    heartbeats every tick and the span stays covered -- the fix leaves the healthy
+    path untouched."""
+    now = 3_400_000
+    start = now - 3600
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=0.0)
+    listener.connection_state = "connected"
+    t = start
+    while t < now:
+        listener._flush()
+        listener._maybe_heartbeat(now=t)
+        listener._last_heartbeat_ts = None
+        t += 30
+    listener._maybe_heartbeat(now=now - 1)
+    assert repo.observed_event_coverage(start, now) >= EVENT_COVERAGE_MIN
+
+
+# --------------------------------------------------------------------------- #
+# #w18a-2 (unusable-event drop must SEVER coverage, not just skip one beat): the
+# round-18 defect is that suppressing a single heartbeat leaves a BRIDGEABLE gap.
+# With a 30 s heartbeat cadence, a 2 s flush cadence and an unusable event every
+# 30 s, the next clean beat lands ~2 s after the last clean beat -- inside the 75 s
+# cadence bridge -- so the pure heartbeat chain BRIDGED the whole hour (0 events,
+# ~all heartbeats, ~0.99 coverage) and false-cleared a real client.flaky issue. A
+# drop must record a durable coverage BREAK that severs the chain, so coverage ends
+# at the last CLEAN beat and only resumes after a subsequent clean drain.
+# --------------------------------------------------------------------------- #
+def _drive_flush_ticks(listener, start, now, *, drop_every=None, flush_step=2):
+    """Drive realistic 2 s flush ticks through the REAL rate-limit + break gates.
+
+    When ``drop_every`` is set, an unusable event is marked ``drop_every`` seconds
+    apart (as the real run loop increments the counter on a normalize->None event),
+    reproducing the round-18 interleave WITHOUT resetting ``_last_heartbeat_ts``.
+    """
+    t = start
+    while t <= now:
+        if drop_every is not None and t > start and (t - start) % drop_every == 0:
+            listener._unusable_dropped_since_beat += 1
+        listener._flush()
+        listener._maybe_heartbeat(now=t)
+        t += flush_step
+
+
+def test_w18a2_unusable_drops_sever_coverage_no_bridge(repo: Repository) -> None:
+    """#w18a-2: unusable events every 30 s with a 30 s beat cadence and 2 s flushes
+    record coverage BREAKS between the clean beats, so the chain never bridges and
+    coverage stays well below the floor -> client.flaky FREEZES (UNKNOWN). Pre-fix
+    (suppress-only) the clean beats bridged and fabricated ~0.99 coverage."""
+    now = 9_100_000
+    start = now - 3600
+    seed_coverage(repo, job="fast_sta", now=now, window_s=3600, interval_s=60)
+    ap = repo.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="ap-w18a2", site_id="default"), ts=now
+    )
+    repo.upsert_entity(
+        Entity(
+            entity_type=EntityType.CLIENT, native_id="cc:w18a2", site_id="default",
+            parent_id=ap, first_seen_ts=now - 100_000,
+        ),
+        ts=now,
+    )
+    # Real 30 s beat cadence (NOT 0.0), so clean beats would otherwise bridge.
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=30.0)
+    listener.connection_state = "connected"
+    _drive_flush_ticks(listener, start, now, drop_every=30)
+
+    # Breaks were recorded and they sever the heartbeat chain: coverage < 0.9.
+    breaks = [r for r in repo.read_poll_runs("ws", 0, 20_000_000) if r["error"] == "unusable"]
+    assert breaks, "an unusable-drop span must record a durable coverage break"
+    cov = repo.observed_event_coverage(start, now)
+    assert cov < 0.9
+    assert cov < EVENT_COVERAGE_MIN
+    ctx = DetectorContext(
+        repo=repo, baselines=FakeBaselines(), now_ts=now, site_id="default", settings=None
+    )
+    assert FlakyClientDetector().evaluate(ctx) is UNKNOWN
+
+
+def test_w18a2_clean_stream_still_bridges_and_covers(repo: Repository) -> None:
+    """#w18a-2 control: with NO unusable drops, the same 30 s-cadence / 2 s-flush
+    feed records no breaks, the beats bridge normally, and the hour stays covered --
+    the sever machinery does not fire on a healthy stream."""
+    now = 9_200_000
+    start = now - 3600
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=30.0)
+    listener.connection_state = "connected"
+    _drive_flush_ticks(listener, start, now, drop_every=None)
+
+    assert [r for r in repo.read_poll_runs("ws", 0, 20_000_000) if r["error"] == "unusable"] == []
+    assert repo.observed_event_coverage(start, now) > 0.9
+
+
+@pytest.mark.asyncio
+async def test_w18a4_parser_unusable_frames_reach_drop_accounting_and_sever(
+    repo: Repository,
+) -> None:
+    """#w18a-4 end to end: identifiable-but-unusable rows from an EXPLICIT event
+    frame surface through the WS parser, reach the consumer's drop accounting
+    (normalize->None), and the resulting drop severs coverage (records a break, not
+    a beat). A genuine control frame stays a no-op. Pre-fix the parser silently
+    dropped the unusable rows, so the consumer never saw them: 0 stored, drop
+    counter 0, no break."""
+    from netadmin.ingest.unifi.ws import EventListener as WsEventListener
+
+    # Genuine control frame -> nothing (no false drop).
+    assert WsEventListener._parse('{"meta": {"message": "device:sync"}, "data": [{"mac": "x"}]}') == []
+    # Explicit event frame whose rows lack key/_id -> surfaced as unusable events.
+    parsed = WsEventListener._parse('{"meta": {"message": "events"}, "data": [{"foo": 1}, {"bar": 2}]}')
+    assert len(parsed) == 2  # pre-fix: [] (silently dropped)
+
+    listener = EventListener(FakeWs(parsed), repo, flush_interval=None, heartbeat_interval=30.0)
+    listener.connection_state = "connected"
+    written = await listener.run()
+
+    assert written == 0
+    assert repo.read_events(0, 2_000_000_000) == []          # nothing stored
+    assert listener._unusable_dropped_since_beat == 2         # drop accounted
+
+    # The accounted drop severs coverage: the next beat opportunity records a BREAK.
+    listener.connection_state = "connected"
+    listener._maybe_heartbeat(now=1_000)
+    beats = [r for r in repo.read_poll_runs("ws", 0, 100_000) if r["error"] == "heartbeat"]
+    breaks = [r for r in repo.read_poll_runs("ws", 0, 100_000) if r["error"] == "unusable"]
+    assert beats == [] and len(breaks) == 1
+
+
+# --------------------------------------------------------------------------- #
+# D5 (rescued events must not strand). (1) When storage recovers DURING a
+# replacement listener's life, the events rescued from a prior dead listener must
+# be persisted PROMPTLY -- not left queued until this new listener itself dies. The
+# supervisor now drains rescued buffers whenever a listener proves storage healthy
+# (a heartbeat), mid-life. The repro left persisted IDs == ['new'] with the rescued
+# event still pending after recovery.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_d5_rescued_events_drain_during_replacement_listener_life(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    rescued_ev = Event.model_validate(
+        {"_id": "rescued", "key": "EVT_X", "time": 1_721_600_000_000}
+    )
+    new_ev = Event.model_validate({"_id": "new", "key": "EVT_X", "time": 1_721_600_000_100})
+
+    real_store = repo.record_events_enriching_entities
+    storage = {"down": True}
+
+    def flaky(rows: object) -> int:
+        if storage["down"]:
+            raise sqlite3.OperationalError("database is locked")
+        return real_store(rows)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repo, "record_events_enriching_entities", flaky)
+
+    sup: WsSupervisor
+    snap: dict[str, Any] = {}
+
+    class _MidlifeRecovers:
+        """Replacement listener: storage recovers during its life. It persists its
+        OWN new event and, via the supervisor's healthy-drain hook, must flush the
+        rescued events too -- all BEFORE it returns/dies."""
+
+        def __init__(self) -> None:
+            self.on_connection_state: Optional[Any] = None
+            self.on_healthy_drain: Optional[Any] = None
+            self.terminal_state: Optional[str] = None
+
+        def pending_records(self) -> list[dict[str, Any]]:
+            return []
+
+        def pending_raw_records(self) -> list[Event]:
+            return []
+
+        async def run(self) -> int:
+            if self.on_connection_state is not None:
+                self.on_connection_state("connected")
+            # Storage has recovered mid-life: this listener commits its own event ...
+            storage["down"] = False
+            record = EventNormalizer(repo).normalize(new_ev)
+            assert record is not None
+            repo.record_events_enriching_entities([record])
+            # ... and signals a healthy drain (as a heartbeat would). The supervisor
+            # must hand off the rescued events NOW.
+            if self.on_healthy_drain is not None:
+                self.on_healthy_drain()
+            # Snapshot mid-life -- before this listener returns/dies.
+            snap["pending"] = list(sup._pending)
+            snap["stored"] = {r["native_id"] for r in repo.read_events(0, 2_000_000_000)}
+            sup.stop()
+            return 0
+
+    attempt = {"n": 0}
+
+    def factory() -> Any:
+        attempt["n"] += 1
+        if attempt["n"] == 1:
+            # Buffers `rescued`, every flush fails -> dies with it uncommitted.
+            return EventListener(FakeWs([rescued_ev]), repo, flush_interval=None)
+        return _MidlifeRecovers()
+
+    async def fake_sleep(delay: float) -> None:
+        # Storage is STILL down at the start-of-loop drain for attempt 2, so the
+        # rescued event is only drainable from inside the replacement's life.
+        pass
+
+    sup = WsSupervisor(factory, repo, backoff_base=0.0, max_restarts=5, sleep=fake_sleep)
+    await asyncio.wait_for(sup.run(), timeout=5.0)
+
+    # Rescued event was persisted DURING the replacement's life (mid-life snapshot),
+    # alongside the listener's own new event -- not left pending.
+    assert snap["pending"] == []
+    assert snap["stored"] == {"new", "rescued"}
+
+
+# --------------------------------------------------------------------------- #
+# D5 (2): cancellation/shutdown must drain rescued events, not strand them. The
+# cancel path rescued the dying listener's batch then raised immediately, bypassing
+# the post-loop drain -- so buffered events sat stranded through shutdown even when
+# storage was healthy. A FINAL drain in a finally BEFORE propagating the cancel
+# persists both the previously-rescued events and the dying listener's batch.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_d5_cancellation_drains_rescued_events(repo: Repository) -> None:
+    normalizer = EventNormalizer(repo)
+    rescued = normalizer.normalize(
+        Event.model_validate({"_id": "rescued", "key": "EVT_X", "time": 1_721_600_000_000})
+    )
+    dying = normalizer.normalize(
+        Event.model_validate({"_id": "dying", "key": "EVT_X", "time": 1_721_600_000_100})
+    )
+    assert rescued is not None and dying is not None
+
+    sup: WsSupervisor
+    started = asyncio.Event()
+
+    class _Blocks:
+        """A listener that connects, holds a buffered event, then blocks until the
+        supervisor is cancelled (shutdown)."""
+
+        def __init__(self) -> None:
+            self.on_connection_state: Optional[Any] = None
+            self.on_healthy_drain: Optional[Any] = None
+            self.terminal_state: Optional[str] = None
+
+        def pending_records(self) -> list[dict[str, Any]]:
+            return [dying]
+
+        def pending_raw_records(self) -> list[Event]:
+            return []
+
+        async def run(self) -> int:
+            if self.on_connection_state is not None:
+                self.on_connection_state("connected")
+            started.set()
+            await asyncio.Event().wait()  # block until cancelled
+            return 0  # pragma: no cover
+
+    sup = WsSupervisor(lambda: _Blocks(), repo, backoff_base=0.0)
+    # An event rescued from an EARLIER listener is already queued on the supervisor.
+    sup._pending = [rescued]
+
+    task = asyncio.create_task(sup.run())
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # Shutdown drained BOTH the previously-rescued event and the dying listener's
+    # batch instead of stranding them.
+    assert {r["native_id"] for r in repo.read_events(0, 2_000_000_000)} == {"rescued", "dying"}
+    assert sup._pending == []
+
+
+# --------------------------------------------------------------------------- #
+# BUG#4 (heartbeat must not credit coverage over the SUPERVISOR's undrained
+# buffers): a replacement listener with EMPTY local buffers used to emit
+# heartbeats while the supervisor still held a rescued RAW event stuck behind a
+# failing entity-resolution read -- the heartbeat was committed BEFORE the drain
+# hook ran and the hook's failed reads were swallowed, so coverage was credited
+# over a span of unprocessed history (the repro: 11 beats, ~0.997 coverage). A
+# heartbeat asserts the whole pipeline is drained: it must be suppressed while ANY
+# rescued event (normalized OR raw) is stuck upstream, not just in this listener's
+# local buffer.
+# --------------------------------------------------------------------------- #
+def test_bug4_no_heartbeat_while_supervisor_holds_stuck_rescued_event(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    real_find = repo.find_entity
+
+    def locked_find(etype: EntityType, mac: str) -> Any:
+        raise sqlite3.OperationalError("database is locked")
+
+    # A rescued RAW event lives on the SUPERVISOR; its entity read blips, so it
+    # cannot be re-normalized/persisted while storage is down.
+    stuck = Event.model_validate(
+        {"_id": "stuck", "key": "EVT_WU_Connected", "time": 1_721_600_000_000, "user": CLIENT_MAC}
+    )
+    sup = WsSupervisor(lambda: EventListener(FakeWs([]), repo), repo, backoff_base=0.0)
+    sup._pending_raw = [stuck]
+
+    # A healthy, EMPTY replacement listener wired to the supervisor's drain +
+    # pipeline-blocked hooks exactly as WsSupervisor.run() wires them.
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=0.0)
+    listener.connection_state = "connected"
+    listener.on_healthy_drain = sup._drain_pending
+    listener.pipeline_blocked = sup._pending_blocked
+
+    monkeypatch.setattr(repo, "find_entity", locked_find)
+    for t in (100, 130, 160, 190):
+        listener._maybe_heartbeat(now=t)
+        listener._last_heartbeat_ts = None  # rate-limit is not the guard under test
+
+    beats = [r for r in repo.read_poll_runs("ws", 0, 10_000) if r["error"] == "heartbeat"]
+    assert beats == []  # NO positive liveness while a rescued event is stuck
+    assert repo.observed_event_coverage(100, 191) == 0.0
+    assert sup._pending_raw  # the rescued raw event is still blocked upstream
+
+    # Read recovers: the drain hook re-normalizes and persists the rescued event,
+    # the pipeline is truly drained, and the very next beat is allowed.
+    monkeypatch.setattr(repo, "find_entity", real_find)
+    listener._maybe_heartbeat(now=300)
+    beats = [r for r in repo.read_poll_runs("ws", 0, 10_000) if r["error"] == "heartbeat"]
+    assert len(beats) == 1 and int(beats[0]["ts"]) == 300
+    assert sup._pending_raw == [] and sup._pending == []
+    assert {r["native_id"] for r in repo.read_events(0, 2_000_000_000)} == {"stuck"}
+
+
+# --------------------------------------------------------------------------- #
+# BUG#5 (shutdown DURING backoff loses the final drain): D5 fixed cancellation
+# during ``listener.run()``, but a cancel landing during the between-listeners
+# backoff ``sleep`` lands OUTSIDE that inline handler and used to unwind straight
+# past the post-loop drain -- stranding a rescued event even though storage had
+# recovered by shutdown. The whole supervise loop is now wrapped so a cancel
+# anywhere triggers one best-effort final drain. Production SupervisorTask.stop()
+# uses exactly this cancellation path.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_bug5_shutdown_during_backoff_drains_rescued_event(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    real = repo.record_events_enriching_entities
+    storage = {"down": True}
+
+    def flaky(rows: object) -> int:
+        if storage["down"]:
+            raise sqlite3.OperationalError("database is locked")
+        return real(rows)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repo, "record_events_enriching_entities", flaky)
+
+    ev = Event.model_validate({"_id": "blip", "key": "EVT_X", "time": 1_721_600_000_000})
+
+    attempt = {"n": 0}
+
+    def factory() -> EventListener:
+        attempt["n"] += 1
+        # Attempt 1 buffers the event and dies with it uncommitted (storage down),
+        # so the supervisor rescues it onto ``_pending``. It never gets to attempt 2.
+        events = [ev] if attempt["n"] == 1 else []
+        return EventListener(FakeWs(events), repo, flush_interval=None, batch_size=1)
+
+    in_backoff = asyncio.Event()
+
+    async def fake_sleep(delay: float) -> None:
+        # Storage RECOVERS while the supervisor sits in the between-listeners
+        # backoff; then we block here so the shutdown cancel lands MID-BACKOFF,
+        # outside the inline run()-cancel handler.
+        storage["down"] = False
+        in_backoff.set()
+        await asyncio.Event().wait()
+
+    sup = WsSupervisor(factory, repo, backoff_base=0.0, max_restarts=5, sleep=fake_sleep)
+    task = asyncio.create_task(sup.run())
+    await asyncio.wait_for(in_backoff.wait(), timeout=2.0)
+
+    # Cancel mid-backoff (the production SupervisorTask.stop() path).
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The outer finally ran one final drain despite the cancel landing in the
+    # backoff sleep: the rescued event is persisted, not stranded (repro: 0 stored).
+    assert {r["native_id"] for r in repo.read_events(0, 2_000_000_000)} == {"blip"}
+    assert sup._pending == []
+
+
+# --------------------------------------------------------------------------- #
+# BUG#6 (mixed rescue buffers violate the aggregate cap and evict NEWER events):
+# ``_enforce_pending_bound`` capped the raw and normalized queues INDEPENDENTLY,
+# so cap=3 with 3 old raw + 3 new normalized retained SIX; and recovery appends
+# the old (re-normalized) raw events BEHIND the newer normalized ones, then a
+# blind prefix delete discarded the NEWER events (4-6) while the old (1-3)
+# survived. The cap must bound the AGGREGATE of both buffers, and drop-oldest must
+# evict the genuinely oldest across BOTH buffers by event time.
+# --------------------------------------------------------------------------- #
+def test_bug6_aggregate_cap_evicts_true_oldest_across_both_buffers(
+    repo: Repository,
+) -> None:
+    normalizer = EventNormalizer(repo)
+
+    def norm(_id: str, ts_ms: int) -> dict[str, Any]:
+        rec = normalizer.normalize(
+            Event.model_validate({"_id": _id, "key": "EVT_X", "time": ts_ms})
+        )
+        assert rec is not None
+        return rec
+
+    # 3 OLD raw events (times 1-3 s) + 3 NEW normalized events (times 4-6 s).
+    old_raw = [
+        Event.model_validate({"_id": f"old{i}", "key": "EVT_X", "time": 1_721_600_000_000 + i * 1000})
+        for i in (1, 2, 3)
+    ]
+    new_norm = [norm(f"new{i}", 1_721_600_000_000 + i * 1000) for i in (4, 5, 6)]
+
+    sup = WsSupervisor(lambda: EventListener(FakeWs([]), repo), repo, pending_max=3)
+    sup._pending = list(new_norm)
+    sup._pending_raw = list(old_raw)
+
+    # AGGREGATE cap: 6 retained across the two buffers must clamp to 3 -- the old
+    # independent-cap logic left all SIX (3 + 3, each within its own cap of 3).
+    sup._enforce_pending_bound()
+    total = len(sup._pending) + len(sup._pending_raw)
+    assert total == 3
+    assert sup.dropped == 3
+    # TRUE-OLDEST eviction: the three OLD raw events go; the three NEWER normalized
+    # survive (not the reverse a blind prefix delete would produce).
+    assert sup._pending_raw == []
+    assert {r["native_id"] for r in sup._pending} == {"new4", "new5", "new6"}
+
+
+def test_bug6_recovery_keeps_newer_events_not_prefix(
+    repo: Repository,
+) -> None:
+    """The prompt's exact repro: recovery re-normalizes rescued RAW events and
+    appends them BEHIND newer normalized ones; a prefix delete then discarded the
+    newer survivors. With the aggregate/true-oldest fix the drain persists the
+    NEWER events and drops the genuinely-oldest raw ones."""
+    normalizer = EventNormalizer(repo)
+
+    def norm(_id: str, ts_ms: int) -> dict[str, Any]:
+        rec = normalizer.normalize(
+            Event.model_validate({"_id": _id, "key": "EVT_X", "time": ts_ms})
+        )
+        assert rec is not None
+        return rec
+
+    old_raw = [
+        Event.model_validate({"_id": f"old{i}", "key": "EVT_X", "time": 1_721_600_000_000 + i * 1000})
+        for i in (1, 2, 3)
+    ]
+    new_norm = [norm(f"new{i}", 1_721_600_000_000 + i * 1000) for i in (4, 5, 6)]
+
+    sup = WsSupervisor(lambda: EventListener(FakeWs([]), repo), repo, pending_max=3)
+    # Newer normalized already queued; older raw arrives to be re-normalized behind
+    # them on the healthy drain.
+    sup._pending = list(new_norm)
+    sup._pending_raw = list(old_raw)
+
+    # Storage is healthy: the drain re-normalizes the raw events (appending them
+    # behind the newer ones), clamps to the aggregate cap, and persists survivors.
+    sup._drain_pending()
+
+    stored = {r["native_id"] for r in repo.read_events(0, 2_000_000_000)}
+    # The NEWER events survived and were persisted; the genuinely-oldest raw ones
+    # were the ones dropped (repro persisted {old1, old2, old3} instead).
+    assert stored == {"new4", "new5", "new6"}
+    assert sup.dropped == 3
+    assert sup._pending == [] and sup._pending_raw == []
+
+
+# --------------------------------------------------------------------------- #
+# BUG#5 (a storage failure during CANCELLATION masks CancelledError): cancel the
+# real supervisor while its real listener holds one buffered event; the listener's
+# teardown ``_flush()`` raises OperationalError, which -- from a ``finally`` --
+# silently REPLACED the in-flight CancelledError. The supervisor then saw an
+# ordinary listener death: with max_restarts=0 it returned normally
+# (task.cancelled()==False) or, with retries, could RESTART -- and stop() was lost.
+# Fix: a teardown flush failure during cancellation must never swallow/replace the
+# CancelledError; the batch is retained (rescued), the final drain still runs, and
+# the cancel ALWAYS propagates.
+# --------------------------------------------------------------------------- #
+class _YieldOneThenBlockWs:
+    """WS double: yields ONE event, then blocks forever so the listener holds the
+    event buffered (un-flushed) until the supervise task is cancelled."""
+
+    def __init__(self, event: Event) -> None:
+        self._event = event
+        self.on_state: Optional[Any] = None
+        self._stop = SimpleNamespaceStop()
+
+    async def events(self) -> AsyncIterator[Event]:
+        if self.on_state is not None:
+            self.on_state("connected")
+        yield self._event
+        await asyncio.Event().wait()  # block until cancelled
+        yield self._event  # pragma: no cover - never reached
+
+    def stop(self) -> None:  # pragma: no cover - parity
+        self._stop.set()
+
+
+@pytest.mark.asyncio
+async def test_bug5_cancel_during_teardown_flush_failure_still_propagates(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = repo.record_events_enriching_entities
+    calls = {"n": 0}
+
+    def flaky(rows: object) -> int:
+        calls["n"] += 1
+        # The listener's TEARDOWN flush (call #1, during cancellation) fails -- the
+        # exact storage blip that used to mask the cancel. The supervisor's final
+        # drain (call #2) then succeeds, proving the drain still ran.
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real(rows)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repo, "record_events_enriching_entities", flaky)
+
+    buffered = Event.model_validate(
+        {"_id": "buffered", "key": "EVT_X", "time": 1_721_600_000_000}
+    )
+
+    factory_calls = {"n": 0}
+
+    def factory() -> EventListener:
+        factory_calls["n"] += 1
+        # batch_size high + no periodic flusher => the event sits un-flushed in the
+        # batch until the teardown flush on cancellation.
+        return EventListener(
+            _YieldOneThenBlockWs(buffered), repo, flush_interval=None, batch_size=50
+        )
+
+    # max_restarts=0: were the cancel masked as an ordinary death, the loop would
+    # return normally (task.cancelled()==False) rather than propagate the cancel.
+    sup = WsSupervisor(factory, repo, backoff_base=0.0, max_restarts=0)
+    task = asyncio.create_task(sup.run())
+
+    # Let the listener connect, consume+buffer the event, and reach the block.
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if sup.state == "connected":
+            break
+    assert sup.state == "connected"
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # Cancellation PROPAGATED (not a spurious normal return) ...
+    assert task.cancelled()
+    # ... exactly one listener was built (no restart) ...
+    assert factory_calls["n"] == 1
+    # ... the teardown flush DID fail (the masking scenario was exercised) ...
+    assert calls["n"] >= 2
+    # ... and the final drain still ran: the buffered event was rescued and
+    # persisted, not stranded.
+    assert {r["native_id"] for r in repo.read_events(0, 2_000_000_000)} == {"buffered"}
+    assert sup._pending == []
+
+
+# --------------------------------------------------------------------------- #
+# FINDING#5 (round-12: the cancelling()-count check is DEFEATED by an
+# already-cancelled awaited future). The round-11 fix above detected the
+# "cancelling" state from ``current_task().cancelling() > 0``. But a
+# CancelledError raised by awaiting an ALREADY-CANCELLED future carries
+# cancelling()==0 -- the task itself was never ``.cancel()``ed, the cancel is
+# merely flowing through it. With a teardown flush that also raises
+# OperationalError, the old count-based check saw cancelling()==0, let the
+# OperationalError REPLACE the CancelledError, and the supervisor returned
+# normally (task.cancelled()==False) -- the cancel was swallowed. Fix (root
+# cause): the listener catches ``asyncio.CancelledError`` in its OWN except
+# clause (never consulting the cancelling() count), swallows a teardown storage
+# error, and re-raises so the cancel ALWAYS propagates regardless of how it
+# arose. The final drain still runs and the buffered event is rescued.
+# --------------------------------------------------------------------------- #
+class _YieldOneThenAwaitCancelledFutureWs:
+    """WS double: yields ONE event, then awaits an ALREADY-CANCELLED future so the
+    next drain step raises ``CancelledError`` with the supervise task's
+    ``cancelling()`` count still 0 -- the exact FINDING#5 case that a count-based
+    check misses. No external ``task.cancel()`` is used."""
+
+    def __init__(self, event: Event) -> None:
+        self._event = event
+        self.on_state: Optional[Any] = None
+        self._stop = SimpleNamespaceStop()
+
+    async def events(self) -> AsyncIterator[Event]:
+        if self.on_state is not None:
+            self.on_state("connected")
+        yield self._event
+        # Await an already-cancelled future: raises CancelledError immediately,
+        # WITHOUT the task ever being .cancel()ed -> current_task().cancelling()==0.
+        fut: "asyncio.Future[None]" = asyncio.get_event_loop().create_future()
+        fut.cancel()
+        await fut
+        yield self._event  # pragma: no cover - never reached
+
+    def stop(self) -> None:  # pragma: no cover - parity
+        self._stop.set()
+
+
+@pytest.mark.asyncio
+async def test_finding5_already_cancelled_future_with_teardown_failure_propagates(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = repo.record_events_enriching_entities
+    calls = {"n": 0}
+
+    def flaky(rows: object) -> int:
+        calls["n"] += 1
+        # Teardown flush (call #1, during the propagating cancel) fails -- the blip
+        # that used to mask the cancel. The supervisor's final drain (call #2)
+        # succeeds, proving the drain still ran.
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real(rows)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repo, "record_events_enriching_entities", flaky)
+
+    buffered = Event.model_validate(
+        {"_id": "buffered", "key": "EVT_X", "time": 1_721_600_000_000}
+    )
+
+    factory_calls = {"n": 0}
+
+    def factory() -> EventListener:
+        factory_calls["n"] += 1
+        return EventListener(
+            _YieldOneThenAwaitCancelledFutureWs(buffered),
+            repo,
+            flush_interval=None,
+            batch_size=50,
+        )
+
+    # max_restarts=0: were the cancel masked as an ordinary death, the loop would
+    # return normally (task.cancelled()==False) rather than propagate the cancel.
+    sup = WsSupervisor(factory, repo, backoff_base=0.0, max_restarts=0)
+    task = asyncio.create_task(sup.run())
+
+    # The cancel arises from INSIDE the drain loop (the already-cancelled future),
+    # not an external task.cancel(); it must still propagate out of the task.
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # Cancellation PROPAGATED even though cancelling()==0 (no external .cancel())...
+    assert task.cancelled()
+    # ... exactly one listener was built (no restart) ...
+    assert factory_calls["n"] == 1
+    # ... the teardown flush DID fail (the masking scenario was exercised) ...
+    assert calls["n"] >= 2
+    # ... and the final drain still ran: the buffered event was rescued and
+    # persisted, not stranded.
+    assert {r["native_id"] for r in repo.read_events(0, 2_000_000_000)} == {"buffered"}
+    assert sup._pending == []
+
+
+# --------------------------------------------------------------------------- #
+# BUG#6 (an unrecognized GET response fabricates event coverage): through the real
+# UnifiClient -> Endpoints -> catchup_events, an HTTP 200 body with no well-formed
+# success payload (e.g. ``{"error": "upstream unavailable"}`` -- no "data" key)
+# became ZERO events and 1.0 'complete' coverage for the window: the read helper
+# defaulted a missing "data" to [] and catch-up booked the window complete. That
+# fabricates event-source coverage and defeats every detector coverage gate. Fix:
+# only a well-formed success response (data present, or meta.rc=ok) counts as a
+# real read; anything else is a FAILED read, and catch-up records the window
+# failed (never counted by observed_event_coverage), not complete. A genuinely
+# empty ``{"data": []}`` still records complete.
+# --------------------------------------------------------------------------- #
+_BUG6_HOST = "https://ctrl6.test"
+_BUG6_SITE = "default"
+_BUG6_API = f"{_BUG6_HOST}/proxy/network/api/s/{_BUG6_SITE}"
+
+
+def _bug6_mock_login() -> None:
+    respx.get(f"{_BUG6_HOST}/proxy/network/").mock(return_value=httpx.Response(401))
+    respx.post(f"{_BUG6_HOST}/api/auth/login").mock(
+        return_value=httpx.Response(200, headers={"X-CSRF-Token": "c"}, json={})
+    )
+
+
+async def _bug6_endpoints() -> tuple[Any, Any]:
+    from netadmin.ingest.unifi.client import UnifiClient
+    from netadmin.ingest.unifi.endpoints import Endpoints
+
+    client = UnifiClient(
+        host=_BUG6_HOST, site=_BUG6_SITE, username="u", password="p",
+        min_request_interval=0.0,
+    )
+    await client.connect()
+    return client, Endpoints(client)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_bug6_unrecognized_event_response_records_failed_not_complete(
+    repo: Repository,
+) -> None:
+    from netadmin.ingest.unifi.auth import UnifiError
+
+    _bug6_mock_login()
+    # HTTP 200 but NOT a success envelope: an error body with no "data" key.
+    respx.get(f"{_BUG6_API}/stat/event").mock(
+        return_value=httpx.Response(200, json={"error": "upstream unavailable"})
+    )
+    client, ep = await _bug6_endpoints()
+    now = 1_721_700_000
+
+    # The read is a FAILURE, not a successful empty collection: it must surface so
+    # the caller's poll firewall marks the cycle failed.
+    with pytest.raises(UnifiError):
+        await catchup_events(repo, ep, now=now)
+    await client.aclose()
+
+    # No 'complete' coverage was fabricated: the window reads 0.0 (a gap ->
+    # detectors freeze to UNKNOWN), and a queryable FAILED hole was recorded.
+    assert repo.observed_event_coverage(now - 3600, now) == 0.0
+    assert repo.observed_event_coverage(now - 30 * 24 * 3600, now) == 0.0
+    failed = repo.failed_ingest_coverage(kind="event_history", scope="site")
+    assert failed and any(int(r["end_ts"]) == now for r in failed)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_bug6_wellformed_empty_event_response_still_records_complete(
+    repo: Repository,
+) -> None:
+    _bug6_mock_login()
+    # A genuinely successful, authoritative EMPTY read still records complete.
+    respx.get(f"{_BUG6_API}/stat/event").mock(
+        return_value=httpx.Response(200, json={"meta": {"rc": "ok"}, "data": []})
+    )
+    client, ep = await _bug6_endpoints()
+    now = 1_721_700_000
+
+    inserted = await catchup_events(repo, ep, now=now)
+    await client.aclose()
+
+    assert inserted == 0
+    # A well-formed empty read is a real observation: the window is credited.
+    assert repo.observed_event_coverage(now - 3600, now) == 1.0
+    assert repo.failed_ingest_coverage(kind="event_history", scope="site") == []
+
+
+# --------------------------------------------------------------------------- #
+# #w14a-3: a catch-up GET that fails with a NON-UnifiError transport/response
+# exception (httpx.CloseError / DecodingError -- these propagate UNWRAPPED from the
+# client for an idempotent read) must STILL record a durable FAILED coverage hole
+# and re-raise. Catching only UnifiError left the ledger EMPTY: the window was
+# neither complete NOR failed, so it was silently never retried nor observed.
+# --------------------------------------------------------------------------- #
+class _RaisingEndpoints:
+    """A ``stat_event`` that raises a raw transport/response exception."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+        self.calls = 0
+
+    async def stat_event(
+        self, *, within_hours: Optional[int] = None, max_events: Optional[int] = None
+    ) -> list[Event]:
+        self.calls += 1
+        raise self._exc
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.CloseError("socket faulted finishing the response"),
+        httpx.DecodingError("Error -3 while decompressing data"),
+    ],
+    ids=["CloseError", "DecodingError"],
+)
+async def test_w14a3_catchup_transport_failure_records_failed_hole_and_reraises(
+    repo: Repository, exc: BaseException
+) -> None:
+    ep = _RaisingEndpoints(exc)
+    now = 1_721_700_000
+    # The read FAILED: it must re-raise so the collector firewall marks the poll failed.
+    with pytest.raises(type(exc)):
+        await catchup_events(repo, ep, now=now)
+    assert ep.calls == 1
+    # The ledger is NOT empty and NOT complete: a durable FAILED hole was recorded, so
+    # the next sweep retries it and observed_event_coverage never counts it.
+    assert repo.observed_event_coverage(now - 3600, now) == 0.0
+    failed = repo.failed_ingest_coverage(kind="event_history", scope="site")
+    assert failed and any(int(r["end_ts"]) == now for r in failed)
+
+
+@pytest.mark.asyncio
+async def test_w14a3_catchup_success_still_records_complete(repo: Repository) -> None:
+    # Control: a genuinely successful read still records COMPLETE coverage -- the
+    # broadened except adds no false failed hole.
+    now = 1_721_700_000
+    inserted = await catchup_events(repo, FakeEndpoints([]), now=now)
+    assert inserted == 0
+    assert repo.observed_event_coverage(now - 3600, now) == 1.0
+    assert repo.failed_ingest_coverage(kind="event_history", scope="site") == []
+
+
+# --------------------------------------------------------------------------- #
+# #w15a-3: catch-up must record a FAILED hole for ANY exception raised during the
+# read/parse of the window -- not just the enumerated (UnifiError, httpx.HTTPError).
+# Two concrete classes that are in NEITHER and previously slipped through, leaving
+# the coverage ledger EMPTY (neither complete NOR failed -> silently never retried
+# nor observed):
+#   * httpx.CookieConflict -- a httpx exception that is NOT an HTTPError subclass;
+#   * pydantic.ValidationError -- raised when a malformed stat/event row fails Event
+#     validation while the response is parsed (endpoints.py).
+# Both must now record a durable FAILED hole AND re-raise so the collector firewall
+# marks the poll failed.
+# --------------------------------------------------------------------------- #
+def _sample_validation_error() -> "Exception":
+    """A genuine pydantic ValidationError, as a malformed event row would raise."""
+    import pydantic
+
+    class _Row(pydantic.BaseModel):
+        idx: int
+
+    try:
+        _Row(idx="not-an-int")
+    except pydantic.ValidationError as exc:  # pragma: no cover - construction path
+        return exc
+    raise AssertionError("expected a ValidationError")  # pragma: no cover
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.CookieConflict("multiple TOKEN cookies for the controller origin"),
+        _sample_validation_error(),
+    ],
+    ids=["CookieConflict", "ValidationError"],
+)
+async def test_w15a3_catchup_non_http_failure_records_failed_hole_and_reraises(
+    repo: Repository, exc: BaseException
+) -> None:
+    import httpx as _httpx
+    import pydantic as _pydantic
+
+    from netadmin.ingest.unifi.auth import UnifiError
+
+    # Precondition of the bug: NEITHER class is covered by the old enumerated except.
+    assert not isinstance(exc, (UnifiError, _httpx.HTTPError))
+    assert isinstance(exc, (_httpx.CookieConflict, _pydantic.ValidationError))
+
+    ep = _RaisingEndpoints(exc)
+    now = 1_721_700_000
+    # The read/parse FAILED: catch-up must re-raise (never swallow) so the collector
+    # firewall marks the poll failed.
+    with pytest.raises(type(exc)):
+        await catchup_events(repo, ep, now=now)
+    assert ep.calls == 1
+    # And it must have recorded a durable FAILED hole first: no fabricated coverage,
+    # the window reads 0.0, and the next sweep will retry it.
+    assert repo.observed_event_coverage(now - 3600, now) == 0.0
+    failed = repo.failed_ingest_coverage(kind="event_history", scope="site")
+    assert failed and any(int(r["end_ts"]) == now for r in failed)
+
+
+# --------------------------------------------------------------------------- #
+# #w19a-2 (drop marker must survive an uncommitted break): the unusable-drop
+# marker was cleared BEFORE the WS break write committed, so a failed break write
+# (a transient sqlite blip) lost the marker and a later CLEAN beat then BRIDGED
+# the drop span (~0.989 coverage -- a false clear). The marker must be retained
+# until the break DURABLY commits: attempt the break FIRST, clear only on success,
+# and on failure keep the marker AND keep suppressing the beat so the next tick
+# retries the break and coverage stays SEVERED.
+# --------------------------------------------------------------------------- #
+def test_w19a2_failed_break_write_keeps_coverage_severed(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=30.0)
+    listener.connection_state = "connected"
+    # Two clean beats establish a covered run.
+    listener._maybe_heartbeat(now=1000)
+    listener._maybe_heartbeat(now=1030)
+    # One unusable event is dropped this period.
+    listener._unusable_dropped_since_beat += 1
+
+    # The break write BLIPS (transient sqlite error) on its FIRST attempt, then
+    # recovers -- exactly the round-19 #2 failure the prior order lost.
+    armed = {"fail": True}
+    real_break = repo.record_ws_break
+
+    def flaky_break(*, ts: Optional[int] = None) -> None:
+        if armed["fail"]:
+            armed["fail"] = False
+            raise sqlite3.OperationalError("database is locked")
+        real_break(ts=ts)
+
+    monkeypatch.setattr(repo, "record_ws_break", flaky_break)
+
+    listener._maybe_heartbeat(now=1060)  # break write FAILS
+    # RED-GREEN: the marker is RETAINED (not cleared) and no beat was emitted, so
+    # the drop still severs; pre-fix the marker was cleared and the break was lost.
+    assert listener._unusable_dropped_since_beat == 1
+    assert armed["fail"] is False  # the failure path was actually exercised
+
+    # Next tick: storage recovered, the break is RETRIED and durably commits.
+    listener._maybe_heartbeat(now=1062)
+    assert listener._unusable_dropped_since_beat == 0
+    listener._maybe_heartbeat(now=1092)  # clean beat resumes after the sever
+
+    # A break was durably recorded, so the post-drop beat does NOT bridge back:
+    # coverage is the pre-drop run only (~0.32), far below the bridged ~0.989 the
+    # lost-break bug fabricated and below the detector sufficiency floor.
+    breaks = [r for r in repo.read_poll_runs("ws", 0, 100_000) if r["error"] == "unusable"]
+    assert len(breaks) == 1
+    cov = repo.observed_event_coverage(1000, 1093)
+    assert cov < 0.5
+    assert cov < EVENT_COVERAGE_MIN
+
+
+# --------------------------------------------------------------------------- #
+# #w19a-4 (a normalize EXCEPTION must not bypass drop accounting): a normalize()
+# that RAISES for a single, permanently-unprocessable event (a malformed payload)
+# was logged and dropped WITHOUT counting it -- so no WS break fired and a clean
+# beat bridged the span (0 stored, 0 breaks, ~0.998 coverage). It must be treated
+# the SAME as normalize()->None: counted as an unusable drop that severs coverage.
+# A TRANSIENT storage error stays retained+re-raised, never a silent drop.
+# --------------------------------------------------------------------------- #
+class _MalformedNormalizer(EventNormalizer):
+    """normalize() raises a PERMANENT per-event error (a malformed payload)."""
+
+    def normalize(self, event: Event) -> Optional[dict[str, Any]]:
+        raise ValueError("object-valued ap_from cannot resolve to an entity")
+
+
+class _TransientNormalizer(EventNormalizer):
+    """normalize() raises a TRANSIENT storage error (an entity-read blip)."""
+
+    def normalize(self, event: Event) -> Optional[dict[str, Any]]:
+        raise sqlite3.OperationalError("database is locked")
+
+
+@pytest.mark.asyncio
+async def test_w19a4_normalize_raise_counts_as_drop_and_severs(repo: Repository) -> None:
+    events = [event_by_key("EVT_WU_Roam") for _ in range(3)]
+    listener = EventListener(
+        FakeWs(events), repo, normalizer=_MalformedNormalizer(repo),
+        flush_interval=None, heartbeat_interval=30.0,
+    )
+    listener.connection_state = "connected"
+    written = await listener.run()
+
+    assert written == 0
+    assert repo.read_events(0, 2_000_000_000) == []
+    # RED-GREEN: each raising normalize is counted as an unusable drop (pre-fix the
+    # marker stayed 0 -- a silent discard).
+    assert listener._unusable_dropped_since_beat == 3
+
+    # The accounted drop severs coverage: the next beat opportunity records a BREAK,
+    # not a heartbeat, so the drop span is left UNcovered (detector -> UNKNOWN).
+    listener.connection_state = "connected"
+    listener._maybe_heartbeat(now=1_000)
+    beats = [r for r in repo.read_poll_runs("ws", 0, 100_000) if r["error"] == "heartbeat"]
+    breaks = [r for r in repo.read_poll_runs("ws", 0, 100_000) if r["error"] == "unusable"]
+    assert beats == [] and len(breaks) == 1
+
+
+@pytest.mark.asyncio
+async def test_w19a4_transient_normalize_error_is_retained_not_dropped(
+    repo: Repository,
+) -> None:
+    ev = event_by_key("EVT_WU_Roam")
+    listener = EventListener(
+        FakeWs([ev]), repo, normalizer=_TransientNormalizer(repo), flush_interval=None
+    )
+    listener.connection_state = "connected"
+    written = await listener.run()
+
+    assert written == 0
+    # A TRANSIENT storage error is NOT a drop: the event is retained RAW for retry
+    # and the storage error is surfaced -- it must never be counted as unusable, or
+    # a storage blip would silently sever coverage AND lose an unrecoverable event.
+    assert len(listener._pending_raw) == 1
+    assert listener._unusable_dropped_since_beat == 0
+    assert listener._storage_error is not None
+
+
+# --------------------------------------------------------------------------- #
+# #w19a (cursor stranding, catch-up integration): a failed/partial event-history
+# hole aged beyond the retention window can never be re-read, yet as a retryable
+# row it pins the completion cursor forever. The next catch-up sweep must give it
+# terminal 'unrecoverable' handling so it stops capping the cursor.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_w19a_expired_event_hole_becomes_unrecoverable_on_next_sweep(
+    repo: Repository,
+) -> None:
+    now = 100_000_000
+    old = now - 40 * 24 * 3600  # 40 days ago -- beyond the ~30-day retention window
+    # A complete prefix, a failed (now-expired) hole right after it, and recent
+    # complete coverage the hole is capping the cursor short of.
+    repo.record_ingest_coverage(
+        kind="event_history", scope="site", interval="retained",
+        start_ts=old - 3600, end_ts=old, status="complete",
+    )
+    repo.record_ingest_coverage(
+        kind="event_history", scope="site", interval="retained",
+        start_ts=old, end_ts=old + 3600, status="failed",
+    )
+    # The failed hole pins the cursor at its start (old), short of the real history.
+    assert repo.latest_ingest_coverage_end(kind="event_history", scope="site") == old
+    assert (old, old + 3600) in {
+        (int(r["start_ts"]), int(r["end_ts"]))
+        for r in repo.failed_ingest_coverage(kind="event_history", scope="site")
+    }
+
+    # A catch-up sweep (empty authoritative read) runs. It retires the expired hole
+    # to 'unrecoverable' (terminal, does not cap the cursor).
+    await catchup_events(repo, FakeEndpoints([]), now=now)
+
+    assert (old, old + 3600) not in {
+        (int(r["start_ts"]), int(r["end_ts"]))
+        for r in repo.failed_ingest_coverage(kind="event_history", scope="site")
+    }
+    row = repo.connection.execute(
+        "SELECT status FROM ingest_coverage WHERE start_ts=? AND end_ts=?",
+        (old, old + 3600),
+    ).fetchone()
+    assert row is not None and row["status"] == "unrecoverable"
+    # The cursor is no longer pinned at the expired hole -- it advanced past it.
+    assert repo.latest_ingest_coverage_end(kind="event_history", scope="site") > old
+
+
+# --------------------------------------------------------------------------- #
+# #w20a-1 / #w20a-2 (exceptional listener termination must SEVER coverage across
+# listener replacement). Round-20 defect: a listener that dies ABNORMALLY -- a
+# storage/queue-full ``RuntimeError`` (#1) or a parser ``ValidationError`` (#2) --
+# left only the exception TEXT in poll_runs, which is NOT a recognized sever
+# label. A fresh replacement listener's heartbeats then BRIDGED straight over the
+# death and over-credited coverage (~0.989 -> a false clear). The supervisor now
+# lands a durable WS break at the death (record_ws_break -> error='unusable', a
+# recognized sever), so coverage ends at the last clean beat before the death and
+# only resumes after the replacement drains cleanly. Any pending unusable-drop
+# obligation the dying listener held is carried forward as a durable break too.
+# --------------------------------------------------------------------------- #
+class _ReplacementBeats:
+    """A replacement listener that proves the feed healthy again by writing clean
+    heartbeats at fixed times, then stops the supervisor. Exposes exactly the
+    surface WsSupervisor.run() wires onto a listener."""
+
+    def __init__(self, repo: Repository, sup_box: dict, beats: list[int]) -> None:
+        self._repo = repo
+        self._sup_box = sup_box
+        self._beats = beats
+        self.on_connection_state: Optional[Any] = None
+        self.on_healthy_drain: Optional[Any] = None
+        self.pipeline_blocked: Optional[Any] = None
+        self.terminal_state: Optional[str] = None
+
+    def pending_records(self) -> list[dict[str, Any]]:
+        return []
+
+    def pending_raw_records(self) -> list[Event]:
+        return []
+
+    async def run(self) -> int:
+        for ts in self._beats:
+            self._repo.record_ws_heartbeat(ts=ts)
+        self._sup_box["sup"].stop()
+        return 0
+
+
+async def _run_death_then_replacement(
+    repo: Repository,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    dying_listener_factory,
+    break_ts: int,
+    replacement_beats: list[int],
+) -> WsSupervisor:
+    """Seed a pre-death covered run (beats 1000, 1030), then run a supervisor whose
+    FIRST listener dies exceptionally and whose SECOND is a clean replacement. The
+    real death break defaults to ``time.time()`` (unassertable), so pin it to a
+    deterministic ``break_ts`` for the coverage assertion."""
+    repo.record_ws_heartbeat(ts=1000)
+    repo.record_ws_heartbeat(ts=1030)
+    real_break = repo.record_ws_break
+    monkeypatch.setattr(repo, "record_ws_break", lambda *, ts=None: real_break(ts=break_ts))
+
+    sup_box: dict[str, Any] = {}
+    attempt = {"n": 0}
+
+    def factory() -> Any:
+        attempt["n"] += 1
+        if attempt["n"] == 1:
+            return dying_listener_factory()
+        return _ReplacementBeats(repo, sup_box, replacement_beats)
+
+    async def fake_sleep(delay: float) -> None:
+        pass
+
+    sup = WsSupervisor(factory, repo, backoff_base=0.0, max_restarts=5, sleep=fake_sleep)
+    sup_box["sup"] = sup
+    await asyncio.wait_for(sup.run(), timeout=5.0)
+    return sup
+
+
+def _assert_incident_severed(repo: Repository) -> None:
+    """Shared assertions for #w20a-1/#w20a-2: a durable break was recorded and the
+    incident window's coverage does NOT bridge the death (severed ~0.65, far below
+    the pre-fix bridged ~0.989 and below the detector floor) -> client.flaky freezes
+    to UNKNOWN over the window."""
+    from types import SimpleNamespace
+
+    breaks = [r for r in repo.read_poll_runs("ws", 0, 100_000) if r["error"] == "unusable"]
+    assert breaks, "an exceptional death must record a durable coverage break"
+    cov = repo.observed_event_coverage(1000, 1093)
+    assert cov < 0.9
+    assert cov < EVENT_COVERAGE_MIN
+
+    # The event-coverage gate every event-based detector routes through now reads
+    # below the floor, so client.flaky returns UNKNOWN instead of a false clear.
+    seed_coverage(repo, job="fast_sta", now=1093, window_s=93, interval_s=30)
+    settings = SimpleNamespace(thresholds={"client.flaky": {"window_s": 93}}, poll=None)
+    ctx = DetectorContext(
+        repo=repo, baselines=FakeBaselines(), now_ts=1093, site_id="default",
+        settings=settings,
+    )
+    assert ctx.event_coverage_ok(93) is False
+    assert FlakyClientDetector().evaluate(ctx) is UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_w20a1_exceptional_death_severs_coverage_no_bridge(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#w20a-1: a listener that drops an unusable event (a pending break obligation)
+    then dies with a queue-full RuntimeError severs coverage across the replacement.
+    Pre-fix the marker was discarded on replacement and the terminal error row did
+    not sever, so the replacement's beats bridged the death (0.989)."""
+    def dying() -> EventListener:
+        return EventListener(
+            FakeWs(
+                [_unusable_event(0)],
+                fail=RuntimeError("WS event storage queue is full"),
+            ),
+            repo,
+            flush_interval=None,
+        )
+
+    await _run_death_then_replacement(
+        repo, monkeypatch, dying_listener_factory=dying,
+        break_ts=1060, replacement_beats=[1062, 1092],
+    )
+    _assert_incident_severed(repo)
+
+
+@pytest.mark.asyncio
+async def test_w20a2_parser_validationerror_death_severs_coverage(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#w20a-2: an explicit events frame whose row is malformed ({"key": []}) raises
+    a pydantic ValidationError inside ws._parse that unwinds the listener BEFORE any
+    disconnect/drop accounting. The exceptional termination must still sever coverage
+    (durable break), so the replacement's beats do not bridge the death (0.989)."""
+    from pydantic import ValidationError
+    from netadmin.ingest.unifi.ws import EventListener as WsEventListener
+
+    # The malformed EXPLICIT events frame genuinely raises out of _parse (key:[] is
+    # not a str), so it really does kill the listener rather than being skipped.
+    with pytest.raises(ValidationError):
+        WsEventListener._parse(
+            json.dumps({"meta": {"message": "events"}, "data": [{"key": [], "time": 1060}]})
+        )
+
+    try:
+        Event.model_validate({"key": [], "time": 1060})
+        raise AssertionError("expected ValidationError")  # pragma: no cover
+    except ValidationError as exc:
+        verr = exc
+
+    def dying() -> EventListener:
+        # The ws double raises the ValidationError out of the frame loop, exactly as
+        # a live _parse crash would, unwinding events-layer listener.run().
+        return EventListener(FakeWs([], fail=verr), repo, flush_interval=None)
+
+    await _run_death_then_replacement(
+        repo, monkeypatch, dying_listener_factory=dying,
+        break_ts=1060, replacement_beats=[1062, 1092],
+    )
+    _assert_incident_severed(repo)
+
+
+# --------------------------------------------------------------------------- #
+# #w20a-3 (falsy / non-string ap_from must be treated as ABSENT, consistently with
+# a byte-identical repository SQL predicate). The rule: an ap_from is a usable mac
+# IFF it is a NON-EMPTY str; every other value falls back to the destination `ap`.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("falsy", [False, 0, [], ""])
+def test_w20a3_falsy_ap_from_treated_as_absent(repo: Repository, falsy: Any) -> None:
+    """#w20a-3: a roam event whose ap_from is a falsy non-string (False/0/[]/"") is
+    attributed with ap_from ABSENT -- related resolves to the destination `ap`, not
+    stranded -- matching what the byte-identical SQL resolvability predicate computes."""
+    ev = Event.model_validate(
+        {
+            "_id": "roam-falsy", "key": "EVT_WU_Roam", "time": 1_721_600_000_000,
+            "user": CLIENT_MAC, "ap": AP_TO_MAC, "ap_from": falsy,
+        }
+    )
+    rec = EventNormalizer(repo).normalize(ev)
+    assert rec is not None
+    assert rec["entity_id"] == entity_id(repo, EntityType.CLIENT, CLIENT_MAC)
+    assert rec["related_entity_id"] == entity_id(repo, EntityType.AP, AP_TO_MAC)
+
+
+def test_w20a3_truthy_nonstring_ap_from_treated_as_absent(repo: Repository) -> None:
+    """#w20a-3 robustness (genuinely red-green): a TRUTHY non-string ap_from -- an int
+    or a non-empty list -- is ALSO absent. Pre-fix ``ap_from or ap`` used the int as a
+    mac (mis-resolving to None) or crashed on the unhashable-list resolution key; the
+    non-empty-str rule rejects both and falls back to the destination `ap`."""
+    for bad in (1, [AP_FROM_MAC]):
+        ev = Event.model_validate(
+            {
+                "_id": "roam-bad", "key": "EVT_WU_Roam", "time": 1_721_600_000_000,
+                "user": CLIENT_MAC, "ap": AP_TO_MAC, "ap_from": bad,
+            }
+        )
+        rec = EventNormalizer(repo).normalize(ev)
+        assert rec is not None
+        assert rec["related_entity_id"] == entity_id(repo, EntityType.AP, AP_TO_MAC)
+
+
+def test_w20a3_string_ap_from_still_used(repo: Repository) -> None:
+    """#w20a-3 control: a genuine NON-EMPTY string ap_from is still honored -- the
+    roam's related AP is the FROM ap, not the destination ap."""
+    ev = Event.model_validate(
+        {
+            "_id": "roam-ok", "key": "EVT_WU_Roam", "time": 1_721_600_000_000,
+            "user": CLIENT_MAC, "ap": AP_TO_MAC, "ap_from": AP_FROM_MAC,
+        }
+    )
+    rec = EventNormalizer(repo).normalize(ev)
+    assert rec is not None
+    assert rec["related_entity_id"] == entity_id(repo, EntityType.AP, AP_FROM_MAC)

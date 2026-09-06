@@ -23,11 +23,19 @@ from netadmin.detect.detectors.client import (
     FlakyClientDetector,
     KnownPathologyDetector,
 )
-from netadmin.detect.engine import UNKNOWN
+from netadmin.detect.catalog import build_catalog
+from netadmin.detect.engine import UNKNOWN, DetectorResult
 from netadmin.domain.entities import Entity
-from netadmin.domain.types import EntityType, Severity
+from netadmin.domain.types import EntityType, FixState, IssueState, Severity
+from netadmin.issues.models import EngineConfig
 from netadmin.store.repository import Repository, SampleReading
-from tests.netadmin.detect.support import FakeBaselines, seed_coverage
+from tests.netadmin.detect.support import (
+    FakeBaselines,
+    build_stack,
+    entry,
+    seed_coverage,
+    seed_event_coverage,
+)
 
 NOW = 4_000_000
 
@@ -108,6 +116,7 @@ def _disconnect(repo: Repository, client_id: int, ap_id: int, ts: int, *, reason
 # ====================================================================== #
 def test_flaky_fires_and_attributes_ap_fault(repo: Repository) -> None:
     seed_coverage(repo, job="fast_sta", now=NOW, window_s=3600, interval_s=60)
+    seed_event_coverage(repo, now=NOW, window_s=3600)  # healthy event feed
     ap = _ap(repo, "ap-1", "ap-lobby")
     # 3 clients, each with many pathological disconnects on the same AP -> ap_fault.
     for i in range(3):
@@ -126,6 +135,7 @@ def test_flaky_fires_and_attributes_ap_fault(repo: Repository) -> None:
 
 def test_flaky_device_attribution_many_aps(repo: Repository) -> None:
     seed_coverage(repo, job="fast_sta", now=NOW, window_s=3600, interval_s=60)
+    seed_event_coverage(repo, now=NOW, window_s=3600)  # healthy event feed
     ap1, ap2 = _ap(repo, "ap-1"), _ap(repo, "ap-2")
     cid = _client(repo, mac="dd:1", ap_id=ap1)
     for k in range(4):
@@ -141,11 +151,81 @@ def test_flaky_confounder_benign_roams_suppressed(repo: Repository) -> None:
     # Reason code 8 (leaving BSS) is benign roam churn: weighted down so a mobile
     # client that roams a lot never reads as flaky.
     seed_coverage(repo, job="fast_sta", now=NOW, window_s=3600, interval_s=60)
+    seed_event_coverage(repo, now=NOW, window_s=3600)  # healthy event feed
     ap = _ap(repo, "ap-1")
     cid = _client(repo, mac="ee:1", ap_id=ap)
     for k in range(20):
         _disconnect(repo, cid, ap, NOW - 100 - k * 10, reason=8)
     assert FlakyClientDetector().evaluate(_ctx(repo)) == []
+
+
+# ====================================================================== #
+# client.flaky — B4: event-feed gaps must not false-clear event-based issues
+# ====================================================================== #
+def test_flaky_unknown_when_event_feed_gap_despite_healthy_poll(repo: Repository) -> None:
+    """B4(a): client polling is healthy and the disconnect events have aged out,
+    but the event feed had a coverage gap over the window. The verdict is built
+    from events, so returning ``[]`` here would false-clear a real open issue.
+    The detector must return UNKNOWN (freeze), not a clean empty list."""
+    seed_coverage(repo, job="fast_sta", now=NOW, window_s=3600, interval_s=60)
+    # No event coverage recorded -> the event source was NOT observed this window.
+    ap = _ap(repo, "ap-1")
+    _client(repo, mac="bb:1", ap_id=ap)  # client present, but its disc events aged out
+    assert FlakyClientDetector().evaluate(_ctx(repo)) is UNKNOWN
+
+
+def test_flaky_clears_when_event_feed_healthy_and_events_gone(repo: Repository) -> None:
+    """B4(b): with the event feed observed across the window and the disconnects
+    genuinely gone, the detector returns a clean ``[]`` -> a real clear. Event
+    coverage gates freezing, it does not block a legitimate resolution."""
+    seed_coverage(repo, job="fast_sta", now=NOW, window_s=3600, interval_s=60)
+    seed_event_coverage(repo, now=NOW, window_s=3600)  # healthy event feed, no events
+    ap = _ap(repo, "ap-1")
+    _client(repo, mac="bb:2", ap_id=ap)
+    assert FlakyClientDetector().evaluate(_ctx(repo)) == []
+
+
+def test_event_feed_gap_does_not_verify_a_flaky_fix(repo: Repository) -> None:
+    """B4(c): an applied fix must NOT be credited/greenlit while the event feed
+    was down. A real flaky-client issue fires and a fix is applied; later the
+    event feed has a coverage gap (client polling still healthy, disconnects aged
+    out). Driven through the real engine + issue lifecycle, the clean-looking pass
+    must FREEZE (UNKNOWN) -- the issue stays ACTIVE and the fix stays APPLIED,
+    never resolved-and-VERIFIED on missing event data."""
+    t1 = NOW
+    catalog = build_catalog([entry(FlakyClientDetector(), ceiling=Severity.P2)])
+    stack = build_stack(
+        repo, catalog=catalog, issue_config=EngineConfig(default_m=1, default_k=1)
+    )
+
+    # Phase 1: healthy feed + real disconnects -> the issue fires and goes ACTIVE.
+    seed_coverage(repo, job="fast_sta", now=t1, window_s=3600, interval_s=60)
+    seed_event_coverage(repo, now=t1, window_s=3600)
+    ap = _ap(repo, "ap-1")
+    cid = _client(repo, mac="gg:1", ap_id=ap)
+    for k in range(6):
+        _disconnect(repo, cid, ap, t1 - 100 - k * 10, reason=1)
+    stack.detector_engine.run_window(t1)
+    issue = [r for r in repo.list_issues(open_only=True) if r["detector_key"] == KEY_FLAKY][0]
+    assert issue["state"] == IssueState.ACTIVE.value
+    stack.issue_engine.apply_fix(int(issue["id"]), t1)  # arm the 48 h verification window
+
+    # Phase 2: event-feed gap. fast_sta healthy at t2; NO event coverage recorded
+    # for the new window; the disconnects have aged out. The client is still on
+    # the air (re-seen), so this is a feed gap, not a departure.
+    t2 = t1 + 3600
+    seed_coverage(repo, job="fast_sta", now=t2, window_s=3600, interval_s=60)
+    repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="gg:1", site_id="default", parent_id=ap),
+        ts=t2,
+    )  # keep last_seen fresh -> not "departed"
+    stack.detector_engine.run_window(t2)
+    stack.detector_engine.run_window(t2)  # even repeated clean-looking passes must not clear
+
+    still = [r for r in repo.list_issues(open_only=True) if r["detector_key"] == KEY_FLAKY]
+    assert len(still) == 1, "the issue was false-cleared during the event-feed gap"
+    assert still[0]["state"] == IssueState.ACTIVE.value  # frozen, not resolving/resolved
+    assert still[0]["fix_state"] != FixState.VERIFIED.value  # fix NOT credited on missing data
 
 
 def test_flaky_unknown_on_low_coverage(repo: Repository) -> None:
@@ -157,6 +237,56 @@ def test_flaky_unknown_on_low_coverage(repo: Repository) -> None:
     repo.record_poll_run(job="fast_sta", ok=True, ts=NOW - 120)
     repo.record_poll_run(job="fast_sta", ok=True, ts=NOW - 60)
     assert FlakyClientDetector().evaluate(_ctx(repo)) is UNKNOWN
+
+
+def test_w17a1_flaky_freezes_when_same_second_disconnects_sever_ws_coverage(
+    repo: Repository,
+) -> None:
+    """#w17a-1 end to end: a WS feed CONNECTED ~30 s out of every 90 s, whose drop
+    is recorded in the SAME second as the c+30 beat, must read as mostly UNCOVERED
+    so a real client.flaky issue FREEZES. Pre-fix the same-second disconnect was
+    ignored (the sever test was strictly between beats), the 60 s c+30 -> c+90 gap
+    fell inside the cadence bridge, and ~98% fabricated coverage false-cleared the
+    issue. No ingest_coverage is seeded, so the WS heartbeats are the only
+    event-source signal."""
+    seed_coverage(repo, job="fast_sta", now=NOW, window_s=3600, interval_s=60)
+    c = NOW - 3600
+    while c < NOW:
+        repo.record_ws_heartbeat(ts=c)
+        repo.record_ws_heartbeat(ts=c + 30)
+        # The drop shares the c+30 beat's second, recorded just after it.
+        repo.record_poll_run(
+            job="ws", ok=True, ts=c + 30, error="disconnected", source="live"
+        )
+        c += 90
+    ap = _ap(repo, "ap-1")
+    cid = _client(repo, mac="ss:1", ap_id=ap)
+    for k in range(6):
+        _disconnect(repo, cid, ap, NOW - 100 - k * 10, reason=1)
+    assert FlakyClientDetector().evaluate(_ctx(repo)) is UNKNOWN
+
+
+def test_w17a1_flaky_fires_when_healthy_ws_feed_missed_one_beat(
+    repo: Repository,
+) -> None:
+    """#w17a-1 control: a healthy WS feed (one missed beat, NO disconnect) stays
+    covered, so the same disconnects fire a verdict rather than freezing -- the
+    closed-interval sever does not break the healthy single-missed-beat bridge."""
+    seed_coverage(repo, job="fast_sta", now=NOW, window_s=3600, interval_s=60)
+    ts = NOW - 3600 - 30
+    skip_at = NOW - 1800
+    while ts < NOW:
+        if ts != skip_at:
+            repo.record_ws_heartbeat(ts=ts)
+        ts += 30
+    repo.record_ws_heartbeat(ts=NOW - 1)
+    ap = _ap(repo, "ap-1")
+    cid = _client(repo, mac="ss:2", ap_id=ap)
+    for k in range(6):
+        _disconnect(repo, cid, ap, NOW - 100 - k * 10, reason=1)
+    findings = FlakyClientDetector().evaluate(_ctx(repo))
+    assert findings is not UNKNOWN
+    assert len(findings) == 1
 
 
 # ====================================================================== #
@@ -235,6 +365,7 @@ def test_dhcp_association_without_ip_fires_with_gateway(repo: Repository) -> Non
 # ====================================================================== #
 def test_known_pathology_iot_pmf_fires(repo: Repository) -> None:
     seed_coverage(repo, job="fast_sta", now=NOW, window_s=3600, interval_s=60)
+    seed_event_coverage(repo, now=NOW, window_s=3600)  # healthy event feed
     ap = _ap(repo, "ap-1")
     cid = _client(repo, mac="io:1", name="ESP32-sensor", ap_id=ap)
     for k in range(4):
@@ -262,6 +393,7 @@ def test_known_pathology_confounder_iot_without_symptom_quiet(repo: Repository) 
     # A 2.4-only IoT device that is NOT disconnecting is not a pathology: symptom
     # required, never inventory-only.
     seed_coverage(repo, job="fast_sta", now=NOW, window_s=3600, interval_s=60)
+    seed_event_coverage(repo, now=NOW, window_s=3600)  # healthy event feed -> a real clear
     _client(repo, mac="io:2", name="esp8266-plug", ap_id=_ap(repo, "ap-1"))
     assert KnownPathologyDetector().evaluate(_ctx(repo)) == []
 
@@ -275,8 +407,126 @@ def test_known_pathology_unknown_on_low_coverage(repo: Repository) -> None:
     assert KnownPathologyDetector().evaluate(_ctx(repo)) is UNKNOWN
 
 
+# ---------------------------------------------------------------------- #
+# client.known_pathology — B4/#8: event-feed gaps must not false-clear the
+# event-driven iot_pmf_11r arm (its verdict consumes DISCONNECT EVENTS but the
+# detector only gated on CLIENT-POLL coverage). The ios_aggressive_roam arm is
+# poll-driven and must be untouched by the event gate.
+# ---------------------------------------------------------------------- #
+def test_known_pathology_iot_freezes_when_event_feed_gap_despite_healthy_poll(
+    repo: Repository,
+) -> None:
+    """B4(a): an ESP32's client poll is healthy and its disconnect events have aged
+    out, but the event feed had a coverage gap over the window. The iot_pmf_11r
+    verdict is built from those events, so returning a clean list here would let
+    the engine clear a real, still-open issue by absence. The detector must FREEZE
+    the client (mark it UNKNOWN / advance nothing), not clear it."""
+    seed_coverage(repo, job="fast_sta", now=NOW, window_s=3600, interval_s=60)
+    # No event coverage recorded -> the event source was NOT observed this window.
+    ap = _ap(repo, "ap-1")
+    cid = _client(repo, mac="io:gap", name="ESP32-sensor", ap_id=ap)  # disc events aged out
+
+    result = KnownPathologyDetector().evaluate(_ctx(repo))
+    assert isinstance(result, DetectorResult), "an event-feed gap must freeze, not clear"
+    assert result.findings == []  # nothing fired on untrustworthy event data
+    assert result.unknown_entities == {cid}  # the IoT client is frozen, not cleared
+
+
+def test_known_pathology_iot_clears_when_event_feed_healthy_and_disconnects_gone(
+    repo: Repository,
+) -> None:
+    """B4(b): with the event feed observed across the window and the disconnects
+    genuinely gone, the detector returns a plain (bare-list) clean verdict -> a
+    real clear. The event gate freezes only across a gap; it never blocks a
+    legitimate resolution."""
+    seed_coverage(repo, job="fast_sta", now=NOW, window_s=3600, interval_s=60)
+    seed_event_coverage(repo, now=NOW, window_s=3600)  # healthy event feed, no events
+    ap = _ap(repo, "ap-1")
+    _client(repo, mac="io:ok", name="ESP32-sensor", ap_id=ap)
+
+    result = KnownPathologyDetector().evaluate(_ctx(repo))
+    assert result == []  # a bare list -> a real clear, no frozen entities
+    assert not isinstance(result, DetectorResult)
+
+
+def test_known_pathology_ios_roam_arm_is_poll_only_and_unaffected_by_event_gap(
+    repo: Repository,
+) -> None:
+    """B4(c): the ios_aggressive_roam arm is driven by ``roam_count`` *samples*
+    (client polling), not events. It must keep firing during an event-feed gap:
+    the event gate is applied only to the event-driven iot_pmf_11r arm, so
+    poll-only behaviour is unchanged."""
+    seed_coverage(repo, job="fast_sta", now=NOW, window_s=3600, interval_s=60)
+    # Deliberately NO event coverage: the event feed is down this window.
+    cid = _client(repo, mac="ap:gap", name="Janes-iPhone-15")
+    pts = [(NOW - 3000 + i * 60, float(i)) for i in range(0, 8)]  # deltas sum to >= 5
+    repo.record_samples(SampleReading(cid, "roam_count", ts, v) for ts, v in pts)
+
+    findings = KnownPathologyDetector().evaluate(_ctx(repo))
+    assert not isinstance(findings, DetectorResult)  # a plain list, nothing frozen
+    assert len(findings) == 1
+    assert findings[0].evidence["pathology"] == "ios_aggressive_roam"
+
+
+def test_event_feed_gap_does_not_false_clear_an_active_iot_pathology_issue(
+    repo: Repository,
+) -> None:
+    """B4/#8 end-to-end: an active iot_pmf_11r issue must NOT resolve while the
+    event feed is down. An ESP32 fires the pathology and goes ACTIVE; a fix is
+    applied. Later the event feed has a coverage gap (client polling still healthy,
+    the disconnects aged out). Driven through the real engine + issue lifecycle,
+    repeated clean-looking passes must FREEZE -- the issue stays open and ACTIVE
+    and the fix is never credited/VERIFIED on missing event data. This is the exact
+    round-10 repro (resolved, clear streak 6, event coverage 0.0)."""
+    t1 = NOW
+    catalog = build_catalog([entry(KnownPathologyDetector(), ceiling=Severity.P3)])
+    stack = build_stack(
+        repo, catalog=catalog, issue_config=EngineConfig(default_m=1, default_k=1)
+    )
+
+    # Phase 1: healthy feed + real disconnects -> the pathology fires and goes ACTIVE.
+    seed_coverage(repo, job="fast_sta", now=t1, window_s=3600, interval_s=60)
+    seed_event_coverage(repo, now=t1, window_s=3600)
+    ap = _ap(repo, "ap-1")
+    cid = _client(repo, mac="io:e2e", name="ESP32-sensor", ap_id=ap)
+    for k in range(4):
+        _disconnect(repo, cid, ap, t1 - 100 - k * 10, reason=15)
+    stack.detector_engine.run_window(t1)
+    issue = [
+        r for r in repo.list_issues(open_only=True) if r["detector_key"] == KEY_KNOWN_PATHOLOGY
+    ][0]
+    assert issue["state"] == IssueState.ACTIVE.value
+    stack.issue_engine.apply_fix(int(issue["id"]), t1)  # arm the verification window
+
+    # Phase 2: event-feed gap. fast_sta healthy at t2; NO event coverage recorded
+    # for the new window; the disconnects have aged out. The client is re-seen, so
+    # this is a feed gap, not a departure.
+    t2 = t1 + 3600
+    seed_coverage(repo, job="fast_sta", now=t2, window_s=3600, interval_s=60)
+    repo.upsert_entity(
+        Entity(
+            entity_type=EntityType.CLIENT,
+            native_id="io:e2e",
+            site_id="default",
+            name="ESP32-sensor",
+            parent_id=ap,
+        ),
+        ts=t2,
+    )  # keep last_seen fresh -> not "departed"
+    stack.detector_engine.run_window(t2)
+    stack.detector_engine.run_window(t2)  # even repeated clean-looking passes must not clear
+
+    still = [
+        r for r in repo.list_issues(open_only=True) if r["detector_key"] == KEY_KNOWN_PATHOLOGY
+    ]
+    assert len(still) == 1, "the iot_pmf_11r issue was false-cleared during the event-feed gap"
+    assert still[0]["state"] == IssueState.ACTIVE.value  # frozen, not resolving/resolved
+    assert still[0]["fix_state"] != FixState.VERIFIED.value  # fix NOT credited on missing data
+
+
 def test_known_pathology_threshold_override(repo: Repository) -> None:
     seed_coverage(repo, job="fast_sta", now=NOW, window_s=3600, interval_s=60)
+    seed_event_coverage(repo, now=NOW, window_s=3600)  # healthy event feed
     ap = _ap(repo, "ap-1")
     cid = _client(repo, mac="io:4", name="ESP32", ap_id=ap)
     _disconnect(repo, cid, ap, NOW - 100, reason=15)  # only 1 disconnect
@@ -289,6 +539,7 @@ def test_known_pathology_threshold_override(repo: Repository) -> None:
 
 def _iot_client_with_disconnects(repo: Repository, *, mac: str, name: str) -> None:
     seed_coverage(repo, job="fast_sta", now=NOW, window_s=3600, interval_s=60)
+    seed_event_coverage(repo, now=NOW, window_s=3600)  # healthy event feed
     ap = _ap(repo, "ap-1")
     cid = _client(repo, mac=mac, name=name, ap_id=ap)
     for k in range(4):

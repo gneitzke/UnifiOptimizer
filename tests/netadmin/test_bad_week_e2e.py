@@ -137,6 +137,21 @@ class Site:
             for job in ("fast_device", "fast_sta"):
                 for ts in range(NOW - 25 * 3600, NOW + 1, 60):
                     self.repo.record_poll_run(job=job, ok=True, ts=ts)
+        # The event feed was up across the whole retained history (a good week+),
+        # so the event-source coverage ledger spans it. Event-based detectors gate
+        # on this so a dead feed can't falsely clear/emit an issue (B4). It must
+        # cover not just the last 25 h but the longer look-back the change-point
+        # detectors compare over -- net.firmware_regression compares pre/post
+        # windows around an upgrade ~2 days ago, so both sides must read as
+        # observed. The live pipeline records this as WS/catch-up reads land.
+        self.repo.record_ingest_coverage(
+            kind="event_history",
+            scope="site",
+            interval="retained",
+            start_ts=NOW - 8 * DAY,
+            end_ts=NOW,
+            status="complete",
+        )
 
     def degrading_cable(self) -> None:
         # rx_errors ramp: a sparse low history, a dense high tail in the last 15 min.

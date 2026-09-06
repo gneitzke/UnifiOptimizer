@@ -1178,3 +1178,1071 @@ def test_open_read_only_never_migrates(tmp_db_path: Path) -> None:
             repo.upsert_entity(Entity(entity_type=EntityType.AP, native_id="cc:00"), ts=1)
     finally:
         repo.close()
+
+
+# ---------------------------------------------------------------------------
+# B4: observed_event_coverage -- the honest event-feed gap signal
+#
+# POSITIVE-LIVENESS redesign: coverage is credited only across spans carrying WS
+# liveness HEARTBEATS (record_ws_heartbeat), never through end_ts on a still-open
+# 'connected' row. Beats no more than _WS_HEARTBEAT_MAX_GAP_S apart chain into a
+# continuous covered run; coverage ends at the LAST beat.
+# ---------------------------------------------------------------------------
+def _seed_heartbeats(repo: Repository, start: int, end: int, *, step: int = 60) -> None:
+    """Seed WS liveness heartbeats across ``[start, end]`` at ``step``.
+
+    Both endpoints are guaranteed to carry a beat regardless of alignment, so the
+    covered run reaches exactly ``[start, end]``.
+    """
+    ts = start
+    while ts < end:
+        repo.record_ws_heartbeat(ts=ts)
+        ts += step
+    repo.record_ws_heartbeat(ts=end)
+
+
+def test_observed_event_coverage_credits_healthy_connected_ws(repo: Repository) -> None:
+    """B4(c): a healthy WS-only deployment that is CONNECTED and draining emits a
+    steady stream of liveness heartbeats, so it reads as (effectively) fully
+    covered even with NO history-catchup rows -- 'no catch-up rows yet' must not
+    mean 'frozen forever'. Coverage is bounded by the LAST heartbeat (never
+    credited past it), so it is one heartbeat cadence short of the window edge,
+    which is still far above the 0.5 sufficiency floor."""
+    now = 2_000_000
+    start = now - 3600
+    # A prior beat just before the window bridges the leading edge; beats then run
+    # every 60 s right up to the window end.
+    _seed_heartbeats(repo, start - 60, now - 1, step=60)
+    cov = repo.observed_event_coverage(start, now)
+    assert cov >= 0.99
+    assert cov <= 1.0
+
+
+def test_observed_event_coverage_does_not_bridge_a_real_outage(repo: Repository) -> None:
+    """B4(f) (verifier round 4): heartbeats that resume after an outage must NOT
+    bridge the gap. A feed connected only ~30 s out of every 180 s (down or
+    reconnecting the rest of the time) must read as mostly UNCOVERED -- otherwise
+    a real event-based issue false-resolves across the outage. The old 150 s
+    bridge spanned these gaps and reported ~97% coverage; the tightened bridge
+    (~2.5x the 30 s beat cadence) leaves the outages as real holes."""
+    now = 2_000_000
+    start = now - 3600
+    # Two beats 30 s apart, then a 150 s silent gap (5 missed beats), repeating.
+    t = start
+    while t < now:
+        repo.record_ws_heartbeat(ts=t)
+        repo.record_ws_heartbeat(ts=t + 30)
+        t += 180
+    cov = repo.observed_event_coverage(start, now)
+    # ~30 covered out of every 180 -> well under the 0.9 event-gap sufficiency
+    # floor, so event-based verdicts correctly freeze to UNKNOWN.
+    assert cov < 0.3
+
+
+def test_observed_event_coverage_no_heartbeats_credits_nothing(
+    repo: Repository,
+) -> None:
+    """B4(a): a socket that emitted no liveness heartbeats credits ZERO coverage --
+    even if 'started'/'connected' transition rows exist. Those transitions drive
+    only the health string; a feed with no positive liveness was not observed.
+    Under the old close-event design a dangling 'connected' read as 100% and
+    false-cleared real event issues."""
+    now = 2_000_000
+    start = now - 3600
+    # Transition rows present, but not one heartbeat: no positive evidence.
+    repo.record_poll_run(job="ws", ok=True, ts=start - 100, error="started", source="live")
+    repo.record_poll_run(job="ws", ok=True, ts=start - 50, error="connected", source="live")
+    assert repo.observed_event_coverage(start, now) == 0.0
+
+
+def test_observed_event_coverage_ws_heartbeats_inside_window(repo: Repository) -> None:
+    """A feed that only began heartbeating partway through the window covers only
+    from the first beat onward -- the earlier, beat-less span credits nothing."""
+    now = 2_000_000
+    start = now - 3600
+    # Heartbeats only across the second half [start+1800 .. now].
+    _seed_heartbeats(repo, start + 1800, now - 1, step=60)
+    cov = repo.observed_event_coverage(start, now)
+    # ~0.5 (bounded above by the last beat), comfortably under full.
+    assert cov == pytest.approx(0.5, abs=0.02)
+    assert cov < 0.6
+
+
+def test_observed_event_coverage_heartbeats_stop_ends_interval(
+    repo: Repository,
+) -> None:
+    """B4(b): heartbeats that stop (a drop, a shutdown, or a stalled feed) end
+    coverage at the LAST beat, not through end_ts. Beats run for the first 600 s
+    of the hour then cease; coverage is ~0.167, below the sufficiency floor ->
+    UNKNOWN. The old code left the interval open through end_ts (a false 100%)."""
+    now = 2_000_000
+    start = now - 3600
+    # A prior beat bridges the leading edge; beats run start..start+600 then stop.
+    _seed_heartbeats(repo, start - 60, start + 600, step=60)
+    cov = repo.observed_event_coverage(start, now)
+    assert cov == pytest.approx(600 / 3600, abs=0.02)
+    assert cov < 0.9
+
+
+def test_observed_event_coverage_large_gap_reads_as_uncovered(repo: Repository) -> None:
+    """B4(c): a real large gap still freezes. Two short bursts of heartbeats with a
+    gap far larger than _WS_HEARTBEAT_MAX_GAP_S between them do NOT chain: the
+    empty middle is a genuine hole, so coverage stays well below full -> UNKNOWN."""
+    now = 2_000_000
+    start = now - 3600
+    _seed_heartbeats(repo, start, start + 300, step=60)      # early burst
+    _seed_heartbeats(repo, now - 360, now - 1, step=60)      # late burst
+    cov = repo.observed_event_coverage(start, now)
+    # ~ (300 + ~360) / 3600 -- the big middle gap is uncovered.
+    assert cov < 0.3
+
+
+def test_observed_event_coverage_unions_ws_and_history(repo: Repository) -> None:
+    """WS heartbeat intervals and completed history reads are merged, not double
+    counted: heartbeats cover the first 600 s, a catch-up row the last 600 s ->
+    ~0.33."""
+    now = 2_000_000
+    start = now - 3600
+    _seed_heartbeats(repo, start, start + 600, step=60)
+    repo.record_ingest_coverage(
+        kind="event_history", scope="site", interval="retained",
+        start_ts=now - 600, end_ts=now, status="complete",
+    )
+    assert repo.observed_event_coverage(start, now) == pytest.approx(1200 / 3600, abs=0.02)
+
+
+def test_observed_event_coverage_stale_disconnect_write_cannot_overcredit(
+    repo: Repository,
+) -> None:
+    """B4: a MISSING or failed 'disconnected' close row can no longer over-credit.
+    Coverage is bounded by the last heartbeat regardless of any close row: here a
+    dangling 'connected' with NO closing 'disconnected' and beats only over the
+    first 600 s reads ~0.167, not 100%."""
+    now = 2_000_000
+    start = now - 3600
+    repo.record_poll_run(job="ws", ok=True, ts=start - 100, error="connected", source="live")
+    _seed_heartbeats(repo, start - 60, start + 600, step=60)
+    # No 'disconnected' row was ever written (the failed-close path).
+    cov = repo.observed_event_coverage(start, now)
+    assert cov == pytest.approx(600 / 3600, abs=0.02)
+    assert cov < 0.9
+
+
+def test_w16a1_recorded_disconnect_severs_heartbeat_bridge(repo: Repository) -> None:
+    """#w16a-1 (B4 re-opening): the heartbeat cadence bridge must NOT span a
+    recorded WS DISCONNECT.
+
+    Repro: the feed connects ~32 s out of every 90 s (beats at c+0 and c+30) and
+    is DISCONNECTED the other ~58 s (a disconnect row at c+32, reconnect before the
+    next cycle). The last beat of a cycle (c+30) and the first of the next (c+90)
+    are 60 s apart -- inside the 75 s cadence bridge -- so the pure-cadence bridge
+    joined them and fabricated ~98% coverage over a feed that was actually down
+    most of the time. With the disconnect-aware bridge, the recorded disconnect at
+    c+32 severs the chain: coverage is only the ~30 s connected slice per 90 s
+    cycle (~0.33), far below the 0.9 event-gap sufficiency floor, so event-based
+    detectors correctly FREEZE (UNKNOWN) over the disconnected spans.
+    """
+    now = 2_000_000
+    start = now - 3600
+    c = start
+    while c < now:
+        repo.record_ws_heartbeat(ts=c)
+        repo.record_ws_heartbeat(ts=c + 30)
+        # The supervisor records a disconnect transition when the socket drops.
+        repo.record_poll_run(
+            job="ws", ok=True, ts=c + 32, error="disconnected", source="live"
+        )
+        c += 90
+    cov = repo.observed_event_coverage(start, now)
+    # ~30 covered out of every 90 -> ~0.33, WELL below the 0.9 floor.
+    assert cov < 0.5
+    assert cov == pytest.approx(30 / 90, abs=0.05)
+
+
+def test_w16a1_missed_beat_still_bridges_without_a_disconnect(repo: Repository) -> None:
+    """#w16a-1 control: a healthy, continuously-CONNECTED feed with one missed beat
+    (a 60 s gap and NO disconnect row) still bridges -- the cadence bridge is
+    preserved for a genuinely-connected span. Only a recorded disconnect severs."""
+    now = 2_000_000
+    start = now - 3600
+    # Beats every 30 s across the whole window, EXCEPT one dropped beat mid-window
+    # (a single 60 s gap). No disconnect transition is ever recorded.
+    ts = start - 30
+    skip_at = start + 1800
+    while ts < now:
+        if ts != skip_at:
+            repo.record_ws_heartbeat(ts=ts)
+        ts += 30
+    repo.record_ws_heartbeat(ts=now - 1)
+    cov = repo.observed_event_coverage(start, now)
+    # The 60 s gap is bridged (<=75 s, no disconnect), so coverage stays ~full.
+    assert cov >= 0.99
+
+
+def test_w17a1_same_second_disconnect_severs_heartbeat_bridge(repo: Repository) -> None:
+    """#w17a-1: a disconnect that shares a heartbeat's SECOND must still sever.
+
+    Timestamps are integer-second, so a recorded disconnect very often lands in the
+    exact same second as a beat. The old sever test was STRICTLY between two beats
+    (a < ts < b), so a disconnect at c+30 -- the same second as the c+30 beat,
+    recorded just after it -- was ignored: the 60 s c+30 -> c+90 gap fell inside the
+    75 s cadence bridge and fabricated ~98% coverage over a feed that was actually
+    down ~2/3 of every cycle. The closed-interval, rowid-ordered sever counts that
+    same-second disconnect (it orders after the c+30 beat and at/inside the
+    c+30..c+90 bridge), so coverage is only the ~30 s connected slice per 90 s cycle
+    (~0.33), far below the 0.9 floor -> detectors FREEZE over the down spans."""
+    now = 2_500_000
+    start = now - 3600
+    c = start
+    while c < now:
+        repo.record_ws_heartbeat(ts=c)
+        repo.record_ws_heartbeat(ts=c + 30)
+        # The disconnect lands in the SAME second as the c+30 beat, recorded just
+        # after it (a higher poll_runs rowid). Pre-fix this was NOT strictly between
+        # c+30 and c+90 and so never severed the bridge.
+        repo.record_poll_run(
+            job="ws", ok=True, ts=c + 30, error="disconnected", source="live"
+        )
+        c += 90
+    cov = repo.observed_event_coverage(start, now)
+    # ~30 covered out of every 90 -> ~0.33, WELL below the 0.9 floor.
+    assert cov < 0.9
+    assert cov == pytest.approx(30 / 90, abs=0.05)
+
+
+def test_w17a1_healthy_feed_with_one_missed_beat_still_covered(repo: Repository) -> None:
+    """#w17a-1 control: the closed-interval sever must NOT break the healthy bridge.
+
+    A continuously-connected feed with a single missed beat (a 60 s gap, NO
+    disconnect row at all) still bridges to ~full coverage: the sever only fires on
+    a recorded disconnect, never on cadence alone."""
+    now = 2_500_000
+    start = now - 3600
+    ts = start - 30
+    skip_at = start + 1800
+    while ts < now:
+        if ts != skip_at:
+            repo.record_ws_heartbeat(ts=ts)
+        ts += 30
+    repo.record_ws_heartbeat(ts=now - 1)
+    cov = repo.observed_event_coverage(start, now)
+    assert cov >= 0.99
+
+
+def test_w16a5_out_of_range_int_port_not_accepted_then_mismatched(
+    repo: Repository,
+) -> None:
+    """#w16a-5: an out-of-SQLite-signed-range integer port must NOT be
+    accepted-then-mismatched.
+
+    ``json_extract`` renders an integer above 2**63-1 as a FLOAT (json_type still
+    reports 'integer'), so the pre-fix SQL built a scientific-notation port
+    native_id (``"<sw>:9.22...e+18"``) while the normalizer built the full decimal
+    (``"<sw>:9223372036854775808"``). With a PORT entity matching the SQL's
+    rendering present, the row read forever-'resolvable' yet reconcile could NEVER
+    fill it, floating to the head of the window and starving newer repairable rows.
+    After the bound, both sides reject an out-of-range port (route to the SWITCH);
+    with the switch absent the row is correctly unresolvable and never starves the
+    newer, genuinely-repairable row.
+    """
+    from netadmin.ingest.events import EventNormalizer
+    from netadmin.store.repository import _EVENT_RECONCILE_MAX_ATTEMPTS
+
+    huge = 9223372036854775808  # 2**63, above SQLite's signed-int range
+    unknown_sw = "02:00:de:ad:be:ef"  # switch deliberately NOT in inventory
+    # A PORT entity whose native_id matches exactly what the buggy SQL derived.
+    repo.upsert_entity(
+        Entity(entity_type=EntityType.PORT, native_id=f"{unknown_sw}:9.22337203685478e+18"),
+        ts=500,
+    )
+    huge_ev = repo.record_event(
+        ts=1000, key="EVT_SW_StpPortBlocking", entity_id=None, related_entity_id=None,
+        native_id="stp-huge",
+        data={"key": "EVT_SW_StpPortBlocking", "time": 1000 * 1000,
+              "sw": unknown_sw, "port": huge},
+    )
+    assert huge_ev is not None
+    for _ in range(_EVENT_RECONCILE_MAX_ATTEMPTS):
+        repo.bump_event_reconcile_attempts([huge_ev])
+
+    # A newer, genuinely repairable STP row: its normal INTEGER port IS in inventory.
+    good_sw = "02:00:11:22:33:aa"
+    good_port = repo.upsert_entity(
+        Entity(entity_type=EntityType.PORT, native_id=f"{good_sw}:2"), ts=8000
+    )
+    newer = repo.record_event(
+        ts=9000, key="EVT_SW_StpPortBlocking", entity_id=None, related_entity_id=None,
+        native_id="stp-good",
+        data={"key": "EVT_SW_StpPortBlocking", "time": 9000 * 1000,
+              "sw": good_sw, "port": 2},
+    )
+    assert newer is not None
+
+    # The out-of-range row is NOT falsely resolvable, so with limit=1 only the
+    # genuinely-resolvable newer row is selected (pre-fix, the huge row won the slot).
+    selected = {int(r["id"]) for r in repo.unresolved_events(limit=1)}
+    assert selected == {newer}
+
+    # End-to-end: reconcile fills the newer row's real port; the huge row stays NULL.
+    repaired = EventNormalizer(repo).reconcile_unresolved(limit=500)
+    assert repaired == 1
+    assert repo._conn.execute(
+        "SELECT entity_id FROM events WHERE id=?", (newer,)
+    ).fetchone()["entity_id"] == good_port
+    assert repo._conn.execute(
+        "SELECT entity_id FROM events WHERE id=?", (huge_ev,)
+    ).fetchone()["entity_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# New-bug: no DDL on the read path; a missing coverage table reads as unknown
+# ---------------------------------------------------------------------------
+def test_observed_event_coverage_missing_table_returns_unknown(repo: Repository) -> None:
+    """The reader must tolerate an absent ingest_coverage table without raising and
+    without issuing DDL (which a read-only connection would reject)."""
+    with repo._write() as conn:
+        conn.execute("DROP TABLE IF EXISTS ingest_coverage")
+    assert not repo._table_exists("ingest_coverage")
+    assert repo.observed_event_coverage(1000, 2000) == 0.0
+    # The read issued no CREATE TABLE: the table is still absent.
+    assert not repo._table_exists("ingest_coverage")
+    # The other ledger readers degrade the same way rather than raising.
+    assert repo.failed_ingest_coverage(kind="event_history", scope="site") == []
+    assert repo.latest_ingest_coverage_end(kind="event_history", scope="site") is None
+
+
+def test_observed_event_coverage_read_only_missing_table(tmp_db_path: Path) -> None:
+    """The exact new-bug repro: on a migrated database whose coverage table is
+    absent, a READ-ONLY connection reads unknown coverage instead of raising
+    OperationalError from a lazily-issued CREATE TABLE."""
+    rw = Repository.open(tmp_db_path)
+    with rw._write() as conn:
+        conn.execute("DROP TABLE ingest_coverage")
+    rw.close()
+    ro = Repository.open(tmp_db_path, read_only=True, migrate=True)
+    try:
+        assert ro.observed_event_coverage(1000, 2000) == 0.0
+    finally:
+        ro.close()
+
+
+# ---------------------------------------------------------------------------
+# C7: reconciliation must not let unrepairable AP events starve repairable ones
+# ---------------------------------------------------------------------------
+def test_unresolved_events_ap_flood_does_not_starve_repairable_client(repo: Repository) -> None:
+    """C7: ordinary AP events legitimately have NO related entity, so their
+    related_entity_id is permanently NULL. A flood of them (oldest) must not fill
+    the LIMIT window and starve a later, genuinely-repairable client event whose
+    primary entity has not resolved yet."""
+    ap = repo.upsert_entity(Entity(entity_type=EntityType.AP, native_id="ap:mac"), ts=1000)
+    # 600 AP events: primary resolved to the AP, related permanently NULL.
+    for i in range(600):
+        repo.record_event(
+            ts=1000 + i, key="EVT_AP_Lost_Contact", entity_id=ap,
+            related_entity_id=None, native_id=f"apev-{i}", data={"ap": "ap:mac"},
+        )
+    # A repairable client event arriving later: its client is named in the payload
+    # (so it can resolve) but is not yet in inventory.
+    client_ev = repo.record_event(
+        ts=9000, key="EVT_WU_Disconnected", entity_id=None,
+        related_entity_id=None, native_id="cliev", data={"user": "cli:mac"},
+    )
+
+    rows = repo.unresolved_events(limit=500)
+    returned = {int(r["id"]) for r in rows}
+    # The unrepairable AP flood is excluded; the repairable client event is present.
+    assert client_ev in returned
+    assert len(rows) == 1
+
+
+def test_unresolved_events_keeps_client_with_pending_related(repo: Repository) -> None:
+    """A client event whose primary (client) resolved but whose from-AP is still
+    pending (related NULL) IS repairable and must still be selected."""
+    client = repo.upsert_entity(Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=1000)
+    # The from-AP is named in the payload but not yet in inventory (still pending):
+    # its identity exists, so the row is genuinely repairable and must be selected.
+    ev = repo.record_event(
+        ts=2000, key="EVT_WU_Roam", entity_id=client,
+        related_entity_id=None, native_id="roamev", data={"ap_from": "apx:mac"},
+    )
+    returned = {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+    assert ev in returned
+
+
+def test_w15a4_bool_port_event_not_falsely_resolvable_against_int_port(
+    repo: Repository,
+) -> None:
+    """#w15a-4: a bool-port STP row must not be falsely 'resolvable' against a real
+    integer port, or it floats to the head of the reconcile window forever and
+    starves newer repairable rows.
+
+    The normalizer stores a bool ``port: true`` STP event's native_id as
+    ``"<sw>:True"`` (pre-fix) while the resolvability SQL coerced the same JSON
+    boolean to ``"<sw>:1"``. With a real integer port ``"<sw>:1"`` in inventory the
+    SQL called the row resolvable, but reconcile could NEVER fill it (the
+    normalizer's ``"<sw>:True"`` matches no entity) -- the row was retained even
+    after its attempts were exhausted, filling the LIMIT window and starving a
+    newer, genuinely-repairable row. After the fix, both sides treat a bool port as
+    NOT a port index (routed to the switch); with the switch absent the bool row is
+    correctly unresolvable and, once parked, never starves the newer row.
+    """
+    from netadmin.ingest.events import EventNormalizer
+    from netadmin.store.repository import _EVENT_RECONCILE_MAX_ATTEMPTS
+
+    unknown_sw = "02:00:de:ad:be:ef"  # switch deliberately NOT in inventory
+    # A real INTEGER port "<sw>:1" exists -- the entity the buggy SQL matched.
+    repo.upsert_entity(
+        Entity(entity_type=EntityType.PORT, native_id=f"{unknown_sw}:1"), ts=500
+    )
+    bool_ev = repo.record_event(
+        ts=1000, key="EVT_SW_StpPortBlocking", entity_id=None, related_entity_id=None,
+        native_id="stp-bool",
+        data={"key": "EVT_SW_StpPortBlocking", "time": 1000 * 1000,
+              "sw": unknown_sw, "port": True},
+    )
+    assert bool_ev is not None
+    # Park it: exhaust its attempts so it is retained ONLY if (falsely) resolvable.
+    for _ in range(_EVENT_RECONCILE_MAX_ATTEMPTS):
+        repo.bump_event_reconcile_attempts([bool_ev])
+
+    # A newer, genuinely repairable STP row: its INTEGER port IS in inventory.
+    good_sw = "02:00:11:22:33:aa"
+    good_port = repo.upsert_entity(
+        Entity(entity_type=EntityType.PORT, native_id=f"{good_sw}:2"), ts=8000
+    )
+    newer = repo.record_event(
+        ts=9000, key="EVT_SW_StpPortBlocking", entity_id=None, related_entity_id=None,
+        native_id="stp-good",
+        data={"key": "EVT_SW_StpPortBlocking", "time": 9000 * 1000,
+              "sw": good_sw, "port": 2},
+    )
+    assert newer is not None
+
+    # The bool row is NOT falsely resolvable, so the parked row does not starve the
+    # window: with limit=1, only the genuinely-resolvable newer row is selected.
+    # (Pre-fix, the bool row is falsely resolvable, older by ts, and wins the slot.)
+    selected = {int(r["id"]) for r in repo.unresolved_events(limit=1)}
+    assert selected == {newer}
+
+    # End-to-end: reconcile fills the newer row's real port; the bool row is never
+    # falsely repaired and stays NULL.
+    repaired = EventNormalizer(repo).reconcile_unresolved(limit=500)
+    assert repaired == 1
+    assert repo._conn.execute(
+        "SELECT entity_id FROM events WHERE id=?", (newer,)
+    ).fetchone()["entity_id"] == good_port
+    assert repo._conn.execute(
+        "SELECT entity_id FROM events WHERE id=?", (bool_ev,)
+    ).fetchone()["entity_id"] is None
+
+
+def test_reconcile_parks_unresolvable_and_reaches_newer_repairable(repo: Repository) -> None:
+    """P2: 500 OLDER client events with a resolved client but NO from-AP in the
+    payload can NEVER resolve their related reference.  Being oldest, the prior
+    filter re-selected them every pass, filled the LIMIT window, and starved a
+    newer, genuinely-repairable client event -- while dishonestly reporting 500
+    repairs each pass.  The fix parks rows with no resolvable identity, so the
+    newer event is reached and enriched, and the reported count reflects only the
+    single real enrichment (not 500)."""
+    from netadmin.ingest.events import EventNormalizer
+
+    old_client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli-old:mac"), ts=500
+    )
+    # 500 older client events: client resolved, related NULL, and the payload
+    # names NO AP/switch -- there is nothing to resolve the from-AP from, ever.
+    for i in range(500):
+        repo.record_event(
+            ts=1000 + i, key="EVT_WU_Disconnected", entity_id=old_client,
+            related_entity_id=None, native_id=f"oldev-{i}",
+            data={"key": "EVT_WU_Disconnected", "time": (1000 + i) * 1000,
+                  "user": "cli-old:mac"},
+        )
+    # A newer, genuinely repairable client event: its from-AP IS in inventory now.
+    new_client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli-new:mac"), ts=8000
+    )
+    new_ap = repo.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="ap-new:mac"), ts=8000
+    )
+    newer_ev = repo.record_event(
+        ts=9000, key="EVT_WU_Connected", entity_id=new_client,
+        related_entity_id=None, native_id="newev",
+        data={"key": "EVT_WU_Connected", "time": 9000 * 1000,
+              "user": "cli-new:mac", "ap": "ap-new:mac"},
+    )
+
+    # Selection makes fair progress: the 500 unresolvable rows are parked, so the
+    # newer repairable row (which the old LIMIT-500 window would have starved) is
+    # the only thing returned.
+    selected = {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+    assert selected == {newer_ev}
+
+    # End-to-end reconcile: the reported repair count is the ONE real enrichment,
+    # not 500, and the newer event's related reference is actually filled.
+    repaired = EventNormalizer(repo).reconcile_unresolved(limit=500)
+    assert repaired == 1
+
+    row = repo._conn.execute(
+        "SELECT related_entity_id FROM events WHERE id=?", (newer_ev,)
+    ).fetchone()
+    assert row["related_entity_id"] == new_ap
+    # The parked 500 remain untouched (still NULL) -- never falsely counted.
+    still_null = repo._conn.execute(
+        "SELECT COUNT(*) AS n FROM events WHERE related_entity_id IS NULL "
+        "AND entity_id=?", (old_client,)
+    ).fetchone()["n"]
+    assert still_null == 500
+
+
+def test_reconcile_reaches_newer_resolvable_behind_pending_flood(repo: Repository) -> None:
+    """P2 (residual): the prior fix parked rows that name NO candidate MAC, but a
+    row that DOES name a from-AP simply NOT YET in inventory is a legitimate
+    pending row -- it must keep being retried in case its AP appears. A flood of
+    500 such pending rows (oldest) still filled the oldest-first LIMIT window on
+    every pass and starved a newer row whose AP already IS in inventory: three
+    passes each selected the same 500, returned 0 repairs, and left the newer
+    ref NULL. Fair progress orders currently-resolvable rows first, so the newer
+    resolvable row is reached and enriched no matter how many not-yet-resolvable
+    older rows precede it, and the pending flood reports no false repairs."""
+    from netadmin.ingest.events import EventNormalizer
+
+    old_client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli-old:mac"), ts=500
+    )
+    # 500 older client roam events: client resolved, related NULL, and the payload
+    # NAMES a from-AP that is simply NOT (yet) in inventory -- genuinely pending,
+    # not junk. The prior fix keeps selecting these (right), but they must not
+    # starve a newer row that CAN resolve now.
+    for i in range(500):
+        repo.record_event(
+            ts=1000 + i, key="EVT_WU_Roam", entity_id=old_client,
+            related_entity_id=None, native_id=f"pendev-{i}",
+            data={"key": "EVT_WU_Roam", "time": (1000 + i) * 1000,
+                  "user": "cli-old:mac", "ap_from": "absent-ap:mac"},
+        )
+    # A newer roam event whose from-AP IS already in inventory -> resolvable now.
+    new_client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli-new:mac"), ts=8000
+    )
+    new_ap = repo.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="ap-new:mac"), ts=8000
+    )
+    newer_ev = repo.record_event(
+        ts=9000, key="EVT_WU_Roam", entity_id=new_client,
+        related_entity_id=None, native_id="newev",
+        data={"key": "EVT_WU_Roam", "time": 9000 * 1000,
+              "user": "cli-new:mac", "ap_from": "ap-new:mac"},
+    )
+
+    # Resolvability preference floats the newer resolvable row to the FRONT of the
+    # oldest-first window, so it is selected even behind 500 older pending rows.
+    selected = repo.unresolved_events(limit=500)
+    assert int(selected[0]["id"]) == newer_ev
+    assert newer_ev in {int(r["id"]) for r in selected}
+
+    # End-to-end reconcile: exactly ONE real enrichment (the newer row), and the
+    # 500 pending rows are neither filled nor falsely counted.
+    repaired = EventNormalizer(repo).reconcile_unresolved(limit=500)
+    assert repaired == 1
+    row = repo._conn.execute(
+        "SELECT related_entity_id FROM events WHERE id=?", (newer_ev,)
+    ).fetchone()
+    assert row["related_entity_id"] == new_ap
+    still_null = repo._conn.execute(
+        "SELECT COUNT(*) AS n FROM events WHERE related_entity_id IS NULL "
+        "AND entity_id=?", (old_client,)
+    ).fetchone()["n"]
+    assert still_null == 500
+
+
+def test_pending_row_parks_after_cap_then_resolves_when_ap_appears(
+    repo: Repository,
+) -> None:
+    """A pending from-AP that NEVER appears must eventually stop consuming the
+    LIMIT window (bounded retry), yet a pending row whose AP DOES later appear
+    must still resolve. Both are the same row over time: it is retried, parked
+    once its attempt budget is spent, and un-parked the instant its AP shows up."""
+    from netadmin.ingest.events import EventNormalizer
+    from netadmin.store.repository import _EVENT_RECONCILE_MAX_ATTEMPTS
+
+    client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500
+    )
+    ev = repo.record_event(
+        ts=1000, key="EVT_WU_Roam", entity_id=client, related_entity_id=None,
+        native_id="pending", data={"key": "EVT_WU_Roam", "time": 1000 * 1000,
+                                    "user": "cli:mac", "ap_from": "late-ap:mac"},
+    )
+
+    # While its AP is absent the row is still selected (it may yet resolve) and a
+    # reconcile makes no false repair.
+    assert ev in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+    assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 0
+
+    # Simulate the reconcile caller recording each fruitless pass (the caller bumps
+    # the rows it selected but could not fill). Once the attempt budget is spent
+    # the still-unresolvable row is parked out of the window.
+    for _ in range(_EVENT_RECONCILE_MAX_ATTEMPTS):
+        repo.bump_event_reconcile_attempts([ev])
+    assert ev not in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+
+    # Its AP finally appears: the row is resolvable again and re-admitted despite
+    # its spent attempt budget, then repaired on the next pass (requirement 2).
+    late_ap = repo.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="late-ap:mac"), ts=9000
+    )
+    assert ev in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+    assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 1
+    row = repo._conn.execute(
+        "SELECT related_entity_id FROM events WHERE id=?", (ev,)
+    ).fetchone()
+    assert row["related_entity_id"] == late_ap
+
+
+def test_unresolved_events_degrades_when_attempt_column_absent(
+    tmp_db_path: Path,
+) -> None:
+    """The bounded-retry column (0013) is optional: on a database migrated only to
+    0012 the counter reads as a constant 0 and the resolvability preference alone
+    still prevents starvation -- and the read issues no DDL."""
+    rw = Repository.open(tmp_db_path)
+    with rw._write() as conn:
+        conn.execute("ALTER TABLE events DROP COLUMN reconcile_attempts")
+    assert not rw._column_exists("events", "reconcile_attempts")
+
+    client = rw.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500
+    )
+    ap = rw.upsert_entity(Entity(entity_type=EntityType.AP, native_id="ap:mac"), ts=500)
+    for i in range(3):
+        rw.record_event(
+            ts=1000 + i, key="EVT_WU_Roam", entity_id=client, related_entity_id=None,
+            native_id=f"pend-{i}", data={"key": "EVT_WU_Roam", "time": (1000 + i) * 1000,
+                                         "user": "cli:mac", "ap_from": "absent:mac"},
+        )
+    resolvable_ev = rw.record_event(
+        ts=5000, key="EVT_WU_Roam", entity_id=client, related_entity_id=None,
+        native_id="ok", data={"key": "EVT_WU_Roam", "time": 5000 * 1000,
+                               "user": "cli:mac", "ap_from": "ap:mac"},
+    )
+    # No column, no raise -- and the resolvable row is still ranked first.
+    selected = rw.unresolved_events(limit=500)
+    assert int(selected[0]["id"]) == resolvable_ev
+    # bump is a safe no-op when the column is absent.
+    assert rw.bump_event_reconcile_attempts([resolvable_ev]) == 0
+    rw.close()
+
+
+@pytest.mark.parametrize("falsy_ap_from", [False, 0, []])
+def test_roam_falsy_nonstring_ap_from_resolves_via_ap_not_parked_forever(
+    repo: Repository, falsy_ap_from: object
+) -> None:
+    """#3-SQL: a roam event whose ``ap_from`` is a FALSY NON-STRING (False/0/[])
+    must be attributed to ``ap`` -- exactly as the normalizer's ``ap_from or ap``
+    does -- and be REPAIRED when that ``ap`` appears, not parked forever.
+
+    The normalizer treats only a NON-EMPTY STRING mac as a usable ap_from; a JSON
+    boolean/integer/array is absent and precedence falls back to ``ap``. The old
+    SQL used ``NULLIF(ap_from,'')`` which collapses only the EMPTY STRING, so a
+    JSON ``false``/``0``/``[]`` survived as present-and-unresolvable: ``eapf``
+    joined on that falsy value (never a real native_id), resolvable stayed 0
+    forever, and once the row's attempt budget was spent it was parked out of the
+    reconcile window and NEVER re-admitted -- so discovering the AP yielded ZERO
+    repairs. After aligning the SQL to ``json_type='text'``, the falsy ap_from is
+    absent, resolvability follows ``ap``, and the parked row is un-parked and
+    repaired the instant its ``ap`` shows up.
+    """
+    from netadmin.ingest.events import EventNormalizer
+    from netadmin.store.repository import _EVENT_RECONCILE_MAX_ATTEMPTS
+
+    client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500
+    )
+    ev = repo.record_event(
+        ts=1000, key="EVT_WU_Roam", entity_id=client, related_entity_id=None,
+        native_id="roam-falsy",
+        data={"key": "EVT_WU_Roam", "time": 1000 * 1000, "user": "cli:mac",
+              "ap_from": falsy_ap_from, "ap": "ap-real:mac"},
+    )
+    assert ev is not None
+
+    # AP still absent: exhaust the attempt budget so the row is parked -- the exact
+    # state in which the buggy SQL strands it (resolvable never recovers to 1).
+    for _ in range(_EVENT_RECONCILE_MAX_ATTEMPTS):
+        repo.bump_event_reconcile_attempts([ev])
+    assert ev not in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+
+    # The AP named by ``ap`` appears: the normalizer attributes the falsy-ap_from
+    # roam to THIS ap, so the row must become resolvable and be re-admitted.
+    ap = repo.upsert_entity(Entity(entity_type=EntityType.AP, native_id="ap-real:mac"), ts=9000)
+    assert ev in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+
+    # End-to-end: reconcile repairs it, related_entity_id -> the ``ap`` entity.
+    assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 1
+    row = repo._conn.execute(
+        "SELECT related_entity_id FROM events WHERE id=?", (ev,)
+    ).fetchone()
+    assert row["related_entity_id"] == ap
+
+
+def test_roam_empty_string_ap_from_still_resolves_via_ap(repo: Repository) -> None:
+    """#3-SQL control: the empty-string ap_from case (D3) still routes to ``ap``.
+
+    ``ap_from=""`` was already handled by ``NULLIF(...,'')``; the string-only
+    tightening must not regress it -- an empty string is a text-typed value that
+    NULLIF still collapses to absent, falling through to ``ap``.
+    """
+    from netadmin.ingest.events import EventNormalizer
+    from netadmin.store.repository import _EVENT_RECONCILE_MAX_ATTEMPTS
+
+    client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500
+    )
+    ev = repo.record_event(
+        ts=1000, key="EVT_WU_Roam", entity_id=client, related_entity_id=None,
+        native_id="roam-empty",
+        data={"key": "EVT_WU_Roam", "time": 1000 * 1000, "user": "cli:mac",
+              "ap_from": "", "ap": "ap-real:mac"},
+    )
+    for _ in range(_EVENT_RECONCILE_MAX_ATTEMPTS):
+        repo.bump_event_reconcile_attempts([ev])
+    ap = repo.upsert_entity(Entity(entity_type=EntityType.AP, native_id="ap-real:mac"), ts=9000)
+    assert ev in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+    assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 1
+    row = repo._conn.execute(
+        "SELECT related_entity_id FROM events WHERE id=?", (ev,)
+    ).fetchone()
+    assert row["related_entity_id"] == ap
+
+
+def test_roam_real_nonempty_ap_from_still_routes_to_ap_from(repo: Repository) -> None:
+    """#3-SQL: a real NON-EMPTY STRING ap_from still resolves to the FROM-AP, not
+    to ``ap`` -- the string-only rule keeps genuine attribution intact.
+
+    ``ap_from`` and ``ap`` name DIFFERENT APs. Only the from-AP is in inventory,
+    so the row resolves iff resolvability consults ``ap_from`` (not ``ap``); the
+    repaired related_entity_id must be the from-AP.
+    """
+    from netadmin.ingest.events import EventNormalizer
+
+    client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500
+    )
+    from_ap = repo.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="ap-from:mac"), ts=500
+    )
+    # A DIFFERENT ap that is deliberately NOT in inventory -- if resolvability
+    # (wrongly) consulted ``ap`` the row would not resolve and stay NULL.
+    ev = repo.record_event(
+        ts=1000, key="EVT_WU_Roam", entity_id=client, related_entity_id=None,
+        native_id="roam-real",
+        data={"key": "EVT_WU_Roam", "time": 1000 * 1000, "user": "cli:mac",
+              "ap_from": "ap-from:mac", "ap": "ap-other:mac"},
+    )
+    # Resolvable now (from-AP present) and ranked first.
+    selected = repo.unresolved_events(limit=500)
+    assert int(selected[0]["id"]) == ev
+    assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 1
+    row = repo._conn.execute(
+        "SELECT related_entity_id FROM events WHERE id=?", (ev,)
+    ).fetchone()
+    assert row["related_entity_id"] == from_ap
+
+
+def test_wrong_precedence_mac_is_not_resolvable_and_does_not_starve(
+    repo: Repository,
+) -> None:
+    """Finding #9: the SQL ``resolvable`` predicate must mirror the NORMALIZER's
+    per-column precedence, not merely "some candidate MAC exists".
+
+    500 older non-roam client events each name an ``ap`` that is NOT in inventory
+    and an ``sw`` that IS. The normalizer routes a non-roam client event's related
+    reference to the AP when ``ap`` is present -- it never falls through to the
+    switch -- so these rows can NEVER resolve. The old predicate flagged them
+    resolvable because the switch existed, so (being ordered resolvable-first)
+    they filled the LIMIT-500 window ahead of a newer, genuinely-resolvable row
+    whose AP *is* in inventory, starving it: 0 real repairs, newer ref left NULL.
+    With the precedence-faithful predicate the 500 are correctly NOT resolvable,
+    the newer row floats to the front and is the one that resolves."""
+    from netadmin.ingest.events import EventNormalizer
+
+    old_client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli-old:mac"), ts=500
+    )
+    # The switch these older events name IS in inventory -- but it is the WRONG
+    # MAC: the normalizer would use the (absent) ap, never this switch.
+    repo.upsert_entity(Entity(entity_type=EntityType.SWITCH, native_id="sw:mac"), ts=500)
+    for i in range(500):
+        repo.record_event(
+            ts=1000 + i, key="EVT_WU_Disconnected", entity_id=old_client,
+            related_entity_id=None, native_id=f"wrongprec-{i}",
+            data={"key": "EVT_WU_Disconnected", "time": (1000 + i) * 1000,
+                  "user": "cli-old:mac", "ap": "absent-ap:mac", "sw": "sw:mac"},
+        )
+    # A newer, genuinely repairable non-roam client event: its AP IS in inventory.
+    new_client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli-new:mac"), ts=8000
+    )
+    new_ap = repo.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="ap-new:mac"), ts=8000
+    )
+    newer_ev = repo.record_event(
+        ts=9000, key="EVT_WU_Connected", entity_id=new_client,
+        related_entity_id=None, native_id="newev",
+        data={"key": "EVT_WU_Connected", "time": 9000 * 1000,
+              "user": "cli-new:mac", "ap": "ap-new:mac"},
+    )
+
+    # LIMIT exactly the flood size: under the old (wrong) predicate all 501 rows
+    # were "resolvable" and ordered by ts, so the newest (ts=9000) fell off the
+    # 500-row window and was starved. The precedence-faithful predicate marks the
+    # 500 not-resolvable, so the one truly-resolvable row leads the window.
+    selected = repo.unresolved_events(limit=500)
+    assert int(selected[0]["id"]) == newer_ev
+
+    # End-to-end: exactly ONE real enrichment (the newer row); the 500 wrong-MAC
+    # rows are neither filled nor falsely counted.
+    repaired = EventNormalizer(repo).reconcile_unresolved(limit=500)
+    assert repaired == 1
+    row = repo._conn.execute(
+        "SELECT related_entity_id FROM events WHERE id=?", (newer_ev,)
+    ).fetchone()
+    assert row["related_entity_id"] == new_ap
+    still_null = repo._conn.execute(
+        "SELECT COUNT(*) AS n FROM events WHERE related_entity_id IS NULL "
+        "AND entity_id=?", (old_client,)
+    ).fetchone()["n"]
+    assert still_null == 500
+
+
+def test_stp_absent_port_does_not_starve_and_resolves_when_port_appears(
+    repo: Repository,
+) -> None:
+    """Finding #4 (STP routing): a port-scoped switch event (EVT_SW_StpPortBlocking)
+    is attributed by the normalizer to the PORT entity (native_id "<sw>:<port>"),
+    NOT the switch. The old predicate flagged such a row resolvable merely because
+    the SWITCH exists, so 500 STP events for an ABSENT port floated to the head of
+    the LIMIT window (resolvable-first) and starved a newer, genuinely-repairable
+    client event: it got ZERO repairs and its ref stayed NULL. The precedence-
+    faithful predicate consults the PORT, so a port-not-yet-present STP row is
+    correctly NOT-yet-resolvable (parked, not starving) -- and becomes resolvable
+    exactly when its port entity appears, repairing all 500."""
+    from netadmin.ingest.events import EventNormalizer
+
+    # The switch IS in inventory (so each STP row's related=switch is already set at
+    # ingest, exactly as normalize() would). Its PORT is NOT yet present, so the
+    # primary entity (the port) cannot resolve.
+    sw = repo.upsert_entity(
+        Entity(entity_type=EntityType.SWITCH, native_id="sw:mac"), ts=500
+    )
+    for i in range(500):
+        repo.record_event(
+            ts=1000 + i, key="EVT_SW_StpPortBlocking", entity_id=None,
+            related_entity_id=sw, native_id=f"stp-{i}",
+            data={"key": "EVT_SW_StpPortBlocking", "time": (1000 + i) * 1000,
+                  "sw": "sw:mac", "port": 7},
+        )
+    # A newer, genuinely repairable client event whose AP IS in inventory.
+    new_client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli-new:mac"), ts=8000
+    )
+    new_ap = repo.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="ap-new:mac"), ts=8000
+    )
+    newer_ev = repo.record_event(
+        ts=9000, key="EVT_WU_Connected", entity_id=new_client,
+        related_entity_id=None, native_id="newev",
+        data={"key": "EVT_WU_Connected", "time": 9000 * 1000,
+              "user": "cli-new:mac", "ap": "ap-new:mac"},
+    )
+
+    # (a) LIMIT exactly the flood size: under the old predicate all 501 rows were
+    # "resolvable" (switch exists) and ordered by ts, so the newest (ts=9000) fell
+    # off the 500-row window and was starved. Now the 500 STP rows are NOT
+    # resolvable, so the one truly-resolvable row leads the window.
+    selected = repo.unresolved_events(limit=500)
+    assert int(selected[0]["id"]) == newer_ev
+
+    repaired = EventNormalizer(repo).reconcile_unresolved(limit=500)
+    assert repaired == 1
+    assert repo._conn.execute(
+        "SELECT related_entity_id FROM events WHERE id=?", (newer_ev,)
+    ).fetchone()["related_entity_id"] == new_ap
+    # The STP rows' primary entity (the port) is still unresolved -- parked, not
+    # falsely counted as repaired.
+    stp_null = repo._conn.execute(
+        "SELECT COUNT(*) AS n FROM events WHERE entity_id IS NULL "
+        "AND native_id LIKE 'stp-%'"
+    ).fetchone()["n"]
+    assert stp_null == 500
+
+    # (b) The missing PORT finally appears (native_id "<sw_mac>:<port_idx>", exactly
+    # how ingest/mapping.py keys ports). Every STP row is now resolvable and repairs
+    # to the port on the next pass.
+    port = repo.upsert_entity(
+        Entity(entity_type=EntityType.PORT, native_id="sw:mac:7"), ts=9500
+    )
+    repaired_now = EventNormalizer(repo).reconcile_unresolved(limit=500)
+    assert repaired_now == 500
+    filled = repo._conn.execute(
+        "SELECT COUNT(*) AS n FROM events WHERE entity_id=? AND native_id LIKE 'stp-%'",
+        (port,),
+    ).fetchone()["n"]
+    assert filled == 500
+
+
+def test_switch_scoped_event_still_resolves_on_the_switch(repo: Repository) -> None:
+    """Finding #4 guard: a switch-scoped event that merely CARRIES a port field
+    (EVT_SW_PoeOverload) is NOT in the port-scoped set, so the normalizer routes it
+    to the SWITCH. The predicate must key off the event KEY, not the presence of a
+    ``port`` field -- so this row resolves on the switch (not a phantom port)."""
+    from netadmin.ingest.events import EventNormalizer
+
+    sw = repo.upsert_entity(
+        Entity(entity_type=EntityType.SWITCH, native_id="sw:mac"), ts=500
+    )
+    ev = repo.record_event(
+        ts=1000, key="EVT_SW_PoeOverload", entity_id=None, related_entity_id=None,
+        native_id="poe", data={"key": "EVT_SW_PoeOverload", "time": 1000 * 1000,
+                               "sw": "sw:mac", "port": 3},
+    )
+    # Resolvable now (the switch exists), so it is selected and repaired to the switch.
+    assert ev in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+    assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 1
+    assert repo._conn.execute(
+        "SELECT entity_id FROM events WHERE id=?", (ev,)
+    ).fetchone()["entity_id"] == sw
+
+
+def test_unresolved_events_degrades_when_table_absent(tmp_db_path: Path) -> None:
+    """Finding #9: on a database whose ``events`` table is absent (dropped, or a
+    query-only replica that never provisioned it) the reconcile read must degrade
+    to empty rather than raising OperationalError ("no such table"). The guard is
+    on the missing TABLE, not just a missing column."""
+    rw = Repository.open(tmp_db_path)
+    with rw._write() as conn:
+        conn.execute("DROP TABLE events")
+    assert not rw._table_exists("events")
+    # Must not raise -- returns nothing, the read path degrades safely.
+    assert rw.unresolved_events(limit=500) == []
+    rw.close()
+
+
+# ---------------------------------------------------------------------------
+# D3: empty-string precedence must match the normalizer's TRUTHINESS, not the
+# SQL IS NOT NULL presence test. The normalizer treats an empty MAC string as
+# ABSENT (``if ap_mac:`` / ``if not mac`` -- "" is falsy), skips it, and falls
+# through to the next source. A predicate that reads json_extract(...)=="" as
+# PRESENT picks a never-resolvable branch and permanently parks a row the
+# normalizer would have repaired via its next source. Every candidate MAC is
+# read through NULLIF(x,'') so "" folds to absent exactly as Python sees it
+# (and, matching the normalizer, whitespace-only is NOT stripped -> stays
+# present on both sides).
+# ---------------------------------------------------------------------------
+def test_reconcile_empty_ap_resolves_via_switch_not_parked(repo: Repository) -> None:
+    """D3: a client event carrying ap="" (empty string) and a real ``sw`` must be
+    treated as resolvable-via-SWITCH -- the normalizer skips the empty ap and uses
+    the switch. The prior predicate read the empty ap as PRESENT, marked the row
+    not-resolvable, and after the attempt budget was spent only ``resolvable=1``
+    could re-admit it -- which the empty-ap predicate never yielded, so the row
+    stayed parked forever even once the switch appeared: 0 repairs, ref NULL.
+    The fix folds "" to absent, so the switch resolves the row and it is repaired
+    (not permanently parked)."""
+    from netadmin.ingest.events import EventNormalizer
+    from netadmin.store.repository import _EVENT_RECONCILE_MAX_ATTEMPTS
+
+    client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500
+    )
+    # ap is present-but-EMPTY; sw names a real switch not yet in inventory.
+    ev = repo.record_event(
+        ts=1000, key="EVT_WU_Disconnected", entity_id=client, related_entity_id=None,
+        native_id="emptyap", data={"key": "EVT_WU_Disconnected", "time": 1000 * 1000,
+                                   "user": "cli:mac", "ap": "", "sw": "sw:mac"},
+    )
+
+    # While the switch is absent the row is still a candidate (it may yet resolve),
+    # and a reconcile makes no false repair.
+    assert ev in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+    assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 0
+
+    # The attempt budget is spent while the switch is still absent -> parked out of
+    # the oldest-first window. Only ``resolvable=1`` can re-admit it after this.
+    for _ in range(_EVENT_RECONCILE_MAX_ATTEMPTS):
+        repo.bump_event_reconcile_attempts([ev])
+    assert ev not in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+
+    # The switch appears. The empty ap must NOT block resolution: the row becomes
+    # resolvable-via-switch, is re-admitted despite the spent budget, and repaired.
+    sw = repo.upsert_entity(
+        Entity(entity_type=EntityType.SWITCH, native_id="sw:mac"), ts=9000
+    )
+    assert ev in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+    assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 1
+    row = repo._conn.execute(
+        "SELECT related_entity_id FROM events WHERE id=?", (ev,)
+    ).fetchone()
+    assert row["related_entity_id"] == sw
+
+
+def test_reconcile_precedence_present_ap_beats_switch(repo: Repository) -> None:
+    """D3 (precedence intact): a NON-empty ap still wins over sw, exactly as the
+    normalizer's ``if ap_mac: ... elif sw_mac:`` ordering. The related reference
+    must resolve to the AP, never the switch, when both are present and in
+    inventory. NULLIF only collapses the empty string; it must not disturb the
+    single-winner precedence for a genuinely-present ap."""
+    from netadmin.ingest.events import EventNormalizer
+
+    client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500
+    )
+    ap = repo.upsert_entity(Entity(entity_type=EntityType.AP, native_id="ap:mac"), ts=500)
+    sw = repo.upsert_entity(
+        Entity(entity_type=EntityType.SWITCH, native_id="sw:mac"), ts=500
+    )
+    ev = repo.record_event(
+        ts=1000, key="EVT_WU_Disconnected", entity_id=client, related_entity_id=None,
+        native_id="presentap", data={"key": "EVT_WU_Disconnected", "time": 1000 * 1000,
+                                     "user": "cli:mac", "ap": "ap:mac", "sw": "sw:mac"},
+    )
+
+    assert ev in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+    assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 1
+    row = repo._conn.execute(
+        "SELECT related_entity_id FROM events WHERE id=?", (ev,)
+    ).fetchone()
+    # AP wins; the switch is never consulted for the related reference.
+    assert row["related_entity_id"] == ap
+    assert row["related_entity_id"] != sw
+
+
+def test_reconcile_all_empty_macs_is_not_a_candidate(repo: Repository) -> None:
+    """D3 (all-empty parks): a row whose every candidate MAC is an EMPTY STRING
+    names nothing the normalizer could resolve (all sources are falsy/skipped), so
+    it must NOT be selected at all -- empty folds to absent identically to a
+    missing key. Before the fix the IS NOT NULL predicate read the empty strings as
+    present and admitted a row that can never resolve; the fix excludes it, and a
+    reconcile repairs nothing."""
+    from netadmin.ingest.events import EventNormalizer
+
+    client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500
+    )
+    # Related-scoped all-empty: client resolved, related NULL, ap/sw both empty.
+    rel_ev = repo.record_event(
+        ts=1000, key="EVT_WU_Disconnected", entity_id=client, related_entity_id=None,
+        native_id="allempty-rel", data={"key": "EVT_WU_Disconnected", "time": 1000 * 1000,
+                                        "user": "cli:mac", "ap": "", "sw": ""},
+    )
+    # Primary-scoped all-empty: entity NULL, every primary MAC empty.
+    prim_ev = repo.record_event(
+        ts=1100, key="EVT_WU_Disconnected", entity_id=None, related_entity_id=None,
+        native_id="allempty-prim", data={"key": "EVT_WU_Disconnected", "time": 1100 * 1000,
+                                         "user": "", "ap": "", "sw": "", "gw": ""},
+    )
+
+    selected = {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+    assert rel_ev not in selected
+    assert prim_ev not in selected
+    assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 0

@@ -45,7 +45,7 @@ from typing import Any, Iterable, Optional
 
 from netadmin.detect import device_kb
 from netadmin.detect.baseline import hour_label
-from netadmin.detect.engine import COVERAGE_MIN, UNKNOWN, EvalResult
+from netadmin.detect.engine import COVERAGE_MIN, UNKNOWN, DetectorResult, EvalResult
 from netadmin.domain.entities import Entity, Finding, entity_display_label
 from netadmin.domain.types import Cadence, EntityType, Severity
 from netadmin.logging import get_logger
@@ -955,12 +955,24 @@ class PoeBudgetDetector:
         event_window_s = int(ctx.threshold(self.key, "event_window_s", 900))
         poe_window_s = int(ctx.threshold(self.key, "poe_window_s", 600))
 
+        # B4: this detector has TWO independent arms. The budget-pressure arm is
+        # POLL-derived (Σ polled ``poe_power`` vs the switch's budget) and stays on
+        # the fast_device coverage gate above -- an event-feed gap says nothing
+        # about it. The overload arm is EVENT-derived (EVT_SW_PoeOverload). If the
+        # event feed had a gap, a dropped overload event reads as "no overload" and
+        # an overload-only P1 false-resolves. So we gate ONLY the overload arm on
+        # event-source coverage: when it is below the floor, a switch with no poll
+        # budget pressure is frozen (UNKNOWN) instead of cleared, while a switch the
+        # poll arm can still judge continues to emit/clear normally.
+        overload_arm_ok = ctx.event_coverage_ok(event_window_s)
+
         ports_by_switch: dict[int, list[Entity]] = {}
         for port in _ports(ctx):
             if port.parent_id is not None:
                 ports_by_switch.setdefault(port.parent_id, []).append(port)
 
         findings: list[Finding] = []
+        unknown_switches: set[int] = set()
         for switch in _switches_by_id(ctx).values():
             draw = 0.0
             measured = False
@@ -986,14 +998,35 @@ class PoeBudgetDetector:
                 confounders.append("budget_known")
 
             over_warn = pct is not None and pct >= warn_pct
-            if not over_warn and not overload:
+
+            # B4: the overload EVENT may only FIRE or ESCALATE when the event feed
+            # was substantially observed. On an unobserved window a present
+            # EVT_SW_PoeOverload is *unusable* -- it can neither raise a P1 by
+            # itself nor escalate a poll-budget finding to P1 -- because a dropped
+            # overload event and a genuinely-absent one are indistinguishable there.
+            # The measured-budget arm is POLL-derived and never depends on this: it
+            # keeps firing from real pressure regardless of event coverage.
+            overload_usable = bool(overload) and overload_arm_ok
+
+            if not over_warn and not overload_usable:
+                # No arm can speak this cycle. If the event feed was NOT
+                # substantially observed, "no overload event" is unproven -- a real
+                # overload (whether one is recorded in the gap or not) could have
+                # been dropped -- so an overload-based issue on this switch must not
+                # clear by absence: freeze the switch (UNKNOWN) rather than resolve.
+                # The poll budget arm is unaffected: when it has a verdict
+                # (over_warn) we fall through and emit below.
+                if not overload_arm_ok:
+                    unknown_switches.add(switch.entity_id)
                 continue
 
-            critical = bool(overload) or (pct is not None and pct >= crit_pct)
+            # Escalation to P1 from the overload event requires event coverage; a
+            # poll finding still reaches P1 on its own measured crit-tier pressure.
+            critical = overload_usable or (pct is not None and pct >= crit_pct)
             sev = Severity.P1 if critical else Severity.P2
             evidence: dict[str, Any] = {
                 "poe_draw_w": round(draw, 2),
-                "overload_events": len(overload),
+                "overload_events": len(overload) if overload_usable else 0,
             }
             if pct is not None:
                 evidence["budget_pct"] = round(pct, 1)
@@ -1010,7 +1043,7 @@ class PoeBudgetDetector:
                     confounders,
                 )
             )
-        return findings
+        return DetectorResult.of(findings, unknown_switches)
 
 
 # ====================================================================== #
@@ -1034,6 +1067,15 @@ class StpLoopDetector:
             for s in ctx.threshold(self.key, "blocking_states", self.DEFAULT_BLOCKING_STATES)
         }
 
+        # B4: this detector has two arms. The blocking-STATE arm is POLL-derived
+        # (the port's current ``stp_state``) and stays on the fast_device gate
+        # above. The blocking-EVENT arm (EVT_SW_StpPortBlocking) is EVENT-derived:
+        # when the event feed was not substantially observed, "no blocking event"
+        # is unproven -- an event establishing an active STP issue could have aged
+        # out while the feed was down -- so the event arm can neither fire nor
+        # clear, and a port whose only possible verdict rested on it must FREEZE
+        # (UNKNOWN), not clear by absence.
+        event_ok = ctx.event_coverage_ok(event_window_s)
         blocking_events = ctx.events(
             keys=[self.BLOCKING_EVENT], since_ts=ctx.now_ts - event_window_s
         )
@@ -1043,11 +1085,18 @@ class StpLoopDetector:
 
         switches = _switches_by_id(ctx)
         findings: list[Finding] = []
+        unknown_ports: set[int] = set()
         for port in _ports(ctx):
-            has_event = port.entity_id in event_entity_ids
             state = ctx.repo.current_state(port.entity_id, "stp_state")
             state_blocking = state is not None and str(state).lower() in blocking_states
+            # Event arm usable only when the feed was observed; below the floor it
+            # is neither trusted to fire nor to clear.
+            has_event = event_ok and port.entity_id in event_entity_ids
             if not has_event and not state_blocking:
+                # No poll-arm verdict. If the event feed had a gap, freeze this
+                # port so an open STP issue does not false-resolve across it.
+                if not event_ok:
+                    unknown_ports.add(port.entity_id)
                 continue
             label = _port_label(port, switches)
             findings.append(
@@ -1060,10 +1109,10 @@ class StpLoopDetector:
                         "stp_state": None if state is None else str(state),
                         "blocking_event": has_event,
                     },
-                    ["coverage_gated", "stp_event_or_state"],
+                    ["coverage_gated", "stp_event_or_state", "event_coverage_gated"],
                 )
             )
-        return findings
+        return DetectorResult.of(findings, unknown_ports)
 
 
 # ====================================================================== #

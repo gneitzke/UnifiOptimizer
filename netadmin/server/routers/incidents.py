@@ -28,6 +28,7 @@ SQL lives in the store, section 4). ``async`` because the connection is loop-bou
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import time
 from typing import Any, Optional
@@ -53,6 +54,27 @@ _SEVERITY_RANK: dict[str, int] = {
 
 def _severity_rank(severity: str) -> int:
     return _SEVERITY_RANK.get(severity, len(_SEVERITY_RANK))
+
+
+def _member_sig(current_issue_ids: set[int]) -> str:
+    """A stable signature of an incident's CURRENT member issue-id SET.
+
+    C5 (round 19): the dashboard row (``web/src/pages/incidents/IncidentRow.tsx``)
+    caches its symptom detail and invalidates on a signature the list payload
+    carries. Count alone misses a same-count REPLACEMENT; ``last_seen_ts`` was the
+    round-18 proxy for it, but ``last_seen_ts`` is a ``max``-fold over member
+    evidence (``engine._reconcile``), so a replacement whose *new* member has
+    OLDER evidence than the incident's high-water mark never advances it and the
+    row never refetches (adversarial verifier round 19, real feeder-port swap:
+    current symptoms went 2 -> 3 while the (count, last_seen_ts) signature stayed
+    (1, 1300)). ``member_sig`` is derived from the current member id SET alone,
+    with no evidence timestamp in it, so it changes iff a member is added,
+    removed, or replaced, and is byte-for-byte stable across polls while
+    membership is unchanged. Order-independent (the ids are sorted first) and
+    fixed-width, so it is a cheap, opaque cache key for the client.
+    """
+    payload = ",".join(str(i) for i in sorted(current_issue_ids))
+    return hashlib.blake2b(payload.encode("utf-8"), digest_size=8).hexdigest()
 
 
 def _engine(request: Request, store: Repository) -> IssueEngine:
@@ -139,7 +161,16 @@ async def list_incidents(
         if int(i["root_issue_id"]) in all_issues
     ]
     entity_refs = entity_ref_map(store, root_entity_ids)
-    counts = store.incident_member_counts([int(i["id"]) for i in incidents])
+    # C5: the card's member_count/symptom_count are the incident's PRESENT state
+    # -- current members only (cleared_ts IS NULL) -- never the append-only
+    # historical union. A symptom that cleared (resolved, or reassigned to a
+    # different root) must not keep inflating a card that is otherwise down to
+    # its root alone. Genuineness (below, via list_incidents/genuine_only) is
+    # deliberately the one place that still consults the historical union, so a
+    # once-genuine incident does not flicker out of "genuine" the moment its
+    # last symptom clears.
+    current_counts = store.current_incident_member_counts([int(i["id"]) for i in incidents])
+    current_symptom_counts = store.incident_open_symptom_counts([int(i["id"]) for i in incidents])
 
     # An incident is suppressed for attention purposes only when ALL its members
     # are (Gitea #49): a suppressed root with a live symptom keeps the incident in
@@ -150,8 +181,12 @@ async def list_incidents(
     now = int(time.time())
 
     def _all_members_suppressed(incident_id: int) -> bool:
-        members = store.list_incident_members(incident_id)
-        rows = [all_issues.get(int(m["issue_id"])) for m in members]
+        # C5: judge the list-visibility of an incident by its CURRENT members
+        # only. A cleared/reassigned historical member is no longer part of this
+        # incident, so it must neither keep it visible nor hide it -- otherwise a
+        # fully-suppressed current incident wrongly stays listed.
+        issue_ids = store.current_incident_issue_ids(incident_id)
+        rows = [all_issues.get(int(iid)) for iid in issue_ids]
         rows = [r for r in rows if r is not None]
         return bool(rows) and all(row_is_suppressed(r, now) for r in rows)
 
@@ -162,9 +197,14 @@ async def list_incidents(
             suppressed_excluded += 1
             continue
         incident = dict(inc)
-        member_count = counts.get(int(inc["id"]), 0)
-        incident["member_count"] = member_count
-        incident["symptom_count"] = max(0, member_count - 1)
+        incident["member_count"] = current_counts.get(int(inc["id"]), 0)
+        incident["symptom_count"] = current_symptom_counts.get(int(inc["id"]), 0)
+        # C5 (round 19): the authoritative membership-change signal for the
+        # dashboard row's detail cache — a signature of the CURRENT member id set
+        # (cleared_ts IS NULL), independent of evidence freshness, so a same-count
+        # replacement whose new member has older evidence than last_seen_ts still
+        # invalidates the row. See _member_sig.
+        incident["member_sig"] = _member_sig(store.current_incident_issue_ids(int(inc["id"])))
         incident["root"] = _root_ref(int(inc["root_issue_id"]), all_issues, entity_refs)
         items.append(incident)
 
@@ -212,12 +252,25 @@ async def get_incident(request: Request, incident_id: int) -> dict[str, Any]:
         if issue_row is None:
             return None
         eid = issue_row["entity_id"]
+        # C5: the detail view tells the incident's whole story, historical
+        # members included (e.g. a symptom later reassigned elsewhere still
+        # explains a chunk of the incident's past) -- but every member must
+        # carry when it joined and, if it is no longer attached, when it left,
+        # so the UI can distinguish "still part of this incident" from "was,
+        # but cleared" instead of rendering every historical row as current.
+        # ``left_ts``/``current`` mirror the frontend's IncidentMember contract
+        # (web/src/pages/shared/api.ts) rather than the raw ``cleared_ts`` column
+        # name.
+        cleared_ts = m["cleared_ts"]
         return {
             "issue": _issue_dict(issue_row),
             "entity": entity_refs.get(int(eid)) if eid is not None else None,
             "role": m["role"],
             "rule": m["rule"],
             "rationale": m["rationale"],
+            "joined_ts": m["joined_ts"],
+            "left_ts": cleared_ts,
+            "current": cleared_ts is None,
         }
 
     root_member: Optional[dict[str, Any]] = None
@@ -232,8 +285,13 @@ async def get_incident(request: Request, incident_id: int) -> dict[str, Any]:
             symptoms.append(built)
 
     incident = dict(row)
-    incident["member_count"] = len(members)
-    incident["symptom_count"] = sum(1 for m in members if m["role"] != "root")
+    # C5: counts describe the incident's CURRENT shape (cleared members are shown
+    # in the member list above, with current=False, but must not inflate the
+    # headline counts the way the historical membership would).
+    incident["member_count"] = sum(1 for m in members if m["cleared_ts"] is None)
+    incident["symptom_count"] = sum(
+        1 for m in members if m["cleared_ts"] is None and m["role"] != "root"
+    )
 
     root_issue_id = int(row["root_issue_id"])
     root_issue = issues_by_id.get(root_issue_id)
@@ -256,12 +314,20 @@ async def get_incident(request: Request, incident_id: int) -> dict[str, Any]:
 async def suppress_incident(
     request: Request, incident_id: int, body: IncidentSuppressBody
 ) -> dict[str, Any]:
-    """Suppress a whole incident in one action: the root and every symptom (Gitea
-    #50). Each member is suppressed *individually* — its own ``suppressed`` event,
-    stamped ``source="incident"`` so the trail distinguishes a bulk mute from a
-    per-issue one — because suppression lives on the issue row, not the incident
-    projection. Measured impact is untouched, exactly as for the per-issue route:
-    this parks attention (counts, alerts, HA sensors), never a measured number.
+    """Suppress a whole incident in one action: the root and every CURRENTLY
+    attached symptom (Gitea #50). Each member is suppressed *individually* — its
+    own ``suppressed`` event, stamped ``source="incident"`` so the trail
+    distinguishes a bulk mute from a per-issue one — because suppression lives on
+    the issue row, not the incident projection. Measured impact is untouched,
+    exactly as for the per-issue route: this parks attention (counts, alerts, HA
+    sensors), never a measured number.
+
+    C5: membership is append-only (a cleared/reassigned member keeps its
+    historical row), so this must act on
+    :meth:`Repository.current_incident_issue_ids`, not the full historical
+    ``list_incident_members`` -- otherwise suppressing an old incident would mute
+    a member that has since cleared or moved under a different root, which has
+    nothing to do with the incident being suppressed.
 
     Token-gated as a mutation (fans out on the WebSocket via the engine). 404 if
     the incident is unknown. Idempotent per member: re-suppressing an already-muted
@@ -273,10 +339,8 @@ async def suppress_incident(
     engine = _engine(request, store)
     now = int(time.time())
     count = 0
-    for member in store.list_incident_members(incident_id):
-        transition = engine.suppress(
-            int(member["issue_id"]), now, until_ts=body.until_ts, source="incident"
-        )
+    for issue_id in store.current_incident_issue_ids(incident_id):
+        transition = engine.suppress(issue_id, now, until_ts=body.until_ts, source="incident")
         if transition is not None:
             count += 1
     return {"incident_id": incident_id, "count": count}
@@ -284,17 +348,19 @@ async def suppress_incident(
 
 @router.post("/incidents/{incident_id}/unsuppress")
 async def unsuppress_incident(request: Request, incident_id: int) -> dict[str, Any]:
-    """Lift a bulk incident suppression: unsuppress the root and every symptom,
-    each writing its own ``unsuppressed`` event (Gitea #50). Mirrors
-    :func:`suppress_incident`. 404 if the incident is unknown."""
+    """Lift a bulk incident suppression: unsuppress the root and every CURRENTLY
+    attached symptom, each writing its own ``unsuppressed`` event (Gitea #50).
+    Mirrors :func:`suppress_incident`, including the C5 current-membership scope
+    (a cleared/reassigned member is not this incident's business to unsuppress
+    either). 404 if the incident is unknown."""
     store = get_store(request)
     if store.get_incident(incident_id) is None:
         raise HTTPException(status_code=404, detail=f"incident {incident_id} not found")
     engine = _engine(request, store)
     now = int(time.time())
     count = 0
-    for member in store.list_incident_members(incident_id):
-        transition = engine.unsuppress(int(member["issue_id"]), now)
+    for issue_id in store.current_incident_issue_ids(incident_id):
+        transition = engine.unsuppress(issue_id, now)
         if transition is not None:
             count += 1
     return {"incident_id": incident_id, "count": count}

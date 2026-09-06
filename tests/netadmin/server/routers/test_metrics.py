@@ -16,8 +16,9 @@ async def _client(app: object) -> httpx.AsyncClient:
 
 
 @pytest.mark.asyncio
-async def test_window_returns_downsampled_buckets(rich_app) -> None:
+async def test_window_returns_downsampled_buckets(rich_app, monkeypatch) -> None:
     ap_id = rich_app.state.store.ap_id
+    monkeypatch.setattr("netadmin.server.routers.metrics.time.time", lambda: float(BASE_TS + 661))
     async with await _client(rich_app) as c:
         resp = await c.get(
             "/api/metrics/window",
@@ -52,6 +53,32 @@ async def test_window_404_for_unknown_entity(rich_app) -> None:
     async with await _client(rich_app) as c:
         resp = await c.get("/api/metrics/window", params={"entity_id": 999999, "metric": "cpu"})
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_window_uses_current_clock_for_historical_retention(rich_app, monkeypatch) -> None:
+    """A historical endpoint end time must not make pruned raw data look live."""
+    now = BASE_TS + 40 * 86_400
+    rich_app.state.store.prune(now=now)
+    monkeypatch.setattr("netadmin.server.routers.metrics.time.time", lambda: float(now))
+
+    async with await _client(rich_app) as c:
+        resp = await c.get(
+            "/api/metrics/window",
+            params={
+                "entity_id": rich_app.state.store.ap_id,
+                "metric": "cpu",
+                "seconds": 7_200,
+                "points": 5,
+                "end": BASE_TS + 3_600,
+            },
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["tier"] == "hourly"
+    assert body["raw_count"] > 0
+    assert body["buckets"]
 
 
 # --- downsample pure-function tests --------------------------------------- #

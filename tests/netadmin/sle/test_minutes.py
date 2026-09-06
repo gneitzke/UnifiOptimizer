@@ -171,6 +171,7 @@ def test_coverage_minutes_split_exactly_across_classifiers(repo: Repository) -> 
 def test_failed_coverage_minute_attributed_to_the_ap(repo: Repository) -> None:
     ap = seed_ap(repo)
     c = seed_client(repo, "c1", parent_id=ap)
+    repo.record_state_change(c, "ap_mac", "ap-1", ts=0)
     make_active(repo, c, 0)
     rssi(repo, c, [(30, -85.0), (90, -85.0)])
 
@@ -183,6 +184,64 @@ def test_failed_coverage_minute_attributed_to_the_ap(repo: Repository) -> None:
     ]
     assert len(weak) == 1
     assert weak[0]["attributed_entity_id"] == ap
+
+
+def test_mid_bucket_roam_splits_weak_minutes_between_sample_time_aps(
+    repo: Repository,
+) -> None:
+    """Each weak RSSI sample belongs to the AP attached at its own timestamp."""
+    ap1 = seed_ap(repo, "ap-1")
+    ap2 = seed_ap(repo, "ap-2")
+    client = seed_client(repo, "c-mid-bucket-roamer", parent_id=ap2)
+    repo.record_state_change(client, "ap_mac", "ap-1", ts=0)
+    repo.record_state_change(client, "ap_mac", "ap-2", ts=120)
+    make_active(repo, client, 0)
+    rssi(repo, client, [(30, -85.0), (90, -85.0), (150, -85.0), (210, -85.0), (270, -85.0)])
+
+    SleMinutesJob(repo).run_bucket(0)
+
+    weak_by_ap = {
+        row["attributed_entity_id"]: row["minutes"]
+        for row in _rows(repo, 0, sle=SLE_COVERAGE, entity_id=client)
+        if row["classifier"] == CLS_WEAK_SIGNAL
+    }
+    assert weak_by_ap == {ap1: 2.0, ap2: 3.0}
+
+
+def test_historical_roam_attributes_each_bucket_to_its_ap_and_radio(
+    repo: Repository,
+) -> None:
+    """A backfill must join samples to the attachment trail, not current parent."""
+    ap1 = seed_ap(repo, "ap-1")
+    ap2 = seed_ap(repo, "ap-2")
+    radio1 = seed_radio(repo, ap1, "ap-1:ng")
+    radio2 = seed_radio(repo, ap2, "ap-2:ng")
+    # Inventory is a present-tense snapshot: by recompute time the client is on AP2.
+    client = seed_client(repo, "c-roamer", parent_id=ap2)
+    repo.record_state_change(client, "ap_mac", "ap-1", ts=10)
+    repo.record_state_change(client, "ap_mac", "ap-2", ts=B)
+
+    for bucket in (0, B):
+        make_active(repo, client, bucket)
+        rssi(repo, client, [(bucket + 30, -85.0), (bucket + 90, -85.0)])
+        # Both radios have samples in both buckets. Selecting via the current AP
+        # would therefore produce AP2/radio2 for the historical first bucket.
+        put(repo, radio1, "cu_total", [(bucket + 30, 80.0), (bucket + 90, 80.0)])
+        put(repo, radio2, "cu_total", [(bucket + 30, 20.0), (bucket + 90, 20.0)])
+
+    SleMinutesJob(repo).run_range(0, 2 * B)
+
+    early_coverage = _rows(repo, 0, sle=SLE_COVERAGE, entity_id=client)
+    late_coverage = _rows(repo, B, sle=SLE_COVERAGE, entity_id=client)
+    assert {r["attributed_entity_id"] for r in early_coverage} == {ap1}
+    assert {r["attributed_entity_id"] for r in late_coverage} == {ap2}
+
+    early_capacity = _rows(repo, 0, sle=SLE_CAPACITY, entity_id=client)
+    late_capacity = _rows(repo, B, sle=SLE_CAPACITY, entity_id=client)
+    assert _by_classifier(early_capacity) == {CLS_NON_WIFI_UTIL: 2.0}
+    assert {r["attributed_entity_id"] for r in early_capacity} == {radio1}
+    assert _by_classifier(late_capacity) == {OK: 2.0}
+    assert {r["attributed_entity_id"] for r in late_capacity} == {radio2}
 
 
 def test_partial_presence_scales_minutes_down(repo: Repository) -> None:
@@ -231,6 +290,7 @@ def test_capacity_non_wifi_util_attributed_to_radio(repo: Repository) -> None:
     ap = seed_ap(repo)
     radio = seed_radio(repo, ap)
     c = seed_client(repo, "c1", parent_id=ap)
+    repo.record_state_change(c, "ap_mac", "ap-1", ts=0)
     make_active(repo, c, 0)
     # busy radio, low self-share, no neighbour -> non_wifi_util on the radio
     put(repo, radio, "cu_total", [(30, 70.0), (90, 70.0)])
@@ -250,6 +310,7 @@ def test_capacity_client_load_when_self_dominates(repo: Repository) -> None:
     ap = seed_ap(repo)
     radio = seed_radio(repo, ap)
     c = seed_client(repo, "c1", parent_id=ap)
+    repo.record_state_change(c, "ap_mac", "ap-1", ts=0)
     make_active(repo, c, 0)
     put(repo, radio, "cu_total", [(30, 80.0)])
     put(repo, radio, "cu_self_rx", [(30, 40.0)])

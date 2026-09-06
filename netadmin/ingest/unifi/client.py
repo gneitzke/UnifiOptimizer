@@ -27,19 +27,77 @@ import httpx
 
 from netadmin.logging import get_logger
 
-from .auth import AuthStrategy, UnifiAuthError, UnifiConnectionError, UnifiError, resolve_strategy
+from .auth import (
+    DEFAULT_AUTH_COOLDOWN_SECONDS,
+    AuthStrategy,
+    UnifiAmbiguousOutcomeError,
+    UnifiAuthCooldownError,
+    UnifiAuthError,
+    UnifiConnectionError,
+    UnifiError,
+    resolve_strategy,
+)
 
 logger = get_logger("ingest.unifi.client")
 
 _RETRYABLE_STATUS = frozenset({500, 502, 503, 504})
+# Transport exceptions whose OUTCOME is uncertain. On an idempotent GET each is
+# retried with backoff; on a MUTATION each surfaces as an ambiguous outcome (never
+# retried, never a definitive failure). ``ReadError``/``WriteError`` are raised when
+# the socket faults AFTER the request bytes were sent -- so on a mutation the write
+# may already have landed (D6): they belong here exactly like ``ReadTimeout``, not
+# leaking out as an unhandled failure the caller records as a clean "failed".
 _RETRYABLE_EXC = (
     httpx.ConnectError,
     httpx.ConnectTimeout,
     httpx.ReadTimeout,
     httpx.WriteTimeout,
     httpx.PoolTimeout,
+    httpx.ReadError,
+    httpx.WriteError,
     httpx.RemoteProtocolError,
 )
+# Failures raised AFTER the full request was already sent and the controller
+# answered, while READING / DECODING / FINISHING (closing) the response:
+#   * ``DecodingError`` -- a corrupt/undecodable body (bad gzip, a truncated chunked
+#     stream); a ``RequestError`` that is deliberately NOT a ``TransportError`` and so
+#     is absent from ``_RETRYABLE_EXC`` above (D6/#w10a-1);
+#   * ``CloseError`` -- the response yielded its success bytes, then the socket faulted
+#     during cleanup/close (#w13a-5). A ``NetworkError`` that is deliberately kept OUT
+#     of ``_RETRYABLE_EXC`` (unlike ``ReadError``/``WriteError``) so a GET does NOT
+#     silently retry a response that already delivered its body; on a mutation it is
+#     classified here as post-send ambiguous, exactly like a decode failure.
+# In every one of these the request landed at the controller (it replied) -- only the
+# tail of receiving/finishing the reply failed -- so on a MUTATION the outcome is
+# UNKNOWN, never a definitive failure: the write may well have taken. It is classified
+# exactly like a lost response / an ambiguous 5xx -- ambiguous, never retried, never a
+# clean "failed" the applier could replay. This is the concrete arm of a general rule:
+# ANY exception raised after the request bytes were sent, without a parsed definitive
+# rejection, is ambiguous for a mutation. A GET keeps its existing behavior: the error
+# propagates to the caller unchanged (a read that cannot be finished is a read failure,
+# and a GET is safely re-issued by the caller, not silently ambiguous).
+_POST_SEND_READ_EXC = (httpx.DecodingError, httpx.CloseError)
+
+
+def envelope_error(payload: Any) -> Optional[str]:
+    """Return the UniFi error message when the classic envelope reports failure.
+
+    The classic UniFi envelope is ``{"meta": {"rc": "ok"|"error", "msg": ...},
+    "data": [...]}``. An explicit ``meta.rc == "error"`` is a failure regardless
+    of the HTTP status: the controller answers ``200`` with an error envelope
+    (e.g. ``api.err.InvalidObject``) and the transport looks healthy. Shared by
+    the read path (:meth:`UnifiClient._parse`) and the write path
+    (:meth:`netadmin.fixes.writer.RealControllerWriter._send`) so a read never
+    returns rows and a write never reports success on an envelope that says the
+    operation failed (the R1 finding). Returns ``None`` when there is no explicit
+    error to report (``rc`` absent or ``ok``, or a non-dict body).
+    """
+    if not isinstance(payload, dict):
+        return None
+    meta = payload.get("meta")
+    if isinstance(meta, dict) and str(meta.get("rc", "")).strip().lower() == "error":
+        return str(meta.get("msg") or "api.err (unspecified)")
+    return None
 
 
 class UnifiClient:
@@ -78,10 +136,17 @@ class UnifiClient:
         if not verify_ssl:
             self._suppress_insecure_warning()
 
+        # follow_redirects=False is a security rail (S4): the REST client carries
+        # the controller credential (X-API-KEY header, or the session cookie). httpx
+        # replays request headers across a redirect, so a redirect to another origin
+        # -- easy to induce when TLS verification is disabled for self-signed certs --
+        # would forward that credential off-controller. We never chase redirects on
+        # an authenticated controller request; a 3xx surfaces as a response the
+        # caller can inspect, and no secret leaves the controller origin.
         self._http = httpx.AsyncClient(
             verify=verify_ssl,
             timeout=timeout,
-            follow_redirects=True,
+            follow_redirects=False,
         )
         self._strategy: Optional[AuthStrategy] = None
         # A separate cookie strategy + its own http client for the events
@@ -91,6 +156,12 @@ class UnifiClient:
         self._ws_strategy: Optional[AuthStrategy] = None
         self._ws_http: Optional[httpx.AsyncClient] = None
         self._auth_lock = asyncio.Lock()
+        # Authentication failures are session-wide state, just like successful
+        # authentication. The deadline is guarded by _auth_lock so callers queued
+        # behind one rejected login observe the same failure instead of each
+        # spending another controller login attempt.
+        self._auth_cooldown_until = 0.0
+        self._auth_failure_message: Optional[str] = None
         self._pace_lock = asyncio.Lock()
         self._last_request_ts = 0.0
         # Monotonic counter bumped on every successful (re)login. A request that
@@ -158,7 +229,45 @@ class UnifiClient:
         async with self._auth_lock:
             if self._strategy is not None and self._strategy.authenticated:
                 return self._strategy
-            self._strategy = await resolve_strategy(
+            return await self._connect_locked()
+
+    def _active_auth_cooldown(self) -> Optional[UnifiAuthCooldownError]:
+        """Return the shared cooldown error, if its monotonic deadline is active.
+
+        Must be called while holding :attr:`_auth_lock`.
+        """
+        remaining = self._auth_cooldown_until - time.monotonic()
+        if remaining <= 0:
+            self._auth_cooldown_until = 0.0
+            self._auth_failure_message = None
+            return None
+        return UnifiAuthCooldownError(remaining, self._auth_failure_message)
+
+    def _remember_auth_failure(self, exc: UnifiAuthError) -> None:
+        """Establish one shared quiet period after a refused auth attempt."""
+        delay = (
+            exc.retry_after
+            if isinstance(exc, UnifiAuthCooldownError)
+            else DEFAULT_AUTH_COOLDOWN_SECONDS
+        )
+        self._auth_cooldown_until = max(
+            self._auth_cooldown_until, time.monotonic() + max(0.0, delay)
+        )
+        self._auth_failure_message = (
+            exc.reason if isinstance(exc, UnifiAuthCooldownError) else str(exc)
+        )
+
+    def _clear_auth_failure(self) -> None:
+        self._auth_cooldown_until = 0.0
+        self._auth_failure_message = None
+
+    async def _connect_locked(self) -> AuthStrategy:
+        """Connect with ``_auth_lock`` held, sharing success and failure state."""
+        cooldown = self._active_auth_cooldown()
+        if cooldown is not None:
+            raise cooldown
+        try:
+            strategy = await resolve_strategy(
                 self._http,
                 host=self._host,
                 site=self._site,
@@ -166,8 +275,25 @@ class UnifiClient:
                 password=self._password,
                 api_key=self._api_key,
             )
-            self._login_epoch += 1
-            return self._strategy
+        except UnifiAuthError as exc:
+            self._remember_auth_failure(exc)
+            raise
+        self._strategy = strategy
+        self._clear_auth_failure()
+        self._login_epoch += 1
+        return strategy
+
+    async def _authenticate_locked(self, strategy: AuthStrategy, http: httpx.AsyncClient) -> None:
+        """Authenticate an existing strategy with shared cooldown handling."""
+        cooldown = self._active_auth_cooldown()
+        if cooldown is not None:
+            raise cooldown
+        try:
+            await strategy.authenticate(http)
+        except UnifiAuthError as exc:
+            self._remember_auth_failure(exc)
+            raise
+        self._clear_auth_failure()
 
     async def _relogin(self, observed_epoch: Optional[int] = None) -> None:
         """Force a fresh login on the current strategy (401 recovery).
@@ -185,10 +311,10 @@ class UnifiClient:
             if observed_epoch is not None and observed_epoch != self._login_epoch:
                 return  # someone already re-logged in for this epoch; reuse it
             if self._strategy is None:
-                await self.connect()
+                await self._connect_locked()
                 return
             self._strategy.authenticated = False
-            await self._strategy.authenticate(self._http)
+            await self._authenticate_locked(self._strategy, self._http)
             self._login_epoch += 1
 
     async def ws_strategy(self, *, force_reauth: bool = False) -> AuthStrategy:
@@ -214,7 +340,7 @@ class UnifiClient:
                 # a forced re-auth by re-running the login on that shared strategy.
                 if force_reauth:
                     self._strategy.authenticated = False
-                    await self._strategy.authenticate(self._http)
+                    await self._authenticate_locked(self._strategy, self._http)
                 return self._strategy
             if not (self._username and self._password):
                 raise UnifiAuthError(
@@ -238,7 +364,7 @@ class UnifiClient:
             # pure API-key. Reads its cookies via :attr:`ws_cookies`.
             if self._ws_http is None:
                 self._ws_http = httpx.AsyncClient(
-                    verify=self._verify_ssl, timeout=self._http.timeout, follow_redirects=True
+                    verify=self._verify_ssl, timeout=self._http.timeout, follow_redirects=False
                 )
             cookie_cls = (
                 UnifiOsCookieAuth
@@ -246,7 +372,7 @@ class UnifiClient:
                 else LegacyCookieAuth
             )
             cookie = cookie_cls(self._host, self._site, self._username, self._password)
-            await cookie.authenticate(self._ws_http)
+            await self._authenticate_locked(cookie, self._ws_http)
             self._ws_strategy = cookie
             return cookie
 
@@ -290,6 +416,85 @@ class UnifiClient:
     def _backoff(self, attempt: int) -> float:
         return min(self._backoff_base * (2**attempt), self._backoff_max)
 
+    def _finish_mutation(
+        self,
+        strategy: AuthStrategy,
+        resp: httpx.Response,
+        method_u: str,
+        endpoint: str,
+    ) -> httpx.Response:
+        """Finish a MUTATION's response; any post-send failure is AMBIGUOUS (#w14a-1).
+
+        Single-dispatch by construction -- a mutation is NEVER retried or
+        re-dispatched here. Everything after the request bytes were sent runs under
+        ONE guard: cookie ``capture``, the 401 envelope parse, response close. The
+        rule is structural, not an enumerated exception list: any exception raised in
+        that window that is NOT a parsed definitive rejection means the write may have
+        landed, so it surfaces as :class:`UnifiAmbiguousOutcomeError` (never reaching
+        the applier's generic 'failed' handler, never replayed). Only a PARSED
+        controller rejection (``meta.rc=error`` -- including on a 401, #w12a-1) is a
+        DEFINITIVE failure, returned unchanged; a received 2xx/5xx is returned for the
+        writer's unified envelope classification (a mutation 5xx is a received
+        server-side failure, not a lost response, and is never retried).
+        """
+        try:
+            strategy.capture(resp, self._http.cookies)
+            if resp.status_code == 401:
+                # #w12a-1: honour the envelope. A 401 carrying a PARSED rejection
+                # (``meta.rc=error``) is a DEFINITIVE failure the controller confirmed;
+                # return it for the writer's classification, do NOT launder it into
+                # ambiguous. Only a 401 with NO parseable rejection is ambiguous: the
+                # session dropped and the write may or may not have landed.
+                try:
+                    body = resp.json()
+                except ValueError:
+                    body = None
+                if envelope_error(body) is not None:
+                    logger.warning(
+                        "%s %s -> 401 with a parsed rejection envelope; definitive "
+                        "failure (single dispatch, not re-dispatched, not ambiguous).",
+                        method_u,
+                        endpoint,
+                    )
+                    return resp
+                logger.warning(
+                    "%s %s -> 401 on a mutation with no parseable rejection; "
+                    "not re-dispatched (ambiguous).",
+                    method_u,
+                    endpoint,
+                )
+                raise UnifiAmbiguousOutcomeError(
+                    f"{method_u} {endpoint} -> 401; the session was rejected and the "
+                    "write may or may not have landed. Not re-dispatched. Reconcile "
+                    "controller state via GET before any further attempt."
+                )
+            # A received 2xx / 5xx / other status: return unchanged. A mutation is
+            # never retried on a 5xx (a received response, not a lost one); the writer
+            # classifies the envelope.
+            return resp
+        except UnifiAmbiguousOutcomeError:
+            # Already the deliberate ambiguous classification above -- do not re-wrap.
+            raise
+        except Exception as exc:  # noqa: BLE001 - structural: post-send == unknown
+            # ANY other post-send processing failure (CookieConflict,
+            # LocalProtocolError, a cleanup RuntimeError, CloseError, DecodingError,
+            # ReadError, ...) means the write may have landed. Ambiguous, single
+            # dispatch, never a clean 'failed' the applier could replay.
+            logger.warning(
+                "%s %s post-send response processing failed (%s: %s); mutation "
+                "outcome unknown, single dispatch, not replayed.",
+                method_u,
+                endpoint,
+                type(exc).__name__,
+                exc,
+            )
+            raise UnifiAmbiguousOutcomeError(
+                f"{method_u} {endpoint} post-send response processing failed "
+                f"({type(exc).__name__}: {exc}); the request was sent and the write "
+                "may have landed. Not retried, not a definitive failure. Reconcile "
+                "controller state via GET before any further attempt."
+            ) from exc
+
     async def request(
         self,
         method: str,
@@ -297,12 +502,39 @@ class UnifiClient:
         *,
         params: Optional[dict[str, Any]] = None,
         json_body: Optional[Any] = None,
+        allow_mutation: bool = False,
     ) -> httpx.Response:
-        """Issue an authenticated request to a site endpoint with retries.
+        """Issue an authenticated request to a site endpoint.
 
         ``endpoint`` is a site-relative path such as ``stat/device`` or
         ``stat/report/hourly.ap``; the strategy resolves the full URL.
+
+        This is the collector transport boundary and it enforces the GET-only
+        contract (S1): routine collection may issue **only** idempotent GETs.
+        A non-GET verb is refused unless the caller sets ``allow_mutation=True``,
+        which exactly one production object does -- the approved fix writer
+        (:class:`netadmin.fixes.writer.RealControllerWriter`), the single seam
+        allowed to change the controller. Any other non-GET is a contract
+        violation and raises :class:`UnifiError` before a socket opens.
+
+        Retry policy is method-aware (C2). GETs are idempotent, so a transport
+        error or a retryable 5xx is retried with backoff. A mutation is **never**
+        auto-retried on an ambiguous transport failure: a lost response could
+        otherwise dispatch the same write several times. Such a mutation raises
+        :class:`UnifiAmbiguousOutcomeError` after a single attempt so the caller
+        keeps the before-state and reconciles via a GET before trying again. The
+        same rule governs a 401 on a mutation (C2): only a GET is re-dispatched
+        after the single re-login; a non-GET that draws a 401 raises
+        :class:`UnifiAmbiguousOutcomeError` without a second dispatch.
         """
+        method_u = method.upper()
+        idempotent = method_u == "GET"
+        if not idempotent and not allow_mutation:
+            raise UnifiError(
+                f"GET-only contract: refusing {method_u} {endpoint}. The collector is "
+                "read-only; only the approved fix writer may issue a controller mutation."
+            )
+
         strategy = await self.connect()
         url = strategy.api_url(self._host, self._site, endpoint)
         # The epoch we authenticated under; the 401 guard uses it so a burst of
@@ -318,15 +550,39 @@ class UnifiClient:
                 resp = await self._http.request(
                     method, url, params=params, json=json_body, headers=headers
                 )
+            except _POST_SEND_READ_EXC as exc:
+                # A read/decode failure of the RESPONSE body -- the request was fully
+                # sent and the controller answered, only the answer could not be
+                # decoded (#w10a-1). On a MUTATION the write may have landed, so this
+                # is AMBIGUOUS, never a definitive failure: surface it exactly like a
+                # lost response so the caller records "unknown" and reconciles via a
+                # GET, and never retries (a retry could double-apply). A GET keeps its
+                # existing behavior: the error propagates for the caller to re-issue.
+                if not idempotent:
+                    raise UnifiAmbiguousOutcomeError(
+                        f"{method_u} {endpoint} response could not be read/decoded "
+                        f"({type(exc).__name__}: {exc}); the request was sent and the "
+                        "write may have landed. Not retried. Reconcile controller "
+                        "state via GET before any further attempt."
+                    ) from exc
+                raise
             except _RETRYABLE_EXC as exc:
+                if not idempotent:
+                    # Ambiguous outcome on a mutation: do NOT retry (C2). The write
+                    # may already have landed; retrying could apply it again.
+                    raise UnifiAmbiguousOutcomeError(
+                        f"{method_u} {endpoint} outcome unknown "
+                        f"({type(exc).__name__}: {exc}); not retried. Reconcile "
+                        "controller state via GET before any further attempt."
+                    ) from exc
                 if attempt >= self._max_retries:
                     raise UnifiConnectionError(
-                        f"{method} {endpoint} failed after {attempt + 1} attempts: {exc}"
+                        f"{method_u} {endpoint} failed after {attempt + 1} attempts: {exc}"
                     ) from exc
                 delay = self._backoff(attempt)
                 logger.warning(
                     "%s %s transport error (%s); retry %d in %.1fs",
-                    method,
+                    method_u,
                     endpoint,
                     type(exc).__name__,
                     attempt + 1,
@@ -335,21 +591,74 @@ class UnifiClient:
                 attempt += 1
                 await asyncio.sleep(delay)
                 continue
+            except Exception as exc:  # noqa: BLE001 - structural single-dispatch guard
+                # #w15a-1 (STRUCTURAL, not enumerate-more): the request bytes were
+                # DISPATCHED and the exception surfaced from WITHIN the request/response
+                # await ITSELF -- e.g. a ``RuntimeError`` (or any non-enumerated error)
+                # raised while httpx finishes the response, closing/``aclose``-ing the
+                # stream AFTER the controller already delivered its ``meta.rc=ok`` bytes.
+                # Such an exception is neither a pre-send transport error nor a body
+                # read/decode error, so it slipped past ``_RETRYABLE_EXC`` /
+                # ``_POST_SEND_READ_EXC`` and past ``_finish_mutation`` (which only
+                # guards processing AFTER the await returns) and escaped ``request``
+                # unclassified -- the applier then recorded a clean 'failed' and a
+                # REPLAY dispatched a SECOND PUT. For a MUTATION the ENTIRE response
+                # lifecycle (dispatch, read, context-manager exit / ``aclose`` / cleanup)
+                # is now inside the single-dispatch ambiguity guard: any exception here
+                # that is NOT a parsed definitive rejection means the write may have
+                # landed, so it is AMBIGUOUS -- single dispatch, never a clean 'failed',
+                # never replayed. A GET re-raises unchanged (an idempotent read the
+                # caller safely re-issues).
+                if not idempotent:
+                    raise UnifiAmbiguousOutcomeError(
+                        f"{method_u} {endpoint} outcome unknown while finishing the "
+                        f"response ({type(exc).__name__}: {exc}); the request was "
+                        "dispatched and the write may have landed. Not retried. "
+                        "Reconcile controller state via GET before any further attempt."
+                    ) from exc
+                raise
+
+            # ---- post-send response processing (capture / parse / close) ----
+            # #w14a-1 (STRUCTURAL, not enumerate-more): the request bytes are now
+            # dispatched and the controller has answered. ANY exception raised while
+            # PROCESSING that response -- cookie ``capture`` (a ``CookieConflict`` from
+            # duplicate TOKEN cookies, a ``LocalProtocolError``), a cleanup
+            # ``RuntimeError``, a ``CloseError``/``DecodingError`` finishing the body,
+            # anything -- means a MUTATION's outcome is UNKNOWN: the write may already
+            # have landed. Previously ``capture`` ran OUTSIDE the classifier, so such a
+            # post-send error escaped ``request`` and reached the applier's generic
+            # handler as a clean 'failed', permitting a REPLAY (a second PUT). For a
+            # mutation we now wrap ALL post-send processing so any exception that is NOT
+            # a PARSED definitive rejection is classified AMBIGUOUS -- single dispatch,
+            # never a clean 'failed', never replayed. This is the general rule the
+            # earlier CloseError/DecodingError fix only enumerated one arm of. A GET
+            # keeps its existing behavior: these errors propagate to the caller, which
+            # safely re-issues an idempotent read.
+            if not idempotent:
+                return self._finish_mutation(strategy, resp, method_u, endpoint)
 
             strategy.capture(resp, self._http.cookies)
 
             if resp.status_code == 401 and not relogged:
-                logger.info("%s %s -> 401; re-logging in once.", method, endpoint)
+                # A GET is idempotent: a single re-login and retry is safe.
+                logger.info("%s %s -> 401; re-logging in once.", method_u, endpoint)
                 relogged = True
                 await self._relogin(login_epoch)
                 login_epoch = self._login_epoch  # adopt whichever login now stands
                 continue
 
-            if resp.status_code in _RETRYABLE_STATUS and attempt < self._max_retries:
+            # Retryable 5xx: only GETs are retried. A mutation that draws a 5xx is
+            # a definite server-side failure (a received response, not a lost one),
+            # so it is surfaced to the caller as a non-2xx outcome, never retried.
+            if (
+                idempotent
+                and resp.status_code in _RETRYABLE_STATUS
+                and attempt < self._max_retries
+            ):
                 delay = self._backoff(attempt)
                 logger.warning(
                     "%s %s -> %d; retry %d in %.1fs",
-                    method,
+                    method_u,
                     endpoint,
                     resp.status_code,
                     attempt + 1,
@@ -364,23 +673,20 @@ class UnifiClient:
     # ------------------------------------------------------------------ #
     # JSON helpers (classic UniFi envelope: {"meta": {...}, "data": [...]})
     # ------------------------------------------------------------------ #
+    # There is deliberately no ``post_json`` / ``post_data`` helper: the collector
+    # is GET-only (S1), so a read helper that POSTs would be a contract violation
+    # waiting to be called. The one legitimate controller mutation path is the fix
+    # writer, which calls :meth:`request` directly with ``allow_mutation=True``.
     async def get_json(
         self, endpoint: str, params: Optional[dict[str, Any]] = None
     ) -> dict[str, Any]:
         resp = await self.request("GET", endpoint, params=params)
         return self._parse(resp, endpoint)
 
-    async def post_json(self, endpoint: str, body: Optional[Any] = None) -> dict[str, Any]:
-        resp = await self.request("POST", endpoint, json_body=body if body is not None else {})
-        return self._parse(resp, endpoint)
-
     async def get_data(
         self, endpoint: str, params: Optional[dict[str, Any]] = None
     ) -> list[dict[str, Any]]:
         return self._data(await self.get_json(endpoint, params))
-
-    async def post_data(self, endpoint: str, body: Optional[Any] = None) -> list[dict[str, Any]]:
-        return self._data(await self.post_json(endpoint, body))
 
     def _parse(self, resp: httpx.Response, endpoint: str) -> dict[str, Any]:
         if resp.status_code in (401, 403):
@@ -393,6 +699,71 @@ class UnifiClient:
             raise UnifiError(f"{endpoint} returned non-JSON response") from exc
         if not isinstance(data, dict):
             raise UnifiError(f"{endpoint} returned unexpected JSON shape")
+        # An explicit error envelope is a failure even on HTTP 200 (R1). Without
+        # this, a ``{"meta":{"rc":"error"},"data":[]}`` body would quietly parse to
+        # zero rows and read as an empty-but-healthy result.
+        err = envelope_error(data)
+        if err is not None:
+            raise UnifiError(f"{endpoint} -> {err}")
+        # BUG#6 / #w12a-2 / #w13a-1 (positive-proof of a real read): a 200 body counts
+        # as a well-formed SUCCESSFUL read ONLY when it POSITIVELY presents the classic
+        # UniFi success shape -- a ``data`` field that is an ACTUAL LIST (a real,
+        # present list; possibly empty) AND, when a ``meta`` KEY is present, a ``meta``
+        # that is a VALID dict carrying an explicit ``meta.rc == "ok"``. Nothing weaker
+        # is a successful read:
+        #
+        #   * ``{"meta":{"rc":"ok"}}`` with NO ``data`` -- a success envelope over
+        #     no rows is not a read of zero rows; the payload the caller reads is
+        #     simply absent. rc=ok WITHOUT a real data list is NOT a valid read.
+        #   * ``{"data":null}`` / ``{"data":false}`` -- ``data`` present but not a
+        #     list; a null/false body is not an empty successful read.
+        #   * ``{"meta":{"rc":"pending"},...}`` (or any meta.rc other than "ok") --
+        #     a pending/other envelope is NOT a completed read even with ``data:[]``.
+        #   * ``{"meta":null,...}`` / ``{"meta":false,...}`` / ``{"meta":[],...}`` /
+        #     ``{"meta":"pending",...}`` -- the ``meta`` KEY is PRESENT but is not a
+        #     valid dict, so the controller sent SOMETHING for meta that is not a
+        #     success envelope. A present-but-non-dict meta is NOT proof of rc=ok and
+        #     must NOT be treated as an absent meta (#w13a-1): if the ``meta`` key
+        #     exists at all it MUST be a dict with rc=="ok" for the read to be a
+        #     well-formed success. (Only a genuinely ABSENT ``meta`` key, over a real
+        #     data list, is the bare ``{"data":[...]}`` success shape.)
+        #
+        # Previously this used ``meta_present = isinstance(meta, dict)``, so a present-
+        # but-non-dict meta was treated as ABSENT and the read accepted (the #w13a-1
+        # bug: ``{"meta":null,"data":[]}`` recorded 'complete'/coverage 1.0). Earlier
+        # still it accepted ``has_data OR rc_ok`` and :meth:`_data` defaulted a
+        # missing/falsy ``data`` to ``[]``, so every malformed body above parsed to
+        # zero rows and read as empty-but-healthy; event catch-up then credited
+        # ``event_history`` coverage (status 'complete', 1.0) for a window it never
+        # actually read, defeating every detector coverage gate. Absent POSITIVE
+        # proof of a real read this is a FAILED/UNAVAILABLE read and must raise, so
+        # catch-up records a FAILED hole rather than fabricated coverage. A genuine
+        # ``{"meta":{"rc":"ok"},"data":[]}`` (or a bare ``{"data":[...]}`` with NO
+        # meta key) still reads as complete -- normal reads are unaffected.
+        data_field = data.get("data")
+        data_is_list = isinstance(data_field, list)
+        meta_key_present = "meta" in data
+        meta = data.get("meta")
+        meta_is_dict = isinstance(meta, dict)
+        # A present ``meta`` key is well-formed ONLY as a dict with rc=="ok". An absent
+        # meta key is fine (the bare ``{"data":[...]}`` shape); a present non-dict meta,
+        # or a dict whose rc != "ok", is not a success.
+        meta_ok = meta_is_dict and str(meta.get("rc", "")).strip().lower() == "ok"
+        if not data_is_list or (meta_key_present and not meta_ok):
+            if not data_is_list:
+                detail = data.get("error") or data.get("message") or (
+                    f"data is {type(data_field).__name__}, not a list"
+                )
+            elif not meta_is_dict:
+                detail = f"meta is {type(meta).__name__}, not a dict (rc unverifiable)"
+            else:
+                detail = data.get("error") or data.get("message") or (
+                    f"meta.rc={meta.get('rc')!r} (not ok)"
+                )
+            raise UnifiError(
+                f"{endpoint} -> unrecognized response (no well-formed data list / "
+                f"meta.rc=ok): {detail}"
+            )
         return data
 
     @staticmethod
@@ -403,4 +774,4 @@ class UnifiClient:
         return [data] if data else []
 
 
-__all__ = ["UnifiClient"]
+__all__ = ["UnifiClient", "envelope_error"]

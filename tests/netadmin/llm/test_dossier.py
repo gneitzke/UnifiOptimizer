@@ -237,6 +237,65 @@ def test_incident_dossier_narrates_root_and_symptoms(tmp_db_path: Path) -> None:
         store.close()
 
 
+def test_incident_dossier_distinguishes_cleared_from_current_symptoms(
+    tmp_db_path: Path,
+) -> None:
+    """Finding #7 (LLM narration): once a symptom is resolved out and cleared by a
+    second correlation pass, the incident dossier must flag it as FORMER, not
+    describe it as a live symptom of the current root, and the member count must
+    reflect the current shape (root only) rather than the historical union."""
+    from netadmin.correlate.engine import CorrelationEngine
+    from netadmin.correlate.store_repository import StoreCorrelationRepository
+
+    store = Repository.open(tmp_db_path, site_id="default")
+    try:
+        ap = store.upsert_entity(
+            Entity(entity_type=EntityType.AP, native_id="02:00:00:00:00:09", name="Cleared Porch"),
+            ts=BASE_TS,
+        )
+        root = store.insert_issue(
+            fingerprint="mesh-root-clear-dossier",
+            detector_key="wifi.mesh_uplink",
+            severity="p2",
+            state="active",
+            first_seen_ts=BASE_TS,
+            last_seen_ts=BASE_TS + 600,
+            title="Weak mesh backhaul on Cleared Porch",
+            entity_id=ap,
+            evidence={"uplink_rssi_dbm": -78},
+        )
+        symptom = store.insert_issue(
+            fingerprint="cov-hole-clear-dossier",
+            detector_key="net.coverage_hole",
+            severity="p2",
+            state="active",
+            first_seen_ts=BASE_TS + 300,
+            last_seen_ts=BASE_TS + 600,
+            title="Coverage hole on Cleared Porch",
+            entity_id=ap,
+        )
+        store.record_issue_event(root, "detected", ts=BASE_TS)
+        engine = CorrelationEngine(StoreCorrelationRepository(store))
+        engine.run(BASE_TS + 900)
+        incident_id = int(store.list_incidents(open_only=True)[0]["id"])
+
+        store.update_issue(symptom, state="resolved", resolved_ts=BASE_TS + 700)
+        engine.run(BASE_TS + 1000)  # reconcile pass that clears the symptom
+        assert store.current_incident_issue_ids(incident_id) == {root}
+
+        dossier = build_incident_dossier(incident_id, store, now=BASE_TS + 1100)
+        # The cleared symptom still tells its part of the history, but flagged.
+        assert "net.coverage_hole" in dossier
+        assert "former" in dossier.lower()
+        assert "Status" in dossier  # the table now carries a membership-status column
+        # Member count is the current shape (1 root + 0 current symptoms), with the
+        # cleared one disclosed separately -- not the historical union of 2 symptoms.
+        assert "1 current (1 root + 0 symptom(s))" in dossier
+        assert "1 former (cleared)" in dossier
+    finally:
+        store.close()
+
+
 def test_incident_dossier_unknown_raises(tmp_db_path: Path) -> None:
     store = Repository.open(tmp_db_path, site_id="default")
     try:

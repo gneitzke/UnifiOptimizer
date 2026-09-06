@@ -84,7 +84,10 @@ _JOB_CADENCE: dict[str, tuple[str, str, int]] = {
 # so the surface is honest about what is not yet running. These are the ids the
 # collector and probes emit, so once they run their status resolves instead of
 # sitting UNKNOWN forever alongside phantom canonical names.
-DEFAULT_JOBS: tuple[str, ...] = tuple(_JOB_CADENCE)
+# WS is continuous rather than cadence-driven, so it deliberately has no stale
+# interval.  Its poll_runs are nevertheless a first-class health input: a failed
+# socket must degrade health even while every REST poll stays green (R3).
+DEFAULT_JOBS: tuple[str, ...] = (*_JOB_CADENCE, "ws")
 
 # How far back health scans poll_runs to find each job's last success. Wide
 # enough to cover the slowest cadence (report backfill) with headroom.
@@ -344,7 +347,7 @@ def _ws_state(state: DaemonState) -> dict[str, Any]:
     if sup is None:
         reason = state.unavailable.get("ws_supervisor")
         return {"state": UNKNOWN, "detail": reason} if reason else {"state": UNKNOWN}
-    for attr in ("state", "status"):
+    for attr in ("connection_state", "state", "status"):
         value = getattr(sup, attr, None)
         if value is not None:
             return {"state": str(value)}
@@ -433,10 +436,13 @@ def build_health(
     # A channel stuck at ``failing`` means notifications are not reaching anyone.
     # That is exactly the kind of silent failure health exists to make loud.
     alerts_failing = any(c.get("status") == "failing" for c in alerts.get("channels", []))
+    websocket = _ws_state(state)
+    ws_unavailable = websocket.get("state") in {"unsupported", "auth-failed", "storage-failed"}
 
     degraded = (
         bool(state.unavailable)
         or alerts_failing
+        or ws_unavailable
         or any(j["status"] in ("stale", "failing") for j in job_reports)
     )
     if not state.ready:
@@ -459,7 +465,7 @@ def build_health(
         },
         "entities": _entity_counts(store),
         "jobs": job_reports,
-        "websocket": _ws_state(state),
+        "websocket": websocket,
         "components": _components_status(state),
         "alerts": alerts,
         "auto_investigate": _auto_investigate_block(state),

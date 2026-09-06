@@ -10,6 +10,7 @@ Subcommands:
 * ``daemon``      - run the always-on collector + detection + API process
                     (the explicit, service-manager form: no browser is opened).
 * ``status``      - hit a running daemon's ``/api/health`` and report it.
+* ``doctor``      - inspect and migrate the local store without controller access.
 * ``token``       - print the configured access token (or error if none is set).
 * ``mcp-token``   - print the configured NETADMIN_MCP_TOKEN (or error if unset);
                     ``--regenerate`` mints and persists a new one. This is the
@@ -179,32 +180,199 @@ def _cmd_status(args: argparse.Namespace) -> int:
     try:
         resp = httpx.get(url, timeout=5.0)
     except httpx.HTTPError as exc:
-        log.error("daemon unreachable at %s: %s", url, exc)
+        print(f"daemon unreachable at {url}: {exc}", file=sys.stderr)
         return 1
 
     if resp.status_code != 200:
-        log.error("health check returned HTTP %d from %s", resp.status_code, url)
+        print(
+            f"health check returned HTTP {resp.status_code} from {url}",
+            file=sys.stderr,
+        )
         return 1
 
-    data = resp.json()
+    try:
+        data = resp.json()
+    except (json.JSONDecodeError, ValueError) as exc:
+        print(f"health check returned invalid JSON from {url}: {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(data, dict):
+        print(f"health check returned a non-object JSON value from {url}", file=sys.stderr)
+        return 1
+
     status = data.get("status", "UNKNOWN")
-    uptime = data.get("uptime_s", "UNKNOWN")
-    entities = data.get("entities", {}).get("total", "UNKNOWN")
-    backfill = data.get("backfill", "UNKNOWN")
-    log.info(
-        "daemon status=%s uptime_s=%s entities=%s backfill=%s", status, uptime, entities, backfill
-    )
-    for job in data.get("jobs", []):
-        log.info(
-            "  job=%s status=%s last_success_age_s=%s consecutive_failures=%s",
-            job.get("job"),
-            job.get("status"),
-            job.get("last_success_age_s"),
-            job.get("consecutive_failures"),
-        )
     if args.json:
-        log.info(json.dumps(data, indent=2, sort_keys=True))
+        # U5: stdout is a machine interface.  Exactly one JSON document goes
+        # there; all human-oriented text remains on stderr.
+        print(json.dumps(data, indent=2, sort_keys=True))
+    else:
+        uptime = data.get("uptime_s", "UNKNOWN")
+        entities_block = data.get("entities")
+        entities = (
+            entities_block.get("total", "UNKNOWN")
+            if isinstance(entities_block, dict)
+            else "UNKNOWN"
+        )
+        backfill = data.get("backfill", "UNKNOWN")
+        print(
+            f"daemon status={status} uptime_s={uptime} entities={entities} backfill={backfill}",
+            file=sys.stderr,
+        )
+        jobs = data.get("jobs", [])
+        if isinstance(jobs, list):
+            for job in jobs:
+                if not isinstance(job, dict):
+                    continue
+                print(
+                    "  job={job} status={status} last_success_age_s={age} "
+                    "consecutive_failures={failures}".format(
+                        job=job.get("job"),
+                        status=job.get("status"),
+                        age=job.get("last_success_age_s"),
+                        failures=job.get("consecutive_failures"),
+                    ),
+                    file=sys.stderr,
+                )
     return 0 if status == "ok" else 2
+
+
+def _doctor_summary(settings: object, *, now: int) -> tuple[dict[str, object], int]:
+    """Build the offline local-install health document and its stable exit code."""
+    from netadmin.server.runtime import DEFAULT_JOBS, _job_health
+    from netadmin.store import db as store_db
+    from netadmin.store.repository import Repository
+
+    db_path = Path(getattr(settings, "db_path"))
+    controller_configured = bool(getattr(settings, "unifi").is_configured)
+    ui_token_configured = bool(getattr(settings, "api_token"))
+    credentials = {
+        "configured": controller_configured and ui_token_configured,
+        "controller": controller_configured,
+        "ui_token": ui_token_configured,
+    }
+    database: dict[str, object] = {
+        "path": str(db_path),
+        "present": db_path.is_file(),
+        "migratable": False,
+        "schema_version": None,
+        "latest_schema_version": store_db.latest_migration_version(),
+        "migrations_applied": [],
+    }
+    summary: dict[str, object] = {
+        "status": "degraded",
+        "offline": True,
+        "database": database,
+        "credentials": credentials,
+        "jobs": [],
+        "collection_gaps": [],
+        "errors": [],
+    }
+
+    if not db_path.is_file():
+        summary["errors"] = [f"database not found: {db_path}"]
+        return summary, 2
+
+    repo: Optional[Repository] = None
+    try:
+        before_conn = store_db.connect(db_path, read_only=True)
+        try:
+            before = store_db.schema_version(before_conn)
+        finally:
+            before_conn.close()
+        repo = Repository.open(db_path, site_id=str(getattr(settings, "site_id", "default")))
+        after = store_db.schema_version(repo.connection)
+        database.update(
+            {
+                "migratable": True,
+                "schema_version": after,
+                "migrations_applied": list(range(before + 1, after + 1)),
+            }
+        )
+
+        names = sorted(set(DEFAULT_JOBS) | set(repo.list_poll_jobs()))
+        jobs = [_job_health(repo, settings, job, now, None) for job in names]
+        gaps_by_job: dict[str, dict[str, object]] = {}
+        for job in jobs:
+            state = str(job["status"])
+            if state in ("stale", "failing"):
+                gaps_by_job[str(job["job"])] = {
+                    "job": job["job"],
+                    "status": state,
+                    "last_success_age_s": job["last_success_age_s"],
+                    "consecutive_failures": job["consecutive_failures"],
+                }
+
+            # A fresh final poll can hide a hole earlier in the window.  Reuse
+            # the store's source-aware coverage calculation to detect that case,
+            # but require two recorded runs so a brand-new install is not judged
+            # against time before collection began.
+            interval = job.get("interval_s")
+            if not isinstance(interval, int) or interval <= 0:
+                continue
+            window_s = interval * 10
+            runs = repo.read_poll_runs(str(job["job"]), now - window_s, now + 1)
+            if len(runs) < 2:
+                continue
+            start = max(now - window_s, int(runs[0]["ts"]) - interval)
+            coverage = repo.expected_coverage(str(job["job"]), start, now, interval)
+            if coverage < 0.5:
+                gap = gaps_by_job.setdefault(
+                    str(job["job"]),
+                    {
+                        "job": job["job"],
+                        "status": "coverage_gap",
+                        "last_success_age_s": job["last_success_age_s"],
+                        "consecutive_failures": job["consecutive_failures"],
+                    },
+                )
+                gap["live_coverage"] = round(coverage, 4)
+                gap["coverage_window_s"] = now - start
+        gaps = [gaps_by_job[name] for name in sorted(gaps_by_job)]
+        summary["jobs"] = jobs
+        summary["collection_gaps"] = gaps
+        degraded = bool(gaps) or not bool(credentials["configured"])
+        summary["status"] = "degraded" if degraded else "ok"
+        return summary, 2 if degraded else 0
+    except Exception as exc:  # noqa: BLE001 - doctor reports, never crashes
+        summary["status"] = "error"
+        summary["errors"] = [f"{type(exc).__name__}: {exc}"]
+        return summary, 1
+    finally:
+        if repo is not None:
+            repo.close()
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    """Check the local store and configuration without contacting a controller.
+
+    Exit codes: 0 healthy, 2 degraded, 1 when the store cannot be inspected or
+    migrated.  ``--offline`` is required so the no-network contract is explicit.
+    """
+    settings = get_settings()
+    summary, exit_code = _doctor_summary(settings, now=int(time.time()))
+    database = summary["database"]
+    credentials = summary["credentials"]
+    gaps = summary["collection_gaps"]
+    assert isinstance(database, dict)
+    assert isinstance(credentials, dict)
+    assert isinstance(gaps, list)
+    print(
+        "doctor status={status} db_present={present} db_migratable={migratable} "
+        "schema={schema}/{latest} credentials={configured} gaps={gaps}".format(
+            status=summary["status"],
+            present=database["present"],
+            migratable=database["migratable"],
+            schema=database["schema_version"],
+            latest=database["latest_schema_version"],
+            configured=credentials["configured"],
+            gaps=len(gaps),
+        ),
+        file=sys.stderr,
+    )
+    for error in summary["errors"]:
+        print(f"  {error}", file=sys.stderr)
+    if args.json:
+        print(json.dumps(summary, indent=2, sort_keys=True))
+    return exit_code
 
 
 def _cmd_token(args: argparse.Namespace) -> int:
@@ -772,6 +940,23 @@ def build_parser() -> argparse.ArgumentParser:
     _add_host_port(p_status)
     p_status.add_argument("--json", action="store_true", help="also emit the raw health JSON")
     p_status.set_defaults(func=_cmd_status)
+
+    p_doctor = sub.add_parser(
+        "doctor",
+        help="check the local database and collection health without controller access",
+    )
+    p_doctor.add_argument(
+        "--offline",
+        action="store_true",
+        required=True,
+        help="required safety mode: inspect only local configuration and SQLite data",
+    )
+    p_doctor.add_argument(
+        "--json",
+        action="store_true",
+        help="emit a machine-readable summary to stdout (human summary stays on stderr)",
+    )
+    p_doctor.set_defaults(func=_cmd_doctor)
 
     p_token = sub.add_parser(
         "token",

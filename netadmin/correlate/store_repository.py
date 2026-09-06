@@ -13,10 +13,10 @@ deliberate seam that translates between them, mirroring
 
 It touches no SQL of its own (section 4 keeps SQL inside ``Repository``); it only
 reshapes the store's rows into the engine's dataclasses and builds the topology
-snapshot. Wired-uplink ("feeds") edges are not persisted by the current ingest
-layer, so the topology is parent/child only here -- the ``FEEDS`` rules stay
-dormant in production until an uplink edge exists (deliberately conservative; see
-``topology.py``).
+snapshot. Alongside the parent/child tree it now supplies the physical
+wired-feeder edges ``Repository.feeder_edges`` rebuilds from the uplink identity
+the ingest layer records in device meta, so the four ``FEEDS`` rules resolve a
+concrete edge in production instead of staying dormant (Gitea #B6).
 """
 
 from __future__ import annotations
@@ -84,7 +84,15 @@ class StoreCorrelationRepository:
 
     def topology(self) -> TopologyIndex:
         nodes = [_topo_node_from_row(r) for r in self._store.entity_topology()]
-        return TopologyIndex(nodes)
+        # Physical wired-feeder edges, rebuilt from the uplink identity the ingest
+        # layer records in device meta (see ``Repository.feeder_edges``). These are
+        # what let the four ``FEEDS`` rules resolve a concrete uplink edge instead
+        # of staying dormant; kept distinct from the parent/child containment tree
+        # the nodes above carry.
+        uplinks: dict[int, set[int]] = {}
+        for feeder_id, fed_id in self._store.feeder_edges():
+            uplinks.setdefault(feeder_id, set()).add(fed_id)
+        return TopologyIndex(nodes, uplinks=uplinks)
 
     # --- incident rows ---
     def list_open_incidents(self) -> list[Incident]:

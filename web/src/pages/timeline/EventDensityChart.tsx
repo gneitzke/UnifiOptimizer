@@ -40,6 +40,12 @@ interface Props {
   coverageStart?: number | null;
   /** Boundary caption, e.g. "monitoring since 08:14" or "older events not loaded". */
   coverageLabel?: string;
+  /** Collector outages that fall INSIDE the window, distinct from the leading
+   *  `coverageStart` boundary (audit U2). An empty bucket in the middle of a
+   *  chart otherwise reads as "quiet" with no way to tell it apart from
+   *  "unobserved" — these spans get their own hatch so the two are never
+   *  confused. */
+  internalGaps?: { start: number; end: number; reason?: string | null }[];
 }
 
 const HEIGHT = 200;
@@ -71,6 +77,7 @@ export function EventDensityChart({
   asOf,
   coverageStart,
   coverageLabel,
+  internalGaps,
 }: Props) {
   const [wrapRef, width] = useWidth();
   const [hover, setHover] = useState<number | null>(null);
@@ -145,6 +152,20 @@ export function EventDensityChart({
       ? Math.min(width - PAD_RIGHT, Math.max(PAD_LEFT, xForTs(coverageStart)))
       : null;
   const showCoverage = coverageX != null && coverageX > PAD_LEFT + 1;
+
+  // Internal collection gaps: clip each gap to the visible window and to
+  // whatever's already covered by the leading un-monitored span, so the two
+  // hatched treatments never double up on the same pixels.
+  const winEnd = buckets.length ? buckets[buckets.length - 1].t1 : winStart;
+  const visibleGaps = (internalGaps ?? [])
+    .map((g) => ({
+      start: Math.max(g.start, winStart, coverageStart ?? winStart),
+      end: Math.min(g.end, winEnd),
+      reason: g.reason,
+    }))
+    .filter((g) => g.end > g.start);
+
+  const gapHatchId = useId();
 
   return (
     <div ref={wrapRef} className="w-full">
@@ -259,6 +280,72 @@ export function EventDensityChart({
           </g>
         )}
 
+        {/* internal collection gaps: an outage inside the window, not the leading
+            un-monitored boundary above. Same hatch idiom but a distinct (amber)
+            tone and no dashed edge — this is a bounded outage, not an
+            open-ended "before we started" span — so it reads as a different
+            fact from the coverage boundary rather than a duplicate of it. */}
+        {visibleGaps.length > 0 && (
+          <g pointerEvents="none">
+            <defs>
+              <pattern
+                id={gapHatchId}
+                width={6}
+                height={6}
+                patternUnits="userSpaceOnUse"
+                patternTransform="rotate(45)"
+              >
+                <line
+                  x1={0}
+                  y1={0}
+                  x2={0}
+                  y2={6}
+                  stroke="var(--sev-p3)"
+                  strokeWidth={1}
+                  opacity={0.45}
+                />
+              </pattern>
+            </defs>
+            {visibleGaps.map((g, i) => {
+              const gx0 = Math.max(PAD_LEFT, xForTs(g.start));
+              const gx1 = Math.min(width - PAD_RIGHT, xForTs(g.end));
+              if (gx1 <= gx0) return null;
+              const label = g.reason ? `Collection gap: ${g.reason}` : 'Collection gap — not observed';
+              return (
+                <g key={i}>
+                  <rect
+                    x={gx0}
+                    y={plotTop}
+                    width={gx1 - gx0}
+                    height={plotBottom - plotTop}
+                    fill={`url(#${gapHatchId})`}
+                  >
+                    <title>{label}</title>
+                  </rect>
+                  <line
+                    x1={gx0}
+                    x2={gx0}
+                    y1={plotTop}
+                    y2={plotBottom}
+                    stroke="var(--sev-p3)"
+                    strokeWidth={1}
+                    opacity={0.6}
+                  />
+                  <line
+                    x1={gx1}
+                    x2={gx1}
+                    y1={plotTop}
+                    y2={plotBottom}
+                    stroke="var(--sev-p3)"
+                    strokeWidth={1}
+                    opacity={0.6}
+                  />
+                </g>
+              );
+            })}
+          </g>
+        )}
+
         {/* bars: routine volume (accent) + fault cap (severity tint) */}
         {buckets.map((b, i) => {
           if (b.total === 0) return null; // gap stays a gap
@@ -369,6 +456,7 @@ export function EventDensityChart({
       <div className="flex items-center gap-4 mt-1.5">
         <LegendSwatch color="var(--accent)" label="Events" />
         <LegendSwatch color="var(--sev-p2)" label="Faults" />
+        {visibleGaps.length > 0 && <LegendSwatch color="var(--sev-p3)" label="Collection gap" hatched />}
         <span className="t-caption ml-auto" style={{ color: 'var(--fg-subtle)' }}>
           {selected != null ? 'Click a bar again to clear' : 'Click a bar to inspect its events'}
         </span>
@@ -377,13 +465,30 @@ export function EventDensityChart({
   );
 }
 
-function LegendSwatch({ color, label }: { color: string; label: string }) {
+function LegendSwatch({
+  color,
+  label,
+  hatched = false,
+}: {
+  color: string;
+  label: string;
+  hatched?: boolean;
+}) {
   return (
     <span className="inline-flex items-center gap-1.5 t-caption" style={{ color: 'var(--fg-muted)' }}>
       <span
         aria-hidden
         className="inline-block rounded-[2px]"
-        style={{ width: 10, height: 10, background: color }}
+        style={
+          hatched
+            ? {
+                width: 10,
+                height: 10,
+                border: `1px solid ${color}`,
+                background: `repeating-linear-gradient(45deg, ${color}66 0 2px, transparent 2px 5px)`,
+              }
+            : { width: 10, height: 10, background: color }
+        }
       />
       {label}
     </span>

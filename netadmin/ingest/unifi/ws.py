@@ -16,10 +16,12 @@ from __future__ import annotations
 import asyncio
 import json
 import ssl
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Callable, Optional
 
 import websockets
-from websockets.asyncio.client import connect as ws_connect
+from websockets.asyncio.client import connect as _WsConnect
+from websockets.exceptions import SecurityError
+from websockets.uri import parse_uri
 
 from netadmin.logging import get_logger
 
@@ -28,6 +30,41 @@ from .client import UnifiClient
 from .models import Event
 
 logger = get_logger("ingest.unifi.ws")
+
+
+class _SameOriginConnect(_WsConnect):
+    """A ``websockets`` connector that refuses to follow a redirect off-origin.
+
+    S4: ``websockets`` follows 3xx redirects transparently and *re-sends*
+    ``additional_headers`` -- here the controller ``Cookie``, ``X-CSRF-Token``
+    and ``X-API-KEY`` -- on the new connection. Its own built-in cross-origin
+    guard only blocks Unix sockets or an explicitly overridden host/port, so a
+    plain redirect to a different scheme/host/port is still followed and the
+    session credentials are forwarded to that other origin.
+
+    The events socket authenticates by cookie/CSRF and must only ever present
+    those to the controller it logged in to. We therefore reject any redirect
+    that changes the origin (scheme, host or port) rather than let the base
+    class carry auth headers across it. Same-origin redirects (e.g. a path
+    rewrite on the same controller) are still honored.
+    """
+
+    def process_redirect(self, exc: Exception):  # type: ignore[override]
+        result = super().process_redirect(exc)
+        if isinstance(result, str):
+            old = parse_uri(self.uri)
+            new = parse_uri(result)
+            if old.secure != new.secure or old.host != new.host or old.port != new.port:
+                return SecurityError(
+                    f"refusing cross-origin WebSocket redirect to {result}: "
+                    "controller credentials must not be forwarded off-origin"
+                )
+        return result
+
+
+# Named at module scope so tests can monkeypatch the connector; production always
+# gets the same-origin-guarded subclass above.
+ws_connect = _SameOriginConnect
 
 
 class EventListener:
@@ -57,6 +94,16 @@ class EventListener:
         # handshake-status re-auth path below can't see it.
         self._empty_reauth_threshold = max(1, empty_reauth_threshold)
         self._stop = asyncio.Event()
+        # R3: the socket reports its ACTUAL connection state up to whoever owns
+        # health (the WS supervisor via the events-layer listener). "connected"
+        # is emitted only once the handshake has succeeded; "reconnecting" on
+        # every drop/backoff. Nobody may assume the task existing means it is up.
+        self.on_state: Optional[Callable[[str], None]] = None
+
+    def _emit_state(self, state: str) -> None:
+        callback = self.on_state
+        if callback is not None:
+            callback(state)
 
     def stop(self) -> None:
         """Signal the generator to finish after the current message/backoff."""
@@ -104,6 +151,10 @@ class EventListener:
                     open_timeout=15,
                 ) as socket:
                     logger.info("WebSocket connected: %s", url)
+                    # Handshake accepted: the socket is genuinely up now. This is
+                    # the ONLY place "connected" is reported -- reaching the async
+                    # context means the WebSocket upgrade completed.
+                    self._emit_state("connected")
                     async for raw in socket:
                         if self._stop.is_set():
                             break
@@ -138,6 +189,11 @@ class EventListener:
 
             if self._stop.is_set():
                 break
+
+            # Left the connected context (drop, handshake reject, or clean empty
+            # close) and about to back off: we are no longer up. Report it so the
+            # supervisor's health does not linger on a stale "connected".
+            self._emit_state("reconnecting")
 
             # A connection that carried no events -- a clean immediate close or a
             # fast drop. Never reset the backoff for one (that is the storm), and
@@ -198,12 +254,29 @@ class EventListener:
         if not isinstance(data, list):
             return []
 
-        # Accept explicit event frames; also accept frames whose rows look like
-        # events (have a "key") when meta.message is absent.
-        if message not in (None, "events", "event"):
+        # An EXPLICIT event frame (``meta.message`` == "events"/"event") is
+        # identifiable as an events payload no matter what its rows contain. #w18a-4:
+        # a dict row in such a frame that is UNUSABLE (no ``key`` and no ``_id``)
+        # must NOT be silently discarded here -- the old ``key``/``_id`` filter hid
+        # it from the consumer, so its drop was never accounted and event-source
+        # coverage was never severed (0 stored, drop counter 0, ~0.99 coverage). We
+        # surface EVERY dict row of an explicit event frame as an ``Event``; an
+        # unusable one validates to an Event with no ``key``, which the consumer's
+        # ``normalize`` returns None for -> the #w17a-2 drop accounting + #w18a-2
+        # coverage break fire and the detector freezes. Non-dict rows are not
+        # identifiable as events and are skipped (not a drop).
+        if message in ("events", "event"):
+            return [Event.model_validate(row) for row in data if isinstance(row, dict)]
+
+        # Not an explicit event frame. A genuine non-event control frame (device
+        # sync, speed-test progress, ...) carries a different ``meta.message`` and no
+        # event rows -- skip it entirely (unchanged: its non-event rows are NOT
+        # "identifiable-but-unusable" events, so they count as no loss). When
+        # ``meta.message`` is absent, or a control frame happens to carry rows that
+        # look like events, accept only the rows that ARE events (have "key"/"_id").
+        if message is not None:
             if not any(isinstance(r, dict) and "key" in r for r in data):
                 return []
-
         events: list[Event] = []
         for row in data:
             if isinstance(row, dict) and ("key" in row or "_id" in row):

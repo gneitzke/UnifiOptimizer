@@ -200,3 +200,29 @@ def seed_coverage(
         count += 1
         ts += interval_s
     return count
+
+
+def seed_event_coverage(
+    repo: Repository,
+    *,
+    now: int,
+    window_s: int,
+    kind: str = "event_history",
+    scope: str = "site",
+    status: str = "complete",
+) -> None:
+    """Record a completed event-source coverage interval across the window.
+
+    Mirrors what the event catch-up writes to the ingest-coverage ledger when a
+    full ``stat/event`` read succeeds. A detector that gates on
+    ``ctx.event_coverage`` needs this to model a *healthy* event feed; omit it
+    (or pass a stale window) to model an event-feed gap -> UNKNOWN.
+    """
+    repo.record_ingest_coverage(
+        kind=kind,
+        scope=scope,
+        interval="retained",
+        start_ts=now - window_s,
+        end_ts=now,
+        status=status,
+    )

@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Mapping, Optional
 
 from netadmin.domain.types import EntityType
-from netadmin.ingest.unifi.endpoints import Endpoints
+from netadmin.ingest.unifi.endpoints import Endpoints, ReportUnavailable
 from netadmin.logging import get_logger
 from netadmin.store.metrics import MetricKind, register_metric
 from netadmin.store.repository import Repository, SampleReading
@@ -329,31 +329,175 @@ class Backfiller:
             hourly_retention_s=self._hourly_retention_s,
         )
         attrs = [attr for attr, _metric, _kind in REPORT_METRICS[scope]]
+        # C4: an unsuccessful GET is a named hole, not something a later sample
+        # timestamp can erase.  Retry it before the normal incremental tail.
+        chunks: list[tuple[str, int, int]] = []
+        seen: set[tuple[str, int, int]] = set()
+        for failed in self._repo.failed_ingest_coverage(kind="report", scope=scope):
+            interval = str(failed["interval"])
+            c_lo, c_hi = int(failed["start_ts"]), int(failed["end_ts"])
+            # The controller cannot recover history beyond this run's retention;
+            # preserve that fact explicitly rather than making a futile request.
+            retention_floor = now - (
+                self._fivemin_retention_s if interval == FIVEMIN else self._hourly_retention_s
+            )
+            if c_hi <= retention_floor:
+                self._repo.record_ingest_coverage(
+                    kind="report", scope=scope, interval=interval,
+                    start_ts=c_lo, end_ts=c_hi, status="unrecoverable",
+                    detail="controller report retention elapsed before retry",
+                )
+                continue
+            # A failed request whose tail is still in the current open bucket
+            # cannot yet be retried authoritatively. Keep the original failed
+            # ledger row intact and retry its exact interval after it closes.
+            closed_end = now - (now % INTERVAL_SECONDS[interval])
+            if c_hi > closed_end:
+                continue
+            # Finding #7: retention may have advanced into this failed interval,
+            # so only [clip_start, c_hi) is still fetchable. Clipping the retry to
+            # a new start CHANGES the coverage primary key, so recording the
+            # clipped retry 'complete' would leave the ORIGINAL [c_lo, c_hi)
+            # 'failed' row untouched -- a stale hole that regenerates a redundant
+            # refetch on every subsequent run even though everything retrievable
+            # has been retrieved. The original is therefore retired and split into
+            # its pre-clip [c_lo, clip_start) (unrecoverable) and still-fetchable
+            # [clip_start, c_hi) parts.
+            #
+            # Finding #3 (round-12 durability ordering): the split-and-retire must
+            # be crash/cancel-safe. Retiring the original BEFORE the clipped fetch
+            # completes (the prior wave's ordering) meant a cancellation between
+            # retire and fetch-completion left NO row for the recoverable
+            # [clip_start, c_hi) window -- the original 'failed' row was gone and
+            # its 'complete' replacement never written -- so the hole vanished from
+            # the ledger and the next run made ZERO requests. Fix: SPLIT-FIRST,
+            # durably. Record BOTH replacement rows -- the pre-clip slice as
+            # 'unrecoverable' AND the recoverable slice [clip_start, c_hi) as a
+            # 'failed' hole -- each in its own transaction, THEN retire the
+            # now-redundant original. A cancellation/crash at ANY point therefore
+            # leaves [clip_start, c_hi) still marked 'failed' (retried next run),
+            # never lost. The clipped slice becomes 'complete' on a successful
+            # fetch below (or stays 'failed' on another failure), so the round-11
+            # end state -- unrecoverable + complete, no residual failed row, no
+            # redundant refetch -- is preserved on the success path, and a
+            # genuinely still-missing within-retention hole is still retried.
+            clip_start = max(c_lo, retention_floor)
+            if clip_start > c_lo:
+                self._repo.record_ingest_coverage(
+                    kind="report", scope=scope, interval=interval,
+                    start_ts=c_lo, end_ts=clip_start, status="unrecoverable",
+                    detail="controller report retention elapsed before retry",
+                )
+                self._repo.record_ingest_coverage(
+                    kind="report", scope=scope, interval=interval,
+                    start_ts=clip_start, end_ts=c_hi, status="failed",
+                    detail="retention-clipped retry pending",
+                )
+                self._repo.retire_ingest_coverage(
+                    kind="report", scope=scope, interval=interval,
+                    start_ts=c_lo, end_ts=c_hi,
+                )
+            key = (interval, clip_start, c_hi)
+            chunks.append(key)
+            seen.add(key)
         for interval, window in plan.items():
             if window is None:
                 continue
             lo, hi = window
+            # Report rows are bucket aggregates. The bucket starting at
+            # floor(now / width) * width can still change, and inserting it now
+            # would make its later final value lose to INSERT OR IGNORE. Fetch
+            # and complete only through the last closed bucket boundary.
+            closed_end = now - (now % INTERVAL_SECONDS[interval])
+            hi = min(hi, closed_end)
+            if hi <= lo:
+                continue
             for c_lo, c_hi in chunk_window(lo, hi, self._chunk_s[interval]):
-                res.windows += 1
-                try:
-                    await self._fetch_chunk(interval, scope, c_lo, c_hi, attrs, res)
-                except Exception as exc:  # noqa: BLE001 - firewall per chunk
-                    res.errors += 1
-                    self._repo.record_poll_run(
-                        job=job_name(interval, scope),
-                        ok=False,
-                        ts=c_hi,
-                        error=f"{type(exc).__name__}: {exc}"[:200],
-                        source="backfill",
+                if (interval, c_lo, c_hi) not in seen:
+                    chunks.append((interval, c_lo, c_hi))
+                    seen.add((interval, c_lo, c_hi))
+
+        for interval, c_lo, c_hi in sorted(chunks, key=lambda c: (c[1], c[2], c[0])):
+            res.windows += 1
+            try:
+                dropped = await self._fetch_chunk(interval, scope, c_lo, c_hi, attrs, res)
+                if dropped:
+                    # #w17b: the chunk was READ (GET ok) but at least one report row
+                    # in it was UNUSABLE -- a missing/undecodable bucket timestamp, or
+                    # a row naming a device/entity not yet in inventory (unresolved).
+                    # That row is real history we could not store, so crediting the
+                    # window 'complete' with zero (or fewer) samples fabricates
+                    # observed coverage and lets the production cursor
+                    # (latest_ingest_coverage_end, factory._last_ts_by_scope) SKIP
+                    # re-collecting the lost span once the device is discovered or the
+                    # data becomes recoverable. Mirror the event catch-up 'partial'
+                    # rule (events.catchup_events, #w16a-4): record NOT complete -- a
+                    # 'partial' hole that is queryable, never counted as observed
+                    # coverage, and NEVER advances the completion cursor
+                    # (latest_ingest_coverage_end unions only 'complete'), so the
+                    # window is re-attempted on the next sweep and lands 'complete'
+                    # once every row resolves. A genuinely EMPTY-but-successful chunk
+                    # (the source returned no rows at all for a quiet window) drops
+                    # nothing and still records 'complete' below.
+                    self._repo.record_ingest_coverage(
+                        kind="report", scope=scope, interval=interval,
+                        start_ts=c_lo, end_ts=c_hi, status="partial",
+                        detail=f"{dropped} unusable/unresolved report row(s) dropped; "
+                        "window not fully reconstructed",
                     )
-                    logger.warning(
-                        "backfill %s.%s [%d,%d) failed: %s",
-                        interval,
-                        scope,
-                        c_lo,
-                        c_hi,
-                        exc,
+                else:
+                    self._repo.record_ingest_coverage(
+                        kind="report", scope=scope, interval=interval,
+                        start_ts=c_lo, end_ts=c_hi, status="complete",
                     )
+            except ReportUnavailable as exc:
+                # Unsupported-over-GET is permanent for this process/controller
+                # capability, not a successful empty read and not a retryable
+                # transport failure. Preserve that distinction in the ledger.
+                res.errors += 1
+                detail = f"{type(exc).__name__}: {exc}"[:200]
+                self._repo.record_ingest_coverage(
+                    kind="report", scope=scope, interval=interval,
+                    start_ts=c_lo, end_ts=c_hi, status="unrecoverable",
+                    detail=detail,
+                )
+                self._repo.record_poll_run(
+                    job=job_name(interval, scope),
+                    ok=False,
+                    ts=c_hi,
+                    error=detail,
+                    source="backfill",
+                )
+                logger.warning(
+                    "backfill %s.%s [%d,%d) unavailable: %s",
+                    interval,
+                    scope,
+                    c_lo,
+                    c_hi,
+                    exc,
+                )
+            except Exception as exc:  # noqa: BLE001 - firewall per chunk
+                res.errors += 1
+                self._repo.record_ingest_coverage(
+                    kind="report", scope=scope, interval=interval,
+                    start_ts=c_lo, end_ts=c_hi, status="failed",
+                    detail=f"{type(exc).__name__}: {exc}"[:200],
+                )
+                self._repo.record_poll_run(
+                    job=job_name(interval, scope),
+                    ok=False,
+                    ts=c_hi,
+                    error=f"{type(exc).__name__}: {exc}"[:200],
+                    source="backfill",
+                )
+                logger.warning(
+                    "backfill %s.%s [%d,%d) failed: %s",
+                    interval,
+                    scope,
+                    c_lo,
+                    c_hi,
+                    exc,
+                )
         return res
 
     async def _fetch_chunk(
@@ -364,7 +508,18 @@ class Backfiller:
         end_ts: int,
         attrs: list[str],
         res: ScopeResult,
-    ) -> None:
+    ) -> int:
+        """Fetch one report chunk and store its usable rows.
+
+        Returns the number of rows READ but DROPPED as unusable -- a row with a
+        missing/undecodable bucket timestamp, or one naming a device/entity not
+        yet resolvable (unknown, not in inventory). The caller uses a non-zero
+        count to record the chunk 'partial' rather than 'complete' (#w17b): a
+        dropped row is real history we failed to reconstruct, so the window must
+        stay a retryable hole instead of silently advancing the completion cursor
+        past it. A defensive range-pad skip is NOT a drop: those rows belong to an
+        adjacent chunk and are fetched there, so they are not lost history.
+        """
         rows = await self._ep.stat_report(
             interval,
             scope,
@@ -374,10 +529,14 @@ class Backfiller:
         )
         readings: list[SampleReading] = []
         bucket_ts: set[int] = set()
+        dropped = 0
         for row in rows:
             data = row.model_dump()
             time_ms = data.get("time")
             if time_ms is None:
+                # A row with no usable bucket timestamp is unstorable history, not
+                # a padding artefact: count it so the window records 'partial'.
+                dropped += 1
                 continue
             ts = int(time_ms) // 1000
             if ts < start_ts or ts >= end_ts:
@@ -385,7 +544,12 @@ class Backfiller:
             oid = data.get("oid") or data.get("o")
             entity_id = self._resolve(scope, oid if oid is None else str(oid))
             if entity_id is None:
+                # The row names a device/entity backfill cannot resolve yet (not in
+                # inventory). It is recoverable once the sync job discovers the
+                # device, so the chunk must stay retryable ('partial'), not be
+                # credited complete with this row silently missing.
                 res.skipped_unresolved += 1
+                dropped += 1
                 continue
             for attr, metric, _kind in REPORT_METRICS[scope]:
                 value = data.get(attr)
@@ -420,6 +584,7 @@ class Backfiller:
             lo, hi = min(bucket_ts), max(bucket_ts)
             res.min_ts = lo if res.min_ts is None else min(res.min_ts, lo)
             res.max_ts = hi if res.max_ts is None else max(res.max_ts, hi)
+        return dropped
 
 
 __all__ = [

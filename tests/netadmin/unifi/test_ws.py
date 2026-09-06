@@ -42,6 +42,40 @@ def test_parse_handles_bytes_and_garbage():
     assert EventListener._parse('{"data": 5}') == []
 
 
+def test_parse_surfaces_unusable_rows_in_explicit_event_frame():
+    """#w18a-4: a row in an EXPLICIT event frame (meta.message='events') that is
+    UNUSABLE -- no 'key' and no '_id' -- must NOT be silently discarded by the
+    parser. Pre-fix the key/_id filter hid it, so the consumer never accounted the
+    drop and event-source coverage was never severed (0 stored, drop counter 0,
+    ~0.99 coverage). It is now surfaced as an Event (with no key) so the consumer's
+    normalize->None drop accounting + coverage break fire."""
+    frame = '{"meta": {"message": "events"}, "data": [{"foo": "bar"}, {"nope": 1}]}'
+    events = EventListener._parse(frame)
+    assert len(events) == 2  # surfaced, not dropped
+    assert all(e.key is None and e.id is None for e in events)  # genuinely unusable
+
+
+def test_parse_surfaces_mixed_usable_and_unusable_event_rows():
+    """#w18a-4: a usable event row and an unusable one in the same explicit event
+    frame both reach the consumer (the usable stores, the unusable is accounted)."""
+    frame = '{"meta": {"message": "events"}, "data": [{"key": "EVT_OK", "_id": "9"}, {"junk": 1}]}'
+    events = EventListener._parse(frame)
+    assert [e.key for e in events] == ["EVT_OK", None]
+
+
+def test_parse_control_frame_rows_are_not_counted_as_unusable_events():
+    """#w18a-4 guard: a genuine NON-event control frame (device sync, ...) whose
+    rows carry no event data is still skipped entirely -- its rows are NOT
+    identifiable-but-unusable EVENT rows, so they count as no loss and must not be
+    surfaced as (unusable) events."""
+    assert EventListener._parse(CONTROL_FRAME) == []
+    # A control frame carrying a NON-event row list -> nothing surfaced.
+    assert EventListener._parse('{"meta": {"message": "speed-test"}, "data": [{"progress": 42}]}') == []
+    # ...but a control frame that happens to carry a real event row still yields it.
+    mixed = '{"meta": {"message": "speed-test"}, "data": [{"progress": 42}, {"key": "EVT_X"}]}'
+    assert [e.key for e in EventListener._parse(mixed)] == ["EVT_X"]
+
+
 # --------------------------------------------------------------------------- #
 # SSL context
 # --------------------------------------------------------------------------- #
@@ -277,3 +311,100 @@ async def test_repeated_empty_close_forces_reauth(monkeypatch):
     assert login_route.call_count == 2
     assert collected[0].key == "EVT_TEST"
     await client.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# S4: the events WebSocket must NOT forward controller credentials across an
+# origin boundary. websockets follows 3xx redirects and re-sends
+# additional_headers on the new connection; a redirect to another host would
+# otherwise leak Cookie / X-CSRF-Token / X-API-KEY off-origin.
+# --------------------------------------------------------------------------- #
+class _Redirect(websockets.InvalidStatus):
+    """A 3xx handshake response with a ``Location``, shaped like InvalidStatus."""
+
+    def __init__(self, status: int, location: str) -> None:
+        self.response = SimpleNamespace(status_code=status, headers={"Location": location})
+
+
+def test_ws_connect_refuses_cross_origin_redirect_carrying_credentials():
+    # The production connector is the same-origin-guarded subclass.
+    assert ws_module.ws_connect is ws_module._SameOriginConnect
+
+    creds = {
+        "Cookie": "TOKEN=super-secret-session",
+        "X-CSRF-Token": "csrf-value",
+        "X-API-KEY": "api-key-value",
+    }
+    conn = ws_module.ws_connect(
+        "wss://ctrl.test/proxy/network/wss/s/default/events",
+        additional_headers=creds,
+    )
+
+    # A redirect to a DIFFERENT origin must be refused (returned as an error, not
+    # a new URI to follow) so the credential headers are never sent there.
+    off_origin = conn.process_redirect(_Redirect(302, "wss://evil.test/steal"))
+    assert isinstance(off_origin, websockets.exceptions.SecurityError)
+    # Cross-scheme (TLS downgrade) and cross-port are likewise off-origin.
+    assert isinstance(
+        conn.process_redirect(_Redirect(307, "ws://ctrl.test/x")),
+        websockets.exceptions.SecurityError,
+    )
+    assert isinstance(
+        conn.process_redirect(_Redirect(302, "wss://ctrl.test:8443/x")),
+        websockets.exceptions.SecurityError,
+    )
+
+    # A same-origin redirect (path rewrite on the same controller) is still
+    # honored -- the guard is about the origin boundary, not redirects per se.
+    same = conn.process_redirect(_Redirect(302, "/proxy/network/wss/s/default/events2"))
+    assert same == "wss://ctrl.test/proxy/network/wss/s/default/events2"
+
+
+# --------------------------------------------------------------------------- #
+# R3: the socket reports its ACTUAL connection state. "connected" only once the
+# handshake succeeds; "reconnecting" on a drop/backoff. A connection that never
+# handshakes must never report "connected".
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+@respx.mock
+async def test_ws_emits_connected_only_after_handshake(monkeypatch):
+    respx.get(OS_PROBE).mock(return_value=httpx.Response(401))
+    respx.post(OS_LOGIN).mock(
+        return_value=httpx.Response(
+            200,
+            headers=[("X-CSRF-Token", "c"), ("set-cookie", "TOKEN=sess-abc; Path=/")],
+            json={},
+        )
+    )
+
+    # First attempt: handshake rejected (never connects). Second: connects, yields.
+    sockets = [
+        _FakeSocket([], raise_on_enter=websockets.WebSocketException("drop")),
+        _FakeSocket([EVENT_FRAME]),
+    ]
+    calls = {"n": 0}
+
+    def fake_connect(url, **kwargs):
+        idx = calls["n"]
+        calls["n"] += 1
+        return sockets[min(idx, len(sockets) - 1)]
+
+    monkeypatch.setattr(ws_module, "ws_connect", fake_connect)
+
+    client = UnifiClient(host=HOST, username="u", password="p", verify_ssl=False)
+    listener = EventListener(client, backoff_base=0.01, backoff_max=0.01)
+
+    states: list[str] = []
+    listener.on_state = states.append
+
+    async for event in listener.events():
+        listener.stop()
+        break
+
+    # The first (failed) attempt emitted "reconnecting" and NEVER "connected";
+    # "connected" appears only after the successful handshake, and it is the
+    # first "connected" in the sequence (no premature report).
+    assert "connected" in states
+    assert states.index("reconnecting") < states.index("connected")
+    # The very first state reported was reconnecting -- not a premature connected.
+    assert states[0] == "reconnecting"

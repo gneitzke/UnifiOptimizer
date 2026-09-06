@@ -30,6 +30,7 @@ transaction ride it rather than nesting.
 
 from __future__ import annotations
 
+import bisect
 import json
 import sqlite3
 import time
@@ -59,6 +60,67 @@ __all__ = [
 
 HOUR_SECONDS = 3600
 DAY_SECONDS = 86400
+
+# B4 (positive-liveness redesign): the WS event consumer emits a periodic
+# ``poll_runs`` liveness heartbeat (``job='ws'``, ``error='heartbeat'``, ok=1)
+# every time it is CONNECTED and successfully draining. Event-source coverage is
+# credited ONLY across spans that carry such heartbeats -- positive evidence the
+# feed was observing -- never through the end of a still-open ``connected`` row.
+# Two consecutive heartbeats no further apart than this bridge the span between
+# them into continuous coverage; a larger gap (feed down, stuck, shut down, or a
+# storage stall that stopped draining) is a real hole. The bound is several
+# heartbeat cadences so one or two dropped beats do not manufacture a gap, while
+# a genuine outage still opens one. Coverage ends at the LAST heartbeat, so a
+# shutdown / crash / failed close simply stops the beats and cannot over-credit.
+_WS_HEARTBEAT_LABEL = "heartbeat"
+# The flusher beats every ~30 s while connected AND draining. Bridge a gap only
+# up to ~2.5x that cadence: one missed beat plus jitter still reads as continuous
+# observation, but two or more consecutive misses (>=~90 s of no positive
+# liveness -- a stall, a disconnect the beats already stopped reflecting, an
+# outage) must NOT be bridged, or a down feed over-credits coverage and can
+# false-clear a real event-based issue. Keep this a small multiple of the
+# heartbeat interval in events.py; do not widen it back toward the window size.
+_WS_HEARTBEAT_MAX_GAP_S = 75
+
+# #w16a-1 (disconnect-aware bridge): the ``job='ws'`` connection-state transition
+# rows the supervisor writes (``EventListener._on_listener_state`` -> ``_record``)
+# when the socket drops or backs off. The cadence bridge above may join two beats
+# no more than ``_WS_HEARTBEAT_MAX_GAP_S`` apart, but a beat before a recorded
+# disconnect and one after the reconnect were NOT one continuous observation --
+# the feed was DOWN between them. So a recorded disconnect that falls between two
+# heartbeats SEVERS the chain regardless of the beat gap: coverage ends at the
+# beat before the disconnect and only resumes at the first beat after reconnect.
+# (A missed beat within a still-connected span carries no such row and still
+# bridges.) Match the health-string labels the supervisor emits for "the feed is
+# not connected": ``disconnected`` (``_on_listener_state`` when state !=
+# 'connected'; and the clean cancel/stop close) and ``reconnecting`` (belt-and-
+# braces, should the state word itself ever be recorded).
+# #w18a-2 (unusable-event drop severs coverage): a run of UNUSABLE events consumed
+# off a still-connected socket -- a disconnect frame with no usable timestamp, or a
+# parser-surfaced event-frame row with no ``key``/``_id`` (#w18a-4) -- is NOT a
+# healthy, fully-observed span even though the socket never dropped. Suppressing a
+# single positive-liveness beat is not enough: the next clean beat ~2s later still
+# falls within ``_WS_HEARTBEAT_MAX_GAP_S`` of the last clean beat and BRIDGES the
+# drop span. So the consumer records a durable BREAK row (``error='unusable'``) in
+# ``poll_runs(job='ws')`` for such a span; included in the sever set below, it
+# severs the heartbeat chain exactly like a socket disconnect (via the existing
+# machinery in :meth:`_ws_observed_intervals`), so coverage ends at the last clean
+# beat and only resumes after a subsequent CLEAN drain.
+_WS_UNUSABLE_LABEL = "unusable"
+_WS_DISCONNECT_LABELS = ("disconnected", "reconnecting", _WS_UNUSABLE_LABEL)
+
+# C7/P2: how many reconcile passes a row may be *selected without being filled*
+# before it is parked (stops consuming the oldest-first LIMIT window). It is a
+# retry budget for a "pending from-AP" whose named MAC has not yet reached
+# inventory: high enough that a genuinely-pending row is retried across many
+# catch-up/flush cycles before being set aside, but bounded so a MAC that never
+# appears cannot starve newer repairable rows indefinitely. A parked row is NOT
+# discarded -- ``unresolved_events`` still re-checks it for resolvability every
+# pass, so the moment its AP finally appears it is selected and repaired
+# regardless of how many times it was tried (see the ``resolvable OR attempts <
+# cap`` selection). Only rows that remain unresolvable past this many attempts
+# are held out of the window.
+_EVENT_RECONCILE_MAX_ATTEMPTS = 12
 
 # Entity types a failed SLE minute can be traced to at all (section 8). A client
 # owns its own failed minutes (``sle_minutes.entity_id``); an AP, switch,
@@ -119,6 +181,17 @@ def _hour_bucket(ts: int) -> int:
 def _day_bucket(ts: int) -> int:
     """Start of the UTC day containing ``ts`` (epoch 0 == UTC midnight)."""
     return ts - (ts % DAY_SECONDS)
+
+
+def _next_bucket(ts: int, bucket_seconds: int) -> int:
+    """First bucket edge at or after ``ts``.
+
+    Retention seams assign a complete coarser bucket to the coarser tier.  A
+    ceiling (rather than a floor) keeps a bucket that straddles the nominal
+    retention age out of the finer tier, where it would otherwise overlap its
+    rollup aggregate.
+    """
+    return ((ts + bucket_seconds - 1) // bucket_seconds) * bucket_seconds
 
 
 @dataclass
@@ -844,8 +917,13 @@ class Repository:
         single tier when only one was used, else ``"stitched"``.
         """
         now = _now() if now is None else now
-        raw_floor = now - self.retention_raw_days * DAY_SECONDS
-        hourly_floor = now - self.retention_hourly_days * DAY_SECONDS
+        # Rollups are addressed by bucket *start*, so a seam inside a bucket
+        # cannot safely split ownership.  Give that whole bucket to the
+        # coarser tier and start the finer tier at its next bucket edge.  prune()
+        # uses these same edges, keeping retained rows and read selection in
+        # lockstep.
+        raw_floor = _next_bucket(now - self.retention_raw_days * DAY_SECONDS, HOUR_SECONDS)
+        hourly_floor = _next_bucket(now - self.retention_hourly_days * DAY_SECONDS, DAY_SECONDS)
 
         rows: list[dict[str, Any]] = []
         tiers_used: list[str] = []
@@ -948,6 +1026,720 @@ class Repository:
                     inserted += 1
         return inserted
 
+    # C7: Event ingestion needs to dedupe a replay without freezing the first
+    # (possibly pre-inventory) NULL entity reference forever.  This is separate
+    # from record_events because other event producers retain its insert-only
+    # dedupe contract.
+    def record_events_enriching_entities(self, events: Sequence[dict[str, Any]]) -> int:
+        """Insert events, filling missing entity references on a duplicate.
+
+        A controller event can arrive before the inventory poll that discovers
+        its client/AP.  The later stat/event copy has the same native id but can
+        resolve that entity.  Dedupe must preserve one event row *and* accept
+        that strictly-more-complete information.
+        """
+        inserted = 0
+        with self._write() as conn:
+            for ev in events:
+                native_id = ev.get("native_id")
+                if native_id is not None:
+                    existing = conn.execute(
+                        "SELECT id, entity_id, related_entity_id FROM events "
+                        "WHERE native_id=? LIMIT 1", (native_id,)
+                    ).fetchone()
+                    if existing is not None:
+                        if (
+                            (existing["entity_id"] is None and ev.get("entity_id") is not None)
+                            or (
+                                existing["related_entity_id"] is None
+                                and ev.get("related_entity_id") is not None
+                            )
+                        ):
+                            conn.execute(
+                                "UPDATE events SET "
+                                "entity_id=COALESCE(entity_id, ?), "
+                                "related_entity_id=COALESCE(related_entity_id, ?) "
+                                "WHERE id=?",
+                                (ev.get("entity_id"), ev.get("related_entity_id"), existing["id"]),
+                            )
+                        continue
+                data_json = json.dumps(ev.get("data") or {}, sort_keys=True)
+                conn.execute(
+                    "INSERT INTO events (ts, key, entity_id, related_entity_id, native_id, msg, data) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (
+                        ev["ts"], ev["key"], ev.get("entity_id"),
+                        ev.get("related_entity_id"), native_id, ev.get("msg"), data_json,
+                    ),
+                )
+                inserted += 1
+        return inserted
+
+    # C7: the event listener periodically replays these rows through its
+    # normalizer after inventory discovers their MACs.  The selection must return
+    # only *repairable* rows -- and "repairable" means the payload actually
+    # carries an identity that could fill the missing reference.  Two earlier,
+    # looser filters both starved newer history:
+    #   * a bare ``entity_id IS NULL OR related_entity_id IS NULL`` also matches
+    #     ordinary AP / switch / gateway events, whose scope has NO related entity
+    #     at all; and
+    #   * even ``related_entity_id IS NULL AND en.entity_type='client'`` still
+    #     matches client events whose payload names NO from-AP/switch -- there is
+    #     nothing to resolve from, so they can NEVER resolve, yet being oldest they
+    #     permanently fill the ``LIMIT`` window and starve later, genuinely
+    #     repairable rows (the P2 starvation bug).
+    # The fix makes fair progress by parking rows with no resolvable identity: a
+    # row is selected only when the payload names a candidate MAC for the column
+    # that is still NULL.  Concretely a row is repairable when either:
+    #   * ``entity_id IS NULL`` AND the payload carries a primary MAC
+    #     (``user``/``client``/``ap``/``sw``/``gw``) that could resolve to the
+    #     primary entity once inventory catches up; or
+    #   * ``related_entity_id IS NULL`` AND the resolved primary is a CLIENT AND
+    #     the payload carries a from-AP / switch MAC (``ap_from``/``ap``/``sw``).
+    # A pending row whose named MAC is not yet in inventory is still selected (its
+    # identity exists in the payload and may resolve later); only rows that name no
+    # identity for their missing column are parked, so they cannot crowd out
+    # repairable rows.  Device-scoped events with a resolved primary and a NULL
+    # related name no related identity and are likewise excluded -- terminal, not
+    # pending.  The payload keys are the controller's own event fields (``ap``,
+    # ``ap_from``, ``user``, ...), the same ones the normalizer resolves from, so
+    # this parks by identity presence rather than guessing from a denormalized
+    # column.
+    #
+    # P2 fair progress. The eligibility predicate above still admits a row whose
+    # named MAC is present in the payload but NOT YET in inventory -- a legitimate
+    # "pending from-AP" that may resolve later. But a flood of such rows, being
+    # oldest, still fills the oldest-first ``LIMIT`` window on every pass and
+    # starves a newer row whose MAC *is* already in inventory (0 repairs, newer
+    # ref left NULL). Two mechanisms make progress fair without losing a genuine
+    # pending row:
+    #   1. RESOLVABILITY PREFERENCE. Each candidate MAC is joined to ``entities``
+    #      (by site + type, exactly as the normalizer's ``find_entity`` resolves),
+    #      yielding a ``resolvable`` flag: 1 when a currently-NULL reference could
+    #      be filled *this pass* because its MAC is already in inventory. Rows are
+    #      ordered ``resolvable DESC`` first, so a resolvable newer row is never
+    #      blocked behind any number of not-yet-resolvable older ones. The moment a
+    #      pending row's AP appears it becomes resolvable and floats to the front
+    #      -- so a real pending row still resolves within one further pass
+    #      (requirement 2), regardless of how long it waited.
+    #   2. BOUNDED RETRY. ``reconcile_attempts`` (migration 0013) counts passes
+    #      that selected a row without filling it. A still-unresolvable row is held
+    #      out of the window once it crosses ``_EVENT_RECONCILE_MAX_ATTEMPTS`` --
+    #      ``resolvable = 1 OR attempts < cap`` -- so a MAC that NEVER appears stops
+    #      consuming the LIMIT forever. Parking is not terminal: the ``resolvable``
+    #      disjunct re-admits the row unconditionally the pass its AP shows up, so a
+    #      long-delayed pending row is never lost. The counter is bumped by the
+    #      reconcile caller via :meth:`bump_event_reconcile_attempts` (a write path;
+    #      the selection itself issues no write, so it is safe read-only).
+    # Both the attempt column and the candidate joins degrade safely: on a database
+    # not yet migrated to 0013 the counter reads as a constant 0 (every row under
+    # cap), leaving the resolvability preference -- the actual anti-starvation fix
+    # -- fully in force. No DDL is issued on this read path.
+    def unresolved_events(self, *, limit: int = 500) -> list[sqlite3.Row]:
+        # Read path degrades safely: on a database whose ``events`` table is
+        # absent (dropped, or a query-only replica that never provisioned it) the
+        # reconcile selection returns nothing rather than raising OperationalError
+        # ("no such table"). ``_column_exists`` below already tolerates a missing
+        # column, but a missing TABLE would still blow up the main SELECT; guard it
+        # here so the whole read degrades to empty (no DDL, safe read-only).
+        if not self._table_exists("events"):
+            return []
+        attempts = (
+            "ev.reconcile_attempts"
+            if self._column_exists("events", "reconcile_attempts")
+            else "0"
+        )
+        site = self.site_id
+        # resolvable: a currently-NULL reference the normalizer could fill this
+        # pass because the payload's named MAC is already an entity. It must mirror
+        # EventNormalizer._entities routing EXACTLY -- including its single-winner
+        # PRECEDENCE -- not merely "some candidate MAC exists". The normalizer picks
+        # ONE source per column and does not fall back if that source's MAC is
+        # absent from inventory, so a predicate that flags a row resolvable because
+        # a DIFFERENT (never-consulted) MAC exists produces a false "resolvable"
+        # that resolves nothing yet floats to the head of the LIMIT window forever,
+        # starving genuinely-repairable newer rows (P2 finding #9).
+        #
+        # Precedence, from _entities:
+        #   * primary (entity_id): user/client -> ap -> sw -> gw; first present
+        #     field wins and the row resolves iff THAT field's MAC is in inventory.
+        #   * related (related_entity_id), client-scoped only:
+        #       - roam key ("Roam" in key): related_mac = ap_from OR ap, resolved
+        #         as an AP (never a switch);
+        #       - otherwise: if ``ap`` present -> AP(ap); elif ``sw`` present ->
+        #         SWITCH(sw). ``ap`` present but not yet in inventory does NOT fall
+        #         through to ``sw`` -- so a row whose only in-inventory MAC is its
+        #         switch, while it names an (absent) ap, is NOT resolvable.
+        #
+        # D3 (empty-string-as-absent): the normalizer tests each MAC field for
+        # PYTHON TRUTHINESS (``if ap_mac:`` / ``if not mac``), so an EMPTY STRING is
+        # treated as ABSENT -- ap="" is SKIPPED and precedence falls through to sw.
+        # A bare ``json_extract(...) IS NOT NULL`` disagrees: json_extract of a key
+        # whose value is "" returns the empty string, which is NOT NULL, so the SQL
+        # would treat an empty ap as PRESENT, pick the (never-resolvable) ap branch,
+        # and PARK a row the normalizer would have resolved via its switch. Every
+        # candidate MAC is therefore read through ``NULLIF(x, '')`` so an empty
+        # string collapses to NULL/absent EXACTLY as the normalizer sees it (a
+        # missing key already yields NULL, so both map to absent identically). The
+        # normalizer does NOT strip whitespace -- ``" "`` is truthy in Python -- so
+        # this deliberately does NOT ``TRIM``: whitespace-only stays PRESENT on both
+        # sides, keeping the two predicates byte-for-byte aligned.
+        def _mac(path: str) -> str:
+            return f"NULLIF(json_extract(ev.data,'{path}'),'')"
+
+        # D3b (falsy-non-string-as-absent): the roam normalizer routes
+        # ``related_mac = ap_from or ap_mac`` -- Python truthiness. A NON-STRING
+        # falsy ``ap_from`` (``False``, ``0``, ``[]``) is absent and precedence
+        # falls back to ``ap``; only a NON-EMPTY STRING mac counts as a usable
+        # ap_from. Plain ``_mac`` (``NULLIF(...,'')``) only collapses the EMPTY
+        # STRING: a JSON ``false``/``0``/``[]`` survives it as present-and-
+        # unresolvable, so the SQL would COALESCE to that falsy value (never a real
+        # native_id), never resolve via ap, and PARK the row forever -- while the
+        # normalizer attributed it to ``ap``. So ap_from is read as present ONLY
+        # when it is a JSON string (``json_type='text'``) that is non-empty; any
+        # non-string (json boolean/integer/array) or empty ap_from is ABSENT and
+        # the resolver falls back to ``ap``, byte-identical to the normalizer.
+        def _str_mac(path: str) -> str:
+            return (
+                f"CASE WHEN json_type(ev.data,'{path}')='text' "
+                f"THEN NULLIF(json_extract(ev.data,'{path}'),'') END"
+            )
+
+        user_or_client = f"COALESCE({_mac('$.user')}, {_mac('$.client')})"
+        ap_from_or_ap = f"COALESCE({_str_mac('$.ap_from')}, {_mac('$.ap')})"
+
+        # Finding #4 (STP routing): a port-scoped switch event (e.g.
+        # EVT_SW_StpPortBlocking) does NOT resolve to the SWITCH. The normalizer
+        # (EventNormalizer._entities) attributes it to the PORT entity, native_id
+        # "<sw_mac>:<port_idx>" (mapping.py's port key), whenever the event's key is
+        # in _PORT_SCOPED_SW_EVENT_KEYS AND a port index is present -- otherwise to
+        # the SWITCH. The resolvability predicate must consult that SAME entity, or a
+        # port-not-yet-present STP row is (wrongly) called resolvable because the
+        # switch exists, floats to the head of the LIMIT window on the strength of a
+        # resolution that never happens, and starves genuinely-repairable newer rows.
+        #
+        # The port set is imported from the normalizer itself (single source of
+        # truth -- no drift). The import is lazy: netadmin.ingest.events imports
+        # Repository, so a module-level import here would be circular.
+        from netadmin.ingest.events import _MAX_PORT_INDEX, _PORT_SCOPED_SW_EVENT_KEYS
+
+        port_keys_sql = ",".join(
+            "'" + k.replace("'", "''") + "'" for k in sorted(_PORT_SCOPED_SW_EVENT_KEYS)
+        )
+        # #4/#w15a-4: mirror the normalizer's port-index handling EXACTLY. The
+        # normalizer reads ``$.port`` then falls back to ``$.port_idx``, and treats the
+        # chosen value as a port index ONLY when it is a genuine ``int`` and NOT a
+        # ``bool`` -- a ``bool`` (``port: true``) is NOT a port-scoped event and routes
+        # to the SWITCH. SQL must agree byte-for-byte or a bool/garbage port desyncs
+        # the two native_ids (Python ``str(True)`` -> ``"<sw>:True"`` vs SQLite bool
+        # coercion -> ``"<sw>:1"``), leaving a row falsely "resolvable" that never fills
+        # and starves newer events. So:
+        #   * choose the SAME source the normalizer chooses -- ``$.port`` when present
+        #     (JSON non-null, matching Python's ``is None`` test), else ``$.port_idx``;
+        #     do NOT COALESCE past a present-but-non-integer ``$.port`` (the normalizer
+        #     stops at ``$.port`` once it is present), and
+        #   * accept it ONLY when its ``json_type`` is ``'integer'`` -- a JSON boolean
+        #     is ``json_type`` ``'true'``/``'false'`` (never ``'integer'``), a string is
+        #     ``'text'``, a float ``'real'``: all reject to NULL, exactly as the
+        #     normalizer coerces them to ``None`` and routes to the switch.
+        # For an ACCEPTED integer, ``json_extract`` renders it identically to Python's
+        # ``str(int)`` (``0`` -> ``"0"``, ``5`` -> ``"5"``), so the concatenated port
+        # native_id is byte-identical on both sides. A rejected value yields NULL, so
+        # the resolvability CASE falls to the switch branch (``port_idx IS NOT NULL``
+        # is false), matching the normalizer.
+        # #w16a-5: accept the integer ONLY when it is also within the sane port
+        # range [0, _MAX_PORT_INDEX], mirroring the normalizer. An integer outside
+        # SQLite's signed-64-bit range is rendered by ``json_extract`` as a FLOAT
+        # (json_type still reports 'integer'), so ``json_type='integer'`` alone
+        # would accept it and build "<sw>:9.2...e+18" while the normalizer builds
+        # the full-decimal id -- a permanent native_id desync. The extracted value
+        # for such an integer is > _MAX_PORT_INDEX, so the BETWEEN bound rejects it
+        # to NULL and it routes to the switch, exactly as the normalizer does.
+        port_hi = int(_MAX_PORT_INDEX)
+        port_idx = (
+            "CASE"
+            "  WHEN json_extract(ev.data,'$.port') IS NOT NULL"
+            "    THEN CASE WHEN json_type(ev.data,'$.port')='integer'"
+            f"              AND json_extract(ev.data,'$.port') BETWEEN 0 AND {port_hi}"
+            "              THEN json_extract(ev.data,'$.port') END"
+            "  ELSE CASE WHEN json_type(ev.data,'$.port_idx')='integer'"
+            f"            AND json_extract(ev.data,'$.port_idx') BETWEEN 0 AND {port_hi}"
+            "            THEN json_extract(ev.data,'$.port_idx') END"
+            " END"
+        )
+        # native_id the normalizer builds for the port: "<sw_mac>:<port_idx>". The
+        # switch MAC is non-empty here (this expression is only consulted under the
+        # sw-present branch), so _mac('$.sw') equals the raw value the normalizer used.
+        port_nid = f"({_mac('$.sw')} || ':' || {port_idx})"
+
+        resolvable = (
+            "CASE"
+            # primary reference fillable
+            "  WHEN ev.entity_id IS NULL AND ("
+            "    CASE"
+            f"      WHEN {user_or_client} IS NOT NULL"
+            "        THEN ecli.entity_id IS NOT NULL"
+            f"      WHEN {_mac('$.ap')} IS NOT NULL"
+            "        THEN eap.entity_id IS NOT NULL"
+            f"      WHEN {_mac('$.sw')} IS NOT NULL"
+            # A port-scoped switch event resolves on the PORT entity, not the
+            # switch; a plain switch-scoped event (e.g. EVT_SW_PoeOverload) still
+            # resolves on the switch. Mirror the normalizer's per-key branch.
+            "        THEN CASE"
+            f"          WHEN ev.key IN ({port_keys_sql}) AND {port_idx} IS NOT NULL"
+            "            THEN eport.entity_id IS NOT NULL"
+            "          ELSE esw.entity_id IS NOT NULL"
+            "        END"
+            f"      WHEN {_mac('$.gw')} IS NOT NULL"
+            "        THEN egw.entity_id IS NOT NULL"
+            "      ELSE 0"
+            "    END) THEN 1"
+            # related (from-AP / switch) reference fillable -- client-scoped only,
+            # mirroring the normalizer's per-key precedence rather than OR-ing every
+            # candidate. A row is resolvable ONLY when the SPECIFIC MAC the
+            # normalizer would consult for this NULL column is already in inventory.
+            "  WHEN ev.related_entity_id IS NULL"
+            f"   AND {user_or_client} IS NOT NULL"
+            "    THEN CASE"
+            "      WHEN ev.key LIKE '%Roam%'"
+            "        THEN (CASE WHEN eapf.entity_id IS NOT NULL THEN 1 ELSE 0 END)"
+            f"      WHEN {_mac('$.ap')} IS NOT NULL"
+            "        THEN (CASE WHEN eap.entity_id IS NOT NULL THEN 1 ELSE 0 END)"
+            f"      WHEN {_mac('$.sw')} IS NOT NULL"
+            "        THEN (CASE WHEN esw.entity_id IS NOT NULL THEN 1 ELSE 0 END)"
+            "      ELSE 0"
+            "    END"
+            "  ELSE 0 END"
+        )
+        sql = (
+            "WITH cand AS ("
+            "  SELECT ev.id AS id, ev.data AS data, ev.ts AS ts,"
+            f"        {attempts} AS attempts,"
+            f"        ({resolvable}) AS resolvable"
+            "  FROM events ev"
+            "  LEFT JOIN entities en ON en.entity_id = ev.entity_id"
+            "  LEFT JOIN entities ecli ON ecli.site_id=? AND ecli.entity_type='client'"
+            f"       AND ecli.native_id = {user_or_client}"
+            "  LEFT JOIN entities eap ON eap.site_id=? AND eap.entity_type='ap'"
+            f"       AND eap.native_id = {_mac('$.ap')}"
+            "  LEFT JOIN entities esw ON esw.site_id=? AND esw.entity_type='switch'"
+            f"       AND esw.native_id = {_mac('$.sw')}"
+            "  LEFT JOIN entities egw ON egw.site_id=? AND egw.entity_type='gateway'"
+            f"       AND egw.native_id = {_mac('$.gw')}"
+            "  LEFT JOIN entities eapf ON eapf.site_id=? AND eapf.entity_type='ap'"
+            f"       AND eapf.native_id = {ap_from_or_ap}"
+            # The PORT a port-scoped switch event resolves to (finding #4).
+            "  LEFT JOIN entities eport ON eport.site_id=? AND eport.entity_type='port'"
+            f"       AND eport.native_id = {port_nid}"
+            "  WHERE (ev.entity_id IS NULL AND ("
+            f"          {_mac('$.user')}   IS NOT NULL"
+            f"       OR {_mac('$.client')} IS NOT NULL"
+            f"       OR {_mac('$.ap')}     IS NOT NULL"
+            f"       OR {_mac('$.sw')}     IS NOT NULL"
+            f"       OR {_mac('$.gw')}     IS NOT NULL))"
+            "     OR (ev.related_entity_id IS NULL AND en.entity_type = 'client' AND ("
+            f"          {_mac('$.ap_from')} IS NOT NULL"
+            f"       OR {_mac('$.ap')}      IS NOT NULL"
+            f"       OR {_mac('$.sw')}      IS NOT NULL))"
+            ") "
+            "SELECT id, data FROM cand "
+            "WHERE resolvable = 1 OR attempts < ? "
+            "ORDER BY resolvable DESC, ts, id LIMIT ?"
+        )
+        return self._conn.execute(
+            sql,
+            # 6 site binds: ecli, eap, esw, egw, eapf, eport (in FROM order).
+            (site, site, site, site, site, site, _EVENT_RECONCILE_MAX_ATTEMPTS, max(1, limit)),
+        ).fetchall()
+
+    # P2 fair progress: record that a reconcile pass selected these events but did
+    # not fill them, so a permanently-unresolvable "pending from-AP" is eventually
+    # parked out of the oldest-first LIMIT window (see :meth:`unresolved_events`).
+    # This is the WRITE half of the bounded-retry mechanism; the selection read
+    # never writes, so it stays safe on a read-only connection. A no-op when the
+    # 0013 column is absent (older schema) -- the resolvability preference alone
+    # still prevents starvation there.
+    def bump_event_reconcile_attempts(self, event_ids: Sequence[int]) -> int:
+        if not event_ids:
+            return 0
+        if not self._column_exists("events", "reconcile_attempts"):
+            return 0
+        with self._write() as conn:
+            placeholders = ",".join("?" for _ in event_ids)
+            cur = conn.execute(
+                "UPDATE events SET reconcile_attempts = reconcile_attempts + 1 "
+                f"WHERE id IN ({placeholders})",
+                tuple(int(i) for i in event_ids),
+            )
+            return cur.rowcount
+
+    # C7: fill only absent references; an event's original attribution is never
+    # overwritten by a later, potentially less-specific controller payload.
+    #
+    # The return value must be an HONEST enrichment signal: True only when a
+    # previously-NULL column was actually filled with a non-NULL value.  The WHERE
+    # therefore matches a NULL column only when the *offered* value for it is
+    # non-NULL -- otherwise a row whose ``related_entity_id`` stays NULL (offered
+    # None) would still match ``related_entity_id IS NULL``, report ``rowcount>0``,
+    # and be counted as a repair though COALESCE changed nothing.  That double
+    # counted every re-attempted-but-unresolvable row on every pass (the P2
+    # dishonest-count bug).  Now rowcount>0 iff at least one column was enriched.
+    def fill_event_entity_refs(
+        self, event_id: int, *, entity_id: Optional[int], related_entity_id: Optional[int]
+    ) -> bool:
+        if entity_id is None and related_entity_id is None:
+            return False
+        with self._write() as conn:
+            cur = conn.execute(
+                "UPDATE events SET entity_id=COALESCE(entity_id, ?), "
+                "related_entity_id=COALESCE(related_entity_id, ?) "
+                "WHERE id=? AND ("
+                "     (entity_id IS NULL AND ? IS NOT NULL) "
+                "  OR (related_entity_id IS NULL AND ? IS NOT NULL))",
+                (entity_id, related_entity_id, event_id, entity_id, related_entity_id),
+            )
+            return cur.rowcount > 0
+
+    def _column_exists(self, table: str, column: str) -> bool:
+        """True when ``table`` has a column named ``column``.
+
+        Like :meth:`_table_exists`, this is a read-path probe: it lets a query
+        that wants a column added by a later migration degrade gracefully (fall
+        back to a constant) when run against a database not yet migrated to that
+        version, instead of raising ``no such column``. It issues no DDL, so it
+        is safe on a read-only connection.
+        """
+        rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(str(r["name"]) == column for r in rows)
+
+    def _table_exists(self, name: str) -> bool:
+        """True when ``name`` is a real table in this database.
+
+        A read path must never issue DDL: on a read-only connection (or a reader
+        replica) ``CREATE TABLE IF NOT EXISTS`` raises ``OperationalError`` even
+        though it would be a no-op. Readers consult this instead so a missing
+        table degrades to an empty/unknown result rather than raising.
+        """
+        row = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", (name,)
+        ).fetchone()
+        return row is not None
+
+    # C3/C4: completed controller-history coverage is distinct from the newest
+    # live arrival/sample.  The ``ingest_coverage`` table is created by migration
+    # 0011; this writer-side ensure remains as a belt-and-braces guard on the
+    # WRITE connection only (never on a read path -- see :meth:`_table_exists`).
+    def _ensure_ingest_coverage(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS ingest_coverage ("
+            "kind TEXT NOT NULL, scope TEXT NOT NULL, interval TEXT NOT NULL, "
+            "start_ts INTEGER NOT NULL, end_ts INTEGER NOT NULL, "
+            "status TEXT NOT NULL, detail TEXT, updated_ts INTEGER NOT NULL, "
+            "PRIMARY KEY (kind, scope, interval, start_ts, end_ts))"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ingest_coverage_lookup "
+            "ON ingest_coverage(kind, scope, interval, status, start_ts, end_ts)"
+        )
+
+    # C3/C4: record the exact history interval only after its GET completed.
+    def record_ingest_coverage(
+        self, *, kind: str, scope: str, interval: str, start_ts: int, end_ts: int,
+        status: str, detail: Optional[str] = None,
+    ) -> None:
+        if end_ts <= start_ts:
+            return
+        with self._write() as conn:
+            self._ensure_ingest_coverage(conn)
+            conn.execute(
+                "INSERT INTO ingest_coverage "
+                "(kind, scope, interval, start_ts, end_ts, status, detail, updated_ts) "
+                "VALUES (?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(kind, scope, interval, start_ts, end_ts) DO UPDATE SET "
+                "status=excluded.status, detail=excluded.detail, updated_ts=excluded.updated_ts",
+                (kind, scope, interval, start_ts, end_ts, status, detail, _now()),
+            )
+            if status == "complete":
+                self._reconcile_holes_covered_by_complete(
+                    conn, kind=kind, scope=scope, interval=interval,
+                    start_ts=start_ts, end_ts=end_ts,
+                )
+
+    # CURSOR STRANDING (#w19a): a successful read that COVERS a previously-failed
+    # /partial hole must RECONCILE that hole, or the completion cursor
+    # (:meth:`latest_ingest_coverage_end`, capped at the earliest still-retryable
+    # hole) stays pinned at the hole's start FOREVER even after the gap is fully
+    # covered. When a later read records a COMPLETE span whose start/end differ
+    # from the failed row's (a wider/overlapping window -> a DIFFERENT primary
+    # key), the ``ON CONFLICT`` upsert above never touches the old failed row, so
+    # it survives and keeps pinning the cursor. This retires every failed/partial
+    # row the complete span fully SUBSUMES, and split-first-retires a partially
+    # overlapped one down to only its still-uncovered remainder(s) -- mirroring the
+    # backfill split/retire discipline (see ingest/backfill.py Finding #7/#3), so
+    # the contiguous-complete cursor advances the instant a hole is actually
+    # covered while a genuinely still-open hole is preserved and still caps it.
+    @staticmethod
+    def _reconcile_holes_covered_by_complete(
+        conn: sqlite3.Connection, *, kind: str, scope: str, interval: str,
+        start_ts: int, end_ts: int,
+    ) -> None:
+        holes = conn.execute(
+            "SELECT start_ts, end_ts, status, detail FROM ingest_coverage "
+            "WHERE kind=? AND scope=? AND interval=? "
+            "AND status IN ('failed','partial') AND end_ts>? AND start_ts<?",
+            (kind, scope, interval, start_ts, end_ts),
+        ).fetchall()
+        for h in holes:
+            h_lo, h_hi = int(h["start_ts"]), int(h["end_ts"])
+            h_status, h_detail = str(h["status"]), h["detail"]
+            # Split-first: re-record the uncovered remainder(s) before retiring the
+            # original, so a crash between the two never erases a still-open hole.
+            # The covered middle [max(h_lo,start_ts), min(h_hi,end_ts)] is dropped.
+            if h_lo < start_ts:
+                conn.execute(
+                    "INSERT INTO ingest_coverage "
+                    "(kind, scope, interval, start_ts, end_ts, status, detail, updated_ts) "
+                    "VALUES (?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(kind, scope, interval, start_ts, end_ts) DO UPDATE SET "
+                    "status=excluded.status, detail=excluded.detail, updated_ts=excluded.updated_ts",
+                    (kind, scope, interval, h_lo, min(h_hi, start_ts), h_status, h_detail, _now()),
+                )
+            if h_hi > end_ts:
+                conn.execute(
+                    "INSERT INTO ingest_coverage "
+                    "(kind, scope, interval, start_ts, end_ts, status, detail, updated_ts) "
+                    "VALUES (?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(kind, scope, interval, start_ts, end_ts) DO UPDATE SET "
+                    "status=excluded.status, detail=excluded.detail, updated_ts=excluded.updated_ts",
+                    (kind, scope, interval, max(h_lo, end_ts), h_hi, h_status, h_detail, _now()),
+                )
+            conn.execute(
+                "DELETE FROM ingest_coverage WHERE kind=? AND scope=? AND interval=? "
+                "AND start_ts=? AND end_ts=?",
+                (kind, scope, interval, h_lo, h_hi),
+            )
+
+    # Finding #7: retire (delete) one coverage row by its exact primary key.
+    # When retention clips a failed interval, the retryable window gets a NEW
+    # start_ts and therefore a NEW primary key (kind, scope, interval, start_ts,
+    # end_ts); the original failed row cannot be updated in place (its start_ts
+    # no longer matches) and would otherwise survive as a stale 'failed' hole
+    # that regenerates redundant retries forever. The caller splits it: the
+    # pre-clip portion is recorded 'unrecoverable' and this drops the original
+    # row so nothing beside the new complete/failed clipped row keeps re-firing.
+    def retire_ingest_coverage(
+        self, *, kind: str, scope: str, interval: str, start_ts: int, end_ts: int
+    ) -> None:
+        with self._write() as conn:
+            self._ensure_ingest_coverage(conn)
+            conn.execute(
+                "DELETE FROM ingest_coverage WHERE kind=? AND scope=? AND interval=? "
+                "AND start_ts=? AND end_ts=?",
+                (kind, scope, interval, start_ts, end_ts),
+            )
+
+    # C4: failed report chunks remain first-class holes and are retried even
+    # after a later successful chunk advances sample timestamps.
+    #
+    # #w18a-3: a 'partial' window (some rows dropped as unusable/unresolved --
+    # backfill.py, or catch-up #w16a-4) is ALSO a retryable hole, not a settled
+    # window. It must be re-fetched exactly like a 'failed' one so that once the
+    # missing device/data becomes available a re-fetch can complete it; otherwise a
+    # partial recorded before a later 'complete' chunk is stranded forever (the
+    # retry scan skipped it and the completion cursor advanced past it). Both
+    # retryable statuses are returned here; 'unrecoverable' (terminal) is not.
+    def failed_ingest_coverage(
+        self, *, kind: str, scope: str, interval: Optional[str] = None
+    ) -> list[sqlite3.Row]:
+        if not self._table_exists("ingest_coverage"):
+            return []
+        clauses = ["kind=?", "scope=?", "status IN ('failed','partial')"]
+        params: list[Any] = [kind, scope]
+        if interval is not None:
+            clauses.append("interval=?")
+            params.append(interval)
+        return self._conn.execute(
+            "SELECT * FROM ingest_coverage WHERE " + " AND ".join(clauses) +
+            " ORDER BY start_ts, end_ts", params
+        ).fetchall()
+
+    # C4: this is a coverage cursor, never a proxy derived from samples.
+    #
+    # #w18a-3: the cursor is the end of the contiguous COMPLETE prefix, NOT
+    # MAX(complete). A later 'complete' chunk must NOT bury an earlier retryable
+    # hole ('failed' or 'partial'): if it did, the production cursor would advance
+    # past the hole and the next sweep would only fetch newer intervals, stranding
+    # the hole forever. So the cursor may not advance past the earliest retryable
+    # hole -- history is "completely read up to T" only through the complete (or
+    # permanently-'unrecoverable') prefix that precedes every still-retryable hole.
+    # 'unrecoverable' is terminal (the span is genuinely gone), so it does NOT block
+    # the cursor -- otherwise it would freeze forever on lost history and re-fetch
+    # everything after it every cycle (round-11/12 semantics preserved).
+    def latest_ingest_coverage_end(self, *, kind: str, scope: str) -> Optional[int]:
+        if not self._table_exists("ingest_coverage"):
+            return None
+        hole = self._conn.execute(
+            "SELECT MIN(start_ts) AS s FROM ingest_coverage "
+            "WHERE kind=? AND scope=? AND status IN ('failed','partial')",
+            (kind, scope),
+        ).fetchone()
+        hole_start = None if hole is None or hole["s"] is None else int(hole["s"])
+        if hole_start is None:
+            row = self._conn.execute(
+                "SELECT MAX(end_ts) AS end_ts FROM ingest_coverage "
+                "WHERE kind=? AND scope=? AND status='complete'", (kind, scope)
+            ).fetchone()
+            return None if row is None or row["end_ts"] is None else int(row["end_ts"])
+        # A retryable hole exists: credit only 'complete' coverage that begins
+        # before it, and never report a cursor past the hole's own start.
+        row = self._conn.execute(
+            "SELECT MAX(end_ts) AS end_ts FROM ingest_coverage "
+            "WHERE kind=? AND scope=? AND status='complete' AND start_ts<?",
+            (kind, scope, hole_start),
+        ).fetchone()
+        end = None if row is None or row["end_ts"] is None else int(row["end_ts"])
+        if end is None:
+            return None
+        return min(end, hole_start)
+
+    # B4 (positive-liveness redesign): spans the WS event feed was actually
+    # observing, derived from ``job='ws'`` liveness HEARTBEATS in ``poll_runs``
+    # (:meth:`record_ws_heartbeat`) -- NOT from ``connected``/``disconnected``
+    # transition rows. Each heartbeat is positive proof the feed was connected and
+    # draining at that instant; two consecutive beats no further apart than
+    # ``_WS_HEARTBEAT_MAX_GAP_S`` bridge the span between them into continuous
+    # coverage. This is robust where the old close-event reconstruction was not:
+    # a normal shutdown, task cancellation, crash, or failed disconnect-write
+    # simply STOPS the beats, so coverage ends at the last heartbeat and never
+    # runs through ``end_ts`` on a still-open ``connected`` row (the over-credit
+    # that false-cleared issues after restart). A feed that is stuck / not
+    # draining likewise emits no beats and leaves a real hole. A single lone beat
+    # credits nothing (zero-width) -- coverage needs a sustained, chained run. A
+    # heartbeat up to one max-gap before the window bridges into it, so a window
+    # entered mid-run starts covered.
+    def _ws_observed_intervals(self, start_ts: int, end_ts: int) -> list[tuple[int, int]]:
+        lower = start_ts - _WS_HEARTBEAT_MAX_GAP_S
+        rows = self._conn.execute(
+            "SELECT ts, rowid FROM poll_runs "
+            "WHERE job='ws' AND source='live' AND error=? AND ts>=? AND ts<? "
+            "ORDER BY ts, rowid",
+            (_WS_HEARTBEAT_LABEL, lower, end_ts),
+        ).fetchall()
+        # #w16a-1 / #w17a-1: recorded WS disconnect transitions in the same span. A
+        # disconnect that lands between two heartbeats severs their chain even when
+        # they are within the cadence bridge -- the feed was down, so that span is a
+        # real hole, not continuous observation. Timestamps are integer-second, so a
+        # disconnect frequently SHARES a heartbeat's second; the earlier
+        # strictly-between test (a < ts < b) silently ignored those same-second
+        # disconnects and let the bridge span a real outage. The sever test is now
+        # the CLOSED interval [beat_i, beat_{i+1}] and ties are broken by poll_runs
+        # ``rowid`` (insertion order): a disconnect recorded in the same second as,
+        # but AFTER, a beat orders after that beat and severs the NEXT bridge, so
+        # coverage ends at that beat. Endpoints are (ts, rowid) tuples throughout so
+        # the ordering is total and deterministic.
+        placeholders = ",".join("?" for _ in _WS_DISCONNECT_LABELS)
+        disc_rows = self._conn.execute(
+            "SELECT ts, rowid FROM poll_runs "
+            f"WHERE job='ws' AND source='live' AND error IN ({placeholders}) "
+            "AND ts>=? AND ts<? ORDER BY ts, rowid",
+            (*_WS_DISCONNECT_LABELS, lower, end_ts),
+        ).fetchall()
+        disconnects = [(int(r["ts"]), int(r["rowid"])) for r in disc_rows]
+
+        def _disconnect_between(a: tuple[int, int], b: tuple[int, int]) -> bool:
+            # A recorded disconnect whose (ts, rowid) lands in the CLOSED interval
+            # [a, b] -- including one sharing either beat's integer second, ordered
+            # deterministically by rowid -- means the feed went down between (or
+            # exactly at) these two beats, so the covered run must break here.
+            i = bisect.bisect_left(disconnects, a)
+            return i < len(disconnects) and disconnects[i] <= b
+
+        intervals: list[tuple[int, int]] = []
+        run_start: Optional[int] = None
+        prev: Optional[tuple[int, int]] = None
+        for row in rows:
+            key = (int(row["ts"]), int(row["rowid"]))
+            ts = key[0]
+            if prev is None:
+                run_start = ts
+            elif ts - prev[0] <= _WS_HEARTBEAT_MAX_GAP_S and not _disconnect_between(prev, key):
+                pass  # same continuous run of liveness
+            else:
+                # Either the cadence gap is too large OR a disconnect was recorded
+                # between the two beats: close the run at ``prev`` and start anew.
+                assert run_start is not None
+                if prev[0] > run_start:
+                    intervals.append((run_start, prev[0]))
+                run_start = ts
+            prev = key
+        if prev is not None and run_start is not None and prev[0] > run_start:
+            intervals.append((run_start, prev[0]))
+        return intervals
+
+    # B4: event-source observation coverage as a fraction of a detector window.
+    # Two honest signals are unioned: (1) completed controller-history reads the
+    # event catch-up records (``ingest_coverage`` kind='event_history'), and (2)
+    # the WS feed's own liveness-heartbeat intervals (see
+    # :meth:`_ws_observed_intervals`).  This is NEVER inferred from the presence
+    # or absence of event rows (that exact conflation is the B4 false-clear bug):
+    # a broken feed stops advancing BOTH signals, so a detector window drifts past
+    # the last covered slice and the fraction falls. Read-only: it issues no DDL,
+    # so it is safe on a read-only connection, and tolerates the coverage table
+    # being absent (returns only the WS-derived coverage) rather than raising.
+    def observed_event_coverage(
+        self,
+        start_ts: int,
+        end_ts: int,
+        *,
+        kind: str = "event_history",
+        scope: str = "site",
+    ) -> float:
+        """Fraction in ``[0, 1]`` of ``[start_ts, end_ts)`` the event source was
+        observed for.
+
+        Completed history-read intervals and live WS-connected intervals are
+        merged (overlaps counted once, clipped to the window) so double-counting
+        cannot push the fraction over 1.0. Returns ``0.0`` for a non-positive
+        window or when nothing was observed, which a detector treats as an
+        event-feed gap -> UNKNOWN.
+        """
+        if end_ts <= start_ts:
+            return 0.0
+        segments: list[tuple[int, int]] = []
+        # (1) Completed controller-history reads (may be absent on a fresh /
+        # WS-only store, or if the table has not been migrated in yet).
+        if self._table_exists("ingest_coverage"):
+            for row in self._conn.execute(
+                "SELECT start_ts, end_ts FROM ingest_coverage "
+                "WHERE kind=? AND scope=? AND status='complete' "
+                "AND end_ts>? AND start_ts<? ORDER BY start_ts, end_ts",
+                (kind, scope, start_ts, end_ts),
+            ).fetchall():
+                seg_start = max(int(row["start_ts"]), start_ts)
+                seg_end = min(int(row["end_ts"]), end_ts)
+                if seg_end > seg_start:
+                    segments.append((seg_start, seg_end))
+        # (2) Live WS liveness-heartbeat observation (the healthy WS-only signal).
+        for seg_start, seg_end in self._ws_observed_intervals(start_ts, end_ts):
+            seg_start = max(seg_start, start_ts)
+            seg_end = min(seg_end, end_ts)
+            if seg_end > seg_start:
+                segments.append((seg_start, seg_end))
+        if not segments:
+            return 0.0
+        segments.sort()
+        covered = 0
+        merged_start, merged_end = segments[0]
+        for seg_start, seg_end in segments[1:]:
+            if seg_start <= merged_end:
+                if seg_end > merged_end:
+                    merged_end = seg_end
+            else:
+                covered += merged_end - merged_start
+                merged_start, merged_end = seg_start, seg_end
+        covered += merged_end - merged_start
+        return min(1.0, covered / (end_ts - start_ts))
+
     def read_events(
         self,
         start_ts: int,
@@ -1002,6 +1794,42 @@ class Repository:
                 (ts, job, 1 if ok else 0, duration_ms, error, source),
             )
 
+    def record_ws_heartbeat(self, *, ts: Optional[int] = None) -> None:
+        """Record one WS-event-feed liveness heartbeat (B4 positive liveness).
+
+        Written by the live WS consumer every time it is CONNECTED and has just
+        successfully drained (or found empty) its batch -- positive proof the
+        event feed was observing at ``ts``. It lands as an ordinary successful
+        ``job='ws'`` ``poll_runs`` row (``error='heartbeat'``, ``ok=1``), which
+        serves two purposes at once: :meth:`observed_event_coverage` credits only
+        spans carrying heartbeats (so a still-open ``connected`` interval can
+        never over-credit past the last beat), and, being a fresh *successful* ws
+        row, it clears any trailing storage-failure in the health accounting once
+        flushing recovers. A shutdown, crash, or failed close simply stops the
+        beats -- there is no close row for coverage to depend on.
+        """
+        self.record_poll_run(job="ws", ok=True, ts=ts, error=_WS_HEARTBEAT_LABEL, source="live")
+
+    def record_ws_break(self, *, ts: Optional[int] = None) -> None:
+        """Record a WS coverage BREAK across a span of UNUSABLE events (#w18a-2).
+
+        Written by the live WS consumer when it drained a tick during which one or
+        more events were structurally UNUSABLE -- a disconnect frame with no usable
+        timestamp, or a parser-surfaced event-frame row lacking ``key``/``_id``
+        (#w18a-4). The socket never dropped, so no ``disconnected`` row exists, yet
+        the span was NOT a fully-observed, cleanly-draining one: usable events may
+        have been discarded alongside the unusable ones. Merely suppressing one
+        positive-liveness beat leaves the next clean beat ~2s later within the
+        cadence bridge, so :meth:`_ws_observed_intervals` would BRIDGE the drop span
+        and over-credit coverage. Instead this lands a durable ``job='ws'`` break
+        row (``error='unusable'``, ``ok=0``) that the interval builder treats as a
+        disconnect: it SEVERS the heartbeat chain, so coverage ends at the last
+        clean beat before the drops and only resumes at the first clean beat after a
+        subsequent CLEAN drain -- reusing the disconnect-severing machinery rather
+        than a parallel path.
+        """
+        self.record_poll_run(job="ws", ok=False, ts=ts, error=_WS_UNUSABLE_LABEL, source="live")
+
     def read_poll_runs(
         self, job: str, start_ts: int, end_ts: int, *, ok_only: bool = False
     ) -> list[sqlite3.Row]:
@@ -1010,6 +1838,12 @@ class Repository:
             f"SELECT * FROM poll_runs WHERE job=? AND ts>=? AND ts<? {clause} ORDER BY ts",
             (job, start_ts, end_ts),
         ).fetchall()
+
+    # CLI doctor: enumerate the jobs actually represented in the local store.
+    def list_poll_jobs(self) -> list[str]:
+        """Distinct recorded poll job names, in stable order."""
+        rows = self._conn.execute("SELECT DISTINCT job FROM poll_runs ORDER BY job").fetchall()
+        return [str(row["job"]) for row in rows]
 
     def expected_coverage(
         self,
@@ -1116,13 +1950,15 @@ class Repository:
         table. One transaction.
         """
         now = _now() if now is None else now
-        raw_before = (
-            now - self.retention_raw_days * DAY_SECONDS if raw_before is None else raw_before
+        raw_before = _next_bucket(
+            now - self.retention_raw_days * DAY_SECONDS if raw_before is None else raw_before,
+            HOUR_SECONDS,
         )
-        hourly_before = (
+        hourly_before = _next_bucket(
             now - self.retention_hourly_days * DAY_SECONDS
             if hourly_before is None
-            else hourly_before
+            else hourly_before,
+            DAY_SECONDS,
         )
         with self._write() as conn:
             raw_deleted = conn.execute("DELETE FROM samples WHERE ts < ?", (raw_before,)).rowcount
@@ -1678,7 +2514,7 @@ class Repository:
             "SELECT attributed_entity_id AS eid, SUM(minutes) AS m FROM sle_minutes "
             "WHERE bucket_ts>=? AND bucket_ts<? "
             f"{clause}"
-            "AND classifier != 'ok' AND attributed_entity_id IS NOT NULL "
+            "AND classifier != 'ok' AND attributed_entity_id != 0 "
             "GROUP BY attributed_entity_id",
             params,
         ).fetchall()
@@ -2015,20 +2851,24 @@ class Repository:
         minutes: float,
         attributed_entity_id: Optional[int] = None,
     ) -> None:
-        """Set the minutes for one (bucket, sle, classifier, client) cell.
+        """Set the minutes for one fully attributed SLE cell.
 
         Replaces rather than accumulates: the SLE engine computes a bucket's
         minutes and writes them idempotently, so a recompute of the same bucket
         overwrites cleanly.
         """
+        # ``sle_minutes`` is a WITHOUT ROWID table, whose primary-key columns
+        # are necessarily non-null. Keep the public/reader representation of an
+        # unknown attribution as NULL while using 0 for its storage identity.
+        attributed_key = 0 if attributed_entity_id is None else int(attributed_entity_id)
         with self._write() as conn:
             conn.execute(
                 "INSERT INTO sle_minutes "
                 "(bucket_ts, sle, classifier, entity_id, attributed_entity_id, minutes) "
                 "VALUES (?,?,?,?,?,?) "
-                "ON CONFLICT(bucket_ts, sle, classifier, entity_id) DO UPDATE SET "
-                "  minutes=excluded.minutes, attributed_entity_id=excluded.attributed_entity_id",
-                (bucket_ts, sle, classifier, entity_id, attributed_entity_id, minutes),
+                "ON CONFLICT(bucket_ts, sle, classifier, entity_id, attributed_entity_id) "
+                "DO UPDATE SET minutes=excluded.minutes",
+                (bucket_ts, sle, classifier, entity_id, attributed_key, minutes),
             )
 
     def add_sle_minutes(
@@ -2042,15 +2882,15 @@ class Repository:
         attributed_entity_id: Optional[int] = None,
     ) -> None:
         """Accumulate minutes into a cell (for incremental attribution)."""
+        attributed_key = 0 if attributed_entity_id is None else int(attributed_entity_id)
         with self._write() as conn:
             conn.execute(
                 "INSERT INTO sle_minutes "
                 "(bucket_ts, sle, classifier, entity_id, attributed_entity_id, minutes) "
                 "VALUES (?,?,?,?,?,?) "
-                "ON CONFLICT(bucket_ts, sle, classifier, entity_id) DO UPDATE SET "
-                "  minutes = minutes + excluded.minutes, "
-                "  attributed_entity_id = COALESCE(excluded.attributed_entity_id, attributed_entity_id)",
-                (bucket_ts, sle, classifier, entity_id, attributed_entity_id, minutes),
+                "ON CONFLICT(bucket_ts, sle, classifier, entity_id, attributed_entity_id) "
+                "DO UPDATE SET minutes = minutes + excluded.minutes",
+                (bucket_ts, sle, classifier, entity_id, attributed_key, minutes),
             )
 
     def delete_sle_minutes(self, bucket_ts: int) -> int:
@@ -2090,7 +2930,12 @@ class Repository:
 
         sql = "SELECT "
         if cols:
-            sql += ", ".join(cols) + ", "
+            sql += ", ".join(
+                "NULLIF(attributed_entity_id, 0) AS attributed_entity_id"
+                if col == "attributed_entity_id"
+                else col
+                for col in cols
+            ) + ", "
         sql += "SUM(minutes) AS minutes FROM sle_minutes WHERE bucket_ts>=? AND bucket_ts<?"
         if cols:
             sql += " GROUP BY " + ", ".join(cols) + " ORDER BY " + ", ".join(cols)
@@ -2181,6 +3026,62 @@ class Repository:
             "FROM entities WHERE site_id=? ORDER BY entity_id",
             (site,),
         ).fetchall()
+
+    def feeder_edges(self, *, site_id: Optional[str] = None) -> list[tuple[int, int]]:
+        """Physical wired-feeder edges ``(feeder_entity_id, fed_entity_id)``.
+
+        Distinct from ``parent_id`` containment: a device is *contained* in its
+        site but *fed* by the upstream switch/port it hangs off. Reconstructed
+        from the ``uplink_mac`` / ``uplink_remote_port`` the ingest layer records
+        in each device's meta (the GET ``stat/device`` ``uplink`` block) -- no
+        controller call, and no schema of its own.
+
+        For every device that reports an uplink, up to two edges *into* that
+        device are emitted:
+
+        * from the upstream **switch** device (``native_id == uplink_mac``) --
+          this roots switch-scoped faults such as ``wired.broadcast_storm``;
+        * from that switch **port** (``native_id == "<uplink_mac>:<port>"``),
+          when the remote port is known -- this roots port-scoped faults
+          (``wired.port_flapping`` / ``wired.bad_cable`` / ``wired.stp_loop``).
+
+        Edges whose feeder is not (yet) an entity in this site are skipped, so a
+        half-ingested inventory yields fewer edges rather than dangling ones.
+        """
+        site = site_id or self.site_id
+        rows = self._conn.execute(
+            "SELECT entity_id, native_id, meta FROM entities WHERE site_id=?",
+            (site,),
+        ).fetchall()
+        id_by_native: dict[str, int] = {}
+        uplink_by_id: dict[int, tuple[str, Optional[int]]] = {}
+        for row in rows:
+            native_id = row["native_id"]
+            if native_id is not None:
+                id_by_native[native_id] = int(row["entity_id"])
+            try:
+                meta = json.loads(row["meta"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(meta, dict):
+                continue
+            feeder_mac = meta.get("uplink_mac")
+            if feeder_mac:
+                uplink_by_id[int(row["entity_id"])] = (
+                    str(feeder_mac),
+                    meta.get("uplink_remote_port"),
+                )
+
+        edges: list[tuple[int, int]] = []
+        for fed_id, (feeder_mac, remote_port) in uplink_by_id.items():
+            switch_id = id_by_native.get(feeder_mac)
+            if switch_id is not None and switch_id != fed_id:
+                edges.append((switch_id, fed_id))
+            if remote_port is not None:
+                port_id = id_by_native.get(f"{feeder_mac}:{remote_port}")
+                if port_id is not None and port_id != fed_id:
+                    edges.append((port_id, fed_id))
+        return edges
 
     def get_incident(self, incident_id: int) -> Optional[sqlite3.Row]:
         return self._conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
@@ -2303,6 +3204,50 @@ class Repository:
                     (incident_id, m["issue_id"], m["role"], m["rule"], m["rationale"]),
                 )
 
+    # C5: correlation history is append-only; unlike replace_incident_members,
+    # this reconciles the *current* set while retaining every prior member.
+    def reconcile_incident_members(
+        self, incident_id: int, members: Sequence[dict[str, Any]], *, ts: int
+    ) -> None:
+        """Persist current membership without erasing the incident's history.
+
+        Newly-seen members receive ``joined_ts``.  Current members are reopened
+        (``cleared_ts=NULL``) and refresh their audit explanation; members absent
+        from this pass remain stored and receive their first ``cleared_ts``.
+        """
+        current_ids = [int(m["issue_id"]) for m in members]
+        with self._write() as conn:
+            for m in members:
+                conn.execute(
+                    "INSERT INTO incident_members "
+                    "(incident_id, issue_id, role, rule, rationale, joined_ts, cleared_ts) "
+                    "VALUES (?,?,?,?,?,?,NULL) "
+                    "ON CONFLICT(incident_id, issue_id) DO UPDATE SET "
+                    "role=excluded.role, rule=excluded.rule, rationale=excluded.rationale, "
+                    "cleared_ts=NULL",
+                    (
+                        incident_id,
+                        m["issue_id"],
+                        m["role"],
+                        m["rule"],
+                        m["rationale"],
+                        ts,
+                    ),
+                )
+            if current_ids:
+                placeholders = ",".join("?" for _ in current_ids)
+                conn.execute(
+                    "UPDATE incident_members SET cleared_ts=COALESCE(cleared_ts, ?) "
+                    f"WHERE incident_id=? AND issue_id NOT IN ({placeholders})",
+                    [ts, incident_id, *current_ids],
+                )
+            else:
+                conn.execute(
+                    "UPDATE incident_members SET cleared_ts=COALESCE(cleared_ts, ?) "
+                    "WHERE incident_id=?",
+                    (ts, incident_id),
+                )
+
     def list_incident_members(self, incident_id: int) -> list[sqlite3.Row]:
         """Members of an incident, root first (role ordering), then by issue id."""
         return self._conn.execute(
@@ -2310,6 +3255,16 @@ class Repository:
             "ORDER BY CASE role WHEN 'root' THEN 0 ELSE 1 END, issue_id",
             (incident_id,),
         ).fetchall()
+
+    # C5: distinguish the current association from the historical member rows.
+    def current_incident_issue_ids(self, incident_id: int) -> set[int]:
+        """Issue ids currently attached to an incident (cleared history excluded)."""
+        rows = self._conn.execute(
+            "SELECT issue_id FROM incident_members "
+            "WHERE incident_id=? AND cleared_ts IS NULL",
+            (incident_id,),
+        ).fetchall()
+        return {int(row["issue_id"]) for row in rows}
 
     def incident_id_for_issue(self, issue_id: int) -> Optional[int]:
         """The open incident an issue currently belongs to, if any.
@@ -2320,7 +3275,8 @@ class Repository:
         row = self._conn.execute(
             "SELECT im.incident_id AS incident_id FROM incident_members im "
             "JOIN incidents i ON i.id = im.incident_id "
-            "WHERE im.issue_id=? AND i.state != 'resolved' LIMIT 1",
+            "WHERE im.issue_id=? AND im.cleared_ts IS NULL "
+            "AND i.state != 'resolved' LIMIT 1",
             (issue_id,),
         ).fetchone()
         return None if row is None else int(row["incident_id"])
@@ -2352,7 +3308,8 @@ class Repository:
             "(SELECT COUNT(*) FROM incident_members im2 WHERE im2.incident_id = i.id) "
             "  AS incident_member_count "
             "FROM incident_members im JOIN incidents i ON i.id = im.incident_id "
-            f"WHERE i.state != 'resolved' AND im.issue_id IN ({placeholders})",
+            f"WHERE i.state != 'resolved' AND im.cleared_ts IS NULL "
+            f"AND im.issue_id IN ({placeholders})",
             ids,
         ).fetchall()
         return {int(r["issue_id"]): r for r in rows}
@@ -2376,4 +3333,45 @@ class Repository:
         counts = {i: 0 for i in ids}
         for r in rows:
             counts[int(r["incident_id"])] = int(r["n"])
+        return counts
+
+    # C5: current *total* membership (root + symptoms still attached), batched
+    # like incident_member_counts but scoped to cleared_ts IS NULL -- the list
+    # endpoint's "member_count"/"symptom_count" cards must reflect the
+    # incident's present state, not the append-only historical union (which is
+    # what incident_member_counts/is_genuine_incident deliberately keep using).
+    def current_incident_member_counts(self, incident_ids: Iterable[int]) -> dict[int, int]:
+        """Currently-attached member count per incident (cleared history excluded)."""
+        ids = [int(i) for i in dict.fromkeys(incident_ids) if i is not None]
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            "SELECT incident_id, COUNT(*) AS n FROM incident_members "
+            "WHERE cleared_ts IS NULL "
+            f"AND incident_id IN ({placeholders}) GROUP BY incident_id",
+            ids,
+        ).fetchall()
+        counts = {i: 0 for i in ids}
+        for row in rows:
+            counts[int(row["incident_id"])] = int(row["n"])
+        return counts
+
+    # C5: current symptom counts are deliberately separate from historical
+    # member counts, which keep resolved incidents visible as genuine incidents.
+    def incident_open_symptom_counts(self, incident_ids: Iterable[int]) -> dict[int, int]:
+        """Currently-attached symptom count per incident (cleared history excluded)."""
+        ids = [int(i) for i in dict.fromkeys(incident_ids) if i is not None]
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            "SELECT incident_id, COUNT(*) AS n FROM incident_members "
+            "WHERE role='symptom' AND cleared_ts IS NULL "
+            f"AND incident_id IN ({placeholders}) GROUP BY incident_id",
+            ids,
+        ).fetchall()
+        counts = {i: 0 for i in ids}
+        for row in rows:
+            counts[int(row["incident_id"])] = int(row["n"])
         return counts

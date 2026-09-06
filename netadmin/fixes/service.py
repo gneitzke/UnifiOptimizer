@@ -36,7 +36,7 @@ from typing import Any, Callable, Optional
 
 from netadmin.domain.entities import Entity, Finding
 from netadmin.domain.types import EntityType, Severity
-from netadmin.fixes.applier import Applier
+from netadmin.fixes.applier import Applier, _endpoint_device
 from netadmin.fixes.models import (
     ApplyResult,
     DryRunResult,
@@ -78,23 +78,40 @@ def build_fix_seams(settings: Any, *, for_apply: bool) -> "FixSeams":
     """
     from netadmin.fixes.reader import RealDeviceReader
     from netadmin.fixes.writer import RealControllerWriter
-    from netadmin.ingest.factory import build_endpoints
+    from netadmin.ingest.factory import build_endpoints, get_shared_reader
 
-    endpoints, client = build_endpoints(settings)
+    if for_apply:
+        # Mutations get a fresh, request-owned client we tear down afterwards.
+        endpoints, client = build_endpoints(settings)
+        writer: Optional[RealControllerWriter] = RealControllerWriter(client)
+
+        async def _close() -> None:
+            for name in ("aclose", "close"):
+                fn = getattr(client, name, None)
+                if fn is not None:
+                    result = fn()
+                    if hasattr(result, "__await__"):
+                        await result
+                    return
+
+        closer: Callable[[], Any] = _close
+    else:
+        # R4: read-only previews reuse the daemon-owned shared client so
+        # repeated previews don't each open a new authenticated session
+        # (which defeated shared pacing and could burst controller logins).
+        # The shared client's lifecycle belongs to ingest -> closer is a no-op.
+        endpoints, client = get_shared_reader(settings)
+        writer = None
+
+        async def _noop() -> None:
+            return None
+
+        closer = _noop
+
     _ = endpoints  # the reader talks to the client directly (raw stat/device)
     reader = RealDeviceReader(client)
-    writer = RealControllerWriter(client) if for_apply else None
 
-    async def _close() -> None:
-        for name in ("aclose", "close"):
-            fn = getattr(client, name, None)
-            if fn is not None:
-                result = fn()
-                if hasattr(result, "__await__"):
-                    await result
-                return
-
-    return FixSeams(reader=reader, writer=writer, closer=_close)
+    return FixSeams(reader=reader, writer=writer, closer=closer)
 
 
 class IssueNotFound(FixError):
@@ -213,27 +230,52 @@ class FixService:
                 "evidence and a fresh plan."
             )
         plan = await self.build_plan(issue_id)
-        current_state = await self._read_current_state(plan)
+        # Preview read: the mesh posture the revertibility gate needs is a static
+        # safety property, fine to read before the lock. The BINDING validation
+        # (precondition drift + whole-table clobber guard) reads fresh state INSIDE
+        # the applier's per-device lock, via ``state_reader`` below (C1): reading it
+        # here and validating that pre-lock snapshot is exactly what let a second
+        # concurrent apply overwrite the first's committed change.
+        _, mesh_uplinks, _ = await self._read_current_state(plan)
+
+        async def _fresh_state() -> tuple[
+            dict[str, dict[str, Any]], dict[str, dict[str, dict[str, Any]]], set[str]
+        ]:
+            # Called by the applier once it holds the device lock, so it observes any
+            # concurrent apply's committed write rather than a snapshot taken before.
+            # Returns the applier's (current_state, full_state, mesh_uplinks) order.
+            state, mesh, full = await self._read_current_state(plan)
+            return state, full, mesh
+
         result = await self._applier.apply(
             plan,
             dry_run=False,
             confirm_token=confirm_token,
-            current_state=current_state,
+            mesh_uplinks=mesh_uplinks,
+            state_reader=_fresh_state,
         )
-        # Arm on "did we change the network at all", NOT on "did every step land".
-        # A multi-step plan that applies step 1 and fails step 2 reports
-        # applied=False while carrying real change_ids: the controller was written
-        # to and the ledger holds those rows. Keying arming off `applied` left that
-        # case unverified forever, which is the worst of both worlds -- a live
-        # change nothing is watching. Single-step plans are unaffected, since there
-        # applied and change_ids agree.
-        if result.change_ids and plan.issue_id is not None:
+        # Arm on "which step(s) actually landed", NOT on "was any row written".
+        # ``result.change_ids`` records EVERY attempted step, including one whose
+        # send failed (its ledger row is marked failed but the id is still there).
+        # Arming off that set credited a completely-failed apply as applied and
+        # armed a verification window nothing had earned -- a later, unrelated
+        # recovery would then be mistaken for this fix working (C6). Arm only for
+        # the changes whose write is confirmed OK, and associate the window with
+        # exactly those. A partial apply (step 1 landed, step 2 failed) still arms,
+        # because step 1 genuinely changed the network; a first-step failure does
+        # not, because nothing landed.
+        applied_change_ids = [
+            s.change_id
+            for s in result.steps
+            if s.change_id is not None and s.write is not None and s.write.ok
+        ]
+        if applied_change_ids and plan.issue_id is not None:
             self._verifier.arm(
                 plan.issue_id,
                 self._now_fn(),
                 detail={
                     "action": plan.steps[0].action.value if plan.steps else None,
-                    "change_ids": result.change_ids,
+                    "change_ids": applied_change_ids,
                     "partial": not result.applied,
                 },
             )
@@ -251,10 +293,15 @@ class FixService:
         read leaves the applier with no fresh state, and it refuses rather than
         restore blind.
         """
-        current_radios, is_mesh = await self._read_revert_state(change_id)
-        return await self._applier.revert(
-            change_id, current_radios=current_radios, is_mesh_uplink=is_mesh
-        )
+        # Read fresh live state INSIDE the applier's per-device lock (C1): the
+        # applier calls this back once it holds the lock, so two concurrent reverts
+        # on one device each read the other's committed result instead of racing on
+        # a snapshot taken before either write. Reading here (outside the lock) and
+        # passing the value would reintroduce the stale-snapshot clobber.
+        async def _read_state() -> tuple[Optional[dict[str, dict[str, Any]]], bool]:
+            return await self._read_revert_state(change_id)
+
+        return await self._applier.revert(change_id, state_reader=_read_state)
 
     async def _read_revert_state(
         self, change_id: int
@@ -351,32 +398,75 @@ class FixService:
             name=f"{band} GHz RF environment",
         )
 
-    async def _read_current_state(self, plan: FixPlan) -> dict[str, dict[str, Any]]:
-        """Fresh live values for every step's precondition, keyed by target.
+    async def _read_current_state(
+        self, plan: FixPlan
+    ) -> tuple[dict[str, dict[str, Any]], set[str], dict[str, dict[str, dict[str, Any]]]]:
+        """Fresh live precondition values, the mesh-uplink set, and full radio state.
 
         Reads the device once per distinct device MAC and extracts only the
-        attributes the precondition expects, type-aligned to the expected value so
+        attributes each precondition expects, type-aligned to the expected value so
         a controller that stringifies a channel does not read as spurious drift.
         A device we cannot read is simply absent -- the applier treats a missing
         target as drift and refuses, which is the safe outcome.
+
+        The second element is the set of target device keys
+        (:func:`~netadmin.fixes.applier._endpoint_device`) whose device is currently
+        a mesh uplink. The applier's revertibility gate needs the AP's real mesh
+        posture to dry-run the min-RSSI rail against the reverse of each step (S2),
+        so it is read from the same fresh device, in the same pass.
+
+        The third element is the full live ``radio_table`` per target device key
+        (:func:`~netadmin.fixes.applier._endpoint_device`) as
+        ``{device_key: {radio_code: {attr: value}}}``. A ``rest/device`` PUT replaces
+        the whole table, so the applier's clobber guard needs every field's live
+        value -- not just the narrow precondition attrs -- to detect a payload that
+        would overwrite a field a concurrent apply changed (C1).
         """
         state: dict[str, dict[str, Any]] = {}
+        mesh_uplinks: set[str] = set()
+        full_state: dict[str, dict[str, dict[str, Any]]] = {}
         if self._reader is None:
-            return state
+            return state, mesh_uplinks, full_state
         device_cache: dict[str, Optional[dict[str, Any]]] = {}
-        for step in plan.steps:
-            target = step.precondition.target_native_id
-            expected = step.precondition.expected
-            if not expected or target in state:
-                continue
-            mac = device_mac_of(target)
+
+        async def _device_for(mac: str) -> Optional[dict[str, Any]]:
             if mac not in device_cache:
                 device_cache[mac] = await self._reader.read_device(mac)
-            device = device_cache[mac]
+            return device_cache[mac]
+
+        for step in plan.steps:
+            device = await _device_for(device_mac_of(step.target_native_id))
+            if device is not None:
+                if _device_is_mesh_uplink(device):
+                    mesh_uplinks.add(_endpoint_device(step.endpoint))
+                dev_key = _endpoint_device(step.endpoint)
+                if dev_key not in full_state:
+                    full_state[dev_key] = {
+                        str(r.get("radio")): dict(r)
+                        for r in (device.get("radio_table") or [])
+                        if r.get("radio") is not None
+                    }
+
+            target = step.precondition.target_native_id
+            expected = step.precondition.expected
+            if not expected:
+                continue
+            device = await _device_for(device_mac_of(target))
             if device is None:
                 continue  # absent -> drift, refused by the applier
-            state[target] = _extract_target_attrs(device, target, expected)
-        return state
+            # MERGE every step's expected attrs for a target, don't skip a target a
+            # prior step already read (#4). Two steps on the SAME radio (a channel
+            # move AND a power move) each assert a different attribute; skipping the
+            # second left its attribute (power) unextracted, so the applier's
+            # precondition re-check saw it missing and reported FALSE drift. Union the
+            # extracted attrs so every step's precondition is checked against a value
+            # that was actually read.
+            extracted = _extract_target_attrs(device, target, expected)
+            if target in state:
+                state[target].update(extracted)
+            else:
+                state[target] = extracted
+        return state, mesh_uplinks, full_state
 
 
 # --------------------------------------------------------------------------- #

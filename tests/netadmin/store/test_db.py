@@ -35,6 +35,12 @@ def _rewind_below_0009(conn: sqlite3.Connection, version: int) -> None:
     cleanly — the shape the runner actually meets in production on a v8 database."""
     for col in ("suppressed_ts", "suppress_until_ts", "suppressed_severity"):
         conn.execute(f"ALTER TABLE issues DROP COLUMN {col}")
+    conn.execute("DROP INDEX idx_incident_members_current_issue")
+    for col in ("joined_ts", "cleared_ts"):
+        conn.execute(f"ALTER TABLE incident_members DROP COLUMN {col}")
+    # 0013 (events.reconcile_attempts) is another forward-only ADD COLUMN; drop it
+    # too so the rewound-and-reapplied chain runs 0013 against its pre-0013 shape.
+    conn.execute("ALTER TABLE events DROP COLUMN reconcile_attempts")
     conn.execute(f"PRAGMA user_version={version}")
 
 
@@ -42,8 +48,8 @@ def test_migration_sets_user_version(tmp_db_path: Path) -> None:
     conn = db.connect(tmp_db_path)
     assert db.schema_version(conn) == 0
     applied = db.apply_migrations(conn)
-    assert applied == [1, 2, 3, 4, 5, 6, 7, 8, 9]
-    assert db.schema_version(conn) == 9
+    assert applied[:10] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    assert db.schema_version(conn) == db.latest_migration_version()
     conn.close()
 
 
@@ -71,6 +77,7 @@ def test_migration_creates_all_tables(tmp_db_path: Path) -> None:
         "incidents",
         "incident_members",
         "app_meta",
+        "ingest_coverage",
     }
     assert expected <= names
     conn.close()
@@ -115,10 +122,117 @@ def test_migration_idempotent(tmp_db_path: Path) -> None:
     first = db.apply_migrations(conn)
     second = db.apply_migrations(conn)
     third = db.apply_migrations(conn)
-    assert first == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    assert first[:10] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     assert second == []  # nothing re-applied
     assert third == []
-    assert db.schema_version(conn) == 9
+    assert db.schema_version(conn) == db.latest_migration_version()
+    conn.close()
+
+
+def test_migration_0010_backfills_existing_incident_member_joined_ts(
+    tmp_db_path: Path,
+) -> None:
+    conn = db.connect(tmp_db_path)
+    db.apply_migrations(conn)
+    conn.execute(
+        "INSERT INTO issues (fingerprint, detector_key, severity, state, "
+        "first_seen_ts, last_seen_ts, title) "
+        "VALUES ('root-fp', 'wifi.mesh_uplink', 'p2', 'active', 50, 50, 'root')"
+    )
+    conn.execute(
+        "INSERT INTO incidents (fingerprint, root_issue_id, severity, state, "
+        "first_seen_ts, last_seen_ts, title) "
+        "VALUES ('incident-fp', 1, 'p2', 'open', 100, 100, 'incident')"
+    )
+    conn.execute(
+        "INSERT INTO incident_members "
+        "(incident_id, issue_id, role, rule, rationale) "
+        "VALUES (1, 1, 'root', 'root', 'root cause')"
+    )
+    conn.execute("DROP INDEX idx_incident_members_current_issue")
+    conn.execute("ALTER TABLE incident_members DROP COLUMN joined_ts")
+    conn.execute("ALTER TABLE incident_members DROP COLUMN cleared_ts")
+    # 0013 (events.reconcile_attempts) rode along in the full apply; drop it so the
+    # reapplied chain re-runs 0013 cleanly instead of duplicating the column.
+    conn.execute("ALTER TABLE events DROP COLUMN reconcile_attempts")
+    conn.execute("PRAGMA user_version=9")
+
+    assert db.apply_migrations(conn)[0] == 10
+    member = conn.execute("SELECT * FROM incident_members").fetchone()
+    assert member["joined_ts"] == 100
+    assert member["cleared_ts"] is None
+    conn.close()
+
+
+def test_migration_0011_creates_ingest_coverage_table(tmp_db_path: Path) -> None:
+    """New-bug: the ingest_coverage ledger is created by migration 0011, not lazily
+    on a (possibly read-only) read path. Upgrading from v10 creates the table."""
+    conn = db.connect(tmp_db_path)
+    db.apply_migrations(conn)
+    # Reconstruct a pre-0011 database: drop the table and rewind to v10.
+    conn.execute("DROP TABLE ingest_coverage")
+    # 0013 (events.reconcile_attempts) also rode along; drop its column so the
+    # reapplied chain re-runs 0013 cleanly instead of duplicating the column.
+    conn.execute("ALTER TABLE events DROP COLUMN reconcile_attempts")
+    conn.execute("PRAGMA user_version=10")
+    assert not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ingest_coverage'"
+    ).fetchone()
+
+    # Rewinding to v10 leaves every later migration (0011 and the concurrently
+    # merged 0012) pending; 0011 is the one that creates this table.
+    assert 11 in db.apply_migrations(conn)
+    assert conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ingest_coverage'"
+    ).fetchone() is not None
+    assert conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' "
+        "AND name='idx_ingest_coverage_lookup'"
+    ).fetchone() is not None
+    assert db.schema_version(conn) == db.latest_migration_version()
+
+
+def test_migration_0012_preserves_populated_sle_minutes_and_splits_attribution(
+    tmp_db_path: Path,
+) -> None:
+    """A pre-0012 cell remains intact while a second AP can share its cell."""
+    conn = db.connect(tmp_db_path)
+    db.apply_migrations(conn)
+    conn.execute("DROP TABLE sle_minutes")
+    conn.execute(
+        "CREATE TABLE sle_minutes ("
+        "bucket_ts INTEGER NOT NULL, sle TEXT NOT NULL, classifier TEXT NOT NULL, "
+        "entity_id INTEGER NOT NULL, attributed_entity_id INTEGER, minutes REAL NOT NULL, "
+        "PRIMARY KEY (bucket_ts, sle, classifier, entity_id)"
+        ") WITHOUT ROWID"
+    )
+    conn.execute(
+        "INSERT INTO sle_minutes VALUES (0, 'coverage', 'weak_signal', 7, 11, 2.0)"
+    )
+    conn.execute(
+        "INSERT INTO sle_minutes VALUES (0, 'coverage', 'ok', 7, NULL, 3.0)"
+    )
+    # 0011 is owned by a concurrent change and does not alter this table; this
+    # reconstructed shape is precisely the schema immediately before 0012.
+    # 0013 (events.reconcile_attempts) rode along in the full apply above; drop its
+    # column so the reapplied chain re-runs it cleanly rather than duplicating it.
+    conn.execute("ALTER TABLE events DROP COLUMN reconcile_attempts")
+    conn.execute("PRAGMA user_version=11")
+
+    # Rewinding to v11 leaves both 0012 and the later 0013 pending.
+    assert db.apply_migrations(conn) == [12, 13]
+    conn.execute(
+        "INSERT INTO sle_minutes VALUES (0, 'coverage', 'weak_signal', 7, 12, 3.0)"
+    )
+    rows = conn.execute(
+        "SELECT classifier, attributed_entity_id, minutes FROM sle_minutes "
+        "ORDER BY classifier"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        ("ok", 0, 3.0),
+        ("weak_signal", 11, 2.0),
+        ("weak_signal", 12, 3.0),
+    ]
     conn.close()
 
 
@@ -155,7 +269,8 @@ def test_migration_0005_retires_legacy_rogue_ap_issues(tmp_db_path: Path) -> Non
     # along too -- it is schema-only and touches none of the rows asserted here,
     # as does 0008 (sticky_client, a third taxonomy this fixture never seeds), and
     # 0009 (suppression columns; none of these seeded rows carry a live snooze).
-    assert db.apply_migrations(conn) == [5, 6, 7, 8, 9]
+    applied = db.apply_migrations(conn)
+    assert applied[:6] == [5, 6, 7, 8, 9, 10]
 
     rows = conn.execute(
         "SELECT state, resolved_ts FROM issues WHERE detector_key = 'wifi.rogue_ap'"
@@ -233,7 +348,8 @@ def test_migration_0006_retires_plan_level_channel_plan_issues(tmp_db_path: Path
     # 0007 (app_meta) rides along too -- schema-only, touches none of the rows
     # asserted below -- and so does 0008, which retires a different detector, and
     # 0009 (suppression columns; none of these seeded rows carry a live snooze).
-    assert db.apply_migrations(conn) == [6, 7, 8, 9]
+    applied = db.apply_migrations(conn)
+    assert applied[:5] == [6, 7, 8, 9, 10]
 
     states = dict(
         conn.execute(
@@ -317,7 +433,8 @@ def test_migration_0008_retires_per_ap_sticky_client_issues(tmp_db_path: Path) -
 
     # 0009 (suppression columns) rides along; none of these seeded rows carry a
     # live snooze, so it leaves them untouched and writes no audit event.
-    assert db.apply_migrations(conn) == [8, 9]
+    applied = db.apply_migrations(conn)
+    assert applied[:3] == [8, 9, 10]
 
     # Every sticky fingerprint is retired: the ap dim lives only inside the hash,
     # so SQL cannot tell the two-AP rows from the legacy dims={} one, and
@@ -556,10 +673,17 @@ def test_migration_0009_carries_live_snoozes_into_suppression(tmp_db_path: Path)
     # a duplicate column. Drop them, then rewind, so 0009 applies against v8 cleanly.
     for col in ("suppressed_ts", "suppress_until_ts", "suppressed_severity"):
         conn.execute(f"ALTER TABLE issues DROP COLUMN {col}")
+    conn.execute("DROP INDEX idx_incident_members_current_issue")
+    for col in ("joined_ts", "cleared_ts"):
+        conn.execute(f"ALTER TABLE incident_members DROP COLUMN {col}")
+    # 0013 rode along in the full apply above; drop its column so the reapplied
+    # chain re-runs it cleanly rather than duplicating the column.
+    conn.execute("ALTER TABLE events DROP COLUMN reconcile_attempts")
     conn.execute("PRAGMA user_version=8")  # rewind to the pre-suppression schema
     _seed_snoozes_pre_0009(conn)
 
-    assert db.apply_migrations(conn) == [9]
+    applied = db.apply_migrations(conn)
+    assert applied[:2] == [9, 10]
 
     # The three suppression columns now exist.
     cols = {r[1] for r in conn.execute("PRAGMA table_info(issues)").fetchall()}
@@ -590,3 +714,113 @@ def test_migration_0009_carries_live_snoozes_into_suppression(tmp_db_path: Path)
     assert events[0][0] == "suppressed"
     assert '"source":"migration"' in events[0][1]
     conn.close()
+
+
+def _deny_commit(action: int, arg1, arg2, dbname, source) -> int:
+    """Authorizer that fails only COMMIT -- a stand-in for a WAL/disk COMMIT fault.
+
+    SQLite leaves the transaction OPEN when COMMIT is refused, exactly as a real
+    commit-time I/O error does, so this drives the #4 dangling-transaction path.
+    ROLLBACK and every other statement are allowed, so the cleanup can run.
+    """
+    if action == sqlite3.SQLITE_TRANSACTION and arg1 == "COMMIT":
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
+
+def test_begin_immediate_failed_commit_leaves_no_open_transaction(tmp_db_path: Path) -> None:
+    """#4: a COMMIT that raises must not leave the transaction OPEN.
+
+    Before the fix COMMIT sat outside the rollback-protected try, so a failed
+    COMMIT propagated with the transaction still open. A later writer that tests
+    ``in_transaction`` would then mistake that abandoned transaction for
+    legitimate nesting and silently join it. The fix rolls the transaction back
+    on a COMMIT failure so the connection returns to a clean, known state.
+    """
+    conn = db.connect(tmp_db_path)
+    db.apply_migrations(conn)
+
+    # A durable committed row -- must survive the failed-commit turbulence below.
+    with db.begin_immediate(conn):
+        conn.execute("INSERT INTO poll_runs (ts, job, ok) VALUES (1, 'break', 1)")
+
+    conn.set_authorizer(_deny_commit)
+    with pytest.raises(sqlite3.DatabaseError):
+        with db.begin_immediate(conn):
+            conn.execute("INSERT INTO poll_runs (ts, job, ok) VALUES (2, 'heartbeat', 1)")
+    conn.set_authorizer(None)
+
+    # Root-cause guarantee: no dangling open transaction after the failed COMMIT.
+    assert conn.in_transaction is False
+    # The uncommitted write was rolled back, not silently retained.
+    jobs = {r[0] for r in conn.execute("SELECT job FROM poll_runs").fetchall()}
+    assert jobs == {"break"}
+    conn.close()
+
+
+def test_failed_commit_does_not_strand_open_txn_for_next_writer(tmp_db_path: Path) -> None:
+    """#4 end-to-end: after a failed COMMIT, the NEXT independent write must open
+    its own transaction and durably commit -- not silently ride (and later have
+    rolled back) an abandoned transaction, which erased a durable break + its
+    heartbeats in the repro.
+    """
+    from netadmin.store.repository import Repository
+
+    repo = Repository.open(tmp_db_path)
+    conn = repo._conn
+
+    # A durable committed "ws-break".
+    repo.record_event(ts=1, key="EVT_Break", native_id="brk")
+
+    # The next write's COMMIT fails (WAL/disk fault stand-in) and must be unwound.
+    conn.set_authorizer(_deny_commit)
+    with pytest.raises(sqlite3.DatabaseError):
+        repo.record_event(ts=2, key="EVT_HeartbeatFail", native_id="hb-fail")
+    conn.set_authorizer(None)
+
+    # No abandoned transaction lingers for the next writer to join.
+    assert conn.in_transaction is False
+
+    # A later INDEPENDENT write opens its own transaction and commits for real.
+    repo.record_event(ts=3, key="EVT_HeartbeatOk", native_id="hb-ok")
+    assert conn.in_transaction is False
+
+    # Proof it actually COMMITTED (not merely riding an open txn): a SEPARATE
+    # read-only connection sees the break and the ok heartbeat, and never the
+    # rolled-back failed heartbeat. Pre-fix, hb-ok rode the abandoned txn
+    # uncommitted and this fresh connection would not see it.
+    other = db.connect(tmp_db_path, read_only=True)
+    seen = {r[0] for r in other.execute("SELECT key FROM events ORDER BY ts").fetchall()}
+    assert seen == {"EVT_Break", "EVT_HeartbeatOk"}
+    other.close()
+    repo.close()
+
+
+def test_normal_nested_transaction_still_commits_atomically(tmp_db_path: Path) -> None:
+    """The failed-commit cleanup must not disturb legitimate nesting: an inner
+    ``_write`` inside an open outer transaction still JOINS it (no early commit),
+    and the whole cycle commits atomically on clean exit.
+    """
+    from netadmin.store.repository import Repository
+
+    repo = Repository.open(tmp_db_path)
+    conn = repo._conn
+
+    with repo.transaction():
+        assert conn.in_transaction is True
+        repo.record_event(ts=1, key="EVT_A", native_id="a")
+        # Inner write rides the outer transaction rather than opening its own.
+        with repo._write() as c:
+            assert conn.in_transaction is True
+            c.execute("INSERT INTO events (ts, key, native_id, data) "
+                      "VALUES (2, 'EVT_B', 'b', '{}')")
+        # Still uncommitted inside the block: a separate reader sees nothing yet.
+        reader = db.connect(tmp_db_path, read_only=True)
+        assert reader.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+        reader.close()
+
+    # Committed atomically on clean exit.
+    assert conn.in_transaction is False
+    keys = {r[0] for r in conn.execute("SELECT key FROM events").fetchall()}
+    assert keys == {"EVT_A", "EVT_B"}
+    repo.close()

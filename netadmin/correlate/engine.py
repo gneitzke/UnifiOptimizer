@@ -85,6 +85,12 @@ _CELL_LOCAL_ROOTS: frozenset[str] = frozenset(
     {"wifi.mesh_uplink", "wifi.tx_power_loud", "wifi.airtime_saturation"}
 )
 
+# The trailing locale a cell-local root's summary sentence carries. Kept as a
+# named constant because the retained-incident path (whose root issue has since
+# resolved and is gone from the correlatable set) recovers the root's
+# cell-locality by reading it back off the sentence the root already produced.
+_CELL_LOCALE = " in that cell"
+
 # symptom detector -> (singular, plural) countable noun.
 _SYMPTOM_NOUN: dict[str, tuple[str, str]] = {
     "net.coverage_hole": ("coverage hole", "coverage holes"),
@@ -217,7 +223,8 @@ class CorrelationEngine:
             if inc.root_issue_id in open_by_id:
                 continue  # root still open -> recomputed fresh on the normal path
             members = self.store.get_incident_members(inc.id)
-            surviving = {m.issue_id for m in members if m.issue_id in open_by_id}
+            current_ids = self._current_member_ids(inc.id, members)
+            surviving = {issue_id for issue_id in current_ids if issue_id in open_by_id}
             if surviving:
                 retained.append((inc, members, surviving))
                 retained_issue_ids |= surviving
@@ -266,7 +273,7 @@ class CorrelationEngine:
                 incident = prev
 
             assert incident.id is not None
-            self.store.replace_incident_members(
+            self._reconcile_members(
                 incident.id,
                 [
                     IncidentMember(
@@ -278,13 +285,14 @@ class CorrelationEngine:
                     )
                     for m in comp.members
                 ],
+                now=now,
             )
             live.append(incident)
 
         # Keep retained incidents open: root resolved, ≥1 symptom still active.
-        # The incident keeps its identity and age; membership shrinks to the root
-        # (shown resolved) plus the surviving open symptoms; severity drops to the
-        # worst still-open member.
+        # The incident keeps its identity and age. Historical membership stays in
+        # storage (the resolved root included), while the current set contains only
+        # surviving symptoms; severity drops to the worst still-open member.
         for inc, members, surviving in retained:
             produced_fingerprints.add(inc.fingerprint)
             inc.state = IncidentState.OPEN
@@ -297,9 +305,24 @@ class CorrelationEngine:
             )
             inc.resolved_ts = None
             inc.severity = max_severity([open_by_id[i].severity for i in surviving])
+            kept = [m for m in members if m.issue_id in surviving]
+            # C5: the stored summary was rendered from this incident's ORIGINAL
+            # membership (root + every symptom). The root and some symptoms have
+            # since cleared, so that sentence now narrates faults that no longer
+            # exist ("...is causing 1 coverage hole and 1 client dropout" when
+            # only the client is still open). Recompute it from the CURRENTLY-open
+            # symptoms so the served summary matches current membership. The title
+            # and cell-locale belong to the (now-resolved) root and do not change:
+            # keep the title verbatim and read the root's cell-locality back off
+            # the sentence it already produced, since the root issue is gone from
+            # the correlatable set.
+            inc.summary = self._causal_sentence(
+                inc.title,
+                [open_by_id[m.issue_id].detector_key for m in kept],
+                cell_local=inc.summary.endswith(_CELL_LOCALE + "."),
+            )
             self.store.update_incident(inc)
-            kept = [m for m in members if m.role == IncidentRole.ROOT or m.issue_id in surviving]
-            self.store.replace_incident_members(
+            self._reconcile_members(
                 inc.id,  # type: ignore[arg-type]
                 [
                     IncidentMember(
@@ -311,6 +334,7 @@ class CorrelationEngine:
                     )
                     for m in kept
                 ],
+                now=now,
             )
             live.append(inc)
 
@@ -323,8 +347,57 @@ class CorrelationEngine:
             inc.state = IncidentState.RESOLVED
             inc.resolved_ts = now
             self.store.update_incident(inc)
+            assert inc.id is not None
+            self._reconcile_members(inc.id, [], now=now)
 
         return live
+
+    def _reconcile_members(
+        self, incident_id: int, current: list[IncidentMember], *, now: Timestamp
+    ) -> None:
+        """C5: persist current membership while retaining its historical union.
+
+        The concrete SQLite repository exposes the timestamp-aware additive
+        method without changing the legacy delete-based API used elsewhere.  The
+        in-memory protocol fakes intentionally stay small, so their fallback
+        stores the same historical union (timestamps themselves are a persistence
+        concern covered by store tests).
+        """
+        target = getattr(self.store, "reconcile_incident_members", None)
+        if target is None:
+            target = getattr(getattr(self.store, "_store", None), "reconcile_incident_members", None)
+        if callable(target):
+            target(
+                incident_id,
+                [
+                    {
+                        "issue_id": member.issue_id,
+                        "role": member.role,
+                        "rule": member.rule,
+                        "rationale": member.rationale,
+                    }
+                    for member in current
+                ],
+                ts=now,
+            )
+            return
+
+        historical = {m.issue_id: m for m in self.store.get_incident_members(incident_id)}
+        historical.update({m.issue_id: m for m in current})
+        self.store.replace_incident_members(incident_id, list(historical.values()))
+
+    def _current_member_ids(
+        self, incident_id: int, historical: list[IncidentMember]
+    ) -> set[int]:
+        """C5: read the current subset when timestamp-aware persistence supports it."""
+        target = getattr(self.store, "current_incident_issue_ids", None)
+        if target is None:
+            target = getattr(
+                getattr(self.store, "_store", None), "current_incident_issue_ids", None
+            )
+        if callable(target):
+            return set(target(incident_id))
+        return {member.issue_id for member in historical}
 
     # ------------------------------------------------------------------ #
     # Grouping
@@ -553,12 +626,30 @@ class CorrelationEngine:
         phrase_tmpl = _ROOT_PHRASE.get(root.detector_key)
         title = phrase_tmpl.format(name=root_name) if phrase_tmpl else root.title
 
+        summary = self._causal_sentence(
+            title,
+            [member.issue.detector_key for member in symptoms],
+            cell_local=root.detector_key in _CELL_LOCAL_ROOTS,
+        )
+        return title, summary
+
+    @staticmethod
+    def _causal_sentence(
+        title: str, symptom_detector_keys: list[str], *, cell_local: bool
+    ) -> str:
+        """The "<title> is causing <symptoms>[ in that cell]." sentence.
+
+        Built purely from the CURRENTLY-open symptom detector keys, so a symptom
+        that has cleared drops out of the narration (C5: the stored summary must
+        reflect current membership, never the historical union). Shared by the
+        fresh-render path and the retained-incident reconcile so both compose the
+        sentence identically.
+        """
         counts: dict[str, int] = {}
-        for member in symptoms:
-            counts[member.issue.detector_key] = counts.get(member.issue.detector_key, 0) + 1
+        for key in symptom_detector_keys:
+            counts[key] = counts.get(key, 0) + 1
         # Order symptom clauses by priority for a stable, sensible reading.
         ordered_keys = sorted(counts, key=lambda k: (root_rank(k), k))
         clauses = [_symptom_noun(k, counts[k]) for k in ordered_keys]
-        locale = " in that cell" if root.detector_key in _CELL_LOCAL_ROOTS else ""
-        summary = f"{title} is causing {_join_english(clauses)}{locale}."
-        return title, summary
+        locale = _CELL_LOCALE if cell_local else ""
+        return f"{title} is causing {_join_english(clauses)}{locale}."

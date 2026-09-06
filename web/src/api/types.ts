@@ -144,6 +144,17 @@ export interface Health {
   websocket: { state: string; detail?: string };
   components: Record<string, string>;
   backfill: string;
+  /** Epoch-second windows where the daemon was NOT observing the network —
+   * a collector outage, not a quiet network (audit U2). Optional/assumed: the
+   * backend does not emit this yet. Until it does, the timeline shows only the
+   * leading (pre-monitoring) boundary it can already derive and no interior
+   * gaps, rather than guessing at outages from event silence — inferring a gap
+   * from "no events happened to arrive" would risk the exact mistake this item
+   * exists to prevent. */
+  collection_gaps?: { start_ts: number; end_ts: number; reason?: string | null }[];
+  /** Last time any collected observation was durably written to the store.
+   * Optional/assumed — falls back to the newest `jobs[].last_success_ts`. */
+  last_persisted_ts?: number | null;
 }
 
 /* ---- SLE (/api/sle) ----------------------------------------------------- */
@@ -302,11 +313,37 @@ export interface ChangeRecord {
   ts: number;
   issue_id: number | null;
   action: string;
-  status: 'applied' | 'reverted' | 'failed';
+  /** `applying` (in flight) and `unknown` (an ambiguous send — the request may
+   * or may not have reached the device) joined `applied` / `failed` /
+   * `reverted` so a send outcome is never rendered as a false binary (audit
+   * U1/U4). `revert_unknown` is the mirror state for a REVERT whose outcome
+   * was never confirmed — the backend permanently refuses to retry reverting
+   * that row. `reverting` is written durably BEFORE the revert PUT is sent;
+   * if the send is cancelled or crashes before completing, the row is stuck
+   * here forever and the backend refuses to retry it too. `(string & {})`
+   * keeps these as editor-visible suggestions while still accepting any
+   * value an older or newer daemon reports. */
+  status:
+    | 'applying'
+    | 'applied'
+    | 'failed'
+    | 'unknown'
+    | 'reverted'
+    | 'reverting'
+    | 'revert_unknown'
+    | (string & {});
   reverted_ts: number | null;
   entity: EntityRef | null;
   before: Record<string, unknown>;
   after: Record<string, unknown>;
+  /** Groups the changes produced by one multi-step fix attempt (audit U4).
+   * Optional/assumed: not yet emitted by the backend. Until it lands, the
+   * Changes ledger falls back to a same-issue-and-close-timestamp heuristic. */
+  batch_id?: string | number | null;
+  /** 1-based position of this change within its multi-step plan, and the
+   * plan's total step count. Optional/assumed — same status as `batch_id`. */
+  step_index?: number | null;
+  step_count?: number | null;
 }
 
 /* ---- WebSocket frames (/ws) -------------------------------------------- */

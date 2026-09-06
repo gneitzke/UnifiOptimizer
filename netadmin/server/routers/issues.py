@@ -372,6 +372,14 @@ async def list_issues(
     # Incident membership (section 17) is a join on the read model, never a stored
     # column — so issue lifecycle stays untouched. One batched query for the set.
     incidents = store.incident_brief_for_issues([r["id"] for r in rows])
+    # C5 (finding #11): the brief's symptom_count must be the incident's PRESENT
+    # symptom count (cleared_ts IS NULL), exactly as the incident card reports it
+    # -- never derived from the append-only historical member union. The historical
+    # ``incident_member_count`` is kept ONLY for the is_genuine_incident gate (a
+    # once-genuine incident must not flicker out as its last symptom clears).
+    incident_symptom_counts = store.incident_open_symptom_counts(
+        [int(inc["incident_id"]) for inc in incidents.values()]
+    )
     window_end = int(time.time())
     window_start = window_end - IMPACT_WINDOW_S
     impacts = store.issue_impact_minutes(
@@ -406,7 +414,7 @@ async def list_issues(
                 "title": inc["incident_title"],
                 "summary": inc["incident_summary"],
                 "severity": inc["incident_severity"],
-                "symptom_count": member_count - 1,
+                "symptom_count": incident_symptom_counts.get(int(inc["incident_id"]), 0),
             }
             if inc is not None and Repository.is_genuine_incident(member_count)
             else None
@@ -436,13 +444,24 @@ async def get_issue(request: Request, issue_id: int) -> dict[str, Any]:
     # a genuine incident-of-one (Gitea #21) has `symptom_count == 0`, and the
     # page shows nothing rather than a confusing self-link to its own incident.
     inc = store.incident_brief_for_issues([issue_id]).get(issue_id)
+    # C5 (finding #11): symptom_count is the incident's PRESENT symptom count
+    # (cleared_ts IS NULL), matching the incident card -- not historical members
+    # minus one. When a symptom clears, this drops to 0 like the card, instead of
+    # the stale count the append-only ``incident_member_count`` would report.
+    incident_symptom_count = (
+        store.incident_open_symptom_counts([int(inc["incident_id"])]).get(
+            int(inc["incident_id"]), 0
+        )
+        if inc is not None
+        else 0
+    )
     incident = (
         {
             "id": int(inc["incident_id"]),
             "role": inc["incident_role"],
             "title": inc["incident_title"],
             "severity": inc["incident_severity"],
-            "symptom_count": int(inc["incident_member_count"]) - 1,
+            "symptom_count": incident_symptom_count,
         }
         if inc is not None
         else None

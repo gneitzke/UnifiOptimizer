@@ -117,35 +117,19 @@ class BucketResult:
     active_clients: int = 0
     rows_written: int = 0
     wan_evaluated: bool = False
-    # (sle, classifier, entity_id) -> minutes, exactly as written this bucket.
-    minutes: dict[tuple[str, str, int], float] = field(default_factory=dict)
+    # (sle, classifier, entity_id, attributed_entity_id) -> minutes, exactly as
+    # written this bucket.
+    minutes: dict[tuple[str, str, int, Optional[int]], float] = field(default_factory=dict)
 
 
 @dataclass
 class _Cell:
-    """Accumulated minutes for one (sle, classifier, entity) with attribution.
-
-    ``attributions`` tallies minutes per candidate ``attributed_entity_id`` so a
-    client that roamed mid-bucket (samples pinned on two APs, same classifier)
-    still writes one row, blamed on the entity that owned the most of the minutes.
-    """
+    """Accumulated minutes for one fully attributed SLE cell."""
 
     minutes: float = 0.0
-    attributions: dict[Optional[int], float] = field(default_factory=lambda: defaultdict(float))
 
-    def add(self, minutes: float, attributed: Optional[int]) -> None:
+    def add(self, minutes: float) -> None:
         self.minutes += minutes
-        self.attributions[attributed] += minutes
-
-    @property
-    def attributed_entity_id(self) -> Optional[int]:
-        if not self.attributions:
-            return None
-        # Deterministic tie-break: most minutes, then lowest id (None sorts last).
-        return max(
-            self.attributions,
-            key=lambda k: (self.attributions[k], -(k if k is not None else 1 << 62)),
-        )
 
 
 class SleMinutesJob:
@@ -174,7 +158,7 @@ class SleMinutesJob:
         self._wan_noop_logged = False
         # per-run caches, keyed by bucket_ts so a range sweep does not restale them
         self._radio_cache: dict[int, dict[int, list[Entity]]] = {}
-        self._entity_cache: dict[int, Entity] = {}
+        self._ap_native_cache: dict[str, int] = {}
 
     # ------------------------------------------------------------------ #
     # Public entry points
@@ -221,7 +205,10 @@ class SleMinutesJob:
         bucket_ts = bucket_of(int(bucket_ts), b)
         bucket_end = bucket_ts + b
 
-        cells: dict[tuple[str, str, int], _Cell] = defaultdict(_Cell)
+        # Attribution is part of the cell identity. In particular coverage
+        # samples on either side of a roam retain the AP resolved at each sample
+        # timestamp instead of being reduced to a bucket-level majority AP.
+        cells: dict[tuple[str, str, int, Optional[int]], _Cell] = defaultdict(_Cell)
 
         # Shared per-bucket WAN judgement (attributed to the gateway), computed
         # once and applied to every active client below.
@@ -237,11 +224,12 @@ class SleMinutesJob:
             if not self._is_active(cid, bucket_ts, bucket_end):
                 continue  # idle -> zero minutes across every SLE (the honest rule)
             result.active_clients += 1
-            ap_id = self._client_ap_id(client)
-            self._coverage(cells, cid, ap_id, bucket_ts, bucket_end)
-            self._capacity(cells, cid, ap_id, bucket_ts, bucket_end)
-            self._roaming(cells, cid, ap_id, bucket_ts, bucket_end)
-            self._connect(cells, cid, ap_id, bucket_ts, bucket_end)
+            attachments = self._client_attachment_intervals(cid, bucket_ts, bucket_end)
+            bucket_ap_id = self._representative_attachment(attachments)
+            self._coverage(cells, cid, attachments, bucket_ts, bucket_end)
+            self._capacity(cells, cid, attachments, bucket_ts, bucket_end)
+            self._roaming(cells, cid, bucket_ap_id, bucket_ts, bucket_end)
+            self._connect(cells, cid, bucket_ap_id, bucket_ts, bucket_end)
             if wan_evaluable:
                 self._apply_wan(cells, cid, wan_cls, wan_attr)
 
@@ -311,7 +299,12 @@ class SleMinutesJob:
     # Per-SLE evaluation
     # ------------------------------------------------------------------ #
     def _coverage(
-        self, cells: dict, client_id: int, ap_id: Optional[int], start: int, end: int
+        self,
+        cells: dict,
+        client_id: int,
+        attachments: list[tuple[int, int, Optional[int]]],
+        start: int,
+        end: int,
     ) -> None:
         rssi_rows = self._raw(client_id, "rssi", start, end)
         if not rssi_rows:
@@ -321,41 +314,61 @@ class SleMinutesJob:
         }
         per = self._minutes_per_sample(len(rssi_rows))
         for r in rssi_rows:
+            ts = int(r["ts"])
             rssi = float(r["value"])
-            noise = noise_by_ts.get(int(r["ts"]))
+            noise = noise_by_ts.get(ts)
             cls = classify_coverage(
                 rssi,
                 noise,
                 weak_threshold_dbm=self.cfg.coverage_weak_dbm,
                 snr_min_db=self.cfg.coverage_snr_min_db,
             )
-            self._add(cells, SLE_COVERAGE, cls or OK, client_id, ap_id, per)
+            self._add(
+                cells,
+                SLE_COVERAGE,
+                cls or OK,
+                client_id,
+                self._attachment_at(attachments, ts),
+                per,
+            )
 
     def _capacity(
-        self, cells: dict, client_id: int, ap_id: Optional[int], start: int, end: int
+        self,
+        cells: dict,
+        client_id: int,
+        attachments: list[tuple[int, int, Optional[int]]],
+        start: int,
+        end: int,
     ) -> None:
-        radio = self._representative_radio(ap_id, start, end)
-        if radio is None:
-            return  # wired / no radio data -> capacity does not apply
-        radio_id = int(radio["entity_id"])
-        cu_rows = self._raw(radio_id, "cu_total", start, end)
-        if not cu_rows:
-            return
-        self_rx = {
-            int(r["ts"]): float(r["value"]) for r in self._raw(radio_id, "cu_self_rx", start, end)
-        }
-        self_tx = {
-            int(r["ts"]): float(r["value"]) for r in self._raw(radio_id, "cu_self_tx", start, end)
-        }
-        band = self._band(radio_id, "cu_total", start)
+        # Select a radio separately for every recorded attachment interval. The
+        # current inventory parent says nothing about which cell carried old
+        # traffic, and a roam inside this bucket switches radios at its timestamp.
+        samples: list[tuple[int, float, Optional[float], Any]] = []
         neighbor = self._neighbor_present(start, end)
-        per = self._minutes_per_sample(len(cu_rows))
-        for r in cu_rows:
-            ts = int(r["ts"])
-            cu_total = float(r["value"])
-            cu_self = None
-            if ts in self_rx or ts in self_tx:
-                cu_self = self_rx.get(ts, 0.0) + self_tx.get(ts, 0.0)
+        for seg_start, seg_end, ap_id in attachments:
+            radio = self._representative_radio(ap_id, seg_start, seg_end)
+            if radio is None:
+                continue  # disconnected/wired/no radio evidence in this interval
+            radio_id = int(radio["entity_id"])
+            self_rx = {
+                int(r["ts"]): float(r["value"])
+                for r in self._raw(radio_id, "cu_self_rx", seg_start, seg_end)
+            }
+            self_tx = {
+                int(r["ts"]): float(r["value"])
+                for r in self._raw(radio_id, "cu_self_tx", seg_start, seg_end)
+            }
+            band = self._band(radio_id, "cu_total", seg_start)
+            for row in self._raw(radio_id, "cu_total", seg_start, seg_end):
+                ts = int(row["ts"])
+                cu_self = None
+                if ts in self_rx or ts in self_tx:
+                    cu_self = self_rx.get(ts, 0.0) + self_tx.get(ts, 0.0)
+                samples.append((radio_id, float(row["value"]), cu_self, band))
+        if not samples:
+            return
+        per = self._minutes_per_sample(len(samples))
+        for radio_id, cu_total, cu_self, band in samples:
             cls = classify_capacity(
                 cu_total,
                 cu_self,
@@ -774,26 +787,100 @@ class SleMinutesJob:
         cache[ap_id] = radios
         return radios
 
-    def _client_ap_id(self, client: Any) -> Optional[int]:
-        """The client's current point of attachment, if it is an AP. Coverage,
-        roaming and connect pin their blame here; a wired client (switch parent)
-        yields None and those wireless SLEs no-op for it.
+    def _client_attachment_intervals(
+        self, client_id: int, start: int, end: int
+    ) -> list[tuple[int, int, Optional[int]]]:
+        """Return the recorded ``ap_mac`` trail as half-open AP-id intervals.
+
+        The opening value is the newest change before the bucket; changes inside
+        it split the timeline. Unknown, disconnected, and wired attachment values
+        resolve to ``None`` rather than falling back to the mutable current
+        ``entities.parent_id`` snapshot.
         """
-        parent_id = client["parent_id"]
-        if parent_id is None:
+        opening = self.repo.list_state_changes(
+            -(1 << 62), start, entity_id=client_id, attr="ap_mac", limit=1
+        )
+        changes = self.repo.list_state_changes(
+            start, end, entity_id=client_id, attr="ap_mac", limit=10_000
+        )
+        if opening:
+            current = self._ap_id_for_native(opening[0]["new_value"])
+        elif not changes and not self.repo.list_state_changes(
+            end, 1 << 62, entity_id=client_id, attr="ap_mac", limit=1
+        ):
+            # No ap_mac history anywhere for this client: it never roamed, so its
+            # samples belong to its current (only-ever) parent AP. This restores
+            # the common no-roam case without reintroducing the post-roam
+            # mis-attribution B5 fixes -- that only triggers when a roam was
+            # actually recorded, in which case a change exists and this branch
+            # is skipped in favour of the as-of resolution above/below.
+            current = self._current_parent_ap(client_id)
+        else:
+            current = None
+        since = start
+        intervals: list[tuple[int, int, Optional[int]]] = []
+        for row in reversed(changes):  # list_state_changes is newest-first
+            ts = int(row["ts"])
+            if ts > since:
+                intervals.append((since, ts, current))
+            current = self._ap_id_for_native(row["new_value"])
+            since = ts
+        if end > since:
+            intervals.append((since, end, current))
+        return intervals
+
+    def _current_parent_ap(self, client_id: int) -> Optional[int]:
+        """The client's current parent, iff it is an AP.
+
+        Used only as the attachment for a client with *no* recorded ap_mac
+        history at all (it never roamed). A wired client parented to a switch
+        resolves to ``None`` -- coverage does not apply there.
+        """
+        row = self.repo.get_entity(client_id)
+        if row is None or row["parent_id"] is None:
             return None
-        parent_id = int(parent_id)
-        parent = self._entity(parent_id)
-        if parent is None:
+        parent = self.repo.get_entity(int(row["parent_id"]))
+        if parent is None or parent["entity_type"] != EntityType.AP.value:
             return None
-        if str(parent["entity_type"]) == EntityType.AP.value:
-            return parent_id
+        return int(parent["entity_id"])
+
+    def _ap_id_for_native(self, value: Any) -> Optional[int]:
+        """Resolve a recorded AP native id without consulting client inventory."""
+        if value is None:
+            return None
+        native_id = str(value).strip()
+        if not native_id:
+            return None
+        cache_key = native_id.lower()
+        if cache_key not in self._ap_native_cache:
+            row = self.repo.find_entity(EntityType.AP, native_id, site_id=self.site_id)
+            if row is None and cache_key != native_id:
+                row = self.repo.find_entity(EntityType.AP, cache_key, site_id=self.site_id)
+            # Cache stable entity identities, but not a miss: this job is
+            # long-lived and a newly discovered AP may be inserted later.
+            if row is not None:
+                self._ap_native_cache[cache_key] = int(row["entity_id"])
+        return self._ap_native_cache.get(cache_key)
+
+    @staticmethod
+    def _attachment_at(intervals: list[tuple[int, int, Optional[int]]], ts: int) -> Optional[int]:
+        for start, end, ap_id in intervals:
+            if start <= ts < end:
+                return ap_id
         return None
 
-    def _entity(self, entity_id: int) -> Any:
-        if entity_id not in self._entity_cache:
-            self._entity_cache[entity_id] = self.repo.get_entity(entity_id)
-        return self._entity_cache[entity_id]
+    @staticmethod
+    def _representative_attachment(
+        intervals: list[tuple[int, int, Optional[int]]],
+    ) -> Optional[int]:
+        """AP owning most of the bucket for bucket-level roaming/connect rows."""
+        durations: dict[int, int] = defaultdict(int)
+        for start, end, ap_id in intervals:
+            if ap_id is not None:
+                durations[ap_id] += end - start
+        if not durations:
+            return None
+        return max(durations, key=lambda ap_id: (durations[ap_id], -ap_id))
 
     def _neighbor_present(self, start: int, end: int) -> bool:
         """Whether a neighbouring/rogue BSS is known this window (rogue-AP events).
@@ -853,7 +940,7 @@ class SleMinutesJob:
     ) -> None:
         if minutes <= 0:
             return
-        cells[(sle, classifier, entity_id)].add(minutes, attributed)
+        cells[(sle, classifier, entity_id, attributed)].add(minutes)
 
     def _write(
         self, bucket_ts: int, cells: dict, result: BucketResult, *, clear_existing: bool = False
@@ -873,15 +960,15 @@ class SleMinutesJob:
         with self.repo.transaction():
             if clear_existing:
                 self.repo.delete_sle_minutes(bucket_ts)
-            for (sle, classifier, entity_id), cell in cells.items():
+            for (sle, classifier, entity_id, attributed_entity_id), cell in cells.items():
                 self.repo.upsert_sle_minute(
                     bucket_ts=bucket_ts,
                     sle=sle,
                     classifier=classifier,
                     entity_id=entity_id,
                     minutes=cell.minutes,
-                    attributed_entity_id=cell.attributed_entity_id,
+                    attributed_entity_id=attributed_entity_id,
                 )
-                result.minutes[(sle, classifier, entity_id)] = cell.minutes
+                result.minutes[(sle, classifier, entity_id, attributed_entity_id)] = cell.minutes
                 written += 1
         return written

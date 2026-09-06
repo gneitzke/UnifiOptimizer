@@ -266,7 +266,19 @@ export interface IncidentSummary {
   summary: string;
   member_count: number;
   symptom_count: number;
+  /** Opaque signature of the incident's CURRENT member issue-id set (C5 round
+   * 19). Changes iff a member is added/removed/replaced, and is stable across
+   * polls when membership is unchanged — independent of evidence timestamps, so
+   * it catches a same-count replacement whose new member's evidence is OLDER
+   * than `last_seen_ts` (which `last_seen_ts`, a max-fold, misses). The
+   * dashboard row keys its symptom-detail cache on it. Optional so an older
+   * daemon's payload still reads. */
+  member_sig?: string;
   root: IncidentRootRef | null;
+  /** Client-axis minutes attributed to this incident across its lifetime —
+   * the impact story, not just its duration (audit U3). Optional/assumed: not
+   * yet emitted by the backend. */
+  affected_client_minutes?: number | null;
 }
 
 export interface IncidentListResponse {
@@ -284,6 +296,22 @@ export interface IncidentMember {
   role: IncidentRole;
   rule: string;
   rationale: string;
+  /** When this issue joined / left the incident's membership, if it ever left
+   * (e.g. re-attributed to a different root). Optional/assumed — not yet
+   * emitted; membership history is omitted rather than guessed at when absent
+   * (audit U3). */
+  joined_ts?: number | null;
+  left_ts?: number | null;
+  /** Whether this member is still attached to the incident (`cleared_ts IS NULL`
+   * server-side, C5). Cleared members are kept in the detail payload to tell the
+   * incident's full history but must not be treated as current — e.g. the
+   * "Suppress incident" action only touches current members. Optional for
+   * backward compatibility: an older payload without it is assumed current. */
+  current?: boolean;
+  /** Concrete evidence backing the causal link named by `rule`/`rationale` —
+   * e.g. correlated timestamps, shared entity, a metric threshold crossed.
+   * Optional/assumed; falls back to `rule` + `rationale` alone when absent. */
+  evidence?: string[] | null;
 }
 
 export interface IncidentDetailResponse {
@@ -642,7 +670,28 @@ export interface FixChange {
   ts: number;
   issue_id: number | null;
   action: string;
-  status: 'applied' | 'reverted' | 'failed' | string;
+  /** `applying` (send in flight) and `unknown` (an ambiguous send — the
+   * request may or may not have reached the device) join the original
+   * `applied` / `failed` / `reverted` (audit U1). `revert_unknown` is the
+   * mirror-image terminal-uncertain state for a REVERT: the rollback write
+   * was dispatched but its outcome was never confirmed, so the backend
+   * permanently refuses to retry a revert on this row (`applier.py`
+   * `_assert_revertible_status`) — the UI must not offer Revert for it.
+   * `reverting` is written durably to the row BEFORE the revert PUT is even
+   * sent; if that send is cancelled or the daemon crashes before it
+   * completes, the row is stuck at `reverting` forever and the backend
+   * refuses to retry it, same as `revert_unknown` — the UI must not offer
+   * Revert for it either. `(string & {})` keeps the known literals as editor
+   * suggestions while accepting any daemon value. */
+  status:
+    | 'applying'
+    | 'applied'
+    | 'failed'
+    | 'unknown'
+    | 'reverted'
+    | 'reverting'
+    | 'revert_unknown'
+    | (string & {});
   reverted_ts: number | null;
   before: Record<string, unknown>;
   after: Record<string, unknown>;
@@ -652,6 +701,12 @@ export interface FixChange {
   entity_id: number | null;
   entity_name: string | null;
   entity_native_id: string | null;
+  /** 1-based position within a multi-step plan, and the plan's total step
+   * count — lets a multi-device fix render "Step 2 of 3" instead of an
+   * unordered pile of rows (audit U1). Optional/assumed: not yet emitted;
+   * falls back to the row's position in `changes`. */
+  step_index?: number | null;
+  step_count?: number | null;
 }
 
 export interface FixPlanResponse {
@@ -711,12 +766,29 @@ export const applyFix = (issueId: number, confirmToken: string) =>
     body: JSON.stringify({ confirm: true, confirm_token: confirmToken }),
   });
 
+/** Response for `POST .../fix/revert`. A revert is not always a clean
+ * success/failure binary: the restore write can come back HTTP 200 with
+ * `status: "unknown"` / `ambiguous: true` when the controller never
+ * confirmed the write landed (a lost response, or a 401 it may have landed
+ * under) — mirroring the apply path's ambiguity handling. The ledger's
+ * `change` is deliberately left at its prior status in that case (the router
+ * does not claim the change is definitively still applied, nor that it was
+ * reverted), so the ambiguous outcome must be read from `status`/`ambiguous`
+ * here, not inferred from `change.status`. */
+export interface FixRevertResponse {
+  status: 'reverted' | 'unknown' | (string & {});
+  ambiguous?: boolean;
+  detail?: string;
+  change: FixChange | null;
+  verification: FixVerification;
+}
+
 /** Revert a change from this issue's ledger, restoring its before-state. */
 export const revertFix = (issueId: number, changeId: number) =>
-  request<{ change: FixChange | null; verification: FixVerification }>(
-    `/api/issues/${issueId}/fix/revert`,
-    { method: 'POST', body: JSON.stringify({ change_id: changeId }) },
-  );
+  request<FixRevertResponse>(`/api/issues/${issueId}/fix/revert`, {
+    method: 'POST',
+    body: JSON.stringify({ change_id: changeId }),
+  });
 
 export const getSle = (windowS?: number, buckets?: number) =>
   request<SleResponse>(`/api/sle${qs({ window_s: windowS, buckets })}`);

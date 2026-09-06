@@ -69,12 +69,23 @@ def _settings(key: str, **overrides) -> SimpleNamespace:
 
 
 def seed_cov(repo: Repository, *, now: int = NOW, jobs=("fast_device", "fast_sta")) -> None:
-    """Full live coverage for the given jobs over the last 600 s (10 polls each)."""
+    """Full live coverage for the given jobs over the last 600 s (10 polls each).
+
+    Also records a completed event-source coverage interval spanning the widest
+    detector window (8 days), so B4's event-coverage gate on the event-driven
+    detectors (pingpong / roam_quality / dfs_recurring) reads a healthy feed. A
+    test modelling an event-feed *gap* seeds its own partial/absent coverage
+    instead of calling this.
+    """
     for job in jobs:
         ts = now - 600 + 60
         while ts <= now:
             repo.record_poll_run(job=job, ok=True, ts=ts)
             ts += 60
+    repo.record_ingest_coverage(
+        kind="event_history", scope="site", interval="retained",
+        start_ts=now - 8 * DAY, end_ts=now, status="complete",
+    )
 
 
 def seed_low_cov(repo: Repository, *, now: int = NOW, jobs=("fast_device", "fast_sta")) -> None:
@@ -602,6 +613,36 @@ def test_roam_quality_unknown_on_low_coverage(repo: Repository) -> None:
     assert RoamQualityDetector().evaluate(_ctx(repo)) is UNKNOWN
 
 
+def _seed_poll_only(repo: Repository, *, now: int = NOW, jobs=("fast_device", "fast_sta")) -> None:
+    """Healthy live *poll* coverage only -- no event-source coverage at all.
+
+    Lets a test drive the B4 event-coverage gate in isolation: the poll gate
+    (fast_sta / fast_device) clears, so whether the detector speaks turns purely
+    on event coverage.
+    """
+    for job in jobs:
+        ts = now - 600 + 60
+        while ts <= now:
+            repo.record_poll_run(job=job, ok=True, ts=ts)
+            ts += 60
+
+
+def test_roam_quality_unknown_on_half_covered_event_window(repo: Repository) -> None:
+    """B4(a): a 60-min window with only the last 30 min of event coverage is ~0.5
+    observed -- far below the 0.9 event floor. Bad roams that would fire on a fully
+    observed feed must FREEZE to UNKNOWN, never clear, on a half-observed one."""
+    _seed_poll_only(repo)  # polling healthy -> not a poll gap
+    # Only the most recent half of the 3600 s window has completed event coverage.
+    repo.record_ingest_coverage(
+        kind="event_history", scope="site", interval="retained",
+        start_ts=NOW - 1800, end_ts=NOW, status="complete",
+    )
+    cid = mk_client(repo, "cli-1")
+    _roam_pair(repo, cid, NOW - 1000, before=-55.0, after=-75.0)
+    _roam_pair(repo, cid, NOW - 500, before=-55.0, after=-75.0)
+    assert RoamQualityDetector().evaluate(_ctx(repo)) is UNKNOWN
+
+
 # ====================================================================== #
 # wifi.min_rssi_misconfig
 # ====================================================================== #
@@ -930,6 +971,23 @@ def test_dfs_unknown_on_low_coverage(repo: Repository) -> None:
     assert DfsRecurringDetector().evaluate(_ctx(repo)) is UNKNOWN
 
 
+def test_dfs_unknown_on_half_covered_event_window(repo: Repository) -> None:
+    """B4(a): recurring radar over the 7-day lookback, poll coverage healthy, but
+    the event feed was observed for only ~half the lookback (0.5 < 0.9 floor).
+    A DFS-plagued AP must FREEZE to UNKNOWN, not read as quiet-and-cleared."""
+    _seed_poll_only(repo)
+    window_s = 7 * DAY
+    # Only the most recent half of the lookback has completed event coverage.
+    repo.record_ingest_coverage(
+        kind="event_history", scope="site", interval="retained",
+        start_ts=NOW - window_s // 2, end_ts=NOW, status="complete",
+    )
+    ap1 = mk_ap(repo, "ap-1")
+    for j in range(1, 9):
+        _radar(repo, ap1, NOW - j * DAY)
+    assert DfsRecurringDetector().evaluate(_ctx(repo)) is UNKNOWN
+
+
 # ====================================================================== #
 # wifi.airtime_saturation
 # ====================================================================== #
@@ -1200,6 +1258,61 @@ def test_mesh_uplink_unknown_on_low_coverage(repo: Repository) -> None:
     ap1 = mk_ap(repo, "ap-1", uplink_type="wireless")
     gauge(repo, ap1, "uplink_rssi", [-75.0] * 8)
     assert MeshUplinkDetector().evaluate(_ctx(repo)) is UNKNOWN
+
+
+def test_mesh_uplink_warn_does_not_escalate_on_uncovered_event_window(
+    repo: Repository,
+) -> None:
+    """B4: lost-contact events on an *unobserved* event feed must not escalate.
+
+    Polling is healthy (P3-worthy warn RSSI, no hop corroboration) but the event
+    source was never observed over the window (event coverage 0.0). The two
+    lost-contact events are then untrustworthy -- an aged-out / down feed, not
+    proof of reconnect cycles -- so the finding must fall back to the poll/RSSI-
+    derived P3 and report no reconnect corroboration, not the P2 it would reach
+    on a trusted feed.
+    """
+    _seed_poll_only(repo, jobs=("fast_device",))  # poll healthy, event coverage 0.0
+    ap1 = mk_ap(repo, "ap-1", uplink_type="wireless", uplink_hops=1)
+    gauge(repo, ap1, "uplink_rssi", [-67.0] * 8)  # warn band, poll-derived P3
+    for ts in (NOW - 400, NOW - 200):
+        repo.record_event(ts=ts, key="EVT_AP_Lost_Contact", entity_id=ap1)
+
+    findings = MeshUplinkDetector().evaluate(_ctx(repo))
+    assert len(findings) == 1
+    assert findings[0].severity is Severity.P3
+    assert findings[0].evidence["reconnect_cycles"] == 0
+    assert findings[0].evidence["corroborated"] is False
+
+
+def test_mesh_uplink_warn_escalates_on_covered_event_window(repo: Repository) -> None:
+    """B4 counterpart: the SAME lost-contact events on a substantially-complete
+    event feed DO escalate the warn-band finding to P2, exactly as before the
+    gate. This pins that the gate suppresses only the untrusted-feed case."""
+    seed_cov(repo, jobs=("fast_device",))  # poll + healthy event coverage
+    ap1 = mk_ap(repo, "ap-1", uplink_type="wireless", uplink_hops=1)
+    gauge(repo, ap1, "uplink_rssi", [-67.0] * 8)  # warn band
+    for ts in (NOW - 400, NOW - 200):
+        repo.record_event(ts=ts, key="EVT_AP_Lost_Contact", entity_id=ap1)
+
+    findings = MeshUplinkDetector().evaluate(_ctx(repo))
+    assert len(findings) == 1
+    assert findings[0].severity is Severity.P2
+    assert findings[0].evidence["reconnect_cycles"] == 2
+    assert findings[0].evidence["corroborated"] is True
+
+
+def test_mesh_uplink_bad_rssi_unaffected_by_event_gap(repo: Repository) -> None:
+    """B4 non-regression: the poll/RSSI-only path is unchanged by the gate. A
+    sustained bad-band uplink is P2 on its RSSI alone, so it still fires P2 even
+    with the event feed entirely unobserved (event coverage 0.0)."""
+    _seed_poll_only(repo, jobs=("fast_device",))  # event coverage 0.0
+    ap1 = mk_ap(repo, "ap-1", uplink_type="wireless")
+    gauge(repo, ap1, "uplink_rssi", [-75.0] * 8)  # bad band, RSSI-derived P2
+
+    findings = MeshUplinkDetector().evaluate(_ctx(repo))
+    assert len(findings) == 1
+    assert findings[0].severity is Severity.P2
 
 
 # ====================================================================== #

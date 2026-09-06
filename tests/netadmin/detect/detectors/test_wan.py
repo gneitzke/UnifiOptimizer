@@ -425,11 +425,26 @@ def test_bufferbloat_unknown_low_coverage(repo: Repository) -> None:
 # ====================================================================== #
 # wan.flapping
 # ====================================================================== #
+_FLAP_WINDOW_S = 86_400  # StarlinkWanProfile.flapping_window_s (24 h)
+
+
+def _healthy_event_feed(repo: Repository) -> None:
+    """Model a substantially-complete event feed across the flapping window."""
+    from tests.netadmin.detect.support import seed_event_coverage
+
+    seed_event_coverage(repo, now=NOW, window_s=_FLAP_WINDOW_S)
+
+
 def test_flapping_noop_without_gateway_or_events(repo: Repository) -> None:
+    # A genuine no-op requires proof the event feed was observed; otherwise the
+    # empty transition set is unproven and the verdict must freeze (see the
+    # low-coverage freeze test below).
+    _healthy_event_feed(repo)
     assert WanFlappingDetector().evaluate(_ctx(repo)) == []
 
 
 def test_flapping_fires_on_repeated_transitions(repo: Repository) -> None:
+    _healthy_event_feed(repo)
     gw = _gateway(repo)
     for i in range(3):
         repo.record_event(
@@ -447,9 +462,36 @@ def test_flapping_fires_on_repeated_transitions(repo: Repository) -> None:
 
 
 def test_flapping_confounder_single_transition_quiet(repo: Repository) -> None:
+    _healthy_event_feed(repo)
     gw = _gateway(repo)
     repo.record_event(ts=NOW - 100, key="EVT_GW_WANTransition", entity_id=gw, native_id="wt-solo")
     assert WanFlappingDetector().evaluate(_ctx(repo)) == []
+
+
+# --- B4 (#2): the wholly event-derived verdict freezes on an event-feed gap --- #
+def test_flapping_freezes_unknown_on_event_feed_gap(repo: Repository) -> None:
+    """An active flap must NOT false-resolve when the event feed is unobserved.
+
+    With zero event coverage the transition set reads empty even though the WAN
+    may still be flapping; the detector must return UNKNOWN (freeze), never [].
+    """
+    gw = _gateway(repo)
+    # No seed_event_coverage -> event_coverage == 0.0 over the window.
+    # A prior burst that has since aged out of the (unobserved) feed:
+    repo.record_event(ts=NOW - 100, key="EVT_GW_WANTransition", entity_id=gw, native_id="wt-x")
+    assert WanFlappingDetector().evaluate(_ctx(repo)) is UNKNOWN
+
+
+def test_flapping_fires_again_once_event_feed_recovers(repo: Repository) -> None:
+    """The same fire scenario, now WITH event coverage, still emits the P1."""
+    _healthy_event_feed(repo)
+    gw = _gateway(repo)
+    for i in range(3):
+        repo.record_event(
+            ts=NOW - 3600 * i - 10, key="EVT_GW_WANTransition", entity_id=gw, native_id=f"r-{i}"
+        )
+    findings = WanFlappingDetector().evaluate(_ctx(repo))
+    assert len(findings) == 1 and findings[0].severity is Severity.P1
 
 
 # ====================================================================== #

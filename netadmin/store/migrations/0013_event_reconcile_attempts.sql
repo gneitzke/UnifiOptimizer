@@ -1,0 +1,14 @@
+-- netadmin store schema, migration 0013: bound event-reference repair retries.
+--
+-- C7/P2 fair-progress: event-reference reconciliation (Repository.unresolved_events)
+-- retries rows whose payload names a candidate MAC that is not yet in inventory,
+-- because such a row may still resolve once inventory catches up ("pending
+-- from-AP"). But a candidate whose AP NEVER appears would otherwise be retried on
+-- every pass forever, consuming the oldest-first LIMIT window and starving newer
+-- repairable rows. This counter records how many reconcile passes have selected a
+-- row without filling it; once it crosses the repository's retry cap the row is
+-- parked (still re-checked for resolvability, but no longer counted against the
+-- LIMIT window). Forward-only, transactional. SQLite ADD COLUMN with a constant
+-- NOT NULL DEFAULT is a metadata-only change -- existing rows are not rewritten
+-- and read back as 0.
+ALTER TABLE events ADD COLUMN reconcile_attempts INTEGER NOT NULL DEFAULT 0;

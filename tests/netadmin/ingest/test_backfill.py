@@ -21,6 +21,8 @@ from netadmin.ingest.backfill import (
     job_name,
     plan_report_windows,
 )
+from netadmin.ingest.unifi.auth import UnifiError
+from netadmin.ingest.unifi.endpoints import Endpoints, ReportUnavailable
 from netadmin.ingest.unifi.models import ReportRow
 from netadmin.store.metrics import MetricKind, metric_kind
 from netadmin.store.repository import Repository
@@ -295,6 +297,547 @@ async def test_backfill_records_failure_poll_run_on_error(repo: Repository):
     assert len(runs) == 1
     assert runs[0]["ok"] == 0
     assert runs[0]["source"] == "backfill"
+
+
+@pytest.mark.asyncio
+async def test_c4_retries_failed_chunk_after_later_chunk_advanced_samples(repo: Repository):
+    """A failed [600,1200) equivalent remains a coverage hole, not MAX(ts)."""
+    _ap(repo)
+    failed_start = NOW - 3600
+
+    class FailOnce(FakeEndpoints):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail = True
+
+        async def stat_report(self, interval, scope, *, start_ms, end_ms, attrs):
+            self.calls.append(
+                {"interval": interval, "scope": scope, "start_ms": start_ms, "end_ms": end_ms}
+            )
+            if self.fail and interval == FIVEMIN and start_ms == failed_start * 1000:
+                raise RuntimeError("first chunk unavailable")
+            return []
+
+    ep = FailOnce()
+    bf = Backfiller(ep, repo, scopes=("ap",), chunk_seconds={FIVEMIN: 600})
+    first = await bf.run({"ap": failed_start}, now=NOW)
+    assert first.errors == 1
+
+    # A later completed chunk may have written samples up to now in production;
+    # pass that old MAX-like cursor to prove the named failure still wins.
+    ep.calls.clear()
+    ep.fail = False
+    second = await bf.run({"ap": NOW}, now=NOW)
+
+    assert second.errors == 0
+    assert (FIVEMIN, failed_start * 1000, (failed_start + 600) * 1000) in {
+        (c["interval"], c["start_ms"], c["end_ms"]) for c in ep.calls
+    }
+
+
+@pytest.mark.asyncio
+async def test_c4_open_bucket_is_retried_in_next_sweep(repo: Repository):
+    """A row published after its bucket closes is not buried by the first cursor."""
+    ap_id = _ap(repo)
+    oid = "aa:bb:cc:00:00:01"
+
+    class DelayedBucket(FakeEndpoints):
+        def __init__(self) -> None:
+            super().__init__(
+                {
+                    (FIVEMIN, "ap"): [
+                        {"time": 600_000, "oid": oid, "rx_bytes": 6.0},
+                    ]
+                }
+            )
+
+        def publish_closed_bucket(self) -> None:
+            self._rows[(FIVEMIN, "ap")].extend(
+                [
+                    {"time": 900_000, "oid": oid, "rx_bytes": 9.0},
+                    {"time": 1_200_000, "oid": oid, "rx_bytes": 12.0},
+                ]
+            )
+
+    ep = DelayedBucket()
+    bf = Backfiller(ep, repo, scopes=("ap",), chunk_seconds={FIVEMIN: 600})
+
+    await bf.run({"ap": 600}, now=1_000)
+    assert repo.latest_ingest_coverage_end(kind="report", scope="ap") == 900
+
+    ep.publish_closed_bucket()
+    ep.calls.clear()
+    cursor = repo.latest_ingest_coverage_end(kind="report", scope="ap")
+    await bf.run({"ap": cursor}, now=1_300)
+
+    assert ep.calls[0]["start_ms"] == 900_000
+    series = repo.get_series(ap_id, "rx_bytes")
+    assert [row["ts"] for row in repo.read_raw(series, 0, 1_500)] == [600, 900]
+    assert repo.latest_ingest_coverage_end(kind="report", scope="ap") == 1_200
+
+
+@pytest.mark.asyncio
+async def test_c4_unsupported_report_is_unrecoverable_not_complete(repo: Repository):
+    _ap(repo)
+
+    class UnsupportedClient:
+        async def get_data(self, endpoint, params):
+            raise UnifiError("404 api.err.NotFound")
+
+    endpoints = Endpoints(UnsupportedClient())  # type: ignore[arg-type]
+    result = await Backfiller(endpoints, repo, scopes=("ap",)).run({"ap": 600}, now=1_000)
+
+    coverage = repo._conn.execute(
+        "SELECT status, detail FROM ingest_coverage WHERE kind='report' AND scope='ap'"
+    ).fetchall()
+    assert [row["status"] for row in coverage] == ["unrecoverable"]
+    assert "ReportUnavailable" in coverage[0]["detail"]
+    assert repo.latest_ingest_coverage_end(kind="report", scope="ap") is None
+    assert result.errors == 1
+
+
+@pytest.mark.asyncio
+async def test_stat_report_unsupported_is_distinct_from_supported_empty():
+    class UnsupportedClient:
+        calls = 0
+
+        async def get_data(self, endpoint, params):
+            self.calls += 1
+            raise UnifiError("404 api.err.NotFound")
+
+    unsupported_client = UnsupportedClient()
+    unsupported = Endpoints(unsupported_client)  # type: ignore[arg-type]
+    with pytest.raises(ReportUnavailable):
+        await unsupported.stat_report(FIVEMIN, "ap", start_ms=0, end_ms=300_000)
+    with pytest.raises(ReportUnavailable):
+        await unsupported.stat_report(FIVEMIN, "ap", start_ms=0, end_ms=300_000)
+    assert unsupported_client.calls == 1  # sticky unsupported capability
+
+    class EmptyClient:
+        async def get_data(self, endpoint, params):
+            return []
+
+    supported = Endpoints(EmptyClient())  # type: ignore[arg-type]
+    assert await supported.stat_report(FIVEMIN, "ap", start_ms=0, end_ms=300_000) == []
+
+
+@pytest.mark.asyncio
+async def test_finding7_clipped_failed_retry_retires_original_no_redundant_refetch(
+    repo: Repository,
+):
+    """A retention-clipped retry must retire/split the original failed row.
+
+    Finding #7: an actual failed fetch [4800,6000) is recorded 'failed'; then
+    retention advances so only [5400,6000) is still fetchable. The successful
+    clipped retry records 'complete' for [5400,6000), but the ORIGINAL
+    [4800,6000) 'failed' row must NOT survive -- clipping changes the coverage
+    primary key, so leaving it would regenerate a redundant refetch every run.
+    The fix retires the original and splits it: [4800,5400) -> unrecoverable,
+    [5400,6000) -> complete. A subsequent run must NOT refetch the satisfied
+    window, while a genuinely still-missing within-retention hole still retries.
+    """
+    tnow = 6000  # a closed 5-minute bucket boundary (6000 % 300 == 0)
+    # retention_floor = now - retention = 6000 - 600 = 5400, landing inside the
+    # failed interval so the retry is clipped.
+    ret = 600
+
+    def cov_rows():
+        return repo._conn.execute(
+            "SELECT interval, start_ts, end_ts, status FROM ingest_coverage "
+            "WHERE kind='report' AND scope='ap' ORDER BY start_ts, end_ts"
+        ).fetchall()
+
+    # An actual failed fetch, recorded first-class as a hole.
+    repo.record_ingest_coverage(
+        kind="report", scope="ap", interval=FIVEMIN,
+        start_ts=4800, end_ts=6000, status="failed", detail="boom",
+    )
+
+    ep = FakeEndpoints()  # empty-but-successful retry
+    bf = Backfiller(ep, repo, scopes=("ap",), fivemin_retention_s=ret)
+    # last_ts == now -> the incremental plan opens no new windows; only the
+    # failed-coverage retry drives this run.
+    await bf.run({"ap": tnow}, now=tnow)
+
+    rows = [
+        (r["interval"], r["start_ts"], r["end_ts"], r["status"]) for r in cov_rows()
+    ]
+    # Original [4800,6000) failed row is gone; it is split into an unrecoverable
+    # pre-retention slice and a complete clipped slice.
+    assert rows == [
+        (FIVEMIN, 4800, 5400, "unrecoverable"),
+        (FIVEMIN, 5400, 6000, "complete"),
+    ]
+    assert repo.failed_ingest_coverage(kind="report", scope="ap") == []
+    # The retry actually clipped to the still-fetchable window.
+    assert [(c["start_ms"], c["end_ms"]) for c in ep.calls] == [
+        (5400 * 1000, 6000 * 1000)
+    ]
+
+    # A SUBSEQUENT run must not redundantly refetch the already-satisfied window.
+    ep.calls.clear()
+    await bf.run({"ap": tnow}, now=tnow)
+    assert ep.calls == []  # nothing left generating retry work
+
+    # A genuinely still-missing hole WITHIN retention is still retried.
+    repo.record_ingest_coverage(
+        kind="report", scope="ap", interval=FIVEMIN,
+        start_ts=5460, end_ts=6000, status="failed", detail="still open",
+    )
+    ep.calls.clear()
+    await bf.run({"ap": tnow}, now=tnow)
+    assert [(c["start_ms"], c["end_ms"]) for c in ep.calls] == [
+        (5460 * 1000, 6000 * 1000)
+    ]
+    # ...and it lands as complete (no residual failed row).
+    assert repo.failed_ingest_coverage(kind="report", scope="ap") == []
+    statuses = {(r["start_ts"], r["end_ts"]): r["status"] for r in cov_rows()}
+    assert statuses[(5460, 6000)] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_finding3_cancel_during_clipped_fetch_does_not_lose_recoverable_hole(
+    repo: Repository,
+):
+    """Round-12 durability: a cancel during the clipped retry must not lose the hole.
+
+    Finding #3 regression: the retention-clipped retry retired the ORIGINAL
+    failed [c_lo, c_hi) row BEFORE the clipped fetch completed. A cancellation
+    between retire and fetch-completion left the recoverable slice
+    [clip_start, c_hi) recorded NOWHERE -- the original 'failed' row was gone and
+    its 'complete' replacement never written -- so the next run made ZERO
+    requests and the hole was permanently lost.
+
+    Scenario (from the finding): failed [4800,5700), complete [5700,6000),
+    retention floor 5400. A CancelledError raised during the clipped [5400,5700)
+    fetch tears the run down mid-flight (CancelledError is a BaseException, so it
+    is NOT swallowed by the per-chunk Exception firewall). The split-first fix
+    must leave [5400,5700) durably 'failed', so the NEXT run STILL retries it.
+    """
+    tnow = 6000  # closed 5-minute bucket boundary (6000 % 300 == 0)
+    ret = 600  # retention_floor = 6000 - 600 = 5400, landing inside [4800,5700)
+
+    def cov_rows():
+        return repo._conn.execute(
+            "SELECT interval, start_ts, end_ts, status FROM ingest_coverage "
+            "WHERE kind='report' AND scope='ap' ORDER BY start_ts, end_ts"
+        ).fetchall()
+
+    # The pre-existing ledger: an actual failed fetch plus an adjacent complete
+    # slice, exactly as the finding derives it from a real repository cursor.
+    repo.record_ingest_coverage(
+        kind="report", scope="ap", interval=FIVEMIN,
+        start_ts=4800, end_ts=5700, status="failed", detail="boom",
+    )
+    repo.record_ingest_coverage(
+        kind="report", scope="ap", interval=FIVEMIN,
+        start_ts=5700, end_ts=6000, status="complete",
+    )
+
+    class CancelDuringFetch(FakeEndpoints):
+        """Raises CancelledError on the first report request (the clipped retry)."""
+
+        def __init__(self):
+            super().__init__()
+            self.cancelled = False
+
+        async def stat_report(self, interval, scope, *, start_ms, end_ms, attrs):
+            self.calls.append({"start_ms": start_ms, "end_ms": end_ms})
+            if not self.cancelled:
+                self.cancelled = True
+                raise __import__("asyncio").CancelledError()
+            return []
+
+    ep = CancelDuringFetch()
+    bf = Backfiller(ep, repo, scopes=("ap",), fivemin_retention_s=ret)
+
+    # The run is torn down mid-flight by the cancellation during the clipped fetch.
+    with pytest.raises(__import__("asyncio").CancelledError):
+        await bf.run({"ap": tnow}, now=tnow)
+
+    # The retry did clip to the still-fetchable window before being cancelled.
+    assert ep.calls == [{"start_ms": 5400 * 1000, "end_ms": 5700 * 1000}]
+
+    # DURABILITY: despite the cancel BEFORE the fetch completed, the recoverable
+    # slice [5400,5700) survives as a 'failed' hole (split-first, then retire);
+    # the pre-clip slice is unrecoverable and the untouched complete slice remains.
+    rows = [(r["interval"], r["start_ts"], r["end_ts"], r["status"]) for r in cov_rows()]
+    assert rows == [
+        (FIVEMIN, 4800, 5400, "unrecoverable"),
+        (FIVEMIN, 5400, 5700, "failed"),
+        (FIVEMIN, 5700, 6000, "complete"),
+    ]
+    # The regression's tell was a lost hole -> zero requests next run. The hole is
+    # NOT lost: the next run STILL retries [5400,5700) (and now succeeds).
+    ep.calls.clear()
+    await bf.run({"ap": tnow}, now=tnow)
+    assert ep.calls == [{"start_ms": 5400 * 1000, "end_ms": 5700 * 1000}]
+    assert repo.failed_ingest_coverage(kind="report", scope="ap") == []
+    statuses = {(r["start_ts"], r["end_ts"]): r["status"] for r in cov_rows()}
+    assert statuses[(5400, 5700)] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_finding3_success_path_preserves_round11_end_state(repo: Repository):
+    """The non-cancelled success path still ends unrecoverable+complete, no refetch.
+
+    Same scenario as the cancel test (failed [4800,5700), complete [5700,6000),
+    floor 5400) but with a working endpoint: the split-first ordering must not
+    regress round-11. The clipped retry lands 'complete', leaving exactly the
+    unrecoverable pre-clip slice plus complete slices, no residual 'failed' row,
+    and a subsequent run makes NO redundant request.
+    """
+    tnow = 6000
+    ret = 600
+
+    def cov_rows():
+        return repo._conn.execute(
+            "SELECT interval, start_ts, end_ts, status FROM ingest_coverage "
+            "WHERE kind='report' AND scope='ap' ORDER BY start_ts, end_ts"
+        ).fetchall()
+
+    repo.record_ingest_coverage(
+        kind="report", scope="ap", interval=FIVEMIN,
+        start_ts=4800, end_ts=5700, status="failed", detail="boom",
+    )
+    repo.record_ingest_coverage(
+        kind="report", scope="ap", interval=FIVEMIN,
+        start_ts=5700, end_ts=6000, status="complete",
+    )
+
+    ep = FakeEndpoints()  # empty-but-successful retry
+    bf = Backfiller(ep, repo, scopes=("ap",), fivemin_retention_s=ret)
+    await bf.run({"ap": tnow}, now=tnow)
+
+    rows = [(r["interval"], r["start_ts"], r["end_ts"], r["status"]) for r in cov_rows()]
+    assert rows == [
+        (FIVEMIN, 4800, 5400, "unrecoverable"),
+        (FIVEMIN, 5400, 5700, "complete"),
+        (FIVEMIN, 5700, 6000, "complete"),
+    ]
+    assert repo.failed_ingest_coverage(kind="report", scope="ap") == []
+    assert [(c["start_ms"], c["end_ms"]) for c in ep.calls] == [(5400 * 1000, 5700 * 1000)]
+
+    # No redundant refetch on a subsequent run.
+    ep.calls.clear()
+    await bf.run({"ap": tnow}, now=tnow)
+    assert ep.calls == []
+
+
+class RawRowsEndpoints:
+    """Returns pre-built ``ReportRow`` objects verbatim (no range filtering).
+
+    Unlike :class:`FakeEndpoints` it does not require a ``time`` key on every
+    row, so it can replay a missing-timestamp row exactly as a controller might.
+    """
+
+    def __init__(self, rows_by_key: dict[tuple[str, str], list] | None = None) -> None:
+        self._rows = rows_by_key or {}
+        self.calls: list[dict] = []
+
+    async def stat_report(self, interval, scope, *, start_ms, end_ms, attrs):
+        self.calls.append(
+            {"interval": interval, "scope": scope, "start_ms": start_ms, "end_ms": end_ms}
+        )
+        return list(self._rows.get((interval, scope), []))
+
+
+def _report_coverage(repo: Repository, scope: str = "ap") -> list[tuple]:
+    return [
+        (r["interval"], r["start_ts"], r["end_ts"], r["status"])
+        for r in repo._conn.execute(
+            "SELECT interval, start_ts, end_ts, status FROM ingest_coverage "
+            "WHERE kind='report' AND scope=? ORDER BY start_ts, end_ts",
+            (scope,),
+        ).fetchall()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_w17b_unknown_device_row_records_partial_not_complete(repo: Repository):
+    """#w17b: a chunk that DROPPED a row naming an unknown device is 'partial'.
+
+    The known AP exists, but the report row names a different, undiscovered oid.
+    Backfill drops the row (skipped_unresolved) and inserts ZERO samples -- yet
+    the window must NOT be credited 'complete', or the production cursor
+    (latest_ingest_coverage_end) SKIPS re-collecting this lost history once the
+    device is discovered. Mirror the event catch-up 'partial' rule.
+    """
+    _ap(repo, native_id="aa:bb:cc:00:00:01")
+    ts = NOW - 1800  # inside the 1 h gap -> a single 5-minute chunk
+    rows = {
+        (FIVEMIN, "ap"): [
+            {"time": ts * 1000, "oid": "ff:ff:ff:ff:ff:ff", "rx_bytes": 42.0},
+        ]
+    }
+    bf = Backfiller(FakeEndpoints(rows), repo, scopes=("ap",))
+    result = await bf.run({"ap": NOW - 3600}, now=NOW)
+
+    assert result.rows_inserted == 0
+    assert result.scopes["ap"].skipped_unresolved == 1
+    # The window is a retryable 'partial' hole, NOT complete (the bug), NOT a
+    # transport 'failed'. One chunk was requested.
+    cov = _report_coverage(repo)
+    assert len(cov) == 1
+    assert cov[0][3] == "partial"
+    # CRITICAL: the completion cursor is NOT advanced past the dropped window, so
+    # the next sweep re-attempts it rather than silently losing the history.
+    assert repo.latest_ingest_coverage_end(kind="report", scope="ap") is None
+
+
+@pytest.mark.asyncio
+async def test_w17b_missing_timestamp_row_records_partial_not_complete(repo: Repository):
+    """#w17b: a chunk that DROPPED a row with no bucket timestamp is 'partial'."""
+    ap_id = _ap(repo, native_id="aa:bb:cc:00:00:01")
+    oid = "aa:bb:cc:00:00:01"
+    # A resolvable device, but the row carries no ``time`` -> unstorable history.
+    rows = {
+        (FIVEMIN, "ap"): [ReportRow.model_validate({"oid": oid, "rx_bytes": 42.0})],
+    }
+    ep = RawRowsEndpoints(rows)
+    bf = Backfiller(ep, repo, scopes=("ap",))
+    result = await bf.run({"ap": NOW - 3600}, now=NOW)
+
+    assert result.rows_inserted == 0
+    # No sample landed for the resolvable device (its row had no timestamp)...
+    assert repo.read_raw(repo.get_series(ap_id, "rx_bytes"), 0, NOW + 1) == []
+    # ...and every chunk that saw the dropped row is 'partial', never 'complete'.
+    cov = _report_coverage(repo)
+    assert cov, "expected at least one recorded chunk"
+    assert all(status == "partial" for _i, _s, _e, status in cov)
+    assert repo.latest_ingest_coverage_end(kind="report", scope="ap") is None
+
+
+@pytest.mark.asyncio
+async def test_w17b_empty_successful_chunk_still_records_complete(repo: Repository):
+    """#w17b: a genuinely EMPTY-but-successful chunk drops nothing -> 'complete'.
+
+    The dropped-row rule must not over-fire: a quiet window where the source
+    returned no rows at all is a real, successful, empty read and still advances
+    the cursor.
+    """
+    _ap(repo)
+    ep = FakeEndpoints()  # no rows for this window at all
+    bf = Backfiller(ep, repo, scopes=("ap",))
+    result = await bf.run({"ap": NOW - 3600}, now=NOW)
+
+    assert result.errors == 0
+    cov = _report_coverage(repo)
+    assert len(cov) == 1
+    assert cov[0][3] == "complete"
+    assert repo.latest_ingest_coverage_end(kind="report", scope="ap") is not None
+
+
+@pytest.mark.asyncio
+async def test_w17b_rerun_completes_once_device_is_known(repo: Repository):
+    """#w17b: the 'partial' hole self-heals -- a re-run resolves and completes.
+
+    First run drops the unknown-device row -> 'partial', cursor unmoved. After
+    the sync job discovers the device, a re-run over the same (not-advanced)
+    window resolves the row, stores its samples, and records 'complete'.
+    """
+    ts = NOW - 1800
+    oid = "aa:bb:cc:00:00:02"  # not yet in inventory on the first run
+    rows = {(FIVEMIN, "ap"): [{"time": ts * 1000, "oid": oid, "rx_bytes": 77.0}]}
+    ep = FakeEndpoints(rows)
+    bf = Backfiller(ep, repo, scopes=("ap",))
+
+    first = await bf.run({"ap": NOW - 3600}, now=NOW)
+    assert first.rows_inserted == 0
+    assert _report_coverage(repo)[0][3] == "partial"
+    cursor_after_partial = repo.latest_ingest_coverage_end(kind="report", scope="ap")
+    assert cursor_after_partial is None  # not advanced past the hole
+
+    # The device is discovered; the production loop re-attempts the un-advanced
+    # window (cursor is still None -> the gap is re-planned and re-fetched).
+    ap_id = _ap(repo, native_id=oid)
+    second = await bf.run({"ap": NOW - 3600}, now=NOW)
+
+    assert second.rows_inserted == 1  # one bucket x one metric now resolved
+    assert repo.read_raw(repo.get_series(ap_id, "rx_bytes"), 0, NOW + 1)[0]["value"] == 77.0
+    # The window is now genuinely complete and the cursor advances.
+    statuses = {status for _i, _s, _e, status in _report_coverage(repo)}
+    assert "complete" in statuses and "partial" not in statuses
+    assert repo.latest_ingest_coverage_end(kind="report", scope="ap") is not None
+
+
+# --------------------------------------------------------------------------- #
+# #w18a-3 (partial windows are not stranded): a 'partial' chunk is a retryable
+# hole, so (a) the retry scan must re-fetch it (not only 'failed'), and (b) the
+# completion cursor must not advance PAST it just because a later chunk landed
+# 'complete' -- the cursor is the end of the contiguous COMPLETE prefix, never
+# MAX(complete). Pre-fix a partial recorded before a later complete was skipped by
+# both the retry scan and the cursor, stranding the lost span forever.
+# --------------------------------------------------------------------------- #
+def test_w18a3_partial_blocks_cursor_and_is_retryable(repo: Repository):
+    """Repo-level: a 'partial' hole caps the completion cursor at the contiguous
+    complete prefix and is returned by the retry scan; 'unrecoverable' is terminal
+    and does NOT block the cursor (round-11/12 semantics preserved)."""
+    K, S = "report", "zz-w18a3"
+    # complete [0,100], partial [100,200], complete [200,300]. A later complete
+    # must NOT bury the earlier partial.
+    repo.record_ingest_coverage(kind=K, scope=S, interval=FIVEMIN, start_ts=0, end_ts=100, status="complete")
+    repo.record_ingest_coverage(kind=K, scope=S, interval=FIVEMIN, start_ts=100, end_ts=200, status="partial")
+    repo.record_ingest_coverage(kind=K, scope=S, interval=FIVEMIN, start_ts=200, end_ts=300, status="complete")
+    # (b) cursor stops at the contiguous complete prefix (100), NOT MAX(complete)=300.
+    assert repo.latest_ingest_coverage_end(kind=K, scope=S) == 100
+    # (a) the retry scan treats the partial as a retryable hole.
+    retry = repo.failed_ingest_coverage(kind=K, scope=S)
+    assert [(int(r["start_ts"]), int(r["end_ts"]), r["status"]) for r in retry] == [(100, 200, "partial")]
+
+    # Once the partial is re-fetched and completed, the cursor jumps forward.
+    repo.record_ingest_coverage(kind=K, scope=S, interval=FIVEMIN, start_ts=100, end_ts=200, status="complete")
+    assert repo.failed_ingest_coverage(kind=K, scope=S) == []
+    assert repo.latest_ingest_coverage_end(kind=K, scope=S) == 300
+
+    # unrecoverable is terminal: it must not freeze the cursor on lost history.
+    K2, S2 = "report", "zz-w18a3-unrec"
+    repo.record_ingest_coverage(kind=K2, scope=S2, interval=FIVEMIN, start_ts=0, end_ts=100, status="complete")
+    repo.record_ingest_coverage(kind=K2, scope=S2, interval=FIVEMIN, start_ts=100, end_ts=150, status="unrecoverable")
+    repo.record_ingest_coverage(kind=K2, scope=S2, interval=FIVEMIN, start_ts=150, end_ts=200, status="complete")
+    assert repo.failed_ingest_coverage(kind=K2, scope=S2) == []
+    assert repo.latest_ingest_coverage_end(kind=K2, scope=S2) == 200
+
+
+@pytest.mark.asyncio
+async def test_w18a3_partial_then_later_complete_chunk_not_stranded(repo: Repository):
+    """End-to-end: an OLDER unknown-device chunk records 'partial' and a NEWER
+    empty chunk records 'complete'. Pre-fix the newer 'complete' advanced the
+    production cursor PAST the partial and the retry scan ignored it, so the next
+    run fetched only newer intervals and the lost span was stranded (zero samples
+    ever). Post-fix the cursor does not skip the partial and, once the device is
+    discovered, a re-run driven by the production cursor re-fetches the partial
+    window and completes it with a real sample."""
+    _ap(repo, native_id="aa:bb:cc:00:00:01")  # a KNOWN, unrelated AP exists
+    # 20-min gap -> the 5-min tier; force TWO 600 s chunks so the older one carries
+    # the unknown-device row (partial) and the newer one is empty (complete).
+    closed_end = NOW - (NOW % INTERVAL_SECONDS[FIVEMIN])
+    last_ts = closed_end - 1000  # spans two 600 s chunks up to closed_end
+    older_ts = closed_end - 900  # lands in the older chunk
+    oid = "aa:bb:cc:00:00:02"    # NOT in inventory on the first run
+    rows = {(FIVEMIN, "ap"): [{"time": older_ts * 1000, "oid": oid, "rx_bytes": 77.0}]}
+    ep = FakeEndpoints(rows)
+    bf = Backfiller(ep, repo, scopes=("ap",), chunk_seconds={FIVEMIN: 600})
+
+    first = await bf.run({"ap": last_ts}, now=NOW)
+    assert first.rows_inserted == 0
+    statuses = {s for _i, _s, _e, s in _report_coverage(repo)}
+    assert "partial" in statuses and "complete" in statuses
+    # (b) the cursor did NOT advance past the older partial onto the newer complete.
+    cursor = repo.latest_ingest_coverage_end(kind="report", scope="ap")
+    assert cursor is None or cursor <= older_ts
+    # (a) the partial is a retryable hole.
+    assert any(r["status"] == "partial" for r in repo.failed_ingest_coverage(kind="report", scope="ap"))
+
+    # The sync job discovers the device; a re-run driven by the (un-skipped) cursor
+    # re-fetches the partial window and completes it -- non-zero samples, no strand.
+    ap_id = _ap(repo, native_id=oid)
+    second = await bf.run({"ap": cursor}, now=NOW)
+    assert second.rows_inserted >= 1
+    assert repo.read_raw(repo.get_series(ap_id, "rx_bytes"), 0, NOW + 1)[0]["value"] == 77.0
+    final = {s for _i, _s, _e, s in _report_coverage(repo)}
+    assert "partial" not in final
+    assert repo.latest_ingest_coverage_end(kind="report", scope="ap") is not None
 
 
 def test_user_signal_maps_to_collector_rssi_metric():

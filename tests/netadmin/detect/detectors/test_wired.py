@@ -40,7 +40,7 @@ from netadmin.detect.detectors.wired import (
     UplinkSaturationDetector,
     _known_100mbps_patterns,
 )
-from netadmin.detect.engine import UNKNOWN
+from netadmin.detect.engine import UNKNOWN, DetectorResult
 from netadmin.domain.entities import Entity
 from netadmin.domain.types import EntityType, Severity
 from netadmin.store.repository import Repository, SampleReading
@@ -90,6 +90,13 @@ def full_coverage(repo: Repository) -> None:
 def low_coverage(repo: Repository) -> None:
     repo.record_poll_run(job="fast_device", ok=True, ts=NOW - 120)
     repo.record_poll_run(job="fast_device", ok=True, ts=NOW - 60)
+
+
+def healthy_event_feed(repo: Repository, window_s: int = 3600) -> None:
+    """A substantially-complete event-source coverage interval over the window."""
+    from tests.netadmin.detect.support import seed_event_coverage
+
+    seed_event_coverage(repo, now=NOW, window_s=window_s)
 
 
 def make_switch(repo: Repository, native_id: str = "sw:1", meta: Optional[dict] = None) -> int:
@@ -980,6 +987,7 @@ def test_poe_budget_warn_tier_is_p2(repo: Repository) -> None:
 
 def test_poe_budget_fires_on_overload_event_without_budget(repo: Repository) -> None:
     full_coverage(repo)
+    healthy_event_feed(repo)  # observed feed -> the overload event may fire
     sw = make_switch(repo)  # no budget meta
     make_port(repo, sw_id=sw, idx=1)
     repo.record_event(ts=NOW - 100, key="EVT_SW_PoeOverload", entity_id=sw)
@@ -990,6 +998,7 @@ def test_poe_budget_fires_on_overload_event_without_budget(repo: Repository) -> 
 
 def test_poe_budget_quiet_under_budget(repo: Repository) -> None:
     full_coverage(repo)
+    healthy_event_feed(repo)  # proves no overload was dropped -> a real clean clear
     sw = make_switch(repo, meta={"total_max_power": 60.0})
     p1 = make_port(repo, sw_id=sw, idx=1)
     seed_gauge(repo, p1, "poe_power", 20.0)  # 33%
@@ -1002,11 +1011,101 @@ def test_poe_budget_unknown_on_low_coverage(repo: Repository) -> None:
     assert PoeBudgetDetector().evaluate(_ctx(repo)) is UNKNOWN
 
 
+# --- B4 (#2): the EVENT (overload) arm freezes on an event-feed gap ----------- #
+def test_poe_budget_overload_arm_freezes_switch_on_event_gap(repo: Repository) -> None:
+    """Poll budget is fine, but an overload issue must not false-resolve on a gap.
+
+    Device polling is healthy (fast_device full) so the poll budget arm judges the
+    switch under-budget. But the event feed is unobserved, so a dropped overload
+    event cannot be distinguished from "no overload" -> the switch freezes UNKNOWN
+    rather than clearing an overload-based P1.
+    """
+    full_coverage(repo)  # poll arm healthy
+    # No healthy_event_feed -> event_coverage == 0.0.
+    sw = make_switch(repo, meta={"total_max_power": 60.0})
+    p1 = make_port(repo, sw_id=sw, idx=1)
+    seed_gauge(repo, p1, "poe_power", 20.0)  # 33% -> poll arm says "fine"
+    result = PoeBudgetDetector().evaluate(_ctx(repo))
+    assert isinstance(result, DetectorResult)
+    assert result.findings == []
+    assert result.unknown_entities == {sw}  # the overload arm froze this switch
+
+
+def test_poe_budget_poll_arm_unaffected_by_event_gap(repo: Repository) -> None:
+    """The POLL budget arm still fires (and is not frozen) even with no event feed."""
+    full_coverage(repo)
+    # No event coverage: the poll arm must be untouched by the event-coverage gate.
+    sw = make_switch(repo, meta={"total_max_power": 60.0})
+    p1 = make_port(repo, sw_id=sw, idx=1)
+    p2 = make_port(repo, sw_id=sw, idx=2)
+    seed_gauge(repo, p1, "poe_power", 30.0)
+    seed_gauge(repo, p2, "poe_power", 25.0)  # 55/60 = 91% -> crit P1 from poll arm
+    result = PoeBudgetDetector().evaluate(_ctx(repo))
+    findings = result.findings if isinstance(result, DetectorResult) else result
+    assert len(findings) == 1 and findings[0].severity is Severity.P1
+
+
+def test_poe_budget_overload_event_does_not_emit_p1_on_event_gap(repo: Repository) -> None:
+    """#2: an overload EVENT must not EMIT a P1 on an unobserved window.
+
+    Device polling is healthy; a normalized EVT_SW_PoeOverload is present; there is
+    NO measured budget pressure (no budget meta / no poll draw). Before the fix the
+    event alone selected P1 and a finding was emitted -- fabricated from an event
+    the feed cannot vouch for. The switch must instead FREEZE (UNKNOWN), never emit.
+    """
+    full_coverage(repo)  # poll arm healthy
+    # No healthy_event_feed -> event_coverage == 0.0.
+    sw = make_switch(repo)  # no budget meta -> poll arm has no verdict
+    make_port(repo, sw_id=sw, idx=1)
+    repo.record_event(ts=NOW - 100, key="EVT_SW_PoeOverload", entity_id=sw)
+    result = PoeBudgetDetector().evaluate(_ctx(repo))
+    assert isinstance(result, DetectorResult)
+    assert result.findings == []  # NOT a P1 finding
+    assert result.unknown_entities == {sw}  # frozen instead
+
+
+def test_poe_budget_overload_event_does_not_escalate_on_event_gap(repo: Repository) -> None:
+    """#2: an overload EVENT must not ESCALATE a poll finding to P1 on a gap.
+
+    The poll budget arm legitimately fires at the WARN tier (P2). An unobserved
+    overload event is present, but it may not raise that finding to P1 -- the
+    escalation would rest on an event the feed cannot vouch for. The P2 poll
+    finding still emits (measured pressure needs no event coverage).
+    """
+    full_coverage(repo)  # poll arm healthy
+    # No healthy_event_feed -> event_coverage == 0.0.
+    sw = make_switch(repo, meta={"total_max_power": 60.0})
+    p1 = make_port(repo, sw_id=sw, idx=1)
+    seed_gauge(repo, p1, "poe_power", 50.0)  # 83% -> warn tier (P2) from poll arm
+    repo.record_event(ts=NOW - 100, key="EVT_SW_PoeOverload", entity_id=sw)
+    result = PoeBudgetDetector().evaluate(_ctx(repo))
+    findings = result.findings if isinstance(result, DetectorResult) else result
+    assert len(findings) == 1
+    assert findings[0].severity is Severity.P2  # NOT escalated to P1 by the event
+    assert findings[0].evidence["overload_events"] == 0  # the event was not credited
+
+
+def test_poe_budget_overload_event_escalates_at_healthy_coverage(repo: Repository) -> None:
+    """#2 (green): with the event feed observed, the overload event escalates to P1."""
+    full_coverage(repo)
+    healthy_event_feed(repo)  # observed feed -> the overload event may escalate
+    sw = make_switch(repo, meta={"total_max_power": 60.0})
+    p1 = make_port(repo, sw_id=sw, idx=1)
+    seed_gauge(repo, p1, "poe_power", 50.0)  # 83% -> warn tier on its own
+    repo.record_event(ts=NOW - 100, key="EVT_SW_PoeOverload", entity_id=sw)
+    result = PoeBudgetDetector().evaluate(_ctx(repo))
+    findings = result.findings if isinstance(result, DetectorResult) else result
+    assert len(findings) == 1
+    assert findings[0].severity is Severity.P1  # event escalated the warn finding
+    assert findings[0].evidence["overload_events"] == 1
+
+
 # ====================================================================== #
 # wired.stp_loop
 # ====================================================================== #
 def test_stp_loop_fires_on_blocking_event(repo: Repository) -> None:
     full_coverage(repo)
+    healthy_event_feed(repo)  # observed feed -> the blocking event may fire
     sw = make_switch(repo)
     pid = make_port(repo, sw_id=sw, idx=1)
     repo.record_event(ts=NOW - 100, key="EVT_SW_StpPortBlocking", entity_id=pid)
@@ -1014,6 +1113,37 @@ def test_stp_loop_fires_on_blocking_event(repo: Repository) -> None:
     assert len(findings) == 1
     assert findings[0].detector_key == KEY_STP_LOOP
     assert findings[0].severity is Severity.P1
+    assert findings[0].evidence["blocking_event"] is True
+
+
+def test_stp_loop_fires_end_to_end_via_normalizer(repo: Repository) -> None:
+    """#4: a RAW EVT_SW_StpPortBlocking (switch mac + port idx) must normalize to
+    the PORT entity so the port-scoped detector fires -- the production path the
+    old direct-port-attributed tests hid. Before the fix the event resolved to the
+    SWITCH entity_id, the detector's port-id comparison never matched, and the rule
+    was silently dead.
+    """
+    from netadmin.ingest.events import EventNormalizer
+    from netadmin.ingest.unifi.models import Event
+
+    full_coverage(repo)
+    healthy_event_feed(repo)  # observed feed -> the blocking event may fire
+    sw = make_switch(repo, native_id="sw:1")
+    pid = make_port(repo, sw_id=sw, idx=1)  # native_id "sw:1:1"
+
+    raw = Event.model_validate(
+        {"_id": "stp-e2e", "key": "EVT_SW_StpPortBlocking", "time": (NOW - 100) * 1000,
+         "sw": "sw:1", "port": 1}
+    )
+    rec = EventNormalizer(repo).normalize(raw)
+    assert rec is not None
+    assert rec["entity_id"] == pid  # attributed to the PORT, not the switch
+    assert rec["related_entity_id"] == sw
+    repo.record_event(**rec)
+
+    findings = StpLoopDetector().evaluate(_ctx(repo))
+    assert len(findings) == 1
+    assert findings[0].detector_key == KEY_STP_LOOP
     assert findings[0].evidence["blocking_event"] is True
 
 
@@ -1027,6 +1157,7 @@ def test_stp_loop_fires_on_blocking_state(repo: Repository) -> None:
 
 def test_stp_loop_quiet_on_forwarding_state(repo: Repository) -> None:
     full_coverage(repo)
+    healthy_event_feed(repo)  # observed feed -> a real clean clear, not a freeze
     sw = make_switch(repo)
     make_port(repo, sw_id=sw, idx=1, stp_state="forwarding")
     assert StpLoopDetector().evaluate(_ctx(repo)) == []
@@ -1038,6 +1169,39 @@ def test_stp_loop_unknown_on_low_coverage(repo: Repository) -> None:
     pid = make_port(repo, sw_id=sw, idx=1)
     repo.record_event(ts=NOW - 100, key="EVT_SW_StpPortBlocking", entity_id=pid)
     assert StpLoopDetector().evaluate(_ctx(repo)) is UNKNOWN
+
+
+# --- B4 (#5): the EVENT arm freezes on an event-feed gap ---------------------- #
+def test_stp_loop_freezes_port_when_event_ages_out_on_gap(repo: Repository) -> None:
+    """#5: a blocking event that established an STP issue then ages out.
+
+    Device polling stays healthy so the detector runs, but the event feed has
+    fallen to 0.0 -- the blocking event has aged out of the window and the port now
+    reads a non-blocking state. Before the fix the detector returned [] (a clear)
+    and the STP issue false-resolved after six clear cycles. Now the port with no
+    poll-arm verdict FREEZES (UNKNOWN) so its open issue holds across the gap.
+    """
+    full_coverage(repo)  # poll arm healthy
+    # No healthy_event_feed -> event_coverage == 0.0; the blocking event has aged out.
+    sw = make_switch(repo)
+    pid = make_port(repo, sw_id=sw, idx=1, stp_state="forwarding")
+    result = StpLoopDetector().evaluate(_ctx(repo))
+    assert isinstance(result, DetectorResult)
+    assert result.findings == []  # does NOT resolve
+    assert result.unknown_entities == {pid}  # frozen instead
+
+
+def test_stp_loop_poll_state_arm_unaffected_by_event_gap(repo: Repository) -> None:
+    """#5: a port sitting in a blocking STP state still fires P1 with no event feed."""
+    full_coverage(repo)
+    # No event coverage: the blocking-STATE (poll) arm must be untouched.
+    sw = make_switch(repo)
+    make_port(repo, sw_id=sw, idx=1, stp_state="blocking")
+    result = StpLoopDetector().evaluate(_ctx(repo))
+    findings = result.findings if isinstance(result, DetectorResult) else result
+    assert len(findings) == 1
+    assert findings[0].severity is Severity.P1
+    assert findings[0].evidence["stp_state"] == "blocking"
 
 
 # ====================================================================== #

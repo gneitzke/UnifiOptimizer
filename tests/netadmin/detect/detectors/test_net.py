@@ -205,8 +205,20 @@ def _disc(repo: Repository, device_id: int, ts: int, tag: str) -> None:
     )
 
 
+def _healthy_event_feed(repo: Repository, *, window_s: int = 7200) -> None:
+    """Substantially-complete event coverage spanning BOTH compared windows.
+
+    The disconnect arm compares [up-compare, up] and [up+settle, now]; with
+    up_ts=NOW-1800 and compare_window_s=3600 both live inside [NOW-5400, NOW].
+    """
+    from tests.netadmin.detect.support import seed_event_coverage
+
+    seed_event_coverage(repo, now=NOW, window_s=window_s)
+
+
 def test_firmware_regression_fires_single_device(repo: Repository) -> None:
     seed_coverage(repo, job="fast_device", now=NOW, window_s=3600, interval_s=60)
+    _healthy_event_feed(repo)
     ap = _ap(repo, "ap-1", "ap-x", model="U6-Pro")
     up_ts = NOW - 1800
     _upgrade(repo, ap, old="6.0.0", new="6.1.0", ts=up_ts)
@@ -224,6 +236,7 @@ def test_firmware_regression_fires_single_device(repo: Repository) -> None:
 
 def test_firmware_regression_fleet_escalates_p1(repo: Repository) -> None:
     seed_coverage(repo, job="fast_device", now=NOW, window_s=3600, interval_s=60)
+    _healthy_event_feed(repo)
     up_ts = NOW - 1800
     for n in range(2):
         ap = _ap(repo, f"ap-{n}", f"ap-{n}", model="U6-Pro")
@@ -248,6 +261,7 @@ def test_firmware_regression_confounder_no_upgrade_quiet(repo: Repository) -> No
 def test_firmware_regression_confounder_stable_post_quiet(repo: Repository) -> None:
     # Upgrade happened, but the post-upgrade disconnect rate is not elevated.
     seed_coverage(repo, job="fast_device", now=NOW, window_s=3600, interval_s=60)
+    _healthy_event_feed(repo)  # both windows observed -> a genuine clean clear
     ap = _ap(repo, "ap-1", model="U6-Pro")
     up_ts = NOW - 1800
     _upgrade(repo, ap, old="6.0.0", new="6.1.0", ts=up_ts)
@@ -266,6 +280,53 @@ def test_firmware_regression_unknown_low_coverage(repo: Repository) -> None:
         _disc(repo, ap, NOW - 1000 + k * 100, f"post{k}")
     repo.record_poll_run(job="fast_device", ok=True, ts=NOW - 60)
     assert FirmwareRegressionDetector().evaluate(_ctx(repo, settings=_fw_settings())) is UNKNOWN
+
+
+# --- B4 (#2): the disconnect arm must not read an UNobserved pre-window as a --- #
+# --- zero baseline; it freezes to UNKNOWN instead of manufacturing a regression - #
+def test_firmware_regression_disc_arm_freezes_on_event_gap(repo: Repository) -> None:
+    """The exact false-positive: post-upgrade disconnects, an unobserved pre-window.
+
+    Device polling is healthy (fast_device full), so the top coverage gate passes.
+    But the event feed was NOT observed over the compared windows, so the empty
+    pre-window disconnect count is a phantom zero baseline. The disconnect arm must
+    freeze the device (UNKNOWN) rather than emit a regression that never happened
+    or clear a possibly-open one.
+    """
+    seed_coverage(repo, job="fast_device", now=NOW, window_s=3600, interval_s=60)
+    # No event coverage seeded -> observed_event_coverage == 0.0 on both windows.
+    ap = _ap(repo, "ap-1", "ap-x", model="U6-Pro")
+    _upgrade(repo, ap, old="6.0.0", new="6.1.0", ts=NOW - 1800)
+    for k in range(5):  # would be a clear disc regression IF the pre-window were observed
+        _disc(repo, ap, NOW - 1000 + k * 100, f"post{k}")
+    result = FirmwareRegressionDetector().evaluate(_ctx(repo, settings=_fw_settings()))
+    assert isinstance(result, DetectorResult)
+    assert result.findings == []  # no phantom regression emitted
+    assert result.unknown_entities == {ap}  # frozen, not cleared
+
+
+def test_firmware_regression_poll_error_arm_unaffected_by_event_gap(repo: Repository) -> None:
+    """The port-error arm is POLL-derived and still fires with no event coverage."""
+    seed_coverage(repo, job="fast_device", now=NOW, window_s=3600, interval_s=60)
+    # No event coverage: the poll error arm must be untouched by the event gate.
+    ap = _ap(repo, "ap-1", "ap-x", model="U6-Pro")
+    up_ts = NOW - 1800
+    _upgrade(repo, ap, old="6.0.0", new="6.1.0", ts=up_ts)
+    port = repo.upsert_entity(
+        Entity(entity_type=EntityType.PORT, native_id="ap-x:1", site_id="default", parent_id=ap),
+        ts=NOW,
+    )
+    # rx_errors is a cumulative COUNTER: read_window yields per-bucket deltas, so
+    # seed a RISING series in the post window (none pre) -> positive post_errors,
+    # zero pre -> err_regressed fires regardless of event coverage.
+    repo.record_samples(
+        [SampleReading(port, "rx_errors", NOW - 1000 + k * 100, float(k * 50)) for k in range(6)]
+    )
+    findings = FirmwareRegressionDetector().evaluate(_ctx(repo, settings=_fw_settings()))
+    findings = findings.findings if isinstance(findings, DetectorResult) else findings
+    assert len(findings) == 1
+    assert findings[0].detector_key == KEY_FIRMWARE_REGRESSION
+    assert findings[0].evidence["post_port_errors"] > 0
 
 
 def test_firmware_regression_excludes_settle_window(repo: Repository) -> None:
