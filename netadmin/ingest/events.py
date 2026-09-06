@@ -37,10 +37,8 @@ from datetime import datetime, timezone
 from time import monotonic
 from typing import Any, Awaitable, Callable, Optional
 
-import httpx
 
 from netadmin.domain.types import EntityType
-from netadmin.ingest.unifi.auth import UnifiError
 from netadmin.ingest.unifi.endpoints import Endpoints
 from netadmin.ingest.unifi.models import Event
 from netadmin.ingest.unifi.ws import EventListener as WsEventListener
