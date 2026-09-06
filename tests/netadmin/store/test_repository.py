@@ -1182,94 +1182,129 @@ def test_open_read_only_never_migrates(tmp_db_path: Path) -> None:
 
 # ---------------------------------------------------------------------------
 # B4: observed_event_coverage -- the honest event-feed gap signal
+#
+# POSITIVE-LIVENESS redesign: coverage is credited only across spans carrying WS
+# liveness HEARTBEATS (record_ws_heartbeat), never through end_ts on a still-open
+# 'connected' row. Beats no more than _WS_HEARTBEAT_MAX_GAP_S apart chain into a
+# continuous covered run; coverage ends at the LAST beat.
 # ---------------------------------------------------------------------------
-def test_observed_event_coverage_credits_healthy_connected_ws(repo: Repository) -> None:
-    """B4(c): a healthy WS-only deployment that is CONNECTED and observing reads as
-    covered even with NO history-catchup coverage rows -- 'no catch-up rows yet'
-    must not mean 'frozen forever'. The supervisor recorded a 'connected'
-    transition when its socket handshake completed (before the window) and no
-    closing row since (still up), so coverage runs through end_ts.
+def _seed_heartbeats(repo: Repository, start: int, end: int, *, step: int = 60) -> None:
+    """Seed WS liveness heartbeats across ``[start, end]`` at ``step``.
+
+    Both endpoints are guaranteed to carry a beat regardless of alignment, so the
+    covered run reaches exactly ``[start, end]``.
     """
+    ts = start
+    while ts < end:
+        repo.record_ws_heartbeat(ts=ts)
+        ts += step
+    repo.record_ws_heartbeat(ts=end)
+
+
+def test_observed_event_coverage_credits_healthy_connected_ws(repo: Repository) -> None:
+    """B4(c): a healthy WS-only deployment that is CONNECTED and draining emits a
+    steady stream of liveness heartbeats, so it reads as (effectively) fully
+    covered even with NO history-catchup rows -- 'no catch-up rows yet' must not
+    mean 'frozen forever'. Coverage is bounded by the LAST heartbeat (never
+    credited past it), so it is one heartbeat cadence short of the window edge,
+    which is still far above the 0.5 sufficiency floor."""
     now = 2_000_000
     start = now - 3600
-    repo.record_poll_run(job="ws", ok=True, ts=start - 100, error="connected", source="live")
-    assert repo.observed_event_coverage(start, now) == pytest.approx(1.0)
+    # A prior beat just before the window bridges the leading edge; beats then run
+    # every 60 s right up to the window end.
+    _seed_heartbeats(repo, start - 60, now - 1, step=60)
+    cov = repo.observed_event_coverage(start, now)
+    assert cov >= 0.99
+    assert cov <= 1.0
 
 
-def test_observed_event_coverage_started_never_connected_credits_nothing(
+def test_observed_event_coverage_no_heartbeats_credits_nothing(
     repo: Repository,
 ) -> None:
-    """B4(a): the P1 fix. A pre-handshake 'started' liveness row is NOT a connect:
-    a socket that entered the subscription but never completed a handshake (a
-    dangling 'started') must credit ZERO coverage. Under the old code this stale
-    'started' read as 100% covered and could false-clear real event issues."""
+    """B4(a): a socket that emitted no liveness heartbeats credits ZERO coverage --
+    even if 'started'/'connected' transition rows exist. Those transitions drive
+    only the health string; a feed with no positive liveness was not observed.
+    Under the old close-event design a dangling 'connected' read as 100% and
+    false-cleared real event issues."""
     now = 2_000_000
     start = now - 3600
-    # 'started' before the window and a second 'started' inside it: no 'connected'
-    # transition ever fired, so the feed was never observed.
+    # Transition rows present, but not one heartbeat: no positive evidence.
     repo.record_poll_run(job="ws", ok=True, ts=start - 100, error="started", source="live")
-    repo.record_poll_run(job="ws", ok=True, ts=start + 1800, error="started", source="live")
+    repo.record_poll_run(job="ws", ok=True, ts=start - 50, error="connected", source="live")
     assert repo.observed_event_coverage(start, now) == 0.0
 
 
-def test_observed_event_coverage_ws_connected_inside_window(repo: Repository) -> None:
-    """A WS whose handshake completed partway through the window covers only from
-    that point -- and the 'started' that preceded the handshake credits nothing."""
+def test_observed_event_coverage_ws_heartbeats_inside_window(repo: Repository) -> None:
+    """A feed that only began heartbeating partway through the window covers only
+    from the first beat onward -- the earlier, beat-less span credits nothing."""
     now = 2_000_000
     start = now - 3600
-    # started fires first (entering the subscription), then connected at +1800.
-    repo.record_poll_run(job="ws", ok=True, ts=start + 900, error="started", source="live")
-    repo.record_poll_run(job="ws", ok=True, ts=start + 1800, error="connected", source="live")
-    assert repo.observed_event_coverage(start, now) == pytest.approx(0.5, abs=1e-6)
+    # Heartbeats only across the second half [start+1800 .. now].
+    _seed_heartbeats(repo, start + 1800, now - 1, step=60)
+    cov = repo.observed_event_coverage(start, now)
+    # ~0.5 (bounded above by the last beat), comfortably under full.
+    assert cov == pytest.approx(0.5, abs=0.02)
+    assert cov < 0.6
 
 
-def test_observed_event_coverage_connect_then_disconnect_ends_interval(
+def test_observed_event_coverage_heartbeats_stop_ends_interval(
     repo: Repository,
 ) -> None:
-    """B4(b): connect-then-disconnect credits ONLY the connected span, not through
-    end_ts. The WS handshake completed 100 s before the hour, then an INTERNAL
-    drop moved it to 'reconnecting' (a 'disconnected' row) 600 s in and it never
-    reconnected. Coverage is ~0.167, well below the sufficiency floor -> UNKNOWN.
-    The old code left the interval open through end_ts (a false 100%)."""
+    """B4(b): heartbeats that stop (a drop, a shutdown, or a stalled feed) end
+    coverage at the LAST beat, not through end_ts. Beats run for the first 600 s
+    of the hour then cease; coverage is ~0.167, below the sufficiency floor ->
+    UNKNOWN. The old code left the interval open through end_ts (a false 100%)."""
     now = 2_000_000
     start = now - 3600
-    repo.record_poll_run(job="ws", ok=True, ts=start - 100, error="connected", source="live")
-    repo.record_poll_run(
-        job="ws", ok=True, ts=start + 600, error="disconnected", source="live"
-    )
+    # A prior beat bridges the leading edge; beats run start..start+600 then stop.
+    _seed_heartbeats(repo, start - 60, start + 600, step=60)
     cov = repo.observed_event_coverage(start, now)
-    assert cov == pytest.approx(600 / 3600, abs=1e-6)
+    assert cov == pytest.approx(600 / 3600, abs=0.02)
     assert cov < 0.9
 
 
 def test_observed_event_coverage_large_gap_reads_as_uncovered(repo: Repository) -> None:
-    """B4(c): a real large gap still freezes. The WS connected then the listener
-    DIED (terminal error row) 600 s into the hour and never reconnected; no
-    history catch-up rows exist. Coverage is ~0.167 -> UNKNOWN. Any non-'connected'
-    row (here a terminal error) closes the interval."""
+    """B4(c): a real large gap still freezes. Two short bursts of heartbeats with a
+    gap far larger than _WS_HEARTBEAT_MAX_GAP_S between them do NOT chain: the
+    empty middle is a genuine hole, so coverage stays well below full -> UNKNOWN."""
     now = 2_000_000
     start = now - 3600
-    repo.record_poll_run(job="ws", ok=True, ts=start - 100, error="connected", source="live")
-    repo.record_poll_run(
-        job="ws", ok=False, ts=start + 600, error="ConnectionResetError: peer", source="live"
-    )
+    _seed_heartbeats(repo, start, start + 300, step=60)      # early burst
+    _seed_heartbeats(repo, now - 360, now - 1, step=60)      # late burst
     cov = repo.observed_event_coverage(start, now)
-    assert cov == pytest.approx(600 / 3600, abs=1e-6)
-    assert cov < 0.9
+    # ~ (300 + ~360) / 3600 -- the big middle gap is uncovered.
+    assert cov < 0.3
 
 
 def test_observed_event_coverage_unions_ws_and_history(repo: Repository) -> None:
-    """WS-connected intervals and completed history reads are merged, not double
-    counted: WS covers the first 600 s, a catch-up row the last 600 s -> ~0.33."""
+    """WS heartbeat intervals and completed history reads are merged, not double
+    counted: heartbeats cover the first 600 s, a catch-up row the last 600 s ->
+    ~0.33."""
     now = 2_000_000
     start = now - 3600
-    repo.record_poll_run(job="ws", ok=True, ts=start - 50, error="connected", source="live")
-    repo.record_poll_run(job="ws", ok=False, ts=start + 600, error="died", source="live")
+    _seed_heartbeats(repo, start, start + 600, step=60)
     repo.record_ingest_coverage(
         kind="event_history", scope="site", interval="retained",
         start_ts=now - 600, end_ts=now, status="complete",
     )
-    assert repo.observed_event_coverage(start, now) == pytest.approx(1200 / 3600, abs=1e-6)
+    assert repo.observed_event_coverage(start, now) == pytest.approx(1200 / 3600, abs=0.02)
+
+
+def test_observed_event_coverage_stale_disconnect_write_cannot_overcredit(
+    repo: Repository,
+) -> None:
+    """B4: a MISSING or failed 'disconnected' close row can no longer over-credit.
+    Coverage is bounded by the last heartbeat regardless of any close row: here a
+    dangling 'connected' with NO closing 'disconnected' and beats only over the
+    first 600 s reads ~0.167, not 100%."""
+    now = 2_000_000
+    start = now - 3600
+    repo.record_poll_run(job="ws", ok=True, ts=start - 100, error="connected", source="live")
+    _seed_heartbeats(repo, start - 60, start + 600, step=60)
+    # No 'disconnected' row was ever written (the failed-close path).
+    cov = repo.observed_event_coverage(start, now)
+    assert cov == pytest.approx(600 / 3600, abs=0.02)
+    assert cov < 0.9
 
 
 # ---------------------------------------------------------------------------
