@@ -2701,6 +2701,28 @@ class Repository:
             counts[int(r["incident_id"])] = int(r["n"])
         return counts
 
+    # C5: current *total* membership (root + symptoms still attached), batched
+    # like incident_member_counts but scoped to cleared_ts IS NULL -- the list
+    # endpoint's "member_count"/"symptom_count" cards must reflect the
+    # incident's present state, not the append-only historical union (which is
+    # what incident_member_counts/is_genuine_incident deliberately keep using).
+    def current_incident_member_counts(self, incident_ids: Iterable[int]) -> dict[int, int]:
+        """Currently-attached member count per incident (cleared history excluded)."""
+        ids = [int(i) for i in dict.fromkeys(incident_ids) if i is not None]
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            "SELECT incident_id, COUNT(*) AS n FROM incident_members "
+            "WHERE cleared_ts IS NULL "
+            f"AND incident_id IN ({placeholders}) GROUP BY incident_id",
+            ids,
+        ).fetchall()
+        counts = {i: 0 for i in ids}
+        for row in rows:
+            counts[int(row["incident_id"])] = int(row["n"])
+        return counts
+
     # C5: current symptom counts are deliberately separate from historical
     # member counts, which keep resolved incidents visible as genuine incidents.
     def incident_open_symptom_counts(self, incident_ids: Iterable[int]) -> dict[int, int]:
