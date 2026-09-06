@@ -821,6 +821,86 @@ def test_last_seen_never_moves_backwards_when_membership_shrinks(topo: TopologyB
     assert store.all_incidents()[0].last_seen_ts == T + 900
 
 
+def test_retained_incident_summary_drops_cleared_symptoms(topo: TopologyBuilder) -> None:
+    """C5 (round 15): a retained incident's SUMMARY must be recomputed from the
+    CURRENTLY-open symptoms, not the historical union.
+
+    Root (mesh backhaul) + coverage hole + flaky client, then the root and the
+    coverage hole clear, leaving only the flaky client. The stored summary must
+    stop narrating the cleared coverage hole -- it flows verbatim to API / UI /
+    MCP, so a stale "is causing 1 coverage hole and 1 client dropout" would
+    mis-report the network's current state.
+    """
+    ap = topo.add(1, "ap", name="AP-Garage-Mesh")
+    client = topo.add(2, "client", parent_id=ap, name="Doorbell")
+    issues = [
+        make_issue(10, "wifi.mesh_uplink", ap, first_seen_ts=T, severity=Severity.P2),
+        make_issue(11, "net.coverage_hole", ap, first_seen_ts=T + 10, severity=Severity.P2),
+        make_issue(
+            12,
+            "client.flaky",
+            client,
+            first_seen_ts=T + 20,
+            severity=Severity.P2,
+            evidence={"attribution": "device_or_deadspot", "attributed_ap": "AP-Garage-Mesh"},
+        ),
+    ]
+    store = InMemoryCorrelationStore(issues, topo.build())
+    engine = CorrelationEngine(store)
+    engine.run(NOW)
+
+    # Fully active: the causal sentence names both symptoms in that cell.
+    full = store.all_incidents()[0].summary
+    assert "coverage hole" in full
+    assert "client dropout" in full
+    assert full.endswith("in that cell.")
+
+    # The operator fixes the backhaul AND the coverage hole clears; only the
+    # flaky client is still open -> the incident is retained under its identity.
+    issues[0].state = IssueState.RESOLVED
+    issues[1].state = IssueState.RESOLVED
+    store.set_issues(issues)
+    engine.run(NOW + 300)
+
+    inc = store.all_incidents()[0]
+    assert inc.state == IncidentState.OPEN
+    # The summary now describes ONLY the currently-open symptom.
+    assert "coverage hole" not in inc.summary, "cleared symptom must drop out of the narration"
+    assert "1 client dropout" in inc.summary, "count reflects the single surviving symptom"
+    assert "2 " not in inc.summary, "no stale union count"
+    # Title + cell-locale (both owned by the resolved root) are preserved.
+    assert inc.summary.startswith("Weak mesh backhaul on AP-Garage-Mesh is causing")
+    assert inc.summary.endswith("in that cell.")
+
+
+def test_fully_active_incident_summary_is_stable_across_reruns(topo: TopologyBuilder) -> None:
+    """The control case: while every member stays open, re-running must not alter
+    the summary (only a change in current membership regenerates it)."""
+    ap = topo.add(1, "ap", name="AP-Garage-Mesh")
+    client = topo.add(2, "client", parent_id=ap, name="Doorbell")
+    issues = [
+        make_issue(10, "wifi.mesh_uplink", ap, first_seen_ts=T, severity=Severity.P2),
+        make_issue(11, "net.coverage_hole", ap, first_seen_ts=T + 10, severity=Severity.P2),
+        make_issue(
+            12,
+            "client.flaky",
+            client,
+            first_seen_ts=T + 20,
+            severity=Severity.P2,
+            evidence={"attribution": "device_or_deadspot", "attributed_ap": "AP-Garage-Mesh"},
+        ),
+    ]
+    store = InMemoryCorrelationStore(issues, topo.build())
+    engine = CorrelationEngine(store)
+    engine.run(NOW)
+    first = store.all_incidents()[0].summary
+
+    engine.run(NOW + 300)
+    engine.run(NOW + 600)
+    assert store.all_incidents()[0].summary == first
+    assert "coverage hole" in first and "client dropout" in first
+
+
 def test_retained_incident_tracks_its_surviving_symptom(topo: TopologyBuilder) -> None:
     ap = topo.add(1, "ap", name="AP-Garage-Mesh")
     issues = [
