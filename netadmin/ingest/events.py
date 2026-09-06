@@ -38,6 +38,7 @@ from time import monotonic
 from typing import Any, Awaitable, Callable, Optional
 
 from netadmin.domain.types import EntityType
+from netadmin.ingest.unifi.auth import UnifiError
 from netadmin.ingest.unifi.endpoints import Endpoints
 from netadmin.ingest.unifi.models import Event
 from netadmin.ingest.unifi.ws import EventListener as WsEventListener
@@ -329,7 +330,25 @@ async def catchup_events(
         coverage_start = max(coverage_start, now_s - within_hours * 3600)
     if explicit_cursor and since_ts is not None:
         coverage_start = max(coverage_start, since_ts)
-    events = await endpoints.stat_event(within_hours=within_hours, max_events=max_events)
+    try:
+        events = await endpoints.stat_event(within_hours=within_hours, max_events=max_events)
+    except UnifiError as exc:
+        # BUG#6: the event read FAILED -- the controller answered without a
+        # well-formed success payload (an error envelope / unrecognized body), or
+        # a transport/auth read error surfaced. This is NOT a successful empty
+        # collection: it says nothing about the requested window, so coverage must
+        # NOT be credited for it. Record the window as a first-class FAILED hole
+        # (queryable, retried on the next sweep -- never counted by
+        # ``observed_event_coverage``, which unions only 'complete' spans) instead
+        # of the bogus 'complete' the empty-default fabricated, then re-raise so the
+        # collector's per-job firewall marks this poll failed rather than clean.
+        repo.record_ingest_coverage(
+            kind="event_history", scope="site", interval="retained",
+            start_ts=coverage_start, end_ts=now_s, status="failed",
+            detail=f"event read failed: {type(exc).__name__}: {exc}"[:200],
+        )
+        logger.warning("Catch-up event read failed; window recorded failed: %s", exc)
+        raise
     records: list[dict[str, Any]] = []
     for event in events:
         record = normalizer.normalize(event)
@@ -717,11 +736,45 @@ class EventListener:
             if flusher is not None:
                 flusher.cancel()
                 await asyncio.gather(flusher, return_exceptions=True)
-            # Do not discard a retained batch on a failed final flush.  Raise the
-            # failure so supervisor/health report it; a normal final flush still
-            # commits and clears exactly once.
-            self._flush()
-            self._normalizer.reconcile_unresolved()
+            # BUG#5: if this teardown is running because the task is being
+            # CANCELLED (production ``SupervisorTask.stop()`` cancels the supervise
+            # loop, and the cancel lands mid-``async for`` here), a storage failure
+            # in the final ``_flush()`` must NEVER replace the in-flight
+            # CancelledError. A raw exception raised from a ``finally`` silently
+            # REPLACES the exception propagating through it -- so an
+            # ``OperationalError`` from a teardown flush turned a shutdown into a
+            # spurious listener DEATH: the supervisor's ``except Exception`` treated
+            # it as ordinary and returned normally (task.cancelled()==False) or
+            # restarted, and the stop() was lost. Detect the cancelling state and,
+            # on a flush failure during cancellation, retain the batch (the
+            # supervisor rescues it) and let the CancelledError propagate untouched.
+            # The batch is preserved either way -- ``_flush`` removes nothing until
+            # SQLite commits -- so a normal final flush still commits and clears
+            # exactly once, and a non-cancel flush failure still RAISES so
+            # supervisor/health report it.
+            cancelling = False
+            current = asyncio.current_task()
+            if current is not None:
+                try:
+                    cancelling = current.cancelling() > 0
+                except AttributeError:  # pragma: no cover - Python < 3.11
+                    cancelling = False
+            try:
+                self._flush()
+                self._normalizer.reconcile_unresolved()
+            except Exception as exc:  # noqa: BLE001 - classified by cancel state
+                self._storage_error = exc
+                if not cancelling:
+                    # Normal (non-shutdown) death: surface the failure as before.
+                    raise
+                # Shutdown: keep the batch for the supervisor to rescue and let the
+                # cancel win. Swallowing here (not returning) lets the original
+                # CancelledError resume propagating out of ``run``.
+                logger.exception(
+                    "WS event storage flush failed during cancellation; retaining "
+                    "%d events for rescue and propagating the cancel",
+                    len(self._batch),
+                )
             # The production low-level listener returns normally only when its
             # subscription is unavailable (a requested stop is not a failure).
             ws_stop = getattr(self._ws, "_stop", None)
@@ -1030,6 +1083,22 @@ class WsSupervisor:
                         self._drain_pending()
                     raise
                 except Exception as exc:  # noqa: BLE001 - firewall: any death is recoverable
+                    # BUG#5 (belt-and-braces): a storage failure in listener
+                    # teardown can surface HERE as an ordinary exception even while
+                    # this task is being cancelled -- if any cleanup path still lets
+                    # a non-CancelledError replace the cancel. When the task is
+                    # actually being cancelled this is a SHUTDOWN, not a listener
+                    # death: rescue + final-drain the dying listener's buffers and
+                    # re-raise CancelledError so ``stop()`` reliably stops instead of
+                    # returning normally (task.cancelled()==False) or restarting.
+                    current = asyncio.current_task()
+                    if current is not None and getattr(current, "cancelling", lambda: 0)() > 0:
+                        self.state = "stopped"
+                        try:
+                            self._rescue_pending(listener)
+                        finally:
+                            self._drain_pending()
+                        raise asyncio.CancelledError() from exc
                     clean = False
                     error = f"{type(exc).__name__}: {exc}"
                     lowered = error.lower()

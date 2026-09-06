@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
+import httpx
 import pytest
+import respx
 
 from netadmin.domain.entities import Entity
 from netadmin.domain.types import EntityType
@@ -1561,3 +1564,181 @@ def test_bug6_recovery_keeps_newer_events_not_prefix(
     assert stored == {"new4", "new5", "new6"}
     assert sup.dropped == 3
     assert sup._pending == [] and sup._pending_raw == []
+
+
+# --------------------------------------------------------------------------- #
+# BUG#5 (a storage failure during CANCELLATION masks CancelledError): cancel the
+# real supervisor while its real listener holds one buffered event; the listener's
+# teardown ``_flush()`` raises OperationalError, which -- from a ``finally`` --
+# silently REPLACED the in-flight CancelledError. The supervisor then saw an
+# ordinary listener death: with max_restarts=0 it returned normally
+# (task.cancelled()==False) or, with retries, could RESTART -- and stop() was lost.
+# Fix: a teardown flush failure during cancellation must never swallow/replace the
+# CancelledError; the batch is retained (rescued), the final drain still runs, and
+# the cancel ALWAYS propagates.
+# --------------------------------------------------------------------------- #
+class _YieldOneThenBlockWs:
+    """WS double: yields ONE event, then blocks forever so the listener holds the
+    event buffered (un-flushed) until the supervise task is cancelled."""
+
+    def __init__(self, event: Event) -> None:
+        self._event = event
+        self.on_state: Optional[Any] = None
+        self._stop = SimpleNamespaceStop()
+
+    async def events(self) -> AsyncIterator[Event]:
+        if self.on_state is not None:
+            self.on_state("connected")
+        yield self._event
+        await asyncio.Event().wait()  # block until cancelled
+        yield self._event  # pragma: no cover - never reached
+
+    def stop(self) -> None:  # pragma: no cover - parity
+        self._stop.set()
+
+
+@pytest.mark.asyncio
+async def test_bug5_cancel_during_teardown_flush_failure_still_propagates(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = repo.record_events_enriching_entities
+    calls = {"n": 0}
+
+    def flaky(rows: object) -> int:
+        calls["n"] += 1
+        # The listener's TEARDOWN flush (call #1, during cancellation) fails -- the
+        # exact storage blip that used to mask the cancel. The supervisor's final
+        # drain (call #2) then succeeds, proving the drain still ran.
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real(rows)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repo, "record_events_enriching_entities", flaky)
+
+    buffered = Event.model_validate(
+        {"_id": "buffered", "key": "EVT_X", "time": 1_721_600_000_000}
+    )
+
+    factory_calls = {"n": 0}
+
+    def factory() -> EventListener:
+        factory_calls["n"] += 1
+        # batch_size high + no periodic flusher => the event sits un-flushed in the
+        # batch until the teardown flush on cancellation.
+        return EventListener(
+            _YieldOneThenBlockWs(buffered), repo, flush_interval=None, batch_size=50
+        )
+
+    # max_restarts=0: were the cancel masked as an ordinary death, the loop would
+    # return normally (task.cancelled()==False) rather than propagate the cancel.
+    sup = WsSupervisor(factory, repo, backoff_base=0.0, max_restarts=0)
+    task = asyncio.create_task(sup.run())
+
+    # Let the listener connect, consume+buffer the event, and reach the block.
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if sup.state == "connected":
+            break
+    assert sup.state == "connected"
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # Cancellation PROPAGATED (not a spurious normal return) ...
+    assert task.cancelled()
+    # ... exactly one listener was built (no restart) ...
+    assert factory_calls["n"] == 1
+    # ... the teardown flush DID fail (the masking scenario was exercised) ...
+    assert calls["n"] >= 2
+    # ... and the final drain still ran: the buffered event was rescued and
+    # persisted, not stranded.
+    assert {r["native_id"] for r in repo.read_events(0, 2_000_000_000)} == {"buffered"}
+    assert sup._pending == []
+
+
+# --------------------------------------------------------------------------- #
+# BUG#6 (an unrecognized GET response fabricates event coverage): through the real
+# UnifiClient -> Endpoints -> catchup_events, an HTTP 200 body with no well-formed
+# success payload (e.g. ``{"error": "upstream unavailable"}`` -- no "data" key)
+# became ZERO events and 1.0 'complete' coverage for the window: the read helper
+# defaulted a missing "data" to [] and catch-up booked the window complete. That
+# fabricates event-source coverage and defeats every detector coverage gate. Fix:
+# only a well-formed success response (data present, or meta.rc=ok) counts as a
+# real read; anything else is a FAILED read, and catch-up records the window
+# failed (never counted by observed_event_coverage), not complete. A genuinely
+# empty ``{"data": []}`` still records complete.
+# --------------------------------------------------------------------------- #
+_BUG6_HOST = "https://ctrl6.test"
+_BUG6_SITE = "default"
+_BUG6_API = f"{_BUG6_HOST}/proxy/network/api/s/{_BUG6_SITE}"
+
+
+def _bug6_mock_login() -> None:
+    respx.get(f"{_BUG6_HOST}/proxy/network/").mock(return_value=httpx.Response(401))
+    respx.post(f"{_BUG6_HOST}/api/auth/login").mock(
+        return_value=httpx.Response(200, headers={"X-CSRF-Token": "c"}, json={})
+    )
+
+
+async def _bug6_endpoints() -> tuple[Any, Any]:
+    from netadmin.ingest.unifi.client import UnifiClient
+    from netadmin.ingest.unifi.endpoints import Endpoints
+
+    client = UnifiClient(
+        host=_BUG6_HOST, site=_BUG6_SITE, username="u", password="p",
+        min_request_interval=0.0,
+    )
+    await client.connect()
+    return client, Endpoints(client)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_bug6_unrecognized_event_response_records_failed_not_complete(
+    repo: Repository,
+) -> None:
+    from netadmin.ingest.unifi.auth import UnifiError
+
+    _bug6_mock_login()
+    # HTTP 200 but NOT a success envelope: an error body with no "data" key.
+    respx.get(f"{_BUG6_API}/stat/event").mock(
+        return_value=httpx.Response(200, json={"error": "upstream unavailable"})
+    )
+    client, ep = await _bug6_endpoints()
+    now = 1_721_700_000
+
+    # The read is a FAILURE, not a successful empty collection: it must surface so
+    # the caller's poll firewall marks the cycle failed.
+    with pytest.raises(UnifiError):
+        await catchup_events(repo, ep, now=now)
+    await client.aclose()
+
+    # No 'complete' coverage was fabricated: the window reads 0.0 (a gap ->
+    # detectors freeze to UNKNOWN), and a queryable FAILED hole was recorded.
+    assert repo.observed_event_coverage(now - 3600, now) == 0.0
+    assert repo.observed_event_coverage(now - 30 * 24 * 3600, now) == 0.0
+    failed = repo.failed_ingest_coverage(kind="event_history", scope="site")
+    assert failed and any(int(r["end_ts"]) == now for r in failed)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_bug6_wellformed_empty_event_response_still_records_complete(
+    repo: Repository,
+) -> None:
+    _bug6_mock_login()
+    # A genuinely successful, authoritative EMPTY read still records complete.
+    respx.get(f"{_BUG6_API}/stat/event").mock(
+        return_value=httpx.Response(200, json={"meta": {"rc": "ok"}, "data": []})
+    )
+    client, ep = await _bug6_endpoints()
+    now = 1_721_700_000
+
+    inserted = await catchup_events(repo, ep, now=now)
+    await client.aclose()
+
+    assert inserted == 0
+    # A well-formed empty read is a real observation: the window is credited.
+    assert repo.observed_event_coverage(now - 3600, now) == 1.0
+    assert repo.failed_ingest_coverage(kind="event_history", scope="site") == []
