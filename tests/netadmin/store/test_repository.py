@@ -1834,6 +1834,122 @@ def test_unresolved_events_degrades_when_attempt_column_absent(
     rw.close()
 
 
+@pytest.mark.parametrize("falsy_ap_from", [False, 0, []])
+def test_roam_falsy_nonstring_ap_from_resolves_via_ap_not_parked_forever(
+    repo: Repository, falsy_ap_from: object
+) -> None:
+    """#3-SQL: a roam event whose ``ap_from`` is a FALSY NON-STRING (False/0/[])
+    must be attributed to ``ap`` -- exactly as the normalizer's ``ap_from or ap``
+    does -- and be REPAIRED when that ``ap`` appears, not parked forever.
+
+    The normalizer treats only a NON-EMPTY STRING mac as a usable ap_from; a JSON
+    boolean/integer/array is absent and precedence falls back to ``ap``. The old
+    SQL used ``NULLIF(ap_from,'')`` which collapses only the EMPTY STRING, so a
+    JSON ``false``/``0``/``[]`` survived as present-and-unresolvable: ``eapf``
+    joined on that falsy value (never a real native_id), resolvable stayed 0
+    forever, and once the row's attempt budget was spent it was parked out of the
+    reconcile window and NEVER re-admitted -- so discovering the AP yielded ZERO
+    repairs. After aligning the SQL to ``json_type='text'``, the falsy ap_from is
+    absent, resolvability follows ``ap``, and the parked row is un-parked and
+    repaired the instant its ``ap`` shows up.
+    """
+    from netadmin.ingest.events import EventNormalizer
+    from netadmin.store.repository import _EVENT_RECONCILE_MAX_ATTEMPTS
+
+    client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500
+    )
+    ev = repo.record_event(
+        ts=1000, key="EVT_WU_Roam", entity_id=client, related_entity_id=None,
+        native_id="roam-falsy",
+        data={"key": "EVT_WU_Roam", "time": 1000 * 1000, "user": "cli:mac",
+              "ap_from": falsy_ap_from, "ap": "ap-real:mac"},
+    )
+    assert ev is not None
+
+    # AP still absent: exhaust the attempt budget so the row is parked -- the exact
+    # state in which the buggy SQL strands it (resolvable never recovers to 1).
+    for _ in range(_EVENT_RECONCILE_MAX_ATTEMPTS):
+        repo.bump_event_reconcile_attempts([ev])
+    assert ev not in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+
+    # The AP named by ``ap`` appears: the normalizer attributes the falsy-ap_from
+    # roam to THIS ap, so the row must become resolvable and be re-admitted.
+    ap = repo.upsert_entity(Entity(entity_type=EntityType.AP, native_id="ap-real:mac"), ts=9000)
+    assert ev in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+
+    # End-to-end: reconcile repairs it, related_entity_id -> the ``ap`` entity.
+    assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 1
+    row = repo._conn.execute(
+        "SELECT related_entity_id FROM events WHERE id=?", (ev,)
+    ).fetchone()
+    assert row["related_entity_id"] == ap
+
+
+def test_roam_empty_string_ap_from_still_resolves_via_ap(repo: Repository) -> None:
+    """#3-SQL control: the empty-string ap_from case (D3) still routes to ``ap``.
+
+    ``ap_from=""`` was already handled by ``NULLIF(...,'')``; the string-only
+    tightening must not regress it -- an empty string is a text-typed value that
+    NULLIF still collapses to absent, falling through to ``ap``.
+    """
+    from netadmin.ingest.events import EventNormalizer
+    from netadmin.store.repository import _EVENT_RECONCILE_MAX_ATTEMPTS
+
+    client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500
+    )
+    ev = repo.record_event(
+        ts=1000, key="EVT_WU_Roam", entity_id=client, related_entity_id=None,
+        native_id="roam-empty",
+        data={"key": "EVT_WU_Roam", "time": 1000 * 1000, "user": "cli:mac",
+              "ap_from": "", "ap": "ap-real:mac"},
+    )
+    for _ in range(_EVENT_RECONCILE_MAX_ATTEMPTS):
+        repo.bump_event_reconcile_attempts([ev])
+    ap = repo.upsert_entity(Entity(entity_type=EntityType.AP, native_id="ap-real:mac"), ts=9000)
+    assert ev in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+    assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 1
+    row = repo._conn.execute(
+        "SELECT related_entity_id FROM events WHERE id=?", (ev,)
+    ).fetchone()
+    assert row["related_entity_id"] == ap
+
+
+def test_roam_real_nonempty_ap_from_still_routes_to_ap_from(repo: Repository) -> None:
+    """#3-SQL: a real NON-EMPTY STRING ap_from still resolves to the FROM-AP, not
+    to ``ap`` -- the string-only rule keeps genuine attribution intact.
+
+    ``ap_from`` and ``ap`` name DIFFERENT APs. Only the from-AP is in inventory,
+    so the row resolves iff resolvability consults ``ap_from`` (not ``ap``); the
+    repaired related_entity_id must be the from-AP.
+    """
+    from netadmin.ingest.events import EventNormalizer
+
+    client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500
+    )
+    from_ap = repo.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="ap-from:mac"), ts=500
+    )
+    # A DIFFERENT ap that is deliberately NOT in inventory -- if resolvability
+    # (wrongly) consulted ``ap`` the row would not resolve and stay NULL.
+    ev = repo.record_event(
+        ts=1000, key="EVT_WU_Roam", entity_id=client, related_entity_id=None,
+        native_id="roam-real",
+        data={"key": "EVT_WU_Roam", "time": 1000 * 1000, "user": "cli:mac",
+              "ap_from": "ap-from:mac", "ap": "ap-other:mac"},
+    )
+    # Resolvable now (from-AP present) and ranked first.
+    selected = repo.unresolved_events(limit=500)
+    assert int(selected[0]["id"]) == ev
+    assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 1
+    row = repo._conn.execute(
+        "SELECT related_entity_id FROM events WHERE id=?", (ev,)
+    ).fetchone()
+    assert row["related_entity_id"] == from_ap
+
+
 def test_wrong_precedence_mac_is_not_resolvable_and_does_not_starve(
     repo: Repository,
 ) -> None:

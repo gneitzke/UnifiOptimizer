@@ -714,3 +714,113 @@ def test_migration_0009_carries_live_snoozes_into_suppression(tmp_db_path: Path)
     assert events[0][0] == "suppressed"
     assert '"source":"migration"' in events[0][1]
     conn.close()
+
+
+def _deny_commit(action: int, arg1, arg2, dbname, source) -> int:
+    """Authorizer that fails only COMMIT -- a stand-in for a WAL/disk COMMIT fault.
+
+    SQLite leaves the transaction OPEN when COMMIT is refused, exactly as a real
+    commit-time I/O error does, so this drives the #4 dangling-transaction path.
+    ROLLBACK and every other statement are allowed, so the cleanup can run.
+    """
+    if action == sqlite3.SQLITE_TRANSACTION and arg1 == "COMMIT":
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
+
+def test_begin_immediate_failed_commit_leaves_no_open_transaction(tmp_db_path: Path) -> None:
+    """#4: a COMMIT that raises must not leave the transaction OPEN.
+
+    Before the fix COMMIT sat outside the rollback-protected try, so a failed
+    COMMIT propagated with the transaction still open. A later writer that tests
+    ``in_transaction`` would then mistake that abandoned transaction for
+    legitimate nesting and silently join it. The fix rolls the transaction back
+    on a COMMIT failure so the connection returns to a clean, known state.
+    """
+    conn = db.connect(tmp_db_path)
+    db.apply_migrations(conn)
+
+    # A durable committed row -- must survive the failed-commit turbulence below.
+    with db.begin_immediate(conn):
+        conn.execute("INSERT INTO poll_runs (ts, job, ok) VALUES (1, 'break', 1)")
+
+    conn.set_authorizer(_deny_commit)
+    with pytest.raises(sqlite3.DatabaseError):
+        with db.begin_immediate(conn):
+            conn.execute("INSERT INTO poll_runs (ts, job, ok) VALUES (2, 'heartbeat', 1)")
+    conn.set_authorizer(None)
+
+    # Root-cause guarantee: no dangling open transaction after the failed COMMIT.
+    assert conn.in_transaction is False
+    # The uncommitted write was rolled back, not silently retained.
+    jobs = {r[0] for r in conn.execute("SELECT job FROM poll_runs").fetchall()}
+    assert jobs == {"break"}
+    conn.close()
+
+
+def test_failed_commit_does_not_strand_open_txn_for_next_writer(tmp_db_path: Path) -> None:
+    """#4 end-to-end: after a failed COMMIT, the NEXT independent write must open
+    its own transaction and durably commit -- not silently ride (and later have
+    rolled back) an abandoned transaction, which erased a durable break + its
+    heartbeats in the repro.
+    """
+    from netadmin.store.repository import Repository
+
+    repo = Repository.open(tmp_db_path)
+    conn = repo._conn
+
+    # A durable committed "ws-break".
+    repo.record_event(ts=1, key="EVT_Break", native_id="brk")
+
+    # The next write's COMMIT fails (WAL/disk fault stand-in) and must be unwound.
+    conn.set_authorizer(_deny_commit)
+    with pytest.raises(sqlite3.DatabaseError):
+        repo.record_event(ts=2, key="EVT_HeartbeatFail", native_id="hb-fail")
+    conn.set_authorizer(None)
+
+    # No abandoned transaction lingers for the next writer to join.
+    assert conn.in_transaction is False
+
+    # A later INDEPENDENT write opens its own transaction and commits for real.
+    repo.record_event(ts=3, key="EVT_HeartbeatOk", native_id="hb-ok")
+    assert conn.in_transaction is False
+
+    # Proof it actually COMMITTED (not merely riding an open txn): a SEPARATE
+    # read-only connection sees the break and the ok heartbeat, and never the
+    # rolled-back failed heartbeat. Pre-fix, hb-ok rode the abandoned txn
+    # uncommitted and this fresh connection would not see it.
+    other = db.connect(tmp_db_path, read_only=True)
+    seen = {r[0] for r in other.execute("SELECT key FROM events ORDER BY ts").fetchall()}
+    assert seen == {"EVT_Break", "EVT_HeartbeatOk"}
+    other.close()
+    repo.close()
+
+
+def test_normal_nested_transaction_still_commits_atomically(tmp_db_path: Path) -> None:
+    """The failed-commit cleanup must not disturb legitimate nesting: an inner
+    ``_write`` inside an open outer transaction still JOINS it (no early commit),
+    and the whole cycle commits atomically on clean exit.
+    """
+    from netadmin.store.repository import Repository
+
+    repo = Repository.open(tmp_db_path)
+    conn = repo._conn
+
+    with repo.transaction():
+        assert conn.in_transaction is True
+        repo.record_event(ts=1, key="EVT_A", native_id="a")
+        # Inner write rides the outer transaction rather than opening its own.
+        with repo._write() as c:
+            assert conn.in_transaction is True
+            c.execute("INSERT INTO events (ts, key, native_id, data) "
+                      "VALUES (2, 'EVT_B', 'b', '{}')")
+        # Still uncommitted inside the block: a separate reader sees nothing yet.
+        reader = db.connect(tmp_db_path, read_only=True)
+        assert reader.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+        reader.close()
+
+    # Committed atomically on clean exit.
+    assert conn.in_transaction is False
+    keys = {r[0] for r in conn.execute("SELECT key FROM events").fetchall()}
+    assert keys == {"EVT_A", "EVT_B"}
+    repo.close()

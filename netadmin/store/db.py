@@ -112,6 +112,19 @@ def begin_immediate(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     clean exit, rolls back on any exception. If the ``BEGIN`` itself fails
     (another writer holds the lock), the exception propagates and no rollback is
     attempted -- there is no open transaction to unwind.
+
+    Crucially, a *failed COMMIT* is handled too. ``COMMIT`` can raise -- a WAL or
+    disk fault, or an authorizer denial -- and SQLite then leaves the transaction
+    STILL OPEN. If we simply propagated the error, that abandoned transaction
+    would linger on the connection, and the very next writer (``Repository._write``
+    / ``transaction`` test ``in_transaction`` to decide top-level vs nesting)
+    would mistake it for a legitimate outer transaction, silently JOIN it, and a
+    later rollback could then erase the work this transaction believed it had
+    committed. So a COMMIT failure is caught and the still-open transaction is
+    rolled back before the error propagates: the context manager guarantees that
+    once it exits -- success OR failure -- there is no dangling open transaction a
+    subsequent writer could join. Only a genuinely intended nesting (an outer
+    ``begin_immediate`` still on the stack) leaves ``in_transaction`` true.
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -120,7 +133,19 @@ def begin_immediate(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         conn.execute("ROLLBACK")
         raise
     else:
-        conn.execute("COMMIT")
+        try:
+            conn.execute("COMMIT")
+        except BaseException:
+            # A failed COMMIT leaves the transaction OPEN. Return the connection
+            # to a clean, known state so no later ``_write`` silently joins this
+            # abandoned transaction (and later rolls back committed rows). The
+            # rollback is best-effort and never masks the original COMMIT error.
+            try:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+            except BaseException:
+                pass
+            raise
 
 
 def schema_version(conn: sqlite3.Connection) -> int:

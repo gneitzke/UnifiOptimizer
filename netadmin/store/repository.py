@@ -1187,8 +1187,26 @@ class Repository:
         def _mac(path: str) -> str:
             return f"NULLIF(json_extract(ev.data,'{path}'),'')"
 
+        # D3b (falsy-non-string-as-absent): the roam normalizer routes
+        # ``related_mac = ap_from or ap_mac`` -- Python truthiness. A NON-STRING
+        # falsy ``ap_from`` (``False``, ``0``, ``[]``) is absent and precedence
+        # falls back to ``ap``; only a NON-EMPTY STRING mac counts as a usable
+        # ap_from. Plain ``_mac`` (``NULLIF(...,'')``) only collapses the EMPTY
+        # STRING: a JSON ``false``/``0``/``[]`` survives it as present-and-
+        # unresolvable, so the SQL would COALESCE to that falsy value (never a real
+        # native_id), never resolve via ap, and PARK the row forever -- while the
+        # normalizer attributed it to ``ap``. So ap_from is read as present ONLY
+        # when it is a JSON string (``json_type='text'``) that is non-empty; any
+        # non-string (json boolean/integer/array) or empty ap_from is ABSENT and
+        # the resolver falls back to ``ap``, byte-identical to the normalizer.
+        def _str_mac(path: str) -> str:
+            return (
+                f"CASE WHEN json_type(ev.data,'{path}')='text' "
+                f"THEN NULLIF(json_extract(ev.data,'{path}'),'') END"
+            )
+
         user_or_client = f"COALESCE({_mac('$.user')}, {_mac('$.client')})"
-        ap_from_or_ap = f"COALESCE({_mac('$.ap_from')}, {_mac('$.ap')})"
+        ap_from_or_ap = f"COALESCE({_str_mac('$.ap_from')}, {_mac('$.ap')})"
 
         # Finding #4 (STP routing): a port-scoped switch event (e.g.
         # EVT_SW_StpPortBlocking) does NOT resolve to the SWITCH. The normalizer
