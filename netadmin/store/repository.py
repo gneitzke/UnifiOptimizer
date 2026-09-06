@@ -1161,6 +1161,39 @@ class Repository:
 
         user_or_client = f"COALESCE({_mac('$.user')}, {_mac('$.client')})"
         ap_from_or_ap = f"COALESCE({_mac('$.ap_from')}, {_mac('$.ap')})"
+
+        # Finding #4 (STP routing): a port-scoped switch event (e.g.
+        # EVT_SW_StpPortBlocking) does NOT resolve to the SWITCH. The normalizer
+        # (EventNormalizer._entities) attributes it to the PORT entity, native_id
+        # "<sw_mac>:<port_idx>" (mapping.py's port key), whenever the event's key is
+        # in _PORT_SCOPED_SW_EVENT_KEYS AND a port index is present -- otherwise to
+        # the SWITCH. The resolvability predicate must consult that SAME entity, or a
+        # port-not-yet-present STP row is (wrongly) called resolvable because the
+        # switch exists, floats to the head of the LIMIT window on the strength of a
+        # resolution that never happens, and starves genuinely-repairable newer rows.
+        #
+        # The port set is imported from the normalizer itself (single source of
+        # truth -- no drift). The import is lazy: netadmin.ingest.events imports
+        # Repository, so a module-level import here would be circular.
+        from netadmin.ingest.events import _PORT_SCOPED_SW_EVENT_KEYS
+
+        port_keys_sql = ",".join(
+            "'" + k.replace("'", "''") + "'" for k in sorted(_PORT_SCOPED_SW_EVENT_KEYS)
+        )
+        # The normalizer reads _field(event,"port") then falls back to "port_idx",
+        # and routes to the PORT whenever the chosen value is NOT None -- it does
+        # NOT test truthiness here (0 and "" are valid port indices), so this uses a
+        # plain COALESCE / IS NOT NULL, NOT the empty-string-collapsing _mac(). A
+        # missing key is SQL NULL, matching Python None exactly.
+        port_idx = (
+            "COALESCE(json_extract(ev.data,'$.port'),"
+            " json_extract(ev.data,'$.port_idx'))"
+        )
+        # native_id the normalizer builds for the port: "<sw_mac>:<port_idx>". The
+        # switch MAC is non-empty here (this expression is only consulted under the
+        # sw-present branch), so _mac('$.sw') equals the raw value the normalizer used.
+        port_nid = f"({_mac('$.sw')} || ':' || {port_idx})"
+
         resolvable = (
             "CASE"
             # primary reference fillable
@@ -1171,7 +1204,14 @@ class Repository:
             f"      WHEN {_mac('$.ap')} IS NOT NULL"
             "        THEN eap.entity_id IS NOT NULL"
             f"      WHEN {_mac('$.sw')} IS NOT NULL"
-            "        THEN esw.entity_id IS NOT NULL"
+            # A port-scoped switch event resolves on the PORT entity, not the
+            # switch; a plain switch-scoped event (e.g. EVT_SW_PoeOverload) still
+            # resolves on the switch. Mirror the normalizer's per-key branch.
+            "        THEN CASE"
+            f"          WHEN ev.key IN ({port_keys_sql}) AND {port_idx} IS NOT NULL"
+            "            THEN eport.entity_id IS NOT NULL"
+            "          ELSE esw.entity_id IS NOT NULL"
+            "        END"
             f"      WHEN {_mac('$.gw')} IS NOT NULL"
             "        THEN egw.entity_id IS NOT NULL"
             "      ELSE 0"
@@ -1210,6 +1250,9 @@ class Repository:
             f"       AND egw.native_id = {_mac('$.gw')}"
             "  LEFT JOIN entities eapf ON eapf.site_id=? AND eapf.entity_type='ap'"
             f"       AND eapf.native_id = {ap_from_or_ap}"
+            # The PORT a port-scoped switch event resolves to (finding #4).
+            "  LEFT JOIN entities eport ON eport.site_id=? AND eport.entity_type='port'"
+            f"       AND eport.native_id = {port_nid}"
             "  WHERE (ev.entity_id IS NULL AND ("
             f"          {_mac('$.user')}   IS NOT NULL"
             f"       OR {_mac('$.client')} IS NOT NULL"
@@ -1227,7 +1270,8 @@ class Repository:
         )
         return self._conn.execute(
             sql,
-            (site, site, site, site, site, _EVENT_RECONCILE_MAX_ATTEMPTS, max(1, limit)),
+            # 6 site binds: ecli, eap, esw, egw, eapf, eport (in FROM order).
+            (site, site, site, site, site, site, _EVENT_RECONCILE_MAX_ATTEMPTS, max(1, limit)),
         ).fetchall()
 
     # P2 fair progress: record that a reconcile pass selected these events but did
