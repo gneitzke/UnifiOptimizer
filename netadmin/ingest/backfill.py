@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Mapping, Optional
 
 from netadmin.domain.types import EntityType
-from netadmin.ingest.unifi.endpoints import Endpoints
+from netadmin.ingest.unifi.endpoints import Endpoints, ReportUnavailable
 from netadmin.logging import get_logger
 from netadmin.store.metrics import MetricKind, register_metric
 from netadmin.store.repository import Repository, SampleReading
@@ -348,6 +348,12 @@ class Backfiller:
                     detail="controller report retention elapsed before retry",
                 )
                 continue
+            # A failed request whose tail is still in the current open bucket
+            # cannot yet be retried authoritatively. Keep the original failed
+            # ledger row intact and retry its exact interval after it closes.
+            closed_end = now - (now % INTERVAL_SECONDS[interval])
+            if c_hi > closed_end:
+                continue
             key = (interval, max(c_lo, retention_floor), c_hi)
             chunks.append(key)
             seen.add(key)
@@ -355,6 +361,14 @@ class Backfiller:
             if window is None:
                 continue
             lo, hi = window
+            # Report rows are bucket aggregates. The bucket starting at
+            # floor(now / width) * width can still change, and inserting it now
+            # would make its later final value lose to INSERT OR IGNORE. Fetch
+            # and complete only through the last closed bucket boundary.
+            closed_end = now - (now % INTERVAL_SECONDS[interval])
+            hi = min(hi, closed_end)
+            if hi <= lo:
+                continue
             for c_lo, c_hi in chunk_window(lo, hi, self._chunk_s[interval]):
                 if (interval, c_lo, c_hi) not in seen:
                     chunks.append((interval, c_lo, c_hi))
@@ -367,6 +381,32 @@ class Backfiller:
                 self._repo.record_ingest_coverage(
                     kind="report", scope=scope, interval=interval,
                     start_ts=c_lo, end_ts=c_hi, status="complete",
+                )
+            except ReportUnavailable as exc:
+                # Unsupported-over-GET is permanent for this process/controller
+                # capability, not a successful empty read and not a retryable
+                # transport failure. Preserve that distinction in the ledger.
+                res.errors += 1
+                detail = f"{type(exc).__name__}: {exc}"[:200]
+                self._repo.record_ingest_coverage(
+                    kind="report", scope=scope, interval=interval,
+                    start_ts=c_lo, end_ts=c_hi, status="unrecoverable",
+                    detail=detail,
+                )
+                self._repo.record_poll_run(
+                    job=job_name(interval, scope),
+                    ok=False,
+                    ts=c_hi,
+                    error=detail,
+                    source="backfill",
+                )
+                logger.warning(
+                    "backfill %s.%s [%d,%d) unavailable: %s",
+                    interval,
+                    scope,
+                    c_lo,
+                    c_hi,
+                    exc,
                 )
             except Exception as exc:  # noqa: BLE001 - firewall per chunk
                 res.errors += 1
