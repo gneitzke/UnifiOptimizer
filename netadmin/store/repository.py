@@ -60,6 +60,20 @@ __all__ = [
 HOUR_SECONDS = 3600
 DAY_SECONDS = 86400
 
+# B4 (positive-liveness redesign): the WS event consumer emits a periodic
+# ``poll_runs`` liveness heartbeat (``job='ws'``, ``error='heartbeat'``, ok=1)
+# every time it is CONNECTED and successfully draining. Event-source coverage is
+# credited ONLY across spans that carry such heartbeats -- positive evidence the
+# feed was observing -- never through the end of a still-open ``connected`` row.
+# Two consecutive heartbeats no further apart than this bridge the span between
+# them into continuous coverage; a larger gap (feed down, stuck, shut down, or a
+# storage stall that stopped draining) is a real hole. The bound is several
+# heartbeat cadences so one or two dropped beats do not manufacture a gap, while
+# a genuine outage still opens one. Coverage ends at the LAST heartbeat, so a
+# shutdown / crash / failed close simply stops the beats and cannot over-credit.
+_WS_HEARTBEAT_LABEL = "heartbeat"
+_WS_HEARTBEAT_MAX_GAP_S = 150
+
 # Entity types a failed SLE minute can be traced to at all (section 8). A client
 # owns its own failed minutes (``sle_minutes.entity_id``); an AP, switch,
 # gateway or radio is what the engine pins them on
@@ -1129,54 +1143,52 @@ class Repository:
         ).fetchone()
         return None if row is None or row["end_ts"] is None else int(row["end_ts"])
 
-    # B4: intervals during which the WS event feed was actually CONNECTED and
-    # observing, derived from the supervisor's ``job='ws'`` liveness rows in
-    # ``poll_runs``. Coverage opens ONLY on a ``connected`` transition -- the row
-    # the supervisor writes the moment the socket handshake completes (R3) -- and
-    # closes on the next non-``connected`` row: a ``disconnected`` transition on
-    # an internal drop, or the terminal stopped/error/unsupported row when the
-    # listener dies. The pre-handshake ``started`` marker is deliberately NOT a
-    # connect: a socket that never handshaked (a dangling ``started``) credits
-    # NOTHING, and a mid-window drop ends the covered interval at the drop rather
-    # than running through ``end_ts``. A ``connected`` with no closing row after
-    # it is a genuinely still-live connection, covered through ``end_ts`` -- the
-    # healthy-WS-only signal, so 'no catch-up rows yet' never means 'frozen'.
-    def _ws_connected_intervals(self, start_ts: int, end_ts: int) -> list[tuple[int, int]]:
-        def _is_connect(row: sqlite3.Row) -> bool:
-            return (row["error"] or "") == "connected"
-
-        # The single latest ws transition strictly before the window fully
-        # determines whether the feed was already connected entering it.
-        prior = self._conn.execute(
-            "SELECT ts, error FROM poll_runs "
-            "WHERE job='ws' AND source='live' AND ts<? ORDER BY ts DESC, rowid DESC LIMIT 1",
-            (start_ts,),
-        ).fetchone()
-        open_since: Optional[int] = start_ts if (prior is not None and _is_connect(prior)) else None
-        intervals: list[tuple[int, int]] = []
+    # B4 (positive-liveness redesign): spans the WS event feed was actually
+    # observing, derived from ``job='ws'`` liveness HEARTBEATS in ``poll_runs``
+    # (:meth:`record_ws_heartbeat`) -- NOT from ``connected``/``disconnected``
+    # transition rows. Each heartbeat is positive proof the feed was connected and
+    # draining at that instant; two consecutive beats no further apart than
+    # ``_WS_HEARTBEAT_MAX_GAP_S`` bridge the span between them into continuous
+    # coverage. This is robust where the old close-event reconstruction was not:
+    # a normal shutdown, task cancellation, crash, or failed disconnect-write
+    # simply STOPS the beats, so coverage ends at the last heartbeat and never
+    # runs through ``end_ts`` on a still-open ``connected`` row (the over-credit
+    # that false-cleared issues after restart). A feed that is stuck / not
+    # draining likewise emits no beats and leaves a real hole. A single lone beat
+    # credits nothing (zero-width) -- coverage needs a sustained, chained run. A
+    # heartbeat up to one max-gap before the window bridges into it, so a window
+    # entered mid-run starts covered.
+    def _ws_observed_intervals(self, start_ts: int, end_ts: int) -> list[tuple[int, int]]:
         rows = self._conn.execute(
-            "SELECT ts, error FROM poll_runs "
-            "WHERE job='ws' AND source='live' AND ts>=? AND ts<? ORDER BY ts, rowid",
-            (start_ts, end_ts),
+            "SELECT ts FROM poll_runs "
+            "WHERE job='ws' AND source='live' AND error=? AND ts>=? AND ts<? "
+            "ORDER BY ts, rowid",
+            (_WS_HEARTBEAT_LABEL, start_ts - _WS_HEARTBEAT_MAX_GAP_S, end_ts),
         ).fetchall()
+        intervals: list[tuple[int, int]] = []
+        run_start: Optional[int] = None
+        prev: Optional[int] = None
         for row in rows:
             ts = int(row["ts"])
-            if _is_connect(row):
-                if open_since is None:
-                    open_since = ts
-            elif open_since is not None:
-                if ts > open_since:
-                    intervals.append((open_since, ts))
-                open_since = None
-        if open_since is not None and end_ts > open_since:
-            intervals.append((open_since, end_ts))
+            if prev is None:
+                run_start = ts
+            elif ts - prev <= _WS_HEARTBEAT_MAX_GAP_S:
+                pass  # same continuous run of liveness
+            else:
+                assert run_start is not None
+                if prev > run_start:
+                    intervals.append((run_start, prev))
+                run_start = ts
+            prev = ts
+        if prev is not None and run_start is not None and prev > run_start:
+            intervals.append((run_start, prev))
         return intervals
 
     # B4: event-source observation coverage as a fraction of a detector window.
     # Two honest signals are unioned: (1) completed controller-history reads the
     # event catch-up records (``ingest_coverage`` kind='event_history'), and (2)
-    # the WS feed's own connected-and-observing intervals (see
-    # :meth:`_ws_connected_intervals`).  This is NEVER inferred from the presence
+    # the WS feed's own liveness-heartbeat intervals (see
+    # :meth:`_ws_observed_intervals`).  This is NEVER inferred from the presence
     # or absence of event rows (that exact conflation is the B4 false-clear bug):
     # a broken feed stops advancing BOTH signals, so a detector window drifts past
     # the last covered slice and the fraction falls. Read-only: it issues no DDL,
@@ -1215,8 +1227,8 @@ class Repository:
                 seg_end = min(int(row["end_ts"]), end_ts)
                 if seg_end > seg_start:
                     segments.append((seg_start, seg_end))
-        # (2) Live WS-connected observation (the healthy WS-only signal).
-        for seg_start, seg_end in self._ws_connected_intervals(start_ts, end_ts):
+        # (2) Live WS liveness-heartbeat observation (the healthy WS-only signal).
+        for seg_start, seg_end in self._ws_observed_intervals(start_ts, end_ts):
             seg_start = max(seg_start, start_ts)
             seg_end = min(seg_end, end_ts)
             if seg_end > seg_start:
@@ -1289,6 +1301,22 @@ class Repository:
                 "VALUES (?,?,?,?,?,?)",
                 (ts, job, 1 if ok else 0, duration_ms, error, source),
             )
+
+    def record_ws_heartbeat(self, *, ts: Optional[int] = None) -> None:
+        """Record one WS-event-feed liveness heartbeat (B4 positive liveness).
+
+        Written by the live WS consumer every time it is CONNECTED and has just
+        successfully drained (or found empty) its batch -- positive proof the
+        event feed was observing at ``ts``. It lands as an ordinary successful
+        ``job='ws'`` ``poll_runs`` row (``error='heartbeat'``, ``ok=1``), which
+        serves two purposes at once: :meth:`observed_event_coverage` credits only
+        spans carrying heartbeats (so a still-open ``connected`` interval can
+        never over-credit past the last beat), and, being a fresh *successful* ws
+        row, it clears any trailing storage-failure in the health accounting once
+        flushing recovers. A shutdown, crash, or failed close simply stops the
+        beats -- there is no close row for coverage to depend on.
+        """
+        self.record_poll_run(job="ws", ok=True, ts=ts, error=_WS_HEARTBEAT_LABEL, source="live")
 
     def read_poll_runs(
         self, job: str, start_ts: int, end_ts: int, *, ok_only: bool = False

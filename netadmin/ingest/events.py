@@ -360,12 +360,20 @@ class EventListener:
         normalizer: Optional[EventNormalizer] = None,
         batch_size: int = 50,
         flush_interval: Optional[float] = 2.0,
+        heartbeat_interval: float = 30.0,
     ) -> None:
         self._ws = ws_listener
         self._repo = repo
         self._normalizer = normalizer or EventNormalizer(repo)
         self._batch_size = max(1, batch_size)
         self._flush_interval = flush_interval
+        # B4 (positive liveness): while CONNECTED and successfully draining, the
+        # flusher writes a periodic ``poll_runs`` heartbeat (rate-limited to this
+        # cadence) so event-source coverage is credited only across spans with
+        # positive evidence the feed was observing -- never through end_ts on a
+        # still-open ``connected`` row. Correctness never depends on a close row.
+        self._heartbeat_interval = max(0.0, heartbeat_interval)
+        self._last_heartbeat_ts: Optional[int] = None
         self._batch: list[dict[str, Any]] = []
         self._max_pending = max(1_000, self._batch_size * 4)
         self._storage_error: Optional[BaseException] = None
@@ -414,6 +422,32 @@ class EventListener:
         self.written += inserted
         return inserted
 
+    def _maybe_heartbeat(self, *, now: Optional[float] = None) -> None:
+        """Emit a WS liveness heartbeat when CONNECTED and draining healthily.
+
+        B4 (positive liveness): a heartbeat is credited toward event-source
+        coverage, so it is written ONLY with positive evidence the feed is
+        observing -- the socket is connected AND this flush tick committed (or
+        found an empty queue) without error. Rate-limited to
+        ``heartbeat_interval`` so a 2 s flush cadence does not flood ``poll_runs``.
+        Best-effort: a failed heartbeat write is not a data-path error (coverage
+        merely gets no positive evidence for this tick), it never raises out.
+        """
+        if self.connection_state != "connected":
+            return
+        ts = int(time.time()) if now is None else int(now)
+        if (
+            self._last_heartbeat_ts is not None
+            and ts - self._last_heartbeat_ts < self._heartbeat_interval
+        ):
+            return
+        try:
+            self._repo.record_ws_heartbeat(ts=ts)
+        except Exception:  # noqa: BLE001 - liveness accounting must never break draining
+            logger.exception("Could not record WS liveness heartbeat")
+            return
+        self._last_heartbeat_ts = ts
+
     async def _periodic_flush(self) -> None:
         assert self._flush_interval is not None
         while True:
@@ -431,6 +465,13 @@ class EventListener:
                     )
                 except Exception:
                     logger.exception("Could not surface WS storage failure in poll_runs")
+                # No heartbeat on a failed tick: the feed has no positive evidence
+                # it is observing right now. When flushing RECOVERS, the next tick
+                # resumes heartbeats -- reopening coverage and clearing the health
+                # failure -- so a transient stall never closes coverage forever.
+                continue
+            # Positive liveness: connected AND just drained (or empty) with no error.
+            self._maybe_heartbeat()
 
     async def run(self) -> int:
         """Drain the WS generator into the store until it ends.
@@ -523,14 +564,16 @@ class WsSupervisor:
         Called by the listener when its handshake succeeds ("connected") or it
         drops/backs off ("reconnecting"). Never inferred from the task existing.
 
-        B4: persist the REAL connection transition so event-coverage credit
-        derives from actually-connected intervals, not the pre-handshake
-        ``started`` marker. A ``connected`` row OPENS a covered interval at the
-        moment the handshake completes; any other state ("reconnecting" on an
-        internal drop, an error, a backoff) writes a ``disconnected`` row that
-        CLOSES it. A socket that never handshakes therefore emits no
-        ``connected`` row and credits nothing, and a mid-window drop ends the
-        covered interval at the drop rather than running through end_ts.
+        These ``connected``/``disconnected`` rows drive the health-state STRING
+        only. B4 (positive-liveness redesign): event-source coverage no longer
+        derives from these transitions -- it is credited solely from the periodic
+        liveness HEARTBEATS the listener writes while connected and draining (see
+        :meth:`EventListener._maybe_heartbeat` and
+        :meth:`Repository._ws_observed_intervals`). So correctness does NOT depend
+        on any close row: if this ``disconnected`` accounting write raises (it is
+        swallowed by ``_record``) or is skipped entirely on a shutdown/cancel/crash
+        path, coverage still ends at the last heartbeat and cannot over-credit
+        through end_ts. The row is kept for observability on clean transitions.
         """
         if state == self.state:
             return
@@ -602,6 +645,11 @@ class WsSupervisor:
                 await listener.run()
             except asyncio.CancelledError:
                 self.state = "stopped"
+                # Clean-path observability only: record the close so the health
+                # STRING reflects the stop. B4: coverage does not depend on this
+                # -- the liveness heartbeats already stopped, so coverage ends at
+                # the last beat whether or not this row is written.
+                self._record("disconnected", ok=True)
                 self._rescue_pending(listener)
                 raise
             except Exception as exc:  # noqa: BLE001 - firewall: any death is recoverable

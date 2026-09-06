@@ -25,6 +25,10 @@ from netadmin.ingest.events import (
 )
 from netadmin.ingest.unifi.models import Event
 from netadmin.store.repository import Repository
+from netadmin.detect.context import DetectorContext, EVENT_COVERAGE_MIN
+from netadmin.detect.detectors.client import FlakyClientDetector
+from netadmin.detect.engine import UNKNOWN
+from tests.netadmin.detect.support import FakeBaselines, seed_coverage
 
 FIXTURE = Path(__file__).parents[1] / "unifi" / "fixtures" / "stat_event.json"
 
@@ -769,3 +773,181 @@ async def test_r2_pending_survives_when_health_accounting_also_fails(
     stored = repo.read_events(0, 2_000_000_000)
     assert len(stored) == N
     assert {r["native_id"] for r in stored} == {f"s{i}" for i in range(N)}
+
+
+# --------------------------------------------------------------------------- #
+# B4 (positive-liveness redesign): event-source coverage is credited only across
+# spans carrying WS liveness HEARTBEATS, never through end_ts on a still-open
+# 'connected' row. These tests exercise the heartbeat mechanism end to end.
+# --------------------------------------------------------------------------- #
+def _seed_beats(listener: EventListener, start: int, end: int, *, step: int = 60) -> None:
+    """Drive the listener's own heartbeat writer across ``[start, end]``.
+
+    Goes through ``_maybe_heartbeat`` (not the repo directly) so the test proves
+    the listener-side gate: heartbeats land only while ``connection_state`` is
+    ``connected``. Both endpoints are guaranteed a beat.
+    """
+    t = start
+    while t < end:
+        listener._maybe_heartbeat(now=t)
+        listener._last_heartbeat_ts = None  # allow the next explicit beat
+        t += step
+    listener._maybe_heartbeat(now=end)
+
+
+def test_maybe_heartbeat_only_writes_while_connected(repo: Repository) -> None:
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=0.0)
+    # Not connected -> no positive evidence, no beat.
+    listener.connection_state = "reconnecting"
+    listener._maybe_heartbeat(now=1_000)
+    assert [r for r in repo.read_poll_runs("ws", 0, 10_000) if r["error"] == "heartbeat"] == []
+    # Connected -> a beat is recorded.
+    listener.connection_state = "connected"
+    listener._maybe_heartbeat(now=1_001)
+    beats = [r for r in repo.read_poll_runs("ws", 0, 10_000) if r["error"] == "heartbeat"]
+    assert len(beats) == 1 and int(beats[0]["ok"]) == 1
+
+
+def test_a_shutdown_stops_heartbeats_downtime_not_covered(repo: Repository) -> None:
+    """B4(a): a NORMAL SHUTDOWN cancels the listener with NO 'disconnected' close
+    row. The heartbeats simply stop, so coverage ends at the last beat and the
+    post-shutdown downtime is NOT credited -- unlike the old code, which ran a
+    dangling 'connected' interval through end_ts (a false 100%)."""
+    now = 8_000_000
+    start = now - 3600
+    shutdown = start + 300  # feed shut down 300 s into the hour
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=0.0)
+    listener.connection_state = "connected"
+    _seed_beats(listener, start, shutdown, step=60)
+    # Shutdown: the flusher is cancelled, beats stop. Deliberately write NO
+    # 'disconnected'/close row -- correctness must not depend on one.
+    cov = repo.observed_event_coverage(start, now)
+    assert cov == pytest.approx(300 / 3600, abs=0.02)  # only the observed span
+    assert cov < EVENT_COVERAGE_MIN  # -> the detector FREEZES, not clears
+
+
+def test_a_flaky_not_falsely_cleared_after_shutdown(repo: Repository) -> None:
+    """B4(a) end to end: client polling is healthy and the disconnect events have
+    aged out, but the WS feed SHUT DOWN partway through the window (heartbeats
+    stopped, no close row). A restart must not read the downtime as 'observed' and
+    false-clear a real client.flaky issue -- the detector must FREEZE (UNKNOWN)."""
+    now = 8_500_000
+    start = now - 3600
+    seed_coverage(repo, job="fast_sta", now=now, window_s=3600, interval_s=60)
+    ap = repo.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="ap-flaky", site_id="default"), ts=now
+    )
+    repo.upsert_entity(
+        Entity(
+            entity_type=EntityType.CLIENT, native_id="cc:flaky", site_id="default",
+            parent_id=ap, first_seen_ts=now - 100_000,
+        ),
+        ts=now,
+    )
+    # Feed observed only the first 300 s, then shut down. No disconnect events
+    # remain (aged out). Event coverage is far below the floor.
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=0.0)
+    listener.connection_state = "connected"
+    _seed_beats(listener, start, start + 300, step=60)
+    ctx = DetectorContext(
+        repo=repo, baselines=FakeBaselines(), now_ts=now, site_id="default", settings=None
+    )
+    assert FlakyClientDetector().evaluate(ctx) is UNKNOWN
+
+
+def _trailing_failures(repo: Repository, job: str) -> int:
+    """Mirror runtime._job_health: trailing consecutive non-ok poll_runs for a job."""
+    rows = repo.read_poll_runs(job, 0, 2_000_000_000)
+    n = 0
+    for r in reversed(rows):
+        if int(r["ok"]) == 1:
+            break
+        n += 1
+    return n
+
+
+def test_b_failed_then_recovered_flush_reopens_coverage_and_health(repo: Repository) -> None:
+    """B4 new-bug: a failed periodic flush closes coverage/health (an ok=0
+    storage-failed ws row), but a successful retry never reopened it under the old
+    close-event design -- a connected socket with a committed event and empty
+    queue read 0 coverage and 'failing' health. With positive liveness, the
+    recovered flush resumes heartbeats: coverage reopens and the trailing failure
+    clears."""
+    now = 7_000_000
+    start = now - 3600
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=0.0)
+    listener.connection_state = "connected"
+    # Healthy, connected-and-draining span up to shortly before the stall.
+    _seed_beats(listener, start, start + 3480, step=60)
+    # A flush tick fails: storage-failed (ok=0) surfaces, NO heartbeat this tick.
+    repo.record_poll_run(job="ws", ok=False, ts=start + 3500, error="storage-failed: locked", source="live")
+    # While the failure is the latest ws row, health is 'failing'.
+    assert _trailing_failures(repo, "ws") > 0
+    # Flushing RECOVERS: the connected socket commits + empties its queue, so the
+    # next ticks heartbeat again (the gap start+3480 -> start+3540 is under the
+    # bridge bound, so coverage is continuous).
+    listener._maybe_heartbeat(now=start + 3540)
+    listener._last_heartbeat_ts = None
+    listener._maybe_heartbeat(now=now - 1)
+    # Coverage reopened -- effectively full across the window (not 0, not frozen).
+    cov = repo.observed_event_coverage(start, now)
+    assert cov >= EVENT_COVERAGE_MIN
+    # Health cleared: a fresh successful ws heartbeat is now the latest row.
+    assert _trailing_failures(repo, "ws") == 0
+
+
+@pytest.mark.asyncio
+async def test_c_periodic_flush_heartbeats_while_connected_and_covers(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B4(c): a genuinely healthy, connected, draining feed reads fully covered.
+    Drive the REAL periodic-flush loop; while connected it must emit a steady
+    stream of liveness heartbeats (empty queue included), yielding continuous
+    coverage across their span."""
+    import netadmin.ingest.events as evmod
+
+    calls = {"n": 0}
+
+    def fake_time() -> float:
+        # Spread successive heartbeats 10 s apart (distinct, chainable) so the
+        # loop's real sub-ms sleeps do not collapse them onto one second.
+        calls["n"] += 1
+        return 6_000_000 + calls["n"] * 10
+
+    monkeypatch.setattr(evmod.time, "time", fake_time)
+
+    listener = EventListener(FakeWs([]), repo, flush_interval=0.001, heartbeat_interval=1.0)
+    listener.connection_state = "connected"
+    task = asyncio.create_task(listener._periodic_flush())
+
+    async def until_three_beats() -> None:
+        while len([r for r in repo.read_poll_runs("ws", 0, 10_000_000) if r["error"] == "heartbeat"]) < 3:
+            await asyncio.sleep(0.001)
+
+    try:
+        await asyncio.wait_for(until_three_beats(), timeout=3.0)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    beats = [r for r in repo.read_poll_runs("ws", 0, 10_000_000) if r["error"] == "heartbeat"]
+    assert len(beats) >= 3
+    lo, hi = int(beats[0]["ts"]), int(beats[-1]["ts"])
+    # The span between the first and last beat is continuously covered.
+    assert repo.observed_event_coverage(lo, hi + 1) > 0.9
+
+
+def test_d_real_gap_still_freezes(repo: Repository) -> None:
+    """B4(d): a real gap (feed down / not draining) leaves a coverage hole ->
+    UNKNOWN. Two short heartbeat bursts with a long dead middle do not chain, so
+    coverage stays far below the floor."""
+    now = 9_000_000
+    start = now - 3600
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=0.0)
+    listener.connection_state = "connected"
+    _seed_beats(listener, start, start + 240, step=60)   # early burst
+    # ... feed dead for most of the hour (no beats) ...
+    _seed_beats(listener, now - 240, now - 1, step=60)   # late burst
+    cov = repo.observed_event_coverage(start, now)
+    assert cov < EVENT_COVERAGE_MIN
+    assert cov < 0.2
