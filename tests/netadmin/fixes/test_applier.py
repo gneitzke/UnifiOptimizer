@@ -1060,10 +1060,22 @@ async def test_concurrent_applies_second_merges_onto_committed_no_stale_clobber(
     # Shared mutable live radio state: both applies read it (inside their lock) and
     # the writer commits payloads through it.
     live = {
-        "ng": {"radio": "ng", "channel": 3, "tx_power_mode": "high",
-               "min_rssi_enabled": True, "min_rssi": -75, "ht": 20},
-        "na": {"radio": "na", "channel": 36, "tx_power_mode": "auto",
-               "min_rssi_enabled": False, "min_rssi": 0, "ht": 80},
+        "ng": {
+            "radio": "ng",
+            "channel": 3,
+            "tx_power_mode": "high",
+            "min_rssi_enabled": True,
+            "min_rssi": -75,
+            "ht": 20,
+        },
+        "na": {
+            "radio": "na",
+            "channel": 36,
+            "tx_power_mode": "auto",
+            "min_rssi_enabled": False,
+            "min_rssi": 0,
+            "ht": 80,
+        },
     }
     gate = _asyncio.Event()  # blocks the FIRST writer until the second is parked
 
@@ -1106,9 +1118,10 @@ async def test_concurrent_applies_second_merges_onto_committed_no_stale_clobber(
         evidence={"band": "2.4", "tx_power_mode": "high"},
     )
     plan_b = plan_fix(finding_b, device=make_ap_device(), issue_id=None)
-    assert next(r for r in plan_b.steps[0].payload["radio_table"] if r["radio"] == "ng")[
-        "channel"
-    ] == 3  # sanity: B's payload really does carry the stale channel
+    assert (
+        next(r for r in plan_b.steps[0].payload["radio_table"] if r["radio"] == "ng")["channel"]
+        == 3
+    )  # sanity: B's payload really does carry the stale channel
 
     writer_a, writer_b = _LiveWriter(), _LiveWriter()
     applier_a = Applier(store, writer_a)
@@ -1116,7 +1129,9 @@ async def test_concurrent_applies_second_merges_onto_committed_no_stale_clobber(
 
     task_a = _asyncio.create_task(
         applier_a.apply(
-            plan_a, dry_run=False, confirm_token=plan_confirm_token(plan_a),
+            plan_a,
+            dry_run=False,
+            confirm_token=plan_confirm_token(plan_a),
             state_reader=_state_reader(),
         )
     )
@@ -1124,7 +1139,9 @@ async def test_concurrent_applies_second_merges_onto_committed_no_stale_clobber(
         await _asyncio.sleep(0)  # let A take the lock and park in its blocked write
     task_b = _asyncio.create_task(
         applier_b.apply(
-            plan_b, dry_run=False, confirm_token=plan_confirm_token(plan_b),
+            plan_b,
+            dry_run=False,
+            confirm_token=plan_confirm_token(plan_b),
             state_reader=_state_reader(),
         )
     )
@@ -1166,10 +1183,16 @@ async def test_concurrent_reverts_dispatch_the_mutation_exactly_once(store):
     endpoint = f"rest/device/{AP_ID}"
     change_id = store.insert_change(
         action="wifi.channel_change",
-        before={"method": "PUT", "endpoint": endpoint,
-                "body": {"radio_table": [{"radio": "ng", "channel": 3}]}},
-        after={"method": "PUT", "endpoint": endpoint,
-               "body": {"radio_table": [{"radio": "ng", "channel": 1}]}},
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 3}]},
+        },
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 1}]},
+        },
         status="applied",
         ts=1,
     )
@@ -1242,7 +1265,9 @@ async def test_apply_ambiguous_write_reports_unknown_not_failed(store, ap_device
     from netadmin.fixes.models import WriteResult
 
     ambiguous = WriteResult(
-        ok=False, status_code=None, data={"ambiguous": True, "error": "outcome unknown; not retried"}
+        ok=False,
+        status_code=None,
+        data={"ambiguous": True, "error": "outcome unknown; not retried"},
     )
     writer = FakeControllerWriter(response=ambiguous)
     applier = Applier(store, writer)
@@ -1293,10 +1318,16 @@ async def test_apply_refuses_step_whose_reverse_fails_min_rssi_rail(store):
             "method": "PUT",
             "endpoint": endpoint,
             "body": {
-                "radio_table": [{"radio": "ng", "channel": 3, "min_rssi_enabled": True, "min_rssi": -70}]
+                "radio_table": [
+                    {"radio": "ng", "channel": 3, "min_rssi_enabled": True, "min_rssi": -70}
+                ]
             },
         },
-        payload={"radio_table": [{"radio": "ng", "channel": 1, "min_rssi_enabled": False, "min_rssi": -70}]},
+        payload={
+            "radio_table": [
+                {"radio": "ng", "channel": 1, "min_rssi_enabled": False, "min_rssi": -70}
+            ]
+        },
         revertible=True,
     )
     plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "forged", steps=[step])
@@ -1521,7 +1552,9 @@ async def test_legit_power_round_trip_applies_and_reverts(store):
     revert = await applier.revert(change_id, current_radios=live)
     assert revert.ok
     last = writer.calls[-1]
-    assert next(r for r in last.body["radio_table"] if r["radio"] == "ng")["tx_power_mode"] == "high"
+    assert (
+        next(r for r in last.body["radio_table"] if r["radio"] == "ng")["tx_power_mode"] == "high"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1649,14 +1682,24 @@ async def test_multistep_same_device_plan_does_not_self_clobber(store):
 
     # Step 1 snapshot: ng->1, na still 36. Step 2 snapshot: na->40 but ng STILL 3.
     step1 = _step(
-        f"{AP_MAC}:ng", "ng", 3, 1,
-        [{"radio": "ng", "channel": 1, "tx_power_mode": "high", "ht": 20},
-         {"radio": "na", "channel": 36, "tx_power_mode": "auto", "ht": 80}],
+        f"{AP_MAC}:ng",
+        "ng",
+        3,
+        1,
+        [
+            {"radio": "ng", "channel": 1, "tx_power_mode": "high", "ht": 20},
+            {"radio": "na", "channel": 36, "tx_power_mode": "auto", "ht": 80},
+        ],
     )
     step2 = _step(
-        f"{AP_MAC}:na", "na", 36, 40,
-        [{"radio": "ng", "channel": 3, "tx_power_mode": "high", "ht": 20},
-         {"radio": "na", "channel": 40, "tx_power_mode": "auto", "ht": 80}],
+        f"{AP_MAC}:na",
+        "na",
+        36,
+        40,
+        [
+            {"radio": "ng", "channel": 3, "tx_power_mode": "high", "ht": 20},
+            {"radio": "na", "channel": 40, "tx_power_mode": "auto", "ht": 80},
+        ],
     )
     plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "two-radio", steps=[step1, step2])
 
@@ -1834,7 +1877,7 @@ async def test_two_radio_plan_applies_and_each_step_reverts_without_overshoot(st
     # Revert step 2 (na): restores na to 36 and leaves ng's change (1) untouched.
     await applier.revert(na_change, state_reader=_revert_reader)
     assert live["na"]["channel"] == 36  # restored to ITS own before
-    assert live["ng"]["channel"] == 1   # ng's change did not overshoot
+    assert live["ng"]["channel"] == 1  # ng's change did not overshoot
 
     # Revert step 1 (ng): restores ng to 3, na stays at its reverted 36.
     await applier.revert(ng_change, state_reader=_revert_reader)
@@ -1876,10 +1919,20 @@ async def test_untouched_field_removed_from_live_is_not_restored(store):
         endpoint=endpoint,
         payload={"radio_table": [{"radio": "ng", "channel": 1, "tx_power_mode": "high", "ht": 20}]},
         precondition=_radio_pre(f"{AP_MAC}:ng", {"channel": 3}),
-        before={"method": "PUT", "endpoint": endpoint,
-                "body": {"radio_table": [{"radio": "ng", "channel": 3, "tx_power_mode": "high", "ht": 20}]}},
-        after={"method": "PUT", "endpoint": endpoint,
-               "body": {"radio_table": [{"radio": "ng", "channel": 1, "tx_power_mode": "high", "ht": 20}]}},
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {
+                "radio_table": [{"radio": "ng", "channel": 3, "tx_power_mode": "high", "ht": 20}]
+            },
+        },
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {
+                "radio_table": [{"radio": "ng", "channel": 1, "tx_power_mode": "high", "ht": 20}]
+            },
+        },
         revertible=True,
     )
     plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "one", steps=[step])
@@ -1932,15 +1985,33 @@ async def test_radio_added_to_live_is_preserved_not_deleted(store):
         risk=RiskLevel.MEDIUM,
         method="PUT",
         endpoint=endpoint,
-        payload={"radio_table": [{"radio": "ng", "channel": 1, "ht": 20},
-                                 {"radio": "na", "channel": 36, "ht": 80}]},
+        payload={
+            "radio_table": [
+                {"radio": "ng", "channel": 1, "ht": 20},
+                {"radio": "na", "channel": 36, "ht": 80},
+            ]
+        },
         precondition=_radio_pre(f"{AP_MAC}:ng", {"channel": 3}),
-        before={"method": "PUT", "endpoint": endpoint,
-                "body": {"radio_table": [{"radio": "ng", "channel": 3, "ht": 20},
-                                         {"radio": "na", "channel": 36, "ht": 80}]}},
-        after={"method": "PUT", "endpoint": endpoint,
-               "body": {"radio_table": [{"radio": "ng", "channel": 1, "ht": 20},
-                                        {"radio": "na", "channel": 36, "ht": 80}]}},
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {
+                "radio_table": [
+                    {"radio": "ng", "channel": 3, "ht": 20},
+                    {"radio": "na", "channel": 36, "ht": 80},
+                ]
+            },
+        },
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {
+                "radio_table": [
+                    {"radio": "ng", "channel": 1, "ht": 20},
+                    {"radio": "na", "channel": 36, "ht": 80},
+                ]
+            },
+        },
         revertible=True,
     )
     plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "one", steps=[step])
@@ -1985,11 +2056,19 @@ async def test_revert_of_a_change_that_deleted_a_radio_is_refused_not_falsely_re
 
     change_id = store.insert_change(
         action="wifi.channel_change",
-        before={"method": "PUT", "endpoint": endpoint,
-                "body": {"radio_table": [{"radio": "ng", "channel": 3}, {"radio": "na", "channel": 36}]}},
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {
+                "radio_table": [{"radio": "ng", "channel": 3}, {"radio": "na", "channel": 36}]
+            },
+        },
         # Dispatched after DROPPED na (only ng survives the whole-table PUT).
-        after={"method": "PUT", "endpoint": endpoint,
-               "body": {"radio_table": [{"radio": "ng", "channel": 1}]}},
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 1}]},
+        },
         status="applied",
         ts=1,
     )
@@ -2017,10 +2096,16 @@ async def test_concurrent_reverts_first_ambiguous_blocks_the_second_from_replayi
     endpoint = f"rest/device/{AP_ID}"
     change_id = store.insert_change(
         action="wifi.channel_change",
-        before={"method": "PUT", "endpoint": endpoint,
-                "body": {"radio_table": [{"radio": "ng", "channel": 3}]}},
-        after={"method": "PUT", "endpoint": endpoint,
-               "body": {"radio_table": [{"radio": "ng", "channel": 1}]}},
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 3}]},
+        },
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 1}]},
+        },
         status="applied",
         ts=1,
     )
@@ -2033,7 +2118,8 @@ async def test_concurrent_reverts_first_ambiguous_blocks_the_second_from_replayi
             self.puts += 1
             await _asyncio.sleep(0)
             return WriteResult(
-                ok=False, status_code=None,
+                ok=False,
+                status_code=None,
                 data={"ambiguous": True, "error": "lost response after PUT"},
             )
 
@@ -2058,7 +2144,11 @@ async def test_concurrent_reverts_first_ambiguous_blocks_the_second_from_replayi
     refused = [r for r in results if isinstance(r, FixError)]
     assert len(ambiguous) == 1 and ambiguous[0].data.get("ambiguous") is True
     assert len(refused) == 1
-    assert "already" in str(refused[0]) or "unknown" in str(refused[0]) or "ambiguous" in str(refused[0])
+    assert (
+        "already" in str(refused[0])
+        or "unknown" in str(refused[0])
+        or "ambiguous" in str(refused[0])
+    )
     # The row is terminal-uncertain, not 'reverted' and not plain 'applied'.
     assert store.get_change(change_id)["status"] == "revert_unknown"
 
@@ -2101,10 +2191,16 @@ async def test_round8_1_delta_field_diverging_from_live_is_drift(store):
         endpoint=endpoint,
         payload={"radio_table": [{"radio": "ng", "channel": 1, "tx_power_mode": "medium"}]},
         precondition=_radio_pre(f"{AP_MAC}:ng", {"channel": 3}),  # channel-only
-        before={"method": "PUT", "endpoint": endpoint,
-                "body": {"radio_table": [{"radio": "ng", "channel": 3, "tx_power_mode": "high"}]}},
-        after={"method": "PUT", "endpoint": endpoint,
-               "body": {"radio_table": [{"radio": "ng", "channel": 1, "tx_power_mode": "medium"}]}},
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 3, "tx_power_mode": "high"}]},
+        },
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 1, "tx_power_mode": "medium"}]},
+        },
         revertible=True,
     )
     plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "bundle", steps=[step])
@@ -2141,16 +2237,24 @@ async def test_round8_2_unchanged_top_level_field_not_resent_over_live(store):
         endpoint=endpoint,
         payload={"radio_table": [{"radio": "ng", "channel": 1}], "disabled": False},
         precondition=_radio_pre(f"{AP_MAC}:ng", {"channel": 3}),
-        before={"method": "PUT", "endpoint": endpoint,
-                "body": {"radio_table": [{"radio": "ng", "channel": 3}], "disabled": False}},
-        after={"method": "PUT", "endpoint": endpoint,
-               "body": {"radio_table": [{"radio": "ng", "channel": 1}], "disabled": False}},
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 3}], "disabled": False},
+        },
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 1}], "disabled": False},
+        },
         revertible=True,
     )
     plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "toplevel", steps=[step])
     writer = _RecordingLiveWriter()
     applier = Applier(store, writer)
-    live = {"ng": {"radio": "ng", "channel": 3}}  # radio-level live; device 'disabled' is True out-of-band
+    live = {
+        "ng": {"radio": "ng", "channel": 3}
+    }  # radio-level live; device 'disabled' is True out-of-band
 
     async def _reader():
         cur = {f"{AP_MAC}:ng": {"channel": 3}}
@@ -2181,12 +2285,28 @@ async def test_round8_3_merged_reverse_min_rssi_on_mesh_refused_up_front(store):
         risk=RiskLevel.MEDIUM,
         method="PUT",
         endpoint=endpoint,
-        payload={"radio_table": [{"radio": "ng", "channel": 1, "min_rssi_enabled": False, "min_rssi": 0}]},
+        payload={
+            "radio_table": [{"radio": "ng", "channel": 1, "min_rssi_enabled": False, "min_rssi": 0}]
+        },
         precondition=_radio_pre(f"{AP_MAC}:ng", {"channel": 3}),
-        before={"method": "PUT", "endpoint": endpoint,
-                "body": {"radio_table": [{"radio": "ng", "channel": 3, "min_rssi_enabled": False, "min_rssi": 0}]}},
-        after={"method": "PUT", "endpoint": endpoint,
-               "body": {"radio_table": [{"radio": "ng", "channel": 1, "min_rssi_enabled": False, "min_rssi": 0}]}},
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {
+                "radio_table": [
+                    {"radio": "ng", "channel": 3, "min_rssi_enabled": False, "min_rssi": 0}
+                ]
+            },
+        },
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {
+                "radio_table": [
+                    {"radio": "ng", "channel": 1, "min_rssi_enabled": False, "min_rssi": 0}
+                ]
+            },
+        },
         revertible=True,
     )
     plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "merged-reverse", steps=[step])
@@ -2217,10 +2337,16 @@ async def test_round8_10_revert_restores_a_field_the_change_deleted(store):
     endpoint = f"rest/device/{AP_ID}"
     change_id = store.insert_change(
         action="wifi.channel_change",
-        before={"method": "PUT", "endpoint": endpoint,
-                "body": {"radio_table": [{"radio": "ng", "channel": 3, "tx_power_mode": "high"}]}},
-        after={"method": "PUT", "endpoint": endpoint,
-               "body": {"radio_table": [{"radio": "ng", "channel": 1}]}},  # tx_power_mode dropped
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 3, "tx_power_mode": "high"}]},
+        },
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 1}]},
+        },  # tx_power_mode dropped
         status="applied",
         ts=1,
     )
@@ -2249,10 +2375,16 @@ async def test_round8_5_cancelled_mid_send_revert_blocks_replay(store):
     endpoint = f"rest/device/{AP_ID}"
     change_id = store.insert_change(
         action="wifi.channel_change",
-        before={"method": "PUT", "endpoint": endpoint,
-                "body": {"radio_table": [{"radio": "ng", "channel": 3}]}},
-        after={"method": "PUT", "endpoint": endpoint,
-               "body": {"radio_table": [{"radio": "ng", "channel": 1}]}},
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 3}]},
+        },
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 1}]},
+        },
         status="applied",
         ts=1,
     )
@@ -2319,10 +2451,16 @@ async def test_d1_delta_field_absent_from_live_is_drift(store):
         # Delta: channel 3->1 AND tx_power_mode high->medium.
         payload={"radio_table": [{"radio": "ng", "channel": 1, "tx_power_mode": "medium"}]},
         precondition=_radio_pre(f"{AP_MAC}:ng", {"channel": 3}),  # channel-only
-        before={"method": "PUT", "endpoint": endpoint,
-                "body": {"radio_table": [{"radio": "ng", "channel": 3, "tx_power_mode": "high"}]}},
-        after={"method": "PUT", "endpoint": endpoint,
-               "body": {"radio_table": [{"radio": "ng", "channel": 1, "tx_power_mode": "medium"}]}},
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 3, "tx_power_mode": "high"}]},
+        },
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 1, "tx_power_mode": "medium"}]},
+        },
         revertible=True,
     )
     plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "d1", steps=[step])
@@ -2362,14 +2500,25 @@ async def test_d8_change_that_adds_a_radio_is_refused_at_apply(store):
         method="PUT",
         endpoint=endpoint,
         # before has ONLY ng; payload changes ng.channel AND adds a brand-new na radio.
-        payload={"radio_table": [{"radio": "ng", "channel": 1, "ht": 20},
-                                 {"radio": "na", "channel": 36}]},
+        payload={
+            "radio_table": [{"radio": "ng", "channel": 1, "ht": 20}, {"radio": "na", "channel": 36}]
+        },
         precondition=_radio_pre(f"{AP_MAC}:ng", {"channel": 3}),
-        before={"method": "PUT", "endpoint": endpoint,
-                "body": {"radio_table": [{"radio": "ng", "channel": 3, "ht": 20}]}},
-        after={"method": "PUT", "endpoint": endpoint,
-               "body": {"radio_table": [{"radio": "ng", "channel": 1, "ht": 20},
-                                        {"radio": "na", "channel": 36}]}},
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 3, "ht": 20}]},
+        },
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {
+                "radio_table": [
+                    {"radio": "ng", "channel": 1, "ht": 20},
+                    {"radio": "na", "channel": 36},
+                ]
+            },
+        },
         revertible=True,
     )
     plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "d8", steps=[step])
@@ -2404,18 +2553,26 @@ async def test_d8_concurrent_live_added_radio_is_still_preserved_not_refused(sto
         endpoint=endpoint,
         payload={"radio_table": [{"radio": "ng", "channel": 1, "ht": 20}]},
         precondition=_radio_pre(f"{AP_MAC}:ng", {"channel": 3}),
-        before={"method": "PUT", "endpoint": endpoint,
-                "body": {"radio_table": [{"radio": "ng", "channel": 3, "ht": 20}]}},
-        after={"method": "PUT", "endpoint": endpoint,
-               "body": {"radio_table": [{"radio": "ng", "channel": 1, "ht": 20}]}},
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 3, "ht": 20}]},
+        },
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 1, "ht": 20}]},
+        },
         revertible=True,
     )
     plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "d8-ok", steps=[step])
     writer = _RecordingLiveWriter()
     applier = Applier(store, writer)
     # na appeared in live since the plan was built; the STEP never mentions it.
-    live = {"ng": {"radio": "ng", "channel": 3, "ht": 20},
-            "na": {"radio": "na", "channel": 40, "ht": 80}}
+    live = {
+        "ng": {"radio": "ng", "channel": 3, "ht": 20},
+        "na": {"radio": "na", "channel": 40, "ht": 80},
+    }
 
     async def _reader():
         cur = {f"{AP_MAC}:ng": {"channel": 3}}
@@ -2446,7 +2603,9 @@ async def test_w10a2_ambiguous_apply_cannot_be_replayed_with_same_token(store, a
     store.upsert_entity(radio_entity("ng"))
 
     ambiguous = WriteResult(
-        ok=False, status_code=None, data={"ambiguous": True, "error": "outcome unknown; not retried"}
+        ok=False,
+        status_code=None,
+        data={"ambiguous": True, "error": "outcome unknown; not retried"},
     )
     writer = FakeControllerWriter(response=ambiguous)
     applier = Applier(store, writer)
@@ -2455,18 +2614,14 @@ async def test_w10a2_ambiguous_apply_cannot_be_replayed_with_same_token(store, a
     plan = _channel_plan(ap_device)
     token = plan_confirm_token(plan)
 
-    first = await applier.apply(
-        plan, dry_run=False, confirm_token=token, current_state=_state_ok()
-    )
+    first = await applier.apply(plan, dry_run=False, confirm_token=token, current_state=_state_ok())
     assert first.steps[0].status == "unknown"
     assert store.list_changes()[0]["status"] == "unknown"
     assert writer.call_count == 1  # dispatched exactly once so far
 
     # SAME token, SAME unchanged snapshot: the replay must be REFUSED, not dispatched.
     with pytest.raises(FixError) as exc:
-        await applier.apply(
-            plan, dry_run=False, confirm_token=token, current_state=_state_ok()
-        )
+        await applier.apply(plan, dry_run=False, confirm_token=token, current_state=_state_ok())
     assert "unresolved" in str(exc.value) or "uncertain" in str(exc.value)
     # No second dispatch, and still exactly ONE ledger row -- no duplicate 'unknown'.
     assert writer.call_count == 1
@@ -2481,10 +2636,16 @@ async def test_w10a2_reverting_change_blocks_a_fresh_apply_on_same_target(store,
     entity = store.find_entity(EntityType.RADIO, f"{AP_MAC}:ng")
     store.insert_change(
         action="wifi.channel_change",
-        before={"method": "PUT", "endpoint": f"rest/device/{AP_ID}",
-                "body": {"radio_table": [{"radio": "ng", "channel": 3}]}},
-        after={"method": "PUT", "endpoint": f"rest/device/{AP_ID}",
-               "body": {"radio_table": [{"radio": "ng", "channel": 1}]}},
+        before={
+            "method": "PUT",
+            "endpoint": f"rest/device/{AP_ID}",
+            "body": {"radio_table": [{"radio": "ng", "channel": 3}]},
+        },
+        after={
+            "method": "PUT",
+            "endpoint": f"rest/device/{AP_ID}",
+            "body": {"radio_table": [{"radio": "ng", "channel": 1}]},
+        },
         status="reverting",
         ts=1,
         entity_id=int(entity["entity_id"]),
@@ -2519,10 +2680,16 @@ async def test_w11a3_uncertain_change_on_one_radio_blocks_apply_to_sibling_radio
     # An unresolved (ambiguous) apply on the ng radio of this AP still stands.
     store.insert_change(
         action="wifi.channel_change",
-        before={"method": "PUT", "endpoint": endpoint,
-                "body": {"radio_table": [{"radio": "ng", "channel": 3}]}},
-        after={"method": "PUT", "endpoint": endpoint,
-               "body": {"radio_table": [{"radio": "ng", "channel": 1}]}},
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 3}]},
+        },
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 1}]},
+        },
         status="unknown",
         ts=1,
         entity_id=int(ng_entity["entity_id"]),
@@ -2540,10 +2707,16 @@ async def test_w11a3_uncertain_change_on_one_radio_blocks_apply_to_sibling_radio
         endpoint=endpoint,
         payload={"radio_table": [{"radio": "na", "channel": 40}]},
         precondition=_radio_pre(f"{AP_MAC}:na", {"channel": 36}),
-        before={"method": "PUT", "endpoint": endpoint,
-                "body": {"radio_table": [{"radio": "na", "channel": 36}]}},
-        after={"method": "PUT", "endpoint": endpoint,
-               "body": {"radio_table": [{"radio": "na", "channel": 40}]}},
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "na", "channel": 36}]},
+        },
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "na", "channel": 40}]},
+        },
         revertible=True,
     )
     plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:na", "na-only", steps=[na_step])
@@ -2576,10 +2749,16 @@ async def test_w10a3_rejected_revert_leaves_unknown_apply_unknown(store):
     endpoint = f"rest/device/{AP_ID}"
     change_id = store.insert_change(
         action="wifi.channel_change",
-        before={"method": "PUT", "endpoint": endpoint,
-                "body": {"radio_table": [{"radio": "ng", "channel": 3}]}},
-        after={"method": "PUT", "endpoint": endpoint,
-               "body": {"radio_table": [{"radio": "ng", "channel": 1}]}},
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 3}]},
+        },
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 1}]},
+        },
         status="unknown",  # the forward apply outcome was NEVER confirmed
         ts=1,
     )
@@ -2616,10 +2795,16 @@ async def test_w10a3_rejected_revert_of_applied_change_stays_applied(store):
     endpoint = f"rest/device/{AP_ID}"
     change_id = store.insert_change(
         action="wifi.channel_change",
-        before={"method": "PUT", "endpoint": endpoint,
-                "body": {"radio_table": [{"radio": "ng", "channel": 3}]}},
-        after={"method": "PUT", "endpoint": endpoint,
-               "body": {"radio_table": [{"radio": "ng", "channel": 1}]}},
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 3}]},
+        },
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 1}]},
+        },
         status="applied",
         ts=1,
     )
@@ -2650,15 +2835,21 @@ async def test_w10a3_rejected_revert_of_applied_change_stays_applied(store):
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("prior", ["failed", "applying"])
 async def test_w12a4_revert_of_unconfirmed_change_is_refused_no_promotion(store, prior):
-    from netadmin.fixes.models import FixError
+    from netadmin.fixes.models import FixError, WriteResult
 
     endpoint = f"rest/device/{AP_ID}"
     change_id = store.insert_change(
         action="wifi.channel_change",
-        before={"method": "PUT", "endpoint": endpoint,
-                "body": {"radio_table": [{"radio": "ng", "channel": 3}]}},
-        after={"method": "PUT", "endpoint": endpoint,
-               "body": {"radio_table": [{"radio": "ng", "channel": 1}]}},
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 3}]},
+        },
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 1}]},
+        },
         status=prior,  # a change that NEVER confirmed a mutation
         ts=1,
     )
@@ -2694,10 +2885,16 @@ async def test_w12a4_rejected_revert_of_applied_change_still_stays_applied(store
     endpoint = f"rest/device/{AP_ID}"
     change_id = store.insert_change(
         action="wifi.channel_change",
-        before={"method": "PUT", "endpoint": endpoint,
-                "body": {"radio_table": [{"radio": "ng", "channel": 3}]}},
-        after={"method": "PUT", "endpoint": endpoint,
-               "body": {"radio_table": [{"radio": "ng", "channel": 1}]}},
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 3}]},
+        },
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 1}]},
+        },
         status="applied",
         ts=1,
     )
@@ -2741,7 +2938,11 @@ async def test_w12a4_assert_revertible_status_refuses_failed_and_applying():
 # --------------------------------------------------------------------------- #
 def _reader_returning(cur, full, mesh=None):
     async def _r():
-        return cur, {k: {rk: dict(rv) for rk, rv in v.items()} for k, v in full.items()}, (mesh or set())
+        return (
+            cur,
+            {k: {rk: dict(rv) for rk, rv in v.items()} for k, v in full.items()},
+            (mesh or set()),
+        )
 
     return _r
 
@@ -2767,10 +2968,12 @@ async def test_apply_refuses_delta_targeting_radio_absent_from_fresh_live(store)
     before = {
         "method": "PUT",
         "endpoint": endpoint,
-        "body": {"radio_table": [
-            {"radio": "ng", "channel": 3},
-            {"radio": "na", "channel": 36},
-        ]},
+        "body": {
+            "radio_table": [
+                {"radio": "ng", "channel": 3},
+                {"radio": "na", "channel": 36},
+            ]
+        },
     }
     step = FixStep(
         action=ActionType.CHANNEL_CHANGE,
@@ -2781,19 +2984,23 @@ async def test_apply_refuses_delta_targeting_radio_absent_from_fresh_live(store)
         method="PUT",
         endpoint=endpoint,
         # Forged: bundles a delta for 'na', a radio that has vanished from fresh live.
-        payload={"radio_table": [
-            {"radio": "ng", "channel": 1},
-            {"radio": "na", "channel": 40},
-        ]},
+        payload={
+            "radio_table": [
+                {"radio": "ng", "channel": 1},
+                {"radio": "na", "channel": 40},
+            ]
+        },
         precondition=Precondition(target_native_id=f"{AP_MAC}:ng", expected={"channel": 3}),
         before=before,
         after={
             "method": "PUT",
             "endpoint": endpoint,
-            "body": {"radio_table": [
-                {"radio": "ng", "channel": 1},
-                {"radio": "na", "channel": 40},
-            ]},
+            "body": {
+                "radio_table": [
+                    {"radio": "ng", "channel": 1},
+                    {"radio": "na", "channel": 40},
+                ]
+            },
         },
         revertible=True,
     )
@@ -2829,10 +3036,16 @@ async def test_delta_field_drift_flags_a_delta_target_missing_from_live(store):
         endpoint=endpoint,
         payload={"radio_table": [{"radio": "na", "channel": 40}]},
         precondition=Precondition(target_native_id=f"{AP_MAC}:na", expected={}),
-        before={"method": "PUT", "endpoint": endpoint,
-                "body": {"radio_table": [{"radio": "ng", "channel": 3}]}},
-        after={"method": "PUT", "endpoint": endpoint,
-               "body": {"radio_table": [{"radio": "ng", "channel": 3}]}},
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 3}]},
+        },
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 3}]},
+        },
         revertible=True,
     )
     plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:na", "forged", steps=[step])
@@ -2867,8 +3080,11 @@ async def test_apply_present_radio_still_applies_and_reverts(store):
         payload={"radio_table": [{"radio": "ng", "channel": 1}]},
         precondition=Precondition(target_native_id=f"{AP_MAC}:ng", expected={"channel": 3}),
         before=before,
-        after={"method": "PUT", "endpoint": endpoint,
-               "body": {"radio_table": [{"radio": "ng", "channel": 1}]}},
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 1}]},
+        },
         revertible=True,
     )
     plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "legit", steps=[step])
@@ -2901,10 +3117,12 @@ async def test_legit_multi_radio_plan_all_present_still_applies(store):
     before = {
         "method": "PUT",
         "endpoint": endpoint,
-        "body": {"radio_table": [
-            {"radio": "ng", "channel": 3},
-            {"radio": "na", "channel": 36},
-        ]},
+        "body": {
+            "radio_table": [
+                {"radio": "ng", "channel": 3},
+                {"radio": "na", "channel": 36},
+            ]
+        },
     }
     step = FixStep(
         action=ActionType.CHANNEL_CHANGE,
@@ -2914,25 +3132,34 @@ async def test_legit_multi_radio_plan_all_present_still_applies(store):
         risk=RiskLevel.MEDIUM,
         method="PUT",
         endpoint=endpoint,
-        payload={"radio_table": [
-            {"radio": "ng", "channel": 1},
-            {"radio": "na", "channel": 40},
-        ]},
+        payload={
+            "radio_table": [
+                {"radio": "ng", "channel": 1},
+                {"radio": "na", "channel": 40},
+            ]
+        },
         precondition=Precondition(target_native_id=f"{AP_MAC}:ng", expected={"channel": 3}),
         before=before,
-        after={"method": "PUT", "endpoint": endpoint,
-               "body": {"radio_table": [
-                   {"radio": "ng", "channel": 1},
-                   {"radio": "na", "channel": 40},
-               ]}},
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {
+                "radio_table": [
+                    {"radio": "ng", "channel": 1},
+                    {"radio": "na", "channel": 40},
+                ]
+            },
+        },
         revertible=True,
     )
     plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "legit-multi", steps=[step])
     cur = {f"{AP_MAC}:ng": {"channel": 3}}
-    full = {dev_key: {
-        "ng": {"radio": "ng", "channel": 3},
-        "na": {"radio": "na", "channel": 36},
-    }}
+    full = {
+        dev_key: {
+            "ng": {"radio": "ng", "channel": 3},
+            "na": {"radio": "na", "channel": 36},
+        }
+    }
     result = await applier.apply(
         plan,
         dry_run=False,

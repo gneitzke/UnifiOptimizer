@@ -365,7 +365,9 @@ class CorrelationEngine:
         """
         target = getattr(self.store, "reconcile_incident_members", None)
         if target is None:
-            target = getattr(getattr(self.store, "_store", None), "reconcile_incident_members", None)
+            target = getattr(
+                getattr(self.store, "_store", None), "reconcile_incident_members", None
+            )
         if callable(target):
             target(
                 incident_id,
@@ -386,9 +388,7 @@ class CorrelationEngine:
         historical.update({m.issue_id: m for m in current})
         self.store.replace_incident_members(incident_id, list(historical.values()))
 
-    def _current_member_ids(
-        self, incident_id: int, historical: list[IncidentMember]
-    ) -> set[int]:
+    def _current_member_ids(self, incident_id: int, historical: list[IncidentMember]) -> set[int]:
         """C5: read the current subset when timestamp-aware persistence supports it."""
         target = getattr(self.store, "current_incident_issue_ids", None)
         if target is None:
@@ -634,9 +634,7 @@ class CorrelationEngine:
         return title, summary
 
     @staticmethod
-    def _causal_sentence(
-        title: str, symptom_detector_keys: list[str], *, cell_local: bool
-    ) -> str:
+    def _causal_sentence(title: str, symptom_detector_keys: list[str], *, cell_local: bool) -> str:
         """The "<title> is causing <symptoms>[ in that cell]." sentence.
 
         Built purely from the CURRENTLY-open symptom detector keys, so a symptom

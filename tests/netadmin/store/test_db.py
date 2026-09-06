@@ -182,13 +182,19 @@ def test_migration_0011_creates_ingest_coverage_table(tmp_db_path: Path) -> None
     # Rewinding to v10 leaves every later migration (0011 and the concurrently
     # merged 0012) pending; 0011 is the one that creates this table.
     assert 11 in db.apply_migrations(conn)
-    assert conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ingest_coverage'"
-    ).fetchone() is not None
-    assert conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='index' "
-        "AND name='idx_ingest_coverage_lookup'"
-    ).fetchone() is not None
+    assert (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ingest_coverage'"
+        ).fetchone()
+        is not None
+    )
+    assert (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' "
+            "AND name='idx_ingest_coverage_lookup'"
+        ).fetchone()
+        is not None
+    )
     assert db.schema_version(conn) == db.latest_migration_version()
 
 
@@ -206,12 +212,8 @@ def test_migration_0012_preserves_populated_sle_minutes_and_splits_attribution(
         "PRIMARY KEY (bucket_ts, sle, classifier, entity_id)"
         ") WITHOUT ROWID"
     )
-    conn.execute(
-        "INSERT INTO sle_minutes VALUES (0, 'coverage', 'weak_signal', 7, 11, 2.0)"
-    )
-    conn.execute(
-        "INSERT INTO sle_minutes VALUES (0, 'coverage', 'ok', 7, NULL, 3.0)"
-    )
+    conn.execute("INSERT INTO sle_minutes VALUES (0, 'coverage', 'weak_signal', 7, 11, 2.0)")
+    conn.execute("INSERT INTO sle_minutes VALUES (0, 'coverage', 'ok', 7, NULL, 3.0)")
     # 0011 is owned by a concurrent change and does not alter this table; this
     # reconstructed shape is precisely the schema immediately before 0012.
     # 0013 (events.reconcile_attempts) rode along in the full apply above; drop its
@@ -221,12 +223,9 @@ def test_migration_0012_preserves_populated_sle_minutes_and_splits_attribution(
 
     # Rewinding to v11 leaves both 0012 and the later 0013 pending.
     assert db.apply_migrations(conn) == [12, 13]
-    conn.execute(
-        "INSERT INTO sle_minutes VALUES (0, 'coverage', 'weak_signal', 7, 12, 3.0)"
-    )
+    conn.execute("INSERT INTO sle_minutes VALUES (0, 'coverage', 'weak_signal', 7, 12, 3.0)")
     rows = conn.execute(
-        "SELECT classifier, attributed_entity_id, minutes FROM sle_minutes "
-        "ORDER BY classifier"
+        "SELECT classifier, attributed_entity_id, minutes FROM sle_minutes " "ORDER BY classifier"
     ).fetchall()
     assert [tuple(row) for row in rows] == [
         ("ok", 0, 3.0),
@@ -812,8 +811,9 @@ def test_normal_nested_transaction_still_commits_atomically(tmp_db_path: Path) -
         # Inner write rides the outer transaction rather than opening its own.
         with repo._write() as c:
             assert conn.in_transaction is True
-            c.execute("INSERT INTO events (ts, key, native_id, data) "
-                      "VALUES (2, 'EVT_B', 'b', '{}')")
+            c.execute(
+                "INSERT INTO events (ts, key, native_id, data) " "VALUES (2, 'EVT_B', 'b', '{}')"
+            )
         # Still uncommitted inside the block: a separate reader sees nothing yet.
         reader = db.connect(tmp_db_path, read_only=True)
         assert reader.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0

@@ -461,9 +461,9 @@ def test_overview_grouping_uses_current_membership_after_a_clear(tmp_db_path: An
         assert "1 open issue(s)" in summary
         # Overview agrees with the incident card (current member_count == 1).
         card = tools.call_tool(store, "netadmin_incidents", {}, now=_C5_BASE + 1100)
-        member_count = next(
-            i for i in card["incidents"]["items"] if i["incident_id"] == inc_id
-        )["member_count"]
+        member_count = next(i for i in card["incidents"]["items"] if i["incident_id"] == inc_id)[
+            "member_count"
+        ]
         assert member_count == 1
     finally:
         store.close()

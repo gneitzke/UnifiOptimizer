@@ -402,14 +402,16 @@ class Applier:
                 dev_key = _endpoint_device(step.endpoint)
                 base = self._merge_base(step, dev_key, carried, full_state)
                 dispatch_body, merged = self._merge_step_onto(step, base)
-                merged_radios = merged if merged is not None else {
-                    str(r.get("radio")): dict(r)
-                    for r in (dispatch_body.get("radio_table") or [])
-                    if isinstance(r, dict) and r.get("radio") is not None
-                }
-                self._assert_step_reverse_ok(
-                    step, dev_key in mesh_uplinks, merged_radios
+                merged_radios = (
+                    merged
+                    if merged is not None
+                    else {
+                        str(r.get("radio")): dict(r)
+                        for r in (dispatch_body.get("radio_table") or [])
+                        if isinstance(r, dict) and r.get("radio") is not None
+                    }
                 )
+                self._assert_step_reverse_ok(step, dev_key in mesh_uplinks, merged_radios)
                 if merged is not None:
                     carried[dev_key] = merged
                 prepared.append((step, dispatch_body, merged))
@@ -614,7 +616,8 @@ class Applier:
                     non_revertible = sorted(
                         k
                         for k, v in after_body.items()
-                        if k != "radio_table" and v != (body.get(k) if isinstance(body, dict) else None)
+                        if k != "radio_table"
+                        and v != (body.get(k) if isinstance(body, dict) else None)
                     )
                     if non_revertible:
                         raise SafetyViolation(
@@ -700,6 +703,7 @@ class Applier:
         (its caller holds it), so a concurrent apply's just-recorded uncertain row is
         visible here rather than raced past.
         """
+
         def _refuse_if_uncertain(rows: Iterable[Any], target: str) -> None:
             for change in rows:
                 status = change["status"] if "status" in change.keys() else None
@@ -733,9 +737,7 @@ class Applier:
         # issue id (a NULL issue_id would over-match every unattributed change).
         if plan.issue_id is not None:
             target = plan.steps[0].target_native_id if plan.steps else f"issue {plan.issue_id}"
-            _refuse_if_uncertain(
-                self._store.list_changes(issue_id=plan.issue_id), target
-            )
+            _refuse_if_uncertain(self._store.list_changes(issue_id=plan.issue_id), target)
         # (c) Per physical DEVICE ENDPOINT (#w11a-3). A ``rest/device/<id>`` PUT
         # replaces the ENTIRE device (its whole ``radio_table``), so an unresolved
         # uncertain change on ANY radio of that device -- even one recorded against a
@@ -896,9 +898,7 @@ class Applier:
         after_radios = {
             r.get("radio"): r for r in (after_body.get("radio_table") or []) if isinstance(r, dict)
         }
-        deleted_radios = sorted(
-            str(code) for code in before_radios if code not in after_radios
-        )
+        deleted_radios = sorted(str(code) for code in before_radios if code not in after_radios)
         if deleted_radios:
             raise SafetyViolation(
                 f"revert of change {change_id} cannot complete: the applied change dropped "
@@ -915,9 +915,7 @@ class Applier:
             bentry = before_radios.get(radio, {})
             names = (set(aentry) | set(bentry)) - {"radio"}
             fields = {
-                k
-                for k in names
-                if (k in bentry) != (k in aentry) or bentry.get(k) != aentry.get(k)
+                k for k in names if (k in bentry) != (k in aentry) or bentry.get(k) != aentry.get(k)
             }
             if fields:
                 touched[radio] = fields
@@ -945,9 +943,7 @@ class Applier:
                     before_val,
                 ):
                     if not live_present:
-                        conflicts.append(
-                            f"{radio_code}.{field} could not be read from live state"
-                        )
+                        conflicts.append(f"{radio_code}.{field} could not be read from live state")
                     else:
                         conflicts.append(
                             f"{radio_code}.{field} is now {live_val!r}, not the {after_val!r} "
@@ -1181,9 +1177,11 @@ class Applier:
         # A CHANGED top-level field never reaches here -- the revertibility gate refuses
         # it up front (it has no ``radio_table`` inverse), so this loop yields {} in
         # practice; the guard is defence in depth.
-        before_top = {
-            k: v for k, v in (before_body or {}).items() if k != "radio_table"
-        } if isinstance(before_body, dict) else {}
+        before_top = (
+            {k: v for k, v in (before_body or {}).items() if k != "radio_table"}
+            if isinstance(before_body, dict)
+            else {}
+        )
         body = {
             k: v
             for k, v in (step.payload or {}).items()
@@ -1340,9 +1338,7 @@ class Applier:
         # The post-apply live state a revert issued right afterwards would read IS the
         # merged table this apply dispatches (#3), so build the reverse against it.
         current_radios = {
-            str(code): dict(entry)
-            for code, entry in merged_radios.items()
-            if entry is not None
+            str(code): dict(entry) for code, entry in merged_radios.items() if entry is not None
         }
         before_radios = {
             str(r.get("radio")): r
@@ -1410,9 +1406,7 @@ class Applier:
         # revertible, so refuse an apply that mutates anything else (verifier round 4).
         full_dispatched_body = step.payload if isinstance(step.payload, Mapping) else {}
         non_revertible = sorted(
-            k
-            for k, v in full_dispatched_body.items()
-            if k != "radio_table" and v != body.get(k)
+            k for k, v in full_dispatched_body.items() if k != "radio_table" and v != body.get(k)
         )
         if non_revertible:
             raise SafetyViolation(
@@ -1425,9 +1419,7 @@ class Applier:
         # back to their before-values regardless of what ``step.after`` claims and any
         # live-carried field is judged in place (#3).
         try:
-            fresh_table = self._fresh_restore_table(
-                -1, body, intended_after_body, current_radios
-            )
+            fresh_table = self._fresh_restore_table(-1, body, intended_after_body, current_radios)
             # The derived inverse must actually reverse the dispatched op. An empty
             # reverse table inverts nothing and would trivially pass every rail below.
             if not fresh_table:
@@ -1525,9 +1517,7 @@ class Applier:
             if live_radios is None:
                 continue  # device absent from fresh state -> precondition drift handles it
             delta = self._step_radio_delta(step)
-            before_body = (
-                (step.before or {}).get("body") if isinstance(step.before, dict) else {}
-            )
+            before_body = (step.before or {}).get("body") if isinstance(step.before, dict) else {}
             before_radios = {
                 str(r.get("radio")): r
                 for r in ((before_body or {}).get("radio_table") or [])

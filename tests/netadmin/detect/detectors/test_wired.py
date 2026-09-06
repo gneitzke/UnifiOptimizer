@@ -1132,8 +1132,13 @@ def test_stp_loop_fires_end_to_end_via_normalizer(repo: Repository) -> None:
     pid = make_port(repo, sw_id=sw, idx=1)  # native_id "sw:1:1"
 
     raw = Event.model_validate(
-        {"_id": "stp-e2e", "key": "EVT_SW_StpPortBlocking", "time": (NOW - 100) * 1000,
-         "sw": "sw:1", "port": 1}
+        {
+            "_id": "stp-e2e",
+            "key": "EVT_SW_StpPortBlocking",
+            "time": (NOW - 100) * 1000,
+            "sw": "sw:1",
+            "port": 1,
+        }
     )
     rec = EventNormalizer(repo).normalize(raw)
     assert rec is not None

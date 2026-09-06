@@ -1290,8 +1290,8 @@ def test_observed_event_coverage_large_gap_reads_as_uncovered(repo: Repository) 
     empty middle is a genuine hole, so coverage stays well below full -> UNKNOWN."""
     now = 2_000_000
     start = now - 3600
-    _seed_heartbeats(repo, start, start + 300, step=60)      # early burst
-    _seed_heartbeats(repo, now - 360, now - 1, step=60)      # late burst
+    _seed_heartbeats(repo, start, start + 300, step=60)  # early burst
+    _seed_heartbeats(repo, now - 360, now - 1, step=60)  # late burst
     cov = repo.observed_event_coverage(start, now)
     # ~ (300 + ~360) / 3600 -- the big middle gap is uncovered.
     assert cov < 0.3
@@ -1305,8 +1305,12 @@ def test_observed_event_coverage_unions_ws_and_history(repo: Repository) -> None
     start = now - 3600
     _seed_heartbeats(repo, start, start + 600, step=60)
     repo.record_ingest_coverage(
-        kind="event_history", scope="site", interval="retained",
-        start_ts=now - 600, end_ts=now, status="complete",
+        kind="event_history",
+        scope="site",
+        interval="retained",
+        start_ts=now - 600,
+        end_ts=now,
+        status="complete",
     )
     assert repo.observed_event_coverage(start, now) == pytest.approx(1200 / 3600, abs=0.02)
 
@@ -1349,9 +1353,7 @@ def test_w16a1_recorded_disconnect_severs_heartbeat_bridge(repo: Repository) -> 
         repo.record_ws_heartbeat(ts=c)
         repo.record_ws_heartbeat(ts=c + 30)
         # The supervisor records a disconnect transition when the socket drops.
-        repo.record_poll_run(
-            job="ws", ok=True, ts=c + 32, error="disconnected", source="live"
-        )
+        repo.record_poll_run(job="ws", ok=True, ts=c + 32, error="disconnected", source="live")
         c += 90
     cov = repo.observed_event_coverage(start, now)
     # ~30 covered out of every 90 -> ~0.33, WELL below the 0.9 floor.
@@ -1400,9 +1402,7 @@ def test_w17a1_same_second_disconnect_severs_heartbeat_bridge(repo: Repository) 
         # The disconnect lands in the SAME second as the c+30 beat, recorded just
         # after it (a higher poll_runs rowid). Pre-fix this was NOT strictly between
         # c+30 and c+90 and so never severed the bridge.
-        repo.record_poll_run(
-            job="ws", ok=True, ts=c + 30, error="disconnected", source="live"
-        )
+        repo.record_poll_run(job="ws", ok=True, ts=c + 30, error="disconnected", source="live")
         c += 90
     cov = repo.observed_event_coverage(start, now)
     # ~30 covered out of every 90 -> ~0.33, WELL below the 0.9 floor.
@@ -1456,10 +1456,12 @@ def test_w16a5_out_of_range_int_port_not_accepted_then_mismatched(
         ts=500,
     )
     huge_ev = repo.record_event(
-        ts=1000, key="EVT_SW_StpPortBlocking", entity_id=None, related_entity_id=None,
+        ts=1000,
+        key="EVT_SW_StpPortBlocking",
+        entity_id=None,
+        related_entity_id=None,
         native_id="stp-huge",
-        data={"key": "EVT_SW_StpPortBlocking", "time": 1000 * 1000,
-              "sw": unknown_sw, "port": huge},
+        data={"key": "EVT_SW_StpPortBlocking", "time": 1000 * 1000, "sw": unknown_sw, "port": huge},
     )
     assert huge_ev is not None
     for _ in range(_EVENT_RECONCILE_MAX_ATTEMPTS):
@@ -1471,10 +1473,12 @@ def test_w16a5_out_of_range_int_port_not_accepted_then_mismatched(
         Entity(entity_type=EntityType.PORT, native_id=f"{good_sw}:2"), ts=8000
     )
     newer = repo.record_event(
-        ts=9000, key="EVT_SW_StpPortBlocking", entity_id=None, related_entity_id=None,
+        ts=9000,
+        key="EVT_SW_StpPortBlocking",
+        entity_id=None,
+        related_entity_id=None,
         native_id="stp-good",
-        data={"key": "EVT_SW_StpPortBlocking", "time": 9000 * 1000,
-              "sw": good_sw, "port": 2},
+        data={"key": "EVT_SW_StpPortBlocking", "time": 9000 * 1000, "sw": good_sw, "port": 2},
     )
     assert newer is not None
 
@@ -1486,12 +1490,18 @@ def test_w16a5_out_of_range_int_port_not_accepted_then_mismatched(
     # End-to-end: reconcile fills the newer row's real port; the huge row stays NULL.
     repaired = EventNormalizer(repo).reconcile_unresolved(limit=500)
     assert repaired == 1
-    assert repo._conn.execute(
-        "SELECT entity_id FROM events WHERE id=?", (newer,)
-    ).fetchone()["entity_id"] == good_port
-    assert repo._conn.execute(
-        "SELECT entity_id FROM events WHERE id=?", (huge_ev,)
-    ).fetchone()["entity_id"] is None
+    assert (
+        repo._conn.execute("SELECT entity_id FROM events WHERE id=?", (newer,)).fetchone()[
+            "entity_id"
+        ]
+        == good_port
+    )
+    assert (
+        repo._conn.execute("SELECT entity_id FROM events WHERE id=?", (huge_ev,)).fetchone()[
+            "entity_id"
+        ]
+        is None
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1538,14 +1548,22 @@ def test_unresolved_events_ap_flood_does_not_starve_repairable_client(repo: Repo
     # 600 AP events: primary resolved to the AP, related permanently NULL.
     for i in range(600):
         repo.record_event(
-            ts=1000 + i, key="EVT_AP_Lost_Contact", entity_id=ap,
-            related_entity_id=None, native_id=f"apev-{i}", data={"ap": "ap:mac"},
+            ts=1000 + i,
+            key="EVT_AP_Lost_Contact",
+            entity_id=ap,
+            related_entity_id=None,
+            native_id=f"apev-{i}",
+            data={"ap": "ap:mac"},
         )
     # A repairable client event arriving later: its client is named in the payload
     # (so it can resolve) but is not yet in inventory.
     client_ev = repo.record_event(
-        ts=9000, key="EVT_WU_Disconnected", entity_id=None,
-        related_entity_id=None, native_id="cliev", data={"user": "cli:mac"},
+        ts=9000,
+        key="EVT_WU_Disconnected",
+        entity_id=None,
+        related_entity_id=None,
+        native_id="cliev",
+        data={"user": "cli:mac"},
     )
 
     rows = repo.unresolved_events(limit=500)
@@ -1562,8 +1580,12 @@ def test_unresolved_events_keeps_client_with_pending_related(repo: Repository) -
     # The from-AP is named in the payload but not yet in inventory (still pending):
     # its identity exists, so the row is genuinely repairable and must be selected.
     ev = repo.record_event(
-        ts=2000, key="EVT_WU_Roam", entity_id=client,
-        related_entity_id=None, native_id="roamev", data={"ap_from": "apx:mac"},
+        ts=2000,
+        key="EVT_WU_Roam",
+        entity_id=client,
+        related_entity_id=None,
+        native_id="roamev",
+        data={"ap_from": "apx:mac"},
     )
     returned = {int(r["id"]) for r in repo.unresolved_events(limit=500)}
     assert ev in returned
@@ -1591,14 +1613,14 @@ def test_w15a4_bool_port_event_not_falsely_resolvable_against_int_port(
 
     unknown_sw = "02:00:de:ad:be:ef"  # switch deliberately NOT in inventory
     # A real INTEGER port "<sw>:1" exists -- the entity the buggy SQL matched.
-    repo.upsert_entity(
-        Entity(entity_type=EntityType.PORT, native_id=f"{unknown_sw}:1"), ts=500
-    )
+    repo.upsert_entity(Entity(entity_type=EntityType.PORT, native_id=f"{unknown_sw}:1"), ts=500)
     bool_ev = repo.record_event(
-        ts=1000, key="EVT_SW_StpPortBlocking", entity_id=None, related_entity_id=None,
+        ts=1000,
+        key="EVT_SW_StpPortBlocking",
+        entity_id=None,
+        related_entity_id=None,
         native_id="stp-bool",
-        data={"key": "EVT_SW_StpPortBlocking", "time": 1000 * 1000,
-              "sw": unknown_sw, "port": True},
+        data={"key": "EVT_SW_StpPortBlocking", "time": 1000 * 1000, "sw": unknown_sw, "port": True},
     )
     assert bool_ev is not None
     # Park it: exhaust its attempts so it is retained ONLY if (falsely) resolvable.
@@ -1611,10 +1633,12 @@ def test_w15a4_bool_port_event_not_falsely_resolvable_against_int_port(
         Entity(entity_type=EntityType.PORT, native_id=f"{good_sw}:2"), ts=8000
     )
     newer = repo.record_event(
-        ts=9000, key="EVT_SW_StpPortBlocking", entity_id=None, related_entity_id=None,
+        ts=9000,
+        key="EVT_SW_StpPortBlocking",
+        entity_id=None,
+        related_entity_id=None,
         native_id="stp-good",
-        data={"key": "EVT_SW_StpPortBlocking", "time": 9000 * 1000,
-              "sw": good_sw, "port": 2},
+        data={"key": "EVT_SW_StpPortBlocking", "time": 9000 * 1000, "sw": good_sw, "port": 2},
     )
     assert newer is not None
 
@@ -1628,12 +1652,18 @@ def test_w15a4_bool_port_event_not_falsely_resolvable_against_int_port(
     # falsely repaired and stays NULL.
     repaired = EventNormalizer(repo).reconcile_unresolved(limit=500)
     assert repaired == 1
-    assert repo._conn.execute(
-        "SELECT entity_id FROM events WHERE id=?", (newer,)
-    ).fetchone()["entity_id"] == good_port
-    assert repo._conn.execute(
-        "SELECT entity_id FROM events WHERE id=?", (bool_ev,)
-    ).fetchone()["entity_id"] is None
+    assert (
+        repo._conn.execute("SELECT entity_id FROM events WHERE id=?", (newer,)).fetchone()[
+            "entity_id"
+        ]
+        == good_port
+    )
+    assert (
+        repo._conn.execute("SELECT entity_id FROM events WHERE id=?", (bool_ev,)).fetchone()[
+            "entity_id"
+        ]
+        is None
+    )
 
 
 def test_reconcile_parks_unresolvable_and_reaches_newer_repairable(repo: Repository) -> None:
@@ -1653,23 +1683,30 @@ def test_reconcile_parks_unresolvable_and_reaches_newer_repairable(repo: Reposit
     # names NO AP/switch -- there is nothing to resolve the from-AP from, ever.
     for i in range(500):
         repo.record_event(
-            ts=1000 + i, key="EVT_WU_Disconnected", entity_id=old_client,
-            related_entity_id=None, native_id=f"oldev-{i}",
-            data={"key": "EVT_WU_Disconnected", "time": (1000 + i) * 1000,
-                  "user": "cli-old:mac"},
+            ts=1000 + i,
+            key="EVT_WU_Disconnected",
+            entity_id=old_client,
+            related_entity_id=None,
+            native_id=f"oldev-{i}",
+            data={"key": "EVT_WU_Disconnected", "time": (1000 + i) * 1000, "user": "cli-old:mac"},
         )
     # A newer, genuinely repairable client event: its from-AP IS in inventory now.
     new_client = repo.upsert_entity(
         Entity(entity_type=EntityType.CLIENT, native_id="cli-new:mac"), ts=8000
     )
-    new_ap = repo.upsert_entity(
-        Entity(entity_type=EntityType.AP, native_id="ap-new:mac"), ts=8000
-    )
+    new_ap = repo.upsert_entity(Entity(entity_type=EntityType.AP, native_id="ap-new:mac"), ts=8000)
     newer_ev = repo.record_event(
-        ts=9000, key="EVT_WU_Connected", entity_id=new_client,
-        related_entity_id=None, native_id="newev",
-        data={"key": "EVT_WU_Connected", "time": 9000 * 1000,
-              "user": "cli-new:mac", "ap": "ap-new:mac"},
+        ts=9000,
+        key="EVT_WU_Connected",
+        entity_id=new_client,
+        related_entity_id=None,
+        native_id="newev",
+        data={
+            "key": "EVT_WU_Connected",
+            "time": 9000 * 1000,
+            "user": "cli-new:mac",
+            "ap": "ap-new:mac",
+        },
     )
 
     # Selection makes fair progress: the 500 unresolvable rows are parked, so the
@@ -1689,8 +1726,8 @@ def test_reconcile_parks_unresolvable_and_reaches_newer_repairable(repo: Reposit
     assert row["related_entity_id"] == new_ap
     # The parked 500 remain untouched (still NULL) -- never falsely counted.
     still_null = repo._conn.execute(
-        "SELECT COUNT(*) AS n FROM events WHERE related_entity_id IS NULL "
-        "AND entity_id=?", (old_client,)
+        "SELECT COUNT(*) AS n FROM events WHERE related_entity_id IS NULL " "AND entity_id=?",
+        (old_client,),
     ).fetchone()["n"]
     assert still_null == 500
 
@@ -1716,23 +1753,35 @@ def test_reconcile_reaches_newer_resolvable_behind_pending_flood(repo: Repositor
     # starve a newer row that CAN resolve now.
     for i in range(500):
         repo.record_event(
-            ts=1000 + i, key="EVT_WU_Roam", entity_id=old_client,
-            related_entity_id=None, native_id=f"pendev-{i}",
-            data={"key": "EVT_WU_Roam", "time": (1000 + i) * 1000,
-                  "user": "cli-old:mac", "ap_from": "absent-ap:mac"},
+            ts=1000 + i,
+            key="EVT_WU_Roam",
+            entity_id=old_client,
+            related_entity_id=None,
+            native_id=f"pendev-{i}",
+            data={
+                "key": "EVT_WU_Roam",
+                "time": (1000 + i) * 1000,
+                "user": "cli-old:mac",
+                "ap_from": "absent-ap:mac",
+            },
         )
     # A newer roam event whose from-AP IS already in inventory -> resolvable now.
     new_client = repo.upsert_entity(
         Entity(entity_type=EntityType.CLIENT, native_id="cli-new:mac"), ts=8000
     )
-    new_ap = repo.upsert_entity(
-        Entity(entity_type=EntityType.AP, native_id="ap-new:mac"), ts=8000
-    )
+    new_ap = repo.upsert_entity(Entity(entity_type=EntityType.AP, native_id="ap-new:mac"), ts=8000)
     newer_ev = repo.record_event(
-        ts=9000, key="EVT_WU_Roam", entity_id=new_client,
-        related_entity_id=None, native_id="newev",
-        data={"key": "EVT_WU_Roam", "time": 9000 * 1000,
-              "user": "cli-new:mac", "ap_from": "ap-new:mac"},
+        ts=9000,
+        key="EVT_WU_Roam",
+        entity_id=new_client,
+        related_entity_id=None,
+        native_id="newev",
+        data={
+            "key": "EVT_WU_Roam",
+            "time": 9000 * 1000,
+            "user": "cli-new:mac",
+            "ap_from": "ap-new:mac",
+        },
     )
 
     # Resolvability preference floats the newer resolvable row to the FRONT of the
@@ -1750,8 +1799,8 @@ def test_reconcile_reaches_newer_resolvable_behind_pending_flood(repo: Repositor
     ).fetchone()
     assert row["related_entity_id"] == new_ap
     still_null = repo._conn.execute(
-        "SELECT COUNT(*) AS n FROM events WHERE related_entity_id IS NULL "
-        "AND entity_id=?", (old_client,)
+        "SELECT COUNT(*) AS n FROM events WHERE related_entity_id IS NULL " "AND entity_id=?",
+        (old_client,),
     ).fetchone()["n"]
     assert still_null == 500
 
@@ -1766,13 +1815,19 @@ def test_pending_row_parks_after_cap_then_resolves_when_ap_appears(
     from netadmin.ingest.events import EventNormalizer
     from netadmin.store.repository import _EVENT_RECONCILE_MAX_ATTEMPTS
 
-    client = repo.upsert_entity(
-        Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500
-    )
+    client = repo.upsert_entity(Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500)
     ev = repo.record_event(
-        ts=1000, key="EVT_WU_Roam", entity_id=client, related_entity_id=None,
-        native_id="pending", data={"key": "EVT_WU_Roam", "time": 1000 * 1000,
-                                    "user": "cli:mac", "ap_from": "late-ap:mac"},
+        ts=1000,
+        key="EVT_WU_Roam",
+        entity_id=client,
+        related_entity_id=None,
+        native_id="pending",
+        data={
+            "key": "EVT_WU_Roam",
+            "time": 1000 * 1000,
+            "user": "cli:mac",
+            "ap_from": "late-ap:mac",
+        },
     )
 
     # While its AP is absent the row is still selected (it may yet resolve) and a
@@ -1794,9 +1849,7 @@ def test_pending_row_parks_after_cap_then_resolves_when_ap_appears(
     )
     assert ev in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
     assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 1
-    row = repo._conn.execute(
-        "SELECT related_entity_id FROM events WHERE id=?", (ev,)
-    ).fetchone()
+    row = repo._conn.execute("SELECT related_entity_id FROM events WHERE id=?", (ev,)).fetchone()
     assert row["related_entity_id"] == late_ap
 
 
@@ -1811,20 +1864,29 @@ def test_unresolved_events_degrades_when_attempt_column_absent(
         conn.execute("ALTER TABLE events DROP COLUMN reconcile_attempts")
     assert not rw._column_exists("events", "reconcile_attempts")
 
-    client = rw.upsert_entity(
-        Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500
-    )
+    client = rw.upsert_entity(Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500)
     ap = rw.upsert_entity(Entity(entity_type=EntityType.AP, native_id="ap:mac"), ts=500)
     for i in range(3):
         rw.record_event(
-            ts=1000 + i, key="EVT_WU_Roam", entity_id=client, related_entity_id=None,
-            native_id=f"pend-{i}", data={"key": "EVT_WU_Roam", "time": (1000 + i) * 1000,
-                                         "user": "cli:mac", "ap_from": "absent:mac"},
+            ts=1000 + i,
+            key="EVT_WU_Roam",
+            entity_id=client,
+            related_entity_id=None,
+            native_id=f"pend-{i}",
+            data={
+                "key": "EVT_WU_Roam",
+                "time": (1000 + i) * 1000,
+                "user": "cli:mac",
+                "ap_from": "absent:mac",
+            },
         )
     resolvable_ev = rw.record_event(
-        ts=5000, key="EVT_WU_Roam", entity_id=client, related_entity_id=None,
-        native_id="ok", data={"key": "EVT_WU_Roam", "time": 5000 * 1000,
-                               "user": "cli:mac", "ap_from": "ap:mac"},
+        ts=5000,
+        key="EVT_WU_Roam",
+        entity_id=client,
+        related_entity_id=None,
+        native_id="ok",
+        data={"key": "EVT_WU_Roam", "time": 5000 * 1000, "user": "cli:mac", "ap_from": "ap:mac"},
     )
     # No column, no raise -- and the resolvable row is still ranked first.
     selected = rw.unresolved_events(limit=500)
@@ -1856,14 +1918,20 @@ def test_roam_falsy_nonstring_ap_from_resolves_via_ap_not_parked_forever(
     from netadmin.ingest.events import EventNormalizer
     from netadmin.store.repository import _EVENT_RECONCILE_MAX_ATTEMPTS
 
-    client = repo.upsert_entity(
-        Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500
-    )
+    client = repo.upsert_entity(Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500)
     ev = repo.record_event(
-        ts=1000, key="EVT_WU_Roam", entity_id=client, related_entity_id=None,
+        ts=1000,
+        key="EVT_WU_Roam",
+        entity_id=client,
+        related_entity_id=None,
         native_id="roam-falsy",
-        data={"key": "EVT_WU_Roam", "time": 1000 * 1000, "user": "cli:mac",
-              "ap_from": falsy_ap_from, "ap": "ap-real:mac"},
+        data={
+            "key": "EVT_WU_Roam",
+            "time": 1000 * 1000,
+            "user": "cli:mac",
+            "ap_from": falsy_ap_from,
+            "ap": "ap-real:mac",
+        },
     )
     assert ev is not None
 
@@ -1880,9 +1948,7 @@ def test_roam_falsy_nonstring_ap_from_resolves_via_ap_not_parked_forever(
 
     # End-to-end: reconcile repairs it, related_entity_id -> the ``ap`` entity.
     assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 1
-    row = repo._conn.execute(
-        "SELECT related_entity_id FROM events WHERE id=?", (ev,)
-    ).fetchone()
+    row = repo._conn.execute("SELECT related_entity_id FROM events WHERE id=?", (ev,)).fetchone()
     assert row["related_entity_id"] == ap
 
 
@@ -1896,23 +1962,27 @@ def test_roam_empty_string_ap_from_still_resolves_via_ap(repo: Repository) -> No
     from netadmin.ingest.events import EventNormalizer
     from netadmin.store.repository import _EVENT_RECONCILE_MAX_ATTEMPTS
 
-    client = repo.upsert_entity(
-        Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500
-    )
+    client = repo.upsert_entity(Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500)
     ev = repo.record_event(
-        ts=1000, key="EVT_WU_Roam", entity_id=client, related_entity_id=None,
+        ts=1000,
+        key="EVT_WU_Roam",
+        entity_id=client,
+        related_entity_id=None,
         native_id="roam-empty",
-        data={"key": "EVT_WU_Roam", "time": 1000 * 1000, "user": "cli:mac",
-              "ap_from": "", "ap": "ap-real:mac"},
+        data={
+            "key": "EVT_WU_Roam",
+            "time": 1000 * 1000,
+            "user": "cli:mac",
+            "ap_from": "",
+            "ap": "ap-real:mac",
+        },
     )
     for _ in range(_EVENT_RECONCILE_MAX_ATTEMPTS):
         repo.bump_event_reconcile_attempts([ev])
     ap = repo.upsert_entity(Entity(entity_type=EntityType.AP, native_id="ap-real:mac"), ts=9000)
     assert ev in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
     assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 1
-    row = repo._conn.execute(
-        "SELECT related_entity_id FROM events WHERE id=?", (ev,)
-    ).fetchone()
+    row = repo._conn.execute("SELECT related_entity_id FROM events WHERE id=?", (ev,)).fetchone()
     assert row["related_entity_id"] == ap
 
 
@@ -1926,27 +1996,29 @@ def test_roam_real_nonempty_ap_from_still_routes_to_ap_from(repo: Repository) ->
     """
     from netadmin.ingest.events import EventNormalizer
 
-    client = repo.upsert_entity(
-        Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500
-    )
-    from_ap = repo.upsert_entity(
-        Entity(entity_type=EntityType.AP, native_id="ap-from:mac"), ts=500
-    )
+    client = repo.upsert_entity(Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500)
+    from_ap = repo.upsert_entity(Entity(entity_type=EntityType.AP, native_id="ap-from:mac"), ts=500)
     # A DIFFERENT ap that is deliberately NOT in inventory -- if resolvability
     # (wrongly) consulted ``ap`` the row would not resolve and stay NULL.
     ev = repo.record_event(
-        ts=1000, key="EVT_WU_Roam", entity_id=client, related_entity_id=None,
+        ts=1000,
+        key="EVT_WU_Roam",
+        entity_id=client,
+        related_entity_id=None,
         native_id="roam-real",
-        data={"key": "EVT_WU_Roam", "time": 1000 * 1000, "user": "cli:mac",
-              "ap_from": "ap-from:mac", "ap": "ap-other:mac"},
+        data={
+            "key": "EVT_WU_Roam",
+            "time": 1000 * 1000,
+            "user": "cli:mac",
+            "ap_from": "ap-from:mac",
+            "ap": "ap-other:mac",
+        },
     )
     # Resolvable now (from-AP present) and ranked first.
     selected = repo.unresolved_events(limit=500)
     assert int(selected[0]["id"]) == ev
     assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 1
-    row = repo._conn.execute(
-        "SELECT related_entity_id FROM events WHERE id=?", (ev,)
-    ).fetchone()
+    row = repo._conn.execute("SELECT related_entity_id FROM events WHERE id=?", (ev,)).fetchone()
     assert row["related_entity_id"] == from_ap
 
 
@@ -1975,23 +2047,36 @@ def test_wrong_precedence_mac_is_not_resolvable_and_does_not_starve(
     repo.upsert_entity(Entity(entity_type=EntityType.SWITCH, native_id="sw:mac"), ts=500)
     for i in range(500):
         repo.record_event(
-            ts=1000 + i, key="EVT_WU_Disconnected", entity_id=old_client,
-            related_entity_id=None, native_id=f"wrongprec-{i}",
-            data={"key": "EVT_WU_Disconnected", "time": (1000 + i) * 1000,
-                  "user": "cli-old:mac", "ap": "absent-ap:mac", "sw": "sw:mac"},
+            ts=1000 + i,
+            key="EVT_WU_Disconnected",
+            entity_id=old_client,
+            related_entity_id=None,
+            native_id=f"wrongprec-{i}",
+            data={
+                "key": "EVT_WU_Disconnected",
+                "time": (1000 + i) * 1000,
+                "user": "cli-old:mac",
+                "ap": "absent-ap:mac",
+                "sw": "sw:mac",
+            },
         )
     # A newer, genuinely repairable non-roam client event: its AP IS in inventory.
     new_client = repo.upsert_entity(
         Entity(entity_type=EntityType.CLIENT, native_id="cli-new:mac"), ts=8000
     )
-    new_ap = repo.upsert_entity(
-        Entity(entity_type=EntityType.AP, native_id="ap-new:mac"), ts=8000
-    )
+    new_ap = repo.upsert_entity(Entity(entity_type=EntityType.AP, native_id="ap-new:mac"), ts=8000)
     newer_ev = repo.record_event(
-        ts=9000, key="EVT_WU_Connected", entity_id=new_client,
-        related_entity_id=None, native_id="newev",
-        data={"key": "EVT_WU_Connected", "time": 9000 * 1000,
-              "user": "cli-new:mac", "ap": "ap-new:mac"},
+        ts=9000,
+        key="EVT_WU_Connected",
+        entity_id=new_client,
+        related_entity_id=None,
+        native_id="newev",
+        data={
+            "key": "EVT_WU_Connected",
+            "time": 9000 * 1000,
+            "user": "cli-new:mac",
+            "ap": "ap-new:mac",
+        },
     )
 
     # LIMIT exactly the flood size: under the old (wrong) predicate all 501 rows
@@ -2010,8 +2095,8 @@ def test_wrong_precedence_mac_is_not_resolvable_and_does_not_starve(
     ).fetchone()
     assert row["related_entity_id"] == new_ap
     still_null = repo._conn.execute(
-        "SELECT COUNT(*) AS n FROM events WHERE related_entity_id IS NULL "
-        "AND entity_id=?", (old_client,)
+        "SELECT COUNT(*) AS n FROM events WHERE related_entity_id IS NULL " "AND entity_id=?",
+        (old_client,),
     ).fetchone()["n"]
     assert still_null == 500
 
@@ -2033,28 +2118,38 @@ def test_stp_absent_port_does_not_starve_and_resolves_when_port_appears(
     # The switch IS in inventory (so each STP row's related=switch is already set at
     # ingest, exactly as normalize() would). Its PORT is NOT yet present, so the
     # primary entity (the port) cannot resolve.
-    sw = repo.upsert_entity(
-        Entity(entity_type=EntityType.SWITCH, native_id="sw:mac"), ts=500
-    )
+    sw = repo.upsert_entity(Entity(entity_type=EntityType.SWITCH, native_id="sw:mac"), ts=500)
     for i in range(500):
         repo.record_event(
-            ts=1000 + i, key="EVT_SW_StpPortBlocking", entity_id=None,
-            related_entity_id=sw, native_id=f"stp-{i}",
-            data={"key": "EVT_SW_StpPortBlocking", "time": (1000 + i) * 1000,
-                  "sw": "sw:mac", "port": 7},
+            ts=1000 + i,
+            key="EVT_SW_StpPortBlocking",
+            entity_id=None,
+            related_entity_id=sw,
+            native_id=f"stp-{i}",
+            data={
+                "key": "EVT_SW_StpPortBlocking",
+                "time": (1000 + i) * 1000,
+                "sw": "sw:mac",
+                "port": 7,
+            },
         )
     # A newer, genuinely repairable client event whose AP IS in inventory.
     new_client = repo.upsert_entity(
         Entity(entity_type=EntityType.CLIENT, native_id="cli-new:mac"), ts=8000
     )
-    new_ap = repo.upsert_entity(
-        Entity(entity_type=EntityType.AP, native_id="ap-new:mac"), ts=8000
-    )
+    new_ap = repo.upsert_entity(Entity(entity_type=EntityType.AP, native_id="ap-new:mac"), ts=8000)
     newer_ev = repo.record_event(
-        ts=9000, key="EVT_WU_Connected", entity_id=new_client,
-        related_entity_id=None, native_id="newev",
-        data={"key": "EVT_WU_Connected", "time": 9000 * 1000,
-              "user": "cli-new:mac", "ap": "ap-new:mac"},
+        ts=9000,
+        key="EVT_WU_Connected",
+        entity_id=new_client,
+        related_entity_id=None,
+        native_id="newev",
+        data={
+            "key": "EVT_WU_Connected",
+            "time": 9000 * 1000,
+            "user": "cli-new:mac",
+            "ap": "ap-new:mac",
+        },
     )
 
     # (a) LIMIT exactly the flood size: under the old predicate all 501 rows were
@@ -2066,23 +2161,23 @@ def test_stp_absent_port_does_not_starve_and_resolves_when_port_appears(
 
     repaired = EventNormalizer(repo).reconcile_unresolved(limit=500)
     assert repaired == 1
-    assert repo._conn.execute(
-        "SELECT related_entity_id FROM events WHERE id=?", (newer_ev,)
-    ).fetchone()["related_entity_id"] == new_ap
+    assert (
+        repo._conn.execute(
+            "SELECT related_entity_id FROM events WHERE id=?", (newer_ev,)
+        ).fetchone()["related_entity_id"]
+        == new_ap
+    )
     # The STP rows' primary entity (the port) is still unresolved -- parked, not
     # falsely counted as repaired.
     stp_null = repo._conn.execute(
-        "SELECT COUNT(*) AS n FROM events WHERE entity_id IS NULL "
-        "AND native_id LIKE 'stp-%'"
+        "SELECT COUNT(*) AS n FROM events WHERE entity_id IS NULL " "AND native_id LIKE 'stp-%'"
     ).fetchone()["n"]
     assert stp_null == 500
 
     # (b) The missing PORT finally appears (native_id "<sw_mac>:<port_idx>", exactly
     # how ingest/mapping.py keys ports). Every STP row is now resolvable and repairs
     # to the port on the next pass.
-    port = repo.upsert_entity(
-        Entity(entity_type=EntityType.PORT, native_id="sw:mac:7"), ts=9500
-    )
+    port = repo.upsert_entity(Entity(entity_type=EntityType.PORT, native_id="sw:mac:7"), ts=9500)
     repaired_now = EventNormalizer(repo).reconcile_unresolved(limit=500)
     assert repaired_now == 500
     filled = repo._conn.execute(
@@ -2099,20 +2194,22 @@ def test_switch_scoped_event_still_resolves_on_the_switch(repo: Repository) -> N
     ``port`` field -- so this row resolves on the switch (not a phantom port)."""
     from netadmin.ingest.events import EventNormalizer
 
-    sw = repo.upsert_entity(
-        Entity(entity_type=EntityType.SWITCH, native_id="sw:mac"), ts=500
-    )
+    sw = repo.upsert_entity(Entity(entity_type=EntityType.SWITCH, native_id="sw:mac"), ts=500)
     ev = repo.record_event(
-        ts=1000, key="EVT_SW_PoeOverload", entity_id=None, related_entity_id=None,
-        native_id="poe", data={"key": "EVT_SW_PoeOverload", "time": 1000 * 1000,
-                               "sw": "sw:mac", "port": 3},
+        ts=1000,
+        key="EVT_SW_PoeOverload",
+        entity_id=None,
+        related_entity_id=None,
+        native_id="poe",
+        data={"key": "EVT_SW_PoeOverload", "time": 1000 * 1000, "sw": "sw:mac", "port": 3},
     )
     # Resolvable now (the switch exists), so it is selected and repaired to the switch.
     assert ev in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
     assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 1
-    assert repo._conn.execute(
-        "SELECT entity_id FROM events WHERE id=?", (ev,)
-    ).fetchone()["entity_id"] == sw
+    assert (
+        repo._conn.execute("SELECT entity_id FROM events WHERE id=?", (ev,)).fetchone()["entity_id"]
+        == sw
+    )
 
 
 def test_unresolved_events_degrades_when_table_absent(tmp_db_path: Path) -> None:
@@ -2152,14 +2249,21 @@ def test_reconcile_empty_ap_resolves_via_switch_not_parked(repo: Repository) -> 
     from netadmin.ingest.events import EventNormalizer
     from netadmin.store.repository import _EVENT_RECONCILE_MAX_ATTEMPTS
 
-    client = repo.upsert_entity(
-        Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500
-    )
+    client = repo.upsert_entity(Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500)
     # ap is present-but-EMPTY; sw names a real switch not yet in inventory.
     ev = repo.record_event(
-        ts=1000, key="EVT_WU_Disconnected", entity_id=client, related_entity_id=None,
-        native_id="emptyap", data={"key": "EVT_WU_Disconnected", "time": 1000 * 1000,
-                                   "user": "cli:mac", "ap": "", "sw": "sw:mac"},
+        ts=1000,
+        key="EVT_WU_Disconnected",
+        entity_id=client,
+        related_entity_id=None,
+        native_id="emptyap",
+        data={
+            "key": "EVT_WU_Disconnected",
+            "time": 1000 * 1000,
+            "user": "cli:mac",
+            "ap": "",
+            "sw": "sw:mac",
+        },
     )
 
     # While the switch is absent the row is still a candidate (it may yet resolve),
@@ -2175,14 +2279,10 @@ def test_reconcile_empty_ap_resolves_via_switch_not_parked(repo: Repository) -> 
 
     # The switch appears. The empty ap must NOT block resolution: the row becomes
     # resolvable-via-switch, is re-admitted despite the spent budget, and repaired.
-    sw = repo.upsert_entity(
-        Entity(entity_type=EntityType.SWITCH, native_id="sw:mac"), ts=9000
-    )
+    sw = repo.upsert_entity(Entity(entity_type=EntityType.SWITCH, native_id="sw:mac"), ts=9000)
     assert ev in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
     assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 1
-    row = repo._conn.execute(
-        "SELECT related_entity_id FROM events WHERE id=?", (ev,)
-    ).fetchone()
+    row = repo._conn.execute("SELECT related_entity_id FROM events WHERE id=?", (ev,)).fetchone()
     assert row["related_entity_id"] == sw
 
 
@@ -2194,24 +2294,27 @@ def test_reconcile_precedence_present_ap_beats_switch(repo: Repository) -> None:
     single-winner precedence for a genuinely-present ap."""
     from netadmin.ingest.events import EventNormalizer
 
-    client = repo.upsert_entity(
-        Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500
-    )
+    client = repo.upsert_entity(Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500)
     ap = repo.upsert_entity(Entity(entity_type=EntityType.AP, native_id="ap:mac"), ts=500)
-    sw = repo.upsert_entity(
-        Entity(entity_type=EntityType.SWITCH, native_id="sw:mac"), ts=500
-    )
+    sw = repo.upsert_entity(Entity(entity_type=EntityType.SWITCH, native_id="sw:mac"), ts=500)
     ev = repo.record_event(
-        ts=1000, key="EVT_WU_Disconnected", entity_id=client, related_entity_id=None,
-        native_id="presentap", data={"key": "EVT_WU_Disconnected", "time": 1000 * 1000,
-                                     "user": "cli:mac", "ap": "ap:mac", "sw": "sw:mac"},
+        ts=1000,
+        key="EVT_WU_Disconnected",
+        entity_id=client,
+        related_entity_id=None,
+        native_id="presentap",
+        data={
+            "key": "EVT_WU_Disconnected",
+            "time": 1000 * 1000,
+            "user": "cli:mac",
+            "ap": "ap:mac",
+            "sw": "sw:mac",
+        },
     )
 
     assert ev in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
     assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 1
-    row = repo._conn.execute(
-        "SELECT related_entity_id FROM events WHERE id=?", (ev,)
-    ).fetchone()
+    row = repo._conn.execute("SELECT related_entity_id FROM events WHERE id=?", (ev,)).fetchone()
     # AP wins; the switch is never consulted for the related reference.
     assert row["related_entity_id"] == ap
     assert row["related_entity_id"] != sw
@@ -2226,20 +2329,37 @@ def test_reconcile_all_empty_macs_is_not_a_candidate(repo: Repository) -> None:
     reconcile repairs nothing."""
     from netadmin.ingest.events import EventNormalizer
 
-    client = repo.upsert_entity(
-        Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500
-    )
+    client = repo.upsert_entity(Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500)
     # Related-scoped all-empty: client resolved, related NULL, ap/sw both empty.
     rel_ev = repo.record_event(
-        ts=1000, key="EVT_WU_Disconnected", entity_id=client, related_entity_id=None,
-        native_id="allempty-rel", data={"key": "EVT_WU_Disconnected", "time": 1000 * 1000,
-                                        "user": "cli:mac", "ap": "", "sw": ""},
+        ts=1000,
+        key="EVT_WU_Disconnected",
+        entity_id=client,
+        related_entity_id=None,
+        native_id="allempty-rel",
+        data={
+            "key": "EVT_WU_Disconnected",
+            "time": 1000 * 1000,
+            "user": "cli:mac",
+            "ap": "",
+            "sw": "",
+        },
     )
     # Primary-scoped all-empty: entity NULL, every primary MAC empty.
     prim_ev = repo.record_event(
-        ts=1100, key="EVT_WU_Disconnected", entity_id=None, related_entity_id=None,
-        native_id="allempty-prim", data={"key": "EVT_WU_Disconnected", "time": 1100 * 1000,
-                                         "user": "", "ap": "", "sw": "", "gw": ""},
+        ts=1100,
+        key="EVT_WU_Disconnected",
+        entity_id=None,
+        related_entity_id=None,
+        native_id="allempty-prim",
+        data={
+            "key": "EVT_WU_Disconnected",
+            "time": 1100 * 1000,
+            "user": "",
+            "ap": "",
+            "sw": "",
+            "gw": "",
+        },
     )
 
     selected = {int(r["id"]) for r in repo.unresolved_events(limit=500)}

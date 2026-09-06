@@ -11,14 +11,7 @@ from netadmin.fixes.applier import DEFAULT_MAX_DEVICES, DEFAULT_MAX_STEPS
 from netadmin.fixes.models import ActionType, plan_confirm_token
 from netadmin.fixes.planner import MAX_JOINT_CHANNEL_MOVES, plan_fix
 
-from .conftest import (
-    SW_MAC,
-    make_ap_device,
-    make_finding,
-    port_entity,
-    radio_entity,
-    rf_entity,
-)
+from .conftest import SW_MAC, make_ap_device, make_finding, port_entity, radio_entity, rf_entity
 
 
 def _radio(payload, band):

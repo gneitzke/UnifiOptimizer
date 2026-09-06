@@ -579,9 +579,7 @@ async def test_bulk_suppress_only_mutes_current_members(settings, tmp_db_path) -
     store.close()
 
 
-async def test_issue_surface_symptom_count_is_current_not_historical(
-    settings, tmp_db_path
-) -> None:
+async def test_issue_surface_symptom_count_is_current_not_historical(settings, tmp_db_path) -> None:
     """Finding #11 (C5): after a symptom clears, the incident CARD reports 0
     symptoms (its present state) but the ISSUE surface -- both the root's detail
     ``GET /api/issues/{root}`` incident brief and the ``GET /api/issues`` list's
@@ -594,8 +592,7 @@ async def test_issue_surface_symptom_count_is_current_not_historical(
     async with await _client(app) as c:
         # The incident card: present state, root-only, 0 symptoms.
         card = next(
-            i for i in (await c.get("/api/incidents")).json()["incidents"]
-            if int(i["id"]) == inc_id
+            i for i in (await c.get("/api/incidents")).json()["incidents"] if int(i["id"]) == inc_id
         )
         assert card["symptom_count"] == 0
 

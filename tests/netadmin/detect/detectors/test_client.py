@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from netadmin import config
+from netadmin.detect.catalog import build_catalog
 from netadmin.detect.context import DetectorContext
 from netadmin.detect.detectors.client import (
     KEY_DHCP,
@@ -23,7 +24,6 @@ from netadmin.detect.detectors.client import (
     FlakyClientDetector,
     KnownPathologyDetector,
 )
-from netadmin.detect.catalog import build_catalog
 from netadmin.detect.engine import UNKNOWN, DetectorResult
 from netadmin.domain.entities import Entity
 from netadmin.domain.types import EntityType, FixState, IssueState, Severity
@@ -194,9 +194,7 @@ def test_event_feed_gap_does_not_verify_a_flaky_fix(repo: Repository) -> None:
     never resolved-and-VERIFIED on missing event data."""
     t1 = NOW
     catalog = build_catalog([entry(FlakyClientDetector(), ceiling=Severity.P2)])
-    stack = build_stack(
-        repo, catalog=catalog, issue_config=EngineConfig(default_m=1, default_k=1)
-    )
+    stack = build_stack(repo, catalog=catalog, issue_config=EngineConfig(default_m=1, default_k=1))
 
     # Phase 1: healthy feed + real disconnects -> the issue fires and goes ACTIVE.
     seed_coverage(repo, job="fast_sta", now=t1, window_s=3600, interval_s=60)
@@ -255,9 +253,7 @@ def test_w17a1_flaky_freezes_when_same_second_disconnects_sever_ws_coverage(
         repo.record_ws_heartbeat(ts=c)
         repo.record_ws_heartbeat(ts=c + 30)
         # The drop shares the c+30 beat's second, recorded just after it.
-        repo.record_poll_run(
-            job="ws", ok=True, ts=c + 30, error="disconnected", source="live"
-        )
+        repo.record_poll_run(job="ws", ok=True, ts=c + 30, error="disconnected", source="live")
         c += 90
     ap = _ap(repo, "ap-1")
     cid = _client(repo, mac="ss:1", ap_id=ap)
@@ -480,9 +476,7 @@ def test_event_feed_gap_does_not_false_clear_an_active_iot_pathology_issue(
     round-10 repro (resolved, clear streak 6, event coverage 0.0)."""
     t1 = NOW
     catalog = build_catalog([entry(KnownPathologyDetector(), ceiling=Severity.P3)])
-    stack = build_stack(
-        repo, catalog=catalog, issue_config=EngineConfig(default_m=1, default_k=1)
-    )
+    stack = build_stack(repo, catalog=catalog, issue_config=EngineConfig(default_m=1, default_k=1))
 
     # Phase 1: healthy feed + real disconnects -> the pathology fires and goes ACTIVE.
     seed_coverage(repo, job="fast_sta", now=t1, window_s=3600, interval_s=60)

@@ -449,8 +449,13 @@ async def test_finding7_clipped_failed_retry_retires_original_no_redundant_refet
 
     # An actual failed fetch, recorded first-class as a hole.
     repo.record_ingest_coverage(
-        kind="report", scope="ap", interval=FIVEMIN,
-        start_ts=4800, end_ts=6000, status="failed", detail="boom",
+        kind="report",
+        scope="ap",
+        interval=FIVEMIN,
+        start_ts=4800,
+        end_ts=6000,
+        status="failed",
+        detail="boom",
     )
 
     ep = FakeEndpoints()  # empty-but-successful retry
@@ -459,9 +464,7 @@ async def test_finding7_clipped_failed_retry_retires_original_no_redundant_refet
     # failed-coverage retry drives this run.
     await bf.run({"ap": tnow}, now=tnow)
 
-    rows = [
-        (r["interval"], r["start_ts"], r["end_ts"], r["status"]) for r in cov_rows()
-    ]
+    rows = [(r["interval"], r["start_ts"], r["end_ts"], r["status"]) for r in cov_rows()]
     # Original [4800,6000) failed row is gone; it is split into an unrecoverable
     # pre-retention slice and a complete clipped slice.
     assert rows == [
@@ -470,9 +473,7 @@ async def test_finding7_clipped_failed_retry_retires_original_no_redundant_refet
     ]
     assert repo.failed_ingest_coverage(kind="report", scope="ap") == []
     # The retry actually clipped to the still-fetchable window.
-    assert [(c["start_ms"], c["end_ms"]) for c in ep.calls] == [
-        (5400 * 1000, 6000 * 1000)
-    ]
+    assert [(c["start_ms"], c["end_ms"]) for c in ep.calls] == [(5400 * 1000, 6000 * 1000)]
 
     # A SUBSEQUENT run must not redundantly refetch the already-satisfied window.
     ep.calls.clear()
@@ -481,14 +482,17 @@ async def test_finding7_clipped_failed_retry_retires_original_no_redundant_refet
 
     # A genuinely still-missing hole WITHIN retention is still retried.
     repo.record_ingest_coverage(
-        kind="report", scope="ap", interval=FIVEMIN,
-        start_ts=5460, end_ts=6000, status="failed", detail="still open",
+        kind="report",
+        scope="ap",
+        interval=FIVEMIN,
+        start_ts=5460,
+        end_ts=6000,
+        status="failed",
+        detail="still open",
     )
     ep.calls.clear()
     await bf.run({"ap": tnow}, now=tnow)
-    assert [(c["start_ms"], c["end_ms"]) for c in ep.calls] == [
-        (5460 * 1000, 6000 * 1000)
-    ]
+    assert [(c["start_ms"], c["end_ms"]) for c in ep.calls] == [(5460 * 1000, 6000 * 1000)]
     # ...and it lands as complete (no residual failed row).
     assert repo.failed_ingest_coverage(kind="report", scope="ap") == []
     statuses = {(r["start_ts"], r["end_ts"]): r["status"] for r in cov_rows()}
@@ -526,12 +530,21 @@ async def test_finding3_cancel_during_clipped_fetch_does_not_lose_recoverable_ho
     # The pre-existing ledger: an actual failed fetch plus an adjacent complete
     # slice, exactly as the finding derives it from a real repository cursor.
     repo.record_ingest_coverage(
-        kind="report", scope="ap", interval=FIVEMIN,
-        start_ts=4800, end_ts=5700, status="failed", detail="boom",
+        kind="report",
+        scope="ap",
+        interval=FIVEMIN,
+        start_ts=4800,
+        end_ts=5700,
+        status="failed",
+        detail="boom",
     )
     repo.record_ingest_coverage(
-        kind="report", scope="ap", interval=FIVEMIN,
-        start_ts=5700, end_ts=6000, status="complete",
+        kind="report",
+        scope="ap",
+        interval=FIVEMIN,
+        start_ts=5700,
+        end_ts=6000,
+        status="complete",
     )
 
     class CancelDuringFetch(FakeEndpoints):
@@ -597,12 +610,21 @@ async def test_finding3_success_path_preserves_round11_end_state(repo: Repositor
         ).fetchall()
 
     repo.record_ingest_coverage(
-        kind="report", scope="ap", interval=FIVEMIN,
-        start_ts=4800, end_ts=5700, status="failed", detail="boom",
+        kind="report",
+        scope="ap",
+        interval=FIVEMIN,
+        start_ts=4800,
+        end_ts=5700,
+        status="failed",
+        detail="boom",
     )
     repo.record_ingest_coverage(
-        kind="report", scope="ap", interval=FIVEMIN,
-        start_ts=5700, end_ts=6000, status="complete",
+        kind="report",
+        scope="ap",
+        interval=FIVEMIN,
+        start_ts=5700,
+        end_ts=6000,
+        status="complete",
     )
 
     ep = FakeEndpoints()  # empty-but-successful retry
@@ -776,25 +798,41 @@ def test_w18a3_partial_blocks_cursor_and_is_retryable(repo: Repository):
     K, S = "report", "zz-w18a3"
     # complete [0,100], partial [100,200], complete [200,300]. A later complete
     # must NOT bury the earlier partial.
-    repo.record_ingest_coverage(kind=K, scope=S, interval=FIVEMIN, start_ts=0, end_ts=100, status="complete")
-    repo.record_ingest_coverage(kind=K, scope=S, interval=FIVEMIN, start_ts=100, end_ts=200, status="partial")
-    repo.record_ingest_coverage(kind=K, scope=S, interval=FIVEMIN, start_ts=200, end_ts=300, status="complete")
+    repo.record_ingest_coverage(
+        kind=K, scope=S, interval=FIVEMIN, start_ts=0, end_ts=100, status="complete"
+    )
+    repo.record_ingest_coverage(
+        kind=K, scope=S, interval=FIVEMIN, start_ts=100, end_ts=200, status="partial"
+    )
+    repo.record_ingest_coverage(
+        kind=K, scope=S, interval=FIVEMIN, start_ts=200, end_ts=300, status="complete"
+    )
     # (b) cursor stops at the contiguous complete prefix (100), NOT MAX(complete)=300.
     assert repo.latest_ingest_coverage_end(kind=K, scope=S) == 100
     # (a) the retry scan treats the partial as a retryable hole.
     retry = repo.failed_ingest_coverage(kind=K, scope=S)
-    assert [(int(r["start_ts"]), int(r["end_ts"]), r["status"]) for r in retry] == [(100, 200, "partial")]
+    assert [(int(r["start_ts"]), int(r["end_ts"]), r["status"]) for r in retry] == [
+        (100, 200, "partial")
+    ]
 
     # Once the partial is re-fetched and completed, the cursor jumps forward.
-    repo.record_ingest_coverage(kind=K, scope=S, interval=FIVEMIN, start_ts=100, end_ts=200, status="complete")
+    repo.record_ingest_coverage(
+        kind=K, scope=S, interval=FIVEMIN, start_ts=100, end_ts=200, status="complete"
+    )
     assert repo.failed_ingest_coverage(kind=K, scope=S) == []
     assert repo.latest_ingest_coverage_end(kind=K, scope=S) == 300
 
     # unrecoverable is terminal: it must not freeze the cursor on lost history.
     K2, S2 = "report", "zz-w18a3-unrec"
-    repo.record_ingest_coverage(kind=K2, scope=S2, interval=FIVEMIN, start_ts=0, end_ts=100, status="complete")
-    repo.record_ingest_coverage(kind=K2, scope=S2, interval=FIVEMIN, start_ts=100, end_ts=150, status="unrecoverable")
-    repo.record_ingest_coverage(kind=K2, scope=S2, interval=FIVEMIN, start_ts=150, end_ts=200, status="complete")
+    repo.record_ingest_coverage(
+        kind=K2, scope=S2, interval=FIVEMIN, start_ts=0, end_ts=100, status="complete"
+    )
+    repo.record_ingest_coverage(
+        kind=K2, scope=S2, interval=FIVEMIN, start_ts=100, end_ts=150, status="unrecoverable"
+    )
+    repo.record_ingest_coverage(
+        kind=K2, scope=S2, interval=FIVEMIN, start_ts=150, end_ts=200, status="complete"
+    )
     assert repo.failed_ingest_coverage(kind=K2, scope=S2) == []
     assert repo.latest_ingest_coverage_end(kind=K2, scope=S2) == 200
 
@@ -814,7 +852,7 @@ async def test_w18a3_partial_then_later_complete_chunk_not_stranded(repo: Reposi
     closed_end = NOW - (NOW % INTERVAL_SECONDS[FIVEMIN])
     last_ts = closed_end - 1000  # spans two 600 s chunks up to closed_end
     older_ts = closed_end - 900  # lands in the older chunk
-    oid = "aa:bb:cc:00:00:02"    # NOT in inventory on the first run
+    oid = "aa:bb:cc:00:00:02"  # NOT in inventory on the first run
     rows = {(FIVEMIN, "ap"): [{"time": older_ts * 1000, "oid": oid, "rx_bytes": 77.0}]}
     ep = FakeEndpoints(rows)
     bf = Backfiller(ep, repo, scopes=("ap",), chunk_seconds={FIVEMIN: 600})
@@ -827,7 +865,9 @@ async def test_w18a3_partial_then_later_complete_chunk_not_stranded(repo: Reposi
     cursor = repo.latest_ingest_coverage_end(kind="report", scope="ap")
     assert cursor is None or cursor <= older_ts
     # (a) the partial is a retryable hole.
-    assert any(r["status"] == "partial" for r in repo.failed_ingest_coverage(kind="report", scope="ap"))
+    assert any(
+        r["status"] == "partial" for r in repo.failed_ingest_coverage(kind="report", scope="ap")
+    )
 
     # The sync job discovers the device; a re-run driven by the (un-skipped) cursor
     # re-fetches the partial window and completes it -- non-zero samples, no strand.

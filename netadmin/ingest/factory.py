@@ -95,7 +95,9 @@ _REPORT_ANCHOR_METRICS: dict[str, tuple[str, ...]] = {
 # One process owns one paced/authenticated read client per controller/site.  It
 # is deliberately read-facing only: fix applies continue to build their explicit
 # writer seam, while previews can share the daemon's session.
-_shared_readers: dict[tuple[str, str, Optional[str], Optional[str], Optional[str]], tuple[Endpoints, UnifiClient]] = {}
+_shared_readers: dict[
+    tuple[str, str, Optional[str], Optional[str], Optional[str]], tuple[Endpoints, UnifiClient]
+] = {}
 
 
 @dataclass

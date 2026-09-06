@@ -538,9 +538,7 @@ def overview(repo: Repository, params: Mapping[str, Any], now: int) -> dict[str,
     # list/detail. Summing the historical union here let a cleared symptom keep
     # inflating the count (e.g. "grouping 2 of them" when only 1 issue is still
     # grouped), and could push the grouped total past the open-issue count.
-    current_counts = repo.current_incident_member_counts(
-        [int(r["id"]) for r in genuine_incidents]
-    )
+    current_counts = repo.current_incident_member_counts([int(r["id"]) for r in genuine_incidents])
     grouped_issue_count = sum(current_counts.get(int(r["id"]), 0) for r in genuine_incidents)
 
     report = sle_scores(repo, start_ts, end_ts)

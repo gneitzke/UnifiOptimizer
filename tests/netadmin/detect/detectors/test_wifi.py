@@ -83,8 +83,12 @@ def seed_cov(repo: Repository, *, now: int = NOW, jobs=("fast_device", "fast_sta
             repo.record_poll_run(job=job, ok=True, ts=ts)
             ts += 60
     repo.record_ingest_coverage(
-        kind="event_history", scope="site", interval="retained",
-        start_ts=now - 8 * DAY, end_ts=now, status="complete",
+        kind="event_history",
+        scope="site",
+        interval="retained",
+        start_ts=now - 8 * DAY,
+        end_ts=now,
+        status="complete",
     )
 
 
@@ -634,8 +638,12 @@ def test_roam_quality_unknown_on_half_covered_event_window(repo: Repository) -> 
     _seed_poll_only(repo)  # polling healthy -> not a poll gap
     # Only the most recent half of the 3600 s window has completed event coverage.
     repo.record_ingest_coverage(
-        kind="event_history", scope="site", interval="retained",
-        start_ts=NOW - 1800, end_ts=NOW, status="complete",
+        kind="event_history",
+        scope="site",
+        interval="retained",
+        start_ts=NOW - 1800,
+        end_ts=NOW,
+        status="complete",
     )
     cid = mk_client(repo, "cli-1")
     _roam_pair(repo, cid, NOW - 1000, before=-55.0, after=-75.0)
@@ -979,8 +987,12 @@ def test_dfs_unknown_on_half_covered_event_window(repo: Repository) -> None:
     window_s = 7 * DAY
     # Only the most recent half of the lookback has completed event coverage.
     repo.record_ingest_coverage(
-        kind="event_history", scope="site", interval="retained",
-        start_ts=NOW - window_s // 2, end_ts=NOW, status="complete",
+        kind="event_history",
+        scope="site",
+        interval="retained",
+        start_ts=NOW - window_s // 2,
+        end_ts=NOW,
+        status="complete",
     )
     ap1 = mk_ap(repo, "ap-1")
     for j in range(1, 9):

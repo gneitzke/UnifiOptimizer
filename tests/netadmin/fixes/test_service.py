@@ -681,8 +681,11 @@ async def test_round8_4_reader_merges_all_attrs_for_a_repeated_radio(store):
             endpoint=endpoint,
             payload={"radio_table": [{"radio": "ng", payload_field: new_val}]},
             precondition=Precondition(target_native_id=f"{AP_MAC}:ng", expected=expected),
-            before={"method": "PUT", "endpoint": endpoint,
-                    "body": {"radio_table": [{"radio": "ng", "channel": 3, "tx_power_mode": "high"}]}},
+            before={
+                "method": "PUT",
+                "endpoint": endpoint,
+                "body": {"radio_table": [{"radio": "ng", "channel": 3, "tx_power_mode": "high"}]},
+            },
         )
 
     plan = FixPlan(

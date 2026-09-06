@@ -37,7 +37,6 @@ from datetime import datetime, timezone
 from time import monotonic
 from typing import Any, Awaitable, Callable, Optional
 
-
 from netadmin.domain.types import EntityType
 from netadmin.ingest.unifi.endpoints import Endpoints
 from netadmin.ingest.unifi.models import Event
@@ -431,8 +430,11 @@ async def catchup_events(
     for hole in repo.failed_ingest_coverage(kind="event_history", scope="site"):
         if int(hole["end_ts"]) <= retention_floor:
             repo.record_ingest_coverage(
-                kind="event_history", scope="site", interval=str(hole["interval"]),
-                start_ts=int(hole["start_ts"]), end_ts=int(hole["end_ts"]),
+                kind="event_history",
+                scope="site",
+                interval=str(hole["interval"]),
+                start_ts=int(hole["start_ts"]),
+                end_ts=int(hole["end_ts"]),
                 status="unrecoverable",
                 detail="event-history retention elapsed before retry",
             )
@@ -484,8 +486,12 @@ async def catchup_events(
         # hole is the correct, uniform outcome. This never swallows -- it always
         # re-raises after recording so the firewall still sees the poll as failed.
         repo.record_ingest_coverage(
-            kind="event_history", scope="site", interval="retained",
-            start_ts=coverage_start, end_ts=now_s, status="failed",
+            kind="event_history",
+            scope="site",
+            interval="retained",
+            start_ts=coverage_start,
+            end_ts=now_s,
+            status="failed",
             detail=f"event read failed: {type(exc).__name__}: {exc}"[:200],
         )
         logger.warning("Catch-up event read failed; window recorded failed: %s", exc)
@@ -526,20 +532,26 @@ async def catchup_events(
         # counted by ``observed_event_coverage``) then RE-RAISE so the collector's
         # per-job firewall marks this poll failed rather than clean.
         repo.record_ingest_coverage(
-            kind="event_history", scope="site", interval="retained",
-            start_ts=coverage_start, end_ts=now_s, status="failed",
+            kind="event_history",
+            scope="site",
+            interval="retained",
+            start_ts=coverage_start,
+            end_ts=now_s,
+            status="failed",
             detail=f"event normalize/store failed: {type(exc).__name__}: {exc}"[:200],
         )
-        logger.warning(
-            "Catch-up event normalize/store failed; window recorded failed: %s", exc
-        )
+        logger.warning("Catch-up event normalize/store failed; window recorded failed: %s", exc)
         raise
     if getattr(endpoints, "_event_disabled", False):
         # C3/R3: absence of the permitted history read is a durable,
         # queryable unrecoverable gap, not a successful empty collection.
         repo.record_ingest_coverage(
-            kind="event_history", scope="site", interval="retained",
-            start_ts=coverage_start, end_ts=now_s, status="unrecoverable",
+            kind="event_history",
+            scope="site",
+            interval="retained",
+            start_ts=coverage_start,
+            end_ts=now_s,
+            status="unrecoverable",
             detail="controller event-history endpoint unsupported",
         )
     elif unusable_dropped:
@@ -552,16 +564,24 @@ async def catchup_events(
         # gap stands. It self-heals once the undecodable event ages out of the read
         # window and a later fully-usable read of the span records complete.
         repo.record_ingest_coverage(
-            kind="event_history", scope="site", interval="retained",
-            start_ts=coverage_start, end_ts=now_s, status="partial",
+            kind="event_history",
+            scope="site",
+            interval="retained",
+            start_ts=coverage_start,
+            end_ts=now_s,
+            status="partial",
             detail=f"{unusable_dropped} unusable event(s) dropped; window not fully observed",
         )
     elif max_events is None:
         # A successful unbounded/fully-paged GET establishes coverage.  A caller
         # capped response cannot prove the tail complete and must not move it.
         repo.record_ingest_coverage(
-            kind="event_history", scope="site", interval="retained",
-            start_ts=coverage_start, end_ts=now_s, status="complete",
+            kind="event_history",
+            scope="site",
+            interval="retained",
+            start_ts=coverage_start,
+            end_ts=now_s,
+            status="complete",
         )
     logger.info(
         "Catch-up: %d stat/event rows fetched, %d new (cursor=%s).",
@@ -718,9 +738,7 @@ class EventListener:
                     self._storage_error = exc
                     self._pending_raw.extend(raws[i:])
                     return
-                logger.exception(
-                    "Dropping unstorable retained WS event (malformed payload)"
-                )
+                logger.exception("Dropping unstorable retained WS event (malformed payload)")
                 # #w19a-4: a retained raw event that now RAISES a permanent
                 # (non-transient) normalize error is dropped -- and, like the
                 # consumer-loop path, that drop severs coverage: count it so the
@@ -886,10 +904,14 @@ class EventListener:
                 self._normalizer.reconcile_unresolved()
             except Exception as exc:  # keep the flusher alive; the batch remains queued
                 self._storage_error = exc
-                logger.exception("WS event storage flush failed; retaining %d events", len(self._batch))
+                logger.exception(
+                    "WS event storage flush failed; retaining %d events", len(self._batch)
+                )
                 try:
                     self._repo.record_poll_run(
-                        job="ws", ok=False, error=f"storage-failed: {type(exc).__name__}: {exc}"[:200],
+                        job="ws",
+                        ok=False,
+                        error=f"storage-failed: {type(exc).__name__}: {exc}"[:200],
                         source="live",
                     )
                 except Exception:
@@ -930,9 +952,7 @@ class EventListener:
                     # malformed/undecodable payload (a non-transient error) is
                     # dropped-with-logging, matching normalize() returning None.
                     if not self._is_transient_storage_error(exc):
-                        logger.exception(
-                            "Dropping unstorable WS event (malformed payload)"
-                        )
+                        logger.exception("Dropping unstorable WS event (malformed payload)")
                         # #w19a-4 (a normalize EXCEPTION must not bypass drop
                         # accounting): a normalize() that RAISES for a single,
                         # permanently-unprocessable event (a malformed/undecodable
@@ -1222,9 +1242,7 @@ class WsSupervisor:
                 if EventListener._is_transient_storage_error(exc):
                     self._pending_raw.extend(raws[i:])
                     break
-                logger.exception(
-                    "Dropping unstorable rescued WS event (malformed payload)"
-                )
+                logger.exception("Dropping unstorable rescued WS event (malformed payload)")
                 continue
             if record is not None:
                 self._pending.append(record)
@@ -1422,8 +1440,7 @@ class WsSupervisor:
                     # FINDING#5; it remains as a robust net for any residual path.)
                     current = asyncio.current_task()
                     count_cancelling = (
-                        current is not None
-                        and getattr(current, "cancelling", lambda: 0)() > 0
+                        current is not None and getattr(current, "cancelling", lambda: 0)() > 0
                     )
                     if count_cancelling or _masks_cancel(exc):
                         self.state = "stopped"

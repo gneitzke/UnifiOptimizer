@@ -650,11 +650,7 @@ class UnifiClient:
             # Retryable 5xx: only GETs are retried. A mutation that draws a 5xx is
             # a definite server-side failure (a received response, not a lost one),
             # so it is surfaced to the caller as a non-2xx outcome, never retried.
-            if (
-                idempotent
-                and resp.status_code in _RETRYABLE_STATUS
-                and attempt < self._max_retries
-            ):
+            if idempotent and resp.status_code in _RETRYABLE_STATUS and attempt < self._max_retries:
                 delay = self._backoff(attempt)
                 logger.warning(
                     "%s %s -> %d; retry %d in %.1fs",
@@ -751,14 +747,18 @@ class UnifiClient:
         meta_ok = meta_is_dict and str(meta.get("rc", "")).strip().lower() == "ok"
         if not data_is_list or (meta_key_present and not meta_ok):
             if not data_is_list:
-                detail = data.get("error") or data.get("message") or (
-                    f"data is {type(data_field).__name__}, not a list"
+                detail = (
+                    data.get("error")
+                    or data.get("message")
+                    or (f"data is {type(data_field).__name__}, not a list")
                 )
             elif not meta_is_dict:
                 detail = f"meta is {type(meta).__name__}, not a dict (rc unverifiable)"
             else:
-                detail = data.get("error") or data.get("message") or (
-                    f"meta.rc={meta.get('rc')!r} (not ok)"
+                detail = (
+                    data.get("error")
+                    or data.get("message")
+                    or (f"meta.rc={meta.get('rc')!r} (not ok)")
                 )
             raise UnifiError(
                 f"{endpoint} -> unrecognized response (no well-formed data list / "

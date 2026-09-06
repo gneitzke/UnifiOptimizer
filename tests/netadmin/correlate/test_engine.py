@@ -651,12 +651,8 @@ def test_c5_closed_incident_retains_resolved_symptom_and_current_severity(
     topo: TopologyBuilder,
 ) -> None:
     ap = topo.add(1, "ap", name="AP-Garage-Mesh")
-    root = make_issue(
-        10, "wifi.mesh_uplink", ap, first_seen_ts=T, severity=Severity.P3
-    )
-    symptom = make_issue(
-        11, "net.coverage_hole", ap, first_seen_ts=T + 10, severity=Severity.P1
-    )
+    root = make_issue(10, "wifi.mesh_uplink", ap, first_seen_ts=T, severity=Severity.P3)
+    symptom = make_issue(11, "net.coverage_hole", ap, first_seen_ts=T + 10, severity=Severity.P1)
     store = InMemoryCorrelationStore([root, symptom], topo.build())
     engine = CorrelationEngine(store)
 

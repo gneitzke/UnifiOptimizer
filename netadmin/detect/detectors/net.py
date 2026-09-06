@@ -27,13 +27,13 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from netadmin.detect.context import EVENT_COVERAGE_MIN
 from netadmin.detect.detectors._rssi import (
     _attachment_intervals,
     _norm_mac,
     _samples,
     sticky_per_ap_rssi,
 )
-from netadmin.detect.context import EVENT_COVERAGE_MIN
 from netadmin.detect.engine import COVERAGE_MIN, UNKNOWN, DetectorResult, EvalResult
 from netadmin.domain.entities import Entity, Finding
 from netadmin.domain.types import Cadence, EntityType, Severity

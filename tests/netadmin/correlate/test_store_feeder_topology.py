@@ -97,9 +97,7 @@ def test_feeds_dormant_without_uplink_meta(tmp_db_path: Path) -> None:
     switch_id = repo.upsert_entity(
         Entity(entity_type=EntityType.SWITCH, native_id=SWITCH_MAC), ts=1_000_000
     )
-    ap_id = repo.upsert_entity(
-        Entity(entity_type=EntityType.AP, native_id=AP_MAC), ts=1_000_000
-    )
+    ap_id = repo.upsert_entity(Entity(entity_type=EntityType.AP, native_id=AP_MAC), ts=1_000_000)
     topo = StoreCorrelationRepository(repo).topology()
     assert repo.feeder_edges() == []
     assert topo.feeds(switch_id, ap_id) is False

@@ -343,8 +343,12 @@ class Backfiller:
             )
             if c_hi <= retention_floor:
                 self._repo.record_ingest_coverage(
-                    kind="report", scope=scope, interval=interval,
-                    start_ts=c_lo, end_ts=c_hi, status="unrecoverable",
+                    kind="report",
+                    scope=scope,
+                    interval=interval,
+                    start_ts=c_lo,
+                    end_ts=c_hi,
+                    status="unrecoverable",
                     detail="controller report retention elapsed before retry",
                 )
                 continue
@@ -384,18 +388,29 @@ class Backfiller:
             clip_start = max(c_lo, retention_floor)
             if clip_start > c_lo:
                 self._repo.record_ingest_coverage(
-                    kind="report", scope=scope, interval=interval,
-                    start_ts=c_lo, end_ts=clip_start, status="unrecoverable",
+                    kind="report",
+                    scope=scope,
+                    interval=interval,
+                    start_ts=c_lo,
+                    end_ts=clip_start,
+                    status="unrecoverable",
                     detail="controller report retention elapsed before retry",
                 )
                 self._repo.record_ingest_coverage(
-                    kind="report", scope=scope, interval=interval,
-                    start_ts=clip_start, end_ts=c_hi, status="failed",
+                    kind="report",
+                    scope=scope,
+                    interval=interval,
+                    start_ts=clip_start,
+                    end_ts=c_hi,
+                    status="failed",
                     detail="retention-clipped retry pending",
                 )
                 self._repo.retire_ingest_coverage(
-                    kind="report", scope=scope, interval=interval,
-                    start_ts=c_lo, end_ts=c_hi,
+                    kind="report",
+                    scope=scope,
+                    interval=interval,
+                    start_ts=c_lo,
+                    end_ts=c_hi,
                 )
             key = (interval, clip_start, c_hi)
             chunks.append(key)
@@ -440,15 +455,23 @@ class Backfiller:
                     # (the source returned no rows at all for a quiet window) drops
                     # nothing and still records 'complete' below.
                     self._repo.record_ingest_coverage(
-                        kind="report", scope=scope, interval=interval,
-                        start_ts=c_lo, end_ts=c_hi, status="partial",
+                        kind="report",
+                        scope=scope,
+                        interval=interval,
+                        start_ts=c_lo,
+                        end_ts=c_hi,
+                        status="partial",
                         detail=f"{dropped} unusable/unresolved report row(s) dropped; "
                         "window not fully reconstructed",
                     )
                 else:
                     self._repo.record_ingest_coverage(
-                        kind="report", scope=scope, interval=interval,
-                        start_ts=c_lo, end_ts=c_hi, status="complete",
+                        kind="report",
+                        scope=scope,
+                        interval=interval,
+                        start_ts=c_lo,
+                        end_ts=c_hi,
+                        status="complete",
                     )
             except ReportUnavailable as exc:
                 # Unsupported-over-GET is permanent for this process/controller
@@ -457,8 +480,12 @@ class Backfiller:
                 res.errors += 1
                 detail = f"{type(exc).__name__}: {exc}"[:200]
                 self._repo.record_ingest_coverage(
-                    kind="report", scope=scope, interval=interval,
-                    start_ts=c_lo, end_ts=c_hi, status="unrecoverable",
+                    kind="report",
+                    scope=scope,
+                    interval=interval,
+                    start_ts=c_lo,
+                    end_ts=c_hi,
+                    status="unrecoverable",
                     detail=detail,
                 )
                 self._repo.record_poll_run(
@@ -479,8 +506,12 @@ class Backfiller:
             except Exception as exc:  # noqa: BLE001 - firewall per chunk
                 res.errors += 1
                 self._repo.record_ingest_coverage(
-                    kind="report", scope=scope, interval=interval,
-                    start_ts=c_lo, end_ts=c_hi, status="failed",
+                    kind="report",
+                    scope=scope,
+                    interval=interval,
+                    start_ts=c_lo,
+                    end_ts=c_hi,
+                    status="failed",
                     detail=f"{type(exc).__name__}: {exc}"[:200],
                 )
                 self._repo.record_poll_run(

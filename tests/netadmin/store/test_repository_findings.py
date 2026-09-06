@@ -367,8 +367,12 @@ def test_transaction_rolls_back_inventory_when_a_later_write_fails(
 # ---------------------------------------------------------------------------
 def _cov(repo: Repository, start_ts: int, end_ts: int, status: str) -> None:
     repo.record_ingest_coverage(
-        kind="event_history", scope="site", interval="retained",
-        start_ts=start_ts, end_ts=end_ts, status=status,
+        kind="event_history",
+        scope="site",
+        interval="retained",
+        start_ts=start_ts,
+        end_ts=end_ts,
+        status=status,
     )
 
 

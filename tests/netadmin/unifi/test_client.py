@@ -232,9 +232,7 @@ async def test_mutation_401_with_parsed_rejection_is_definitive_single_dispatch(
     )
     url = f"{HOST}/proxy/network/api/s/{SITE}/rest/device/abc"
     rejection = {"meta": {"rc": "error", "msg": "api.err.LoginRequired"}, "data": []}
-    route = getattr(respx, verb.lower())(url).mock(
-        return_value=httpx.Response(401, json=rejection)
-    )
+    route = getattr(respx, verb.lower())(url).mock(return_value=httpx.Response(401, json=rejection))
     client = _client()
     # A DEFINITIVE rejection: request() does NOT raise ambiguous -- it returns the
     # 401 response so the writer's envelope classification reports a definitive
@@ -320,7 +318,9 @@ async def test_envelope_unwrapping():
         await client.get_data("stat/device")
 
     # A genuine empty-but-successful read still succeeds: a real (empty) list.
-    respx.get(DEVICE).mock(return_value=httpx.Response(200, json={"meta": {"rc": "ok"}, "data": []}))
+    respx.get(DEVICE).mock(
+        return_value=httpx.Response(200, json={"meta": {"rc": "ok"}, "data": []})
+    )
     assert await client.get_data("stat/device") == []
     await client.aclose()
 
@@ -335,10 +335,10 @@ async def test_envelope_unwrapping():
 @pytest.mark.parametrize(
     "body",
     [
-        {"meta": {"rc": "ok"}},                       # rc=ok but NO data list
-        {"rc": "ok", "data": None},                   # data present but null
-        {"rc": "ok", "data": False},                  # data present but false
-        {"meta": {"rc": "pending"}, "data": []},      # a real list but meta.rc != ok
+        {"meta": {"rc": "ok"}},  # rc=ok but NO data list
+        {"rc": "ok", "data": None},  # data present but null
+        {"rc": "ok", "data": False},  # data present but false
+        {"meta": {"rc": "pending"}, "data": []},  # a real list but meta.rc != ok
     ],
     ids=["rc-ok-no-data", "data-null", "data-false", "rc-pending"],
 )
@@ -362,10 +362,10 @@ async def test_malformed_successful_looking_read_raises(body):
 @pytest.mark.parametrize(
     "body",
     [
-        {"meta": None, "data": []},        # meta key present but null
-        {"meta": False, "data": []},       # meta key present but false
-        {"meta": [], "data": []},          # meta key present but a list
-        {"meta": "pending", "data": []},   # meta key present but a string
+        {"meta": None, "data": []},  # meta key present but null
+        {"meta": False, "data": []},  # meta key present but false
+        {"meta": [], "data": []},  # meta key present but a list
+        {"meta": "pending", "data": []},  # meta key present but a string
     ],
     ids=["meta-null", "meta-false", "meta-list", "meta-string"],
 )
@@ -512,7 +512,9 @@ async def test_genuine_empty_list_read_is_complete():
     # ``{"data":[...]}``) still read as a completed, empty-or-populated result.
     _mock_login()
     client = _client()
-    respx.get(DEVICE).mock(return_value=httpx.Response(200, json={"meta": {"rc": "ok"}, "data": []}))
+    respx.get(DEVICE).mock(
+        return_value=httpx.Response(200, json={"meta": {"rc": "ok"}, "data": []})
+    )
     assert await client.get_data("stat/device") == []
     respx.get(DEVICE).mock(return_value=httpx.Response(200, json={"data": [{"ok": 1}]}))
     assert await client.get_data("stat/device") == [{"ok": 1}]

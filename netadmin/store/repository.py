@@ -1045,15 +1045,13 @@ class Repository:
                 if native_id is not None:
                     existing = conn.execute(
                         "SELECT id, entity_id, related_entity_id FROM events "
-                        "WHERE native_id=? LIMIT 1", (native_id,)
+                        "WHERE native_id=? LIMIT 1",
+                        (native_id,),
                     ).fetchone()
                     if existing is not None:
-                        if (
-                            (existing["entity_id"] is None and ev.get("entity_id") is not None)
-                            or (
-                                existing["related_entity_id"] is None
-                                and ev.get("related_entity_id") is not None
-                            )
+                        if (existing["entity_id"] is None and ev.get("entity_id") is not None) or (
+                            existing["related_entity_id"] is None
+                            and ev.get("related_entity_id") is not None
                         ):
                             conn.execute(
                                 "UPDATE events SET "
@@ -1068,8 +1066,13 @@ class Repository:
                     "INSERT INTO events (ts, key, entity_id, related_entity_id, native_id, msg, data) "
                     "VALUES (?,?,?,?,?,?,?)",
                     (
-                        ev["ts"], ev["key"], ev.get("entity_id"),
-                        ev.get("related_entity_id"), native_id, ev.get("msg"), data_json,
+                        ev["ts"],
+                        ev["key"],
+                        ev.get("entity_id"),
+                        ev.get("related_entity_id"),
+                        native_id,
+                        ev.get("msg"),
+                        data_json,
                     ),
                 )
                 inserted += 1
@@ -1145,11 +1148,10 @@ class Repository:
         if not self._table_exists("events"):
             return []
         attempts = (
-            "ev.reconcile_attempts"
-            if self._column_exists("events", "reconcile_attempts")
-            else "0"
+            "ev.reconcile_attempts" if self._column_exists("events", "reconcile_attempts") else "0"
         )
         site = self.site_id
+
         # resolvable: a currently-NULL reference the normalizer could fill this
         # pass because the payload's named MAC is already an entity. It must mirror
         # EventNormalizer._entities routing EXACTLY -- including its single-winner
@@ -1444,8 +1446,15 @@ class Repository:
 
     # C3/C4: record the exact history interval only after its GET completed.
     def record_ingest_coverage(
-        self, *, kind: str, scope: str, interval: str, start_ts: int, end_ts: int,
-        status: str, detail: Optional[str] = None,
+        self,
+        *,
+        kind: str,
+        scope: str,
+        interval: str,
+        start_ts: int,
+        end_ts: int,
+        status: str,
+        detail: Optional[str] = None,
     ) -> None:
         if end_ts <= start_ts:
             return
@@ -1461,8 +1470,12 @@ class Repository:
             )
             if status == "complete":
                 self._reconcile_holes_covered_by_complete(
-                    conn, kind=kind, scope=scope, interval=interval,
-                    start_ts=start_ts, end_ts=end_ts,
+                    conn,
+                    kind=kind,
+                    scope=scope,
+                    interval=interval,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
                 )
 
     # CURSOR STRANDING (#w19a): a successful read that COVERS a previously-failed
@@ -1480,8 +1493,13 @@ class Repository:
     # covered while a genuinely still-open hole is preserved and still caps it.
     @staticmethod
     def _reconcile_holes_covered_by_complete(
-        conn: sqlite3.Connection, *, kind: str, scope: str, interval: str,
-        start_ts: int, end_ts: int,
+        conn: sqlite3.Connection,
+        *,
+        kind: str,
+        scope: str,
+        interval: str,
+        start_ts: int,
+        end_ts: int,
     ) -> None:
         holes = conn.execute(
             "SELECT start_ts, end_ts, status, detail FROM ingest_coverage "
@@ -1559,8 +1577,10 @@ class Repository:
             clauses.append("interval=?")
             params.append(interval)
         return self._conn.execute(
-            "SELECT * FROM ingest_coverage WHERE " + " AND ".join(clauses) +
-            " ORDER BY start_ts, end_ts", params
+            "SELECT * FROM ingest_coverage WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY start_ts, end_ts",
+            params,
         ).fetchall()
 
     # C4: this is a coverage cursor, never a proxy derived from samples.
@@ -1587,7 +1607,8 @@ class Repository:
         if hole_start is None:
             row = self._conn.execute(
                 "SELECT MAX(end_ts) AS end_ts FROM ingest_coverage "
-                "WHERE kind=? AND scope=? AND status='complete'", (kind, scope)
+                "WHERE kind=? AND scope=? AND status='complete'",
+                (kind, scope),
             ).fetchone()
             return None if row is None or row["end_ts"] is None else int(row["end_ts"])
         # A retryable hole exists: credit only 'complete' coverage that begins
@@ -2930,12 +2951,15 @@ class Repository:
 
         sql = "SELECT "
         if cols:
-            sql += ", ".join(
-                "NULLIF(attributed_entity_id, 0) AS attributed_entity_id"
-                if col == "attributed_entity_id"
-                else col
-                for col in cols
-            ) + ", "
+            sql += (
+                ", ".join(
+                    "NULLIF(attributed_entity_id, 0) AS attributed_entity_id"
+                    if col == "attributed_entity_id"
+                    else col
+                    for col in cols
+                )
+                + ", "
+            )
         sql += "SUM(minutes) AS minutes FROM sle_minutes WHERE bucket_ts>=? AND bucket_ts<?"
         if cols:
             sql += " GROUP BY " + ", ".join(cols) + " ORDER BY " + ", ".join(cols)
@@ -3260,8 +3284,7 @@ class Repository:
     def current_incident_issue_ids(self, incident_id: int) -> set[int]:
         """Issue ids currently attached to an incident (cleared history excluded)."""
         rows = self._conn.execute(
-            "SELECT issue_id FROM incident_members "
-            "WHERE incident_id=? AND cleared_ts IS NULL",
+            "SELECT issue_id FROM incident_members " "WHERE incident_id=? AND cleared_ts IS NULL",
             (incident_id,),
         ).fetchall()
         return {int(row["issue_id"]) for row in rows}

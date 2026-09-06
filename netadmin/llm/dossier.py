@@ -579,9 +579,7 @@ def build_incident_dossier(
             "Members flagged **former** are no longer attached to this incident "
             "(cleared/re-attributed) and should not be treated as live symptoms.",
             "",
-            _table(
-                ["Detector", "Symptom", "Status", "Why it is attributed"], symptom_rows
-            ),
+            _table(["Detector", "Symptom", "Status", "Why it is attributed"], symptom_rows),
         ]
     lines += [
         "",

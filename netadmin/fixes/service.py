@@ -293,6 +293,7 @@ class FixService:
         read leaves the applier with no fresh state, and it refuses rather than
         restore blind.
         """
+
         # Read fresh live state INSIDE the applier's per-device lock (C1): the
         # applier calls this back once it holds the lock, so two concurrent reverts
         # on one device each read the other's committed result instead of racing on

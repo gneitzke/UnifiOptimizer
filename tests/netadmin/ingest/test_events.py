@@ -17,6 +17,9 @@ import httpx
 import pytest
 import respx
 
+from netadmin.detect.context import EVENT_COVERAGE_MIN, DetectorContext
+from netadmin.detect.detectors.client import FlakyClientDetector
+from netadmin.detect.engine import UNKNOWN
 from netadmin.domain.entities import Entity
 from netadmin.domain.types import EntityType
 from netadmin.ingest.events import (
@@ -28,9 +31,6 @@ from netadmin.ingest.events import (
 )
 from netadmin.ingest.unifi.models import Event
 from netadmin.store.repository import Repository
-from netadmin.detect.context import DetectorContext, EVENT_COVERAGE_MIN
-from netadmin.detect.detectors.client import FlakyClientDetector
-from netadmin.detect.engine import UNKNOWN
 from tests.netadmin.detect.support import FakeBaselines, seed_coverage
 
 FIXTURE = Path(__file__).parents[1] / "unifi" / "fixtures" / "stat_event.json"
@@ -173,8 +173,13 @@ def test_stp_port_event_resolves_to_port_entity(repo: Repository) -> None:
         Entity(entity_type=EntityType.PORT, native_id=port_nid, name="p5"), ts=1_000_000
     )
     ev = Event.model_validate(
-        {"_id": "stp-x", "key": "EVT_SW_StpPortBlocking", "time": 1_721_600_000_000,
-         "sw": SWITCH_MAC, "port": 5}
+        {
+            "_id": "stp-x",
+            "key": "EVT_SW_StpPortBlocking",
+            "time": 1_721_600_000_000,
+            "sw": SWITCH_MAC,
+            "port": 5,
+        }
     )
     rec = EventNormalizer(repo).normalize(ev)
     assert rec is not None
@@ -189,8 +194,13 @@ def test_stp_port_event_null_entity_when_port_absent_then_reconciles(repo: Repos
     created -- the same late-link path client events use.
     """
     ev = Event.model_validate(
-        {"_id": "stp-late", "key": "EVT_SW_StpPortBlocking", "time": 1_721_600_000_000,
-         "sw": SWITCH_MAC, "port": 7}
+        {
+            "_id": "stp-late",
+            "key": "EVT_SW_StpPortBlocking",
+            "time": 1_721_600_000_000,
+            "sw": SWITCH_MAC,
+            "port": 7,
+        }
     )
     norm = EventNormalizer(repo)
     rec = norm.normalize(ev)
@@ -217,8 +227,13 @@ def test_w15a4_bool_port_is_not_a_port_index_routes_to_switch(repo: Repository) 
     the SWITCH (consistently with the SQL), never routed to a bogus port entity.
     """
     ev = Event.model_validate(
-        {"_id": "stp-bool", "key": "EVT_SW_StpPortBlocking",
-         "time": 1_721_600_000_000, "sw": SWITCH_MAC, "port": True}
+        {
+            "_id": "stp-bool",
+            "key": "EVT_SW_StpPortBlocking",
+            "time": 1_721_600_000_000,
+            "sw": SWITCH_MAC,
+            "port": True,
+        }
     )
     rec = EventNormalizer(repo).normalize(ev)
     assert rec is not None
@@ -236,8 +251,13 @@ def test_w15a4_int_port_still_routes_to_port_entity(repo: Repository) -> None:
         Entity(entity_type=EntityType.PORT, native_id=port_nid, name="p1"), ts=1_000_000
     )
     ev = Event.model_validate(
-        {"_id": "stp-int1", "key": "EVT_SW_StpPortBlocking",
-         "time": 1_721_600_000_000, "sw": SWITCH_MAC, "port": 1}
+        {
+            "_id": "stp-int1",
+            "key": "EVT_SW_StpPortBlocking",
+            "time": 1_721_600_000_000,
+            "sw": SWITCH_MAC,
+            "port": 1,
+        }
     )
     rec = EventNormalizer(repo).normalize(ev)
     assert rec is not None
@@ -542,8 +562,12 @@ async def test_catchup_bounds_within_hours_from_cursor(repo: Repository) -> None
     events = load_events()
     # A completed HISTORY read, not a newer live arrival, is the bounded cursor.
     repo.record_ingest_coverage(
-        kind="event_history", scope="site", interval="retained",
-        start_ts=1_721_599_000, end_ts=1_721_600_180, status="complete",
+        kind="event_history",
+        scope="site",
+        interval="retained",
+        start_ts=1_721_599_000,
+        end_ts=1_721_600_180,
+        status="complete",
     )
     # coverage end == 1_721_600_180; pretend "now" is 2 h later.
     now = 1_721_600_180 + 2 * 3600
@@ -567,7 +591,9 @@ async def test_c3_catchup_recovers_gap_older_than_live_event(repo: Repository) -
 
     assert inserted == 2
     assert {r["native_id"] for r in repo.read_events(0, 500_000)} == {
-        "miss-200", "live-300", "hist-400"
+        "miss-200",
+        "live-300",
+        "hist-400",
     }
 
 
@@ -588,7 +614,9 @@ def test_c7_duplicate_replay_fills_pre_inventory_entity(repo: Repository) -> Non
     assert repo.read_events(*FULL)[0]["entity_id"] == eid
 
 
-def test_r2_failed_flush_keeps_batch_for_retry(repo: Repository, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_r2_failed_flush_keeps_batch_for_retry(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
     event = Event.model_validate({"_id": "flush-keep", "key": "EVT_X", "time": 1_721_600_000_000})
     listener = EventListener(FakeWs([]), repo, flush_interval=None)
     record = EventNormalizer(repo).normalize(event)
@@ -633,8 +661,12 @@ async def test_c3_bounded_fetch_clamps_recorded_coverage(repo: Repository) -> No
     day_ago = now - 24 * 3600
     # A stale completed coverage cursor a day in the past (the catch-up baseline).
     repo.record_ingest_coverage(
-        kind="event_history", scope="site", interval="retained",
-        start_ts=day_ago - 3600, end_ts=day_ago, status="complete",
+        kind="event_history",
+        scope="site",
+        interval="retained",
+        start_ts=day_ago - 3600,
+        end_ts=day_ago,
+        status="complete",
     )
     # A caller-pinned 1 h bounded fetch (empty result is fine: coverage is what
     # we assert, not inserts).
@@ -732,8 +764,13 @@ def test_w16a5_out_of_range_int_port_routes_to_switch(repo: Repository) -> None:
     permanent native_id desync. The bound rejects it (routes to the SWITCH), exactly
     and consistently with the SQL, so it is never accepted-then-mismatched."""
     ev = Event.model_validate(
-        {"_id": "stp-huge", "key": "EVT_SW_StpPortBlocking",
-         "time": 1_721_600_000_000, "sw": SWITCH_MAC, "port": 9223372036854775808}
+        {
+            "_id": "stp-huge",
+            "key": "EVT_SW_StpPortBlocking",
+            "time": 1_721_600_000_000,
+            "sw": SWITCH_MAC,
+            "port": 9223372036854775808,
+        }
     )
     rec = EventNormalizer(repo).normalize(ev)
     assert rec is not None
@@ -1232,8 +1269,11 @@ def test_a_flaky_not_falsely_cleared_after_shutdown(repo: Repository) -> None:
     )
     repo.upsert_entity(
         Entity(
-            entity_type=EntityType.CLIENT, native_id="cc:flaky", site_id="default",
-            parent_id=ap, first_seen_ts=now - 100_000,
+            entity_type=EntityType.CLIENT,
+            native_id="cc:flaky",
+            site_id="default",
+            parent_id=ap,
+            first_seen_ts=now - 100_000,
         ),
         ts=now,
     )
@@ -1268,8 +1308,11 @@ def test_w16a1_flaky_freezes_when_disconnects_sever_heartbeat_bridge(
     )
     repo.upsert_entity(
         Entity(
-            entity_type=EntityType.CLIENT, native_id="cc:flaky", site_id="default",
-            parent_id=ap, first_seen_ts=now - 100_000,
+            entity_type=EntityType.CLIENT,
+            native_id="cc:flaky",
+            site_id="default",
+            parent_id=ap,
+            first_seen_ts=now - 100_000,
         ),
         ts=now,
     )
@@ -1318,7 +1361,9 @@ def test_b_failed_then_recovered_flush_reopens_coverage_and_health(repo: Reposit
     # Healthy, connected-and-draining span up to shortly before the stall.
     _seed_beats(listener, start, start + 3480, step=60)
     # A flush tick fails: storage-failed (ok=0) surfaces, NO heartbeat this tick.
-    repo.record_poll_run(job="ws", ok=False, ts=start + 3500, error="storage-failed: locked", source="live")
+    repo.record_poll_run(
+        job="ws", ok=False, ts=start + 3500, error="storage-failed: locked", source="live"
+    )
     # While the failure is the latest ws row, health is 'failing'.
     assert _trailing_failures(repo, "ws") > 0
     # Flushing RECOVERS: the connected socket commits + empties its queue, so the
@@ -1359,7 +1404,10 @@ async def test_c_periodic_flush_heartbeats_while_connected_and_covers(
     task = asyncio.create_task(listener._periodic_flush())
 
     async def until_three_beats() -> None:
-        while len([r for r in repo.read_poll_runs("ws", 0, 10_000_000) if r["error"] == "heartbeat"]) < 3:
+        while (
+            len([r for r in repo.read_poll_runs("ws", 0, 10_000_000) if r["error"] == "heartbeat"])
+            < 3
+        ):
             await asyncio.sleep(0.001)
 
     try:
@@ -1383,9 +1431,9 @@ def test_d_real_gap_still_freezes(repo: Repository) -> None:
     start = now - 3600
     listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=0.0)
     listener.connection_state = "connected"
-    _seed_beats(listener, start, start + 240, step=60)   # early burst
+    _seed_beats(listener, start, start + 240, step=60)  # early burst
     # ... feed dead for most of the hour (no beats) ...
-    _seed_beats(listener, now - 240, now - 1, step=60)   # late burst
+    _seed_beats(listener, now - 240, now - 1, step=60)  # late burst
     cov = repo.observed_event_coverage(start, now)
     assert cov < EVENT_COVERAGE_MIN
     assert cov < 0.2
@@ -1497,8 +1545,11 @@ def test_w17a2_unusable_drops_suppress_heartbeat_and_freeze(repo: Repository) ->
     )
     repo.upsert_entity(
         Entity(
-            entity_type=EntityType.CLIENT, native_id="cc:uw", site_id="default",
-            parent_id=ap, first_seen_ts=now - 100_000,
+            entity_type=EntityType.CLIENT,
+            native_id="cc:uw",
+            site_id="default",
+            parent_id=ap,
+            first_seen_ts=now - 100_000,
         ),
         ts=now,
     )
@@ -1510,9 +1561,9 @@ def test_w17a2_unusable_drops_suppress_heartbeat_and_freeze(repo: Repository) ->
     t = start
     while t < now:
         listener._unusable_dropped_since_beat += 1  # a drop happened this period
-        listener._flush()                            # empty batch, nothing to store
+        listener._flush()  # empty batch, nothing to store
         listener._maybe_heartbeat(now=t)
-        listener._last_heartbeat_ts = None           # rate limit is not the guard here
+        listener._last_heartbeat_ts = None  # rate limit is not the guard here
         t += 30
     beats = [r for r in repo.read_poll_runs("ws", 0, 10_000_000) if r["error"] == "heartbeat"]
     assert beats == []  # NO positive liveness while usable events were being dropped
@@ -1580,8 +1631,11 @@ def test_w18a2_unusable_drops_sever_coverage_no_bridge(repo: Repository) -> None
     )
     repo.upsert_entity(
         Entity(
-            entity_type=EntityType.CLIENT, native_id="cc:w18a2", site_id="default",
-            parent_id=ap, first_seen_ts=now - 100_000,
+            entity_type=EntityType.CLIENT,
+            native_id="cc:w18a2",
+            site_id="default",
+            parent_id=ap,
+            first_seen_ts=now - 100_000,
         ),
         ts=now,
     )
@@ -1629,9 +1683,13 @@ async def test_w18a4_parser_unusable_frames_reach_drop_accounting_and_sever(
     from netadmin.ingest.unifi.ws import EventListener as WsEventListener
 
     # Genuine control frame -> nothing (no false drop).
-    assert WsEventListener._parse('{"meta": {"message": "device:sync"}, "data": [{"mac": "x"}]}') == []
+    assert (
+        WsEventListener._parse('{"meta": {"message": "device:sync"}, "data": [{"mac": "x"}]}') == []
+    )
     # Explicit event frame whose rows lack key/_id -> surfaced as unusable events.
-    parsed = WsEventListener._parse('{"meta": {"message": "events"}, "data": [{"foo": 1}, {"bar": 2}]}')
+    parsed = WsEventListener._parse(
+        '{"meta": {"message": "events"}, "data": [{"foo": 1}, {"bar": 2}]}'
+    )
     assert len(parsed) == 2  # pre-fix: [] (silently dropped)
 
     listener = EventListener(FakeWs(parsed), repo, flush_interval=None, heartbeat_interval=30.0)
@@ -1639,8 +1697,8 @@ async def test_w18a4_parser_unusable_frames_reach_drop_accounting_and_sever(
     written = await listener.run()
 
     assert written == 0
-    assert repo.read_events(0, 2_000_000_000) == []          # nothing stored
-    assert listener._unusable_dropped_since_beat == 2         # drop accounted
+    assert repo.read_events(0, 2_000_000_000) == []  # nothing stored
+    assert listener._unusable_dropped_since_beat == 2  # drop accounted
 
     # The accounted drop severs coverage: the next beat opportunity records a BREAK.
     listener.connection_state = "connected"
@@ -1664,9 +1722,7 @@ async def test_d5_rescued_events_drain_during_replacement_listener_life(
 ) -> None:
     import sqlite3
 
-    rescued_ev = Event.model_validate(
-        {"_id": "rescued", "key": "EVT_X", "time": 1_721_600_000_000}
-    )
+    rescued_ev = Event.model_validate({"_id": "rescued", "key": "EVT_X", "time": 1_721_600_000_000})
     new_ev = Event.model_validate({"_id": "new", "key": "EVT_X", "time": 1_721_600_000_100})
 
     real_store = repo.record_events_enriching_entities
@@ -1938,7 +1994,9 @@ def test_bug6_aggregate_cap_evicts_true_oldest_across_both_buffers(
 
     # 3 OLD raw events (times 1-3 s) + 3 NEW normalized events (times 4-6 s).
     old_raw = [
-        Event.model_validate({"_id": f"old{i}", "key": "EVT_X", "time": 1_721_600_000_000 + i * 1000})
+        Event.model_validate(
+            {"_id": f"old{i}", "key": "EVT_X", "time": 1_721_600_000_000 + i * 1000}
+        )
         for i in (1, 2, 3)
     ]
     new_norm = [norm(f"new{i}", 1_721_600_000_000 + i * 1000) for i in (4, 5, 6)]
@@ -1976,7 +2034,9 @@ def test_bug6_recovery_keeps_newer_events_not_prefix(
         return rec
 
     old_raw = [
-        Event.model_validate({"_id": f"old{i}", "key": "EVT_X", "time": 1_721_600_000_000 + i * 1000})
+        Event.model_validate(
+            {"_id": f"old{i}", "key": "EVT_X", "time": 1_721_600_000_000 + i * 1000}
+        )
         for i in (1, 2, 3)
     ]
     new_norm = [norm(f"new{i}", 1_721_600_000_000 + i * 1000) for i in (4, 5, 6)]
@@ -2048,9 +2108,7 @@ async def test_bug5_cancel_during_teardown_flush_failure_still_propagates(
 
     monkeypatch.setattr(repo, "record_events_enriching_entities", flaky)
 
-    buffered = Event.model_validate(
-        {"_id": "buffered", "key": "EVT_X", "time": 1_721_600_000_000}
-    )
+    buffered = Event.model_validate({"_id": "buffered", "key": "EVT_X", "time": 1_721_600_000_000})
 
     factory_calls = {"n": 0}
 
@@ -2149,9 +2207,7 @@ async def test_finding5_already_cancelled_future_with_teardown_failure_propagate
 
     monkeypatch.setattr(repo, "record_events_enriching_entities", flaky)
 
-    buffered = Event.model_validate(
-        {"_id": "buffered", "key": "EVT_X", "time": 1_721_600_000_000}
-    )
+    buffered = Event.model_validate({"_id": "buffered", "key": "EVT_X", "time": 1_721_600_000_000})
 
     factory_calls = {"n": 0}
 
@@ -2215,7 +2271,10 @@ async def _bug6_endpoints() -> tuple[Any, Any]:
     from netadmin.ingest.unifi.endpoints import Endpoints
 
     client = UnifiClient(
-        host=_BUG6_HOST, site=_BUG6_SITE, username="u", password="p",
+        host=_BUG6_HOST,
+        site=_BUG6_SITE,
+        username="u",
+        password="p",
         min_request_interval=0.0,
     )
     await client.connect()
@@ -2471,8 +2530,11 @@ class _TransientNormalizer(EventNormalizer):
 async def test_w19a4_normalize_raise_counts_as_drop_and_severs(repo: Repository) -> None:
     events = [event_by_key("EVT_WU_Roam") for _ in range(3)]
     listener = EventListener(
-        FakeWs(events), repo, normalizer=_MalformedNormalizer(repo),
-        flush_interval=None, heartbeat_interval=30.0,
+        FakeWs(events),
+        repo,
+        normalizer=_MalformedNormalizer(repo),
+        flush_interval=None,
+        heartbeat_interval=30.0,
     )
     listener.connection_state = "connected"
     written = await listener.run()
@@ -2527,12 +2589,20 @@ async def test_w19a_expired_event_hole_becomes_unrecoverable_on_next_sweep(
     # A complete prefix, a failed (now-expired) hole right after it, and recent
     # complete coverage the hole is capping the cursor short of.
     repo.record_ingest_coverage(
-        kind="event_history", scope="site", interval="retained",
-        start_ts=old - 3600, end_ts=old, status="complete",
+        kind="event_history",
+        scope="site",
+        interval="retained",
+        start_ts=old - 3600,
+        end_ts=old,
+        status="complete",
     )
     repo.record_ingest_coverage(
-        kind="event_history", scope="site", interval="retained",
-        start_ts=old, end_ts=old + 3600, status="failed",
+        kind="event_history",
+        scope="site",
+        interval="retained",
+        start_ts=old,
+        end_ts=old + 3600,
+        status="failed",
     )
     # The failed hole pins the cursor at its start (old), short of the real history.
     assert repo.latest_ingest_coverage_end(kind="event_history", scope="site") == old
@@ -2650,7 +2720,10 @@ def _assert_incident_severed(repo: Repository) -> None:
     seed_coverage(repo, job="fast_sta", now=1093, window_s=93, interval_s=30)
     settings = SimpleNamespace(thresholds={"client.flaky": {"window_s": 93}}, poll=None)
     ctx = DetectorContext(
-        repo=repo, baselines=FakeBaselines(), now_ts=1093, site_id="default",
+        repo=repo,
+        baselines=FakeBaselines(),
+        now_ts=1093,
+        site_id="default",
         settings=settings,
     )
     assert ctx.event_coverage_ok(93) is False
@@ -2665,6 +2738,7 @@ async def test_w20a1_exceptional_death_severs_coverage_no_bridge(
     then dies with a queue-full RuntimeError severs coverage across the replacement.
     Pre-fix the marker was discarded on replacement and the terminal error row did
     not sever, so the replacement's beats bridged the death (0.989)."""
+
     def dying() -> EventListener:
         return EventListener(
             FakeWs(
@@ -2676,8 +2750,11 @@ async def test_w20a1_exceptional_death_severs_coverage_no_bridge(
         )
 
     await _run_death_then_replacement(
-        repo, monkeypatch, dying_listener_factory=dying,
-        break_ts=1060, replacement_beats=[1062, 1092],
+        repo,
+        monkeypatch,
+        dying_listener_factory=dying,
+        break_ts=1060,
+        replacement_beats=[1062, 1092],
     )
     _assert_incident_severed(repo)
 
@@ -2691,6 +2768,7 @@ async def test_w20a2_parser_validationerror_death_severs_coverage(
     disconnect/drop accounting. The exceptional termination must still sever coverage
     (durable break), so the replacement's beats do not bridge the death (0.989)."""
     from pydantic import ValidationError
+
     from netadmin.ingest.unifi.ws import EventListener as WsEventListener
 
     # The malformed EXPLICIT events frame genuinely raises out of _parse (key:[] is
@@ -2712,8 +2790,11 @@ async def test_w20a2_parser_validationerror_death_severs_coverage(
         return EventListener(FakeWs([], fail=verr), repo, flush_interval=None)
 
     await _run_death_then_replacement(
-        repo, monkeypatch, dying_listener_factory=dying,
-        break_ts=1060, replacement_beats=[1062, 1092],
+        repo,
+        monkeypatch,
+        dying_listener_factory=dying,
+        break_ts=1060,
+        replacement_beats=[1062, 1092],
     )
     _assert_incident_severed(repo)
 
@@ -2730,8 +2811,12 @@ def test_w20a3_falsy_ap_from_treated_as_absent(repo: Repository, falsy: Any) -> 
     stranded -- matching what the byte-identical SQL resolvability predicate computes."""
     ev = Event.model_validate(
         {
-            "_id": "roam-falsy", "key": "EVT_WU_Roam", "time": 1_721_600_000_000,
-            "user": CLIENT_MAC, "ap": AP_TO_MAC, "ap_from": falsy,
+            "_id": "roam-falsy",
+            "key": "EVT_WU_Roam",
+            "time": 1_721_600_000_000,
+            "user": CLIENT_MAC,
+            "ap": AP_TO_MAC,
+            "ap_from": falsy,
         }
     )
     rec = EventNormalizer(repo).normalize(ev)
@@ -2748,8 +2833,12 @@ def test_w20a3_truthy_nonstring_ap_from_treated_as_absent(repo: Repository) -> N
     for bad in (1, [AP_FROM_MAC]):
         ev = Event.model_validate(
             {
-                "_id": "roam-bad", "key": "EVT_WU_Roam", "time": 1_721_600_000_000,
-                "user": CLIENT_MAC, "ap": AP_TO_MAC, "ap_from": bad,
+                "_id": "roam-bad",
+                "key": "EVT_WU_Roam",
+                "time": 1_721_600_000_000,
+                "user": CLIENT_MAC,
+                "ap": AP_TO_MAC,
+                "ap_from": bad,
             }
         )
         rec = EventNormalizer(repo).normalize(ev)
@@ -2762,8 +2851,12 @@ def test_w20a3_string_ap_from_still_used(repo: Repository) -> None:
     roam's related AP is the FROM ap, not the destination ap."""
     ev = Event.model_validate(
         {
-            "_id": "roam-ok", "key": "EVT_WU_Roam", "time": 1_721_600_000_000,
-            "user": CLIENT_MAC, "ap": AP_TO_MAC, "ap_from": AP_FROM_MAC,
+            "_id": "roam-ok",
+            "key": "EVT_WU_Roam",
+            "time": 1_721_600_000_000,
+            "user": CLIENT_MAC,
+            "ap": AP_TO_MAC,
+            "ap_from": AP_FROM_MAC,
         }
     )
     rec = EventNormalizer(repo).normalize(ev)

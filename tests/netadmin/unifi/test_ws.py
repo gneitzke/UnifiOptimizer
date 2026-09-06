@@ -70,7 +70,10 @@ def test_parse_control_frame_rows_are_not_counted_as_unusable_events():
     surfaced as (unusable) events."""
     assert EventListener._parse(CONTROL_FRAME) == []
     # A control frame carrying a NON-event row list -> nothing surfaced.
-    assert EventListener._parse('{"meta": {"message": "speed-test"}, "data": [{"progress": 42}]}') == []
+    assert (
+        EventListener._parse('{"meta": {"message": "speed-test"}, "data": [{"progress": 42}]}')
+        == []
+    )
     # ...but a control frame that happens to carry a real event row still yields it.
     mixed = '{"meta": {"message": "speed-test"}, "data": [{"progress": 42}, {"key": "EVT_X"}]}'
     assert [e.key for e in EventListener._parse(mixed)] == ["EVT_X"]
