@@ -21,6 +21,8 @@ from netadmin.ingest.backfill import (
     job_name,
     plan_report_windows,
 )
+from netadmin.ingest.unifi.auth import UnifiError
+from netadmin.ingest.unifi.endpoints import Endpoints, ReportUnavailable
 from netadmin.ingest.unifi.models import ReportRow
 from netadmin.store.metrics import MetricKind, metric_kind
 from netadmin.store.repository import Repository
@@ -331,6 +333,92 @@ async def test_c4_retries_failed_chunk_after_later_chunk_advanced_samples(repo: 
     assert (FIVEMIN, failed_start * 1000, (failed_start + 600) * 1000) in {
         (c["interval"], c["start_ms"], c["end_ms"]) for c in ep.calls
     }
+
+
+@pytest.mark.asyncio
+async def test_c4_open_bucket_is_retried_in_next_sweep(repo: Repository):
+    """A row published after its bucket closes is not buried by the first cursor."""
+    ap_id = _ap(repo)
+    oid = "aa:bb:cc:00:00:01"
+
+    class DelayedBucket(FakeEndpoints):
+        def __init__(self) -> None:
+            super().__init__(
+                {
+                    (FIVEMIN, "ap"): [
+                        {"time": 600_000, "oid": oid, "rx_bytes": 6.0},
+                    ]
+                }
+            )
+
+        def publish_closed_bucket(self) -> None:
+            self._rows[(FIVEMIN, "ap")].extend(
+                [
+                    {"time": 900_000, "oid": oid, "rx_bytes": 9.0},
+                    {"time": 1_200_000, "oid": oid, "rx_bytes": 12.0},
+                ]
+            )
+
+    ep = DelayedBucket()
+    bf = Backfiller(ep, repo, scopes=("ap",), chunk_seconds={FIVEMIN: 600})
+
+    await bf.run({"ap": 600}, now=1_000)
+    assert repo.latest_ingest_coverage_end(kind="report", scope="ap") == 900
+
+    ep.publish_closed_bucket()
+    ep.calls.clear()
+    cursor = repo.latest_ingest_coverage_end(kind="report", scope="ap")
+    await bf.run({"ap": cursor}, now=1_300)
+
+    assert ep.calls[0]["start_ms"] == 900_000
+    series = repo.get_series(ap_id, "rx_bytes")
+    assert [row["ts"] for row in repo.read_raw(series, 0, 1_500)] == [600, 900]
+    assert repo.latest_ingest_coverage_end(kind="report", scope="ap") == 1_200
+
+
+@pytest.mark.asyncio
+async def test_c4_unsupported_report_is_unrecoverable_not_complete(repo: Repository):
+    _ap(repo)
+
+    class UnsupportedClient:
+        async def get_data(self, endpoint, params):
+            raise UnifiError("404 api.err.NotFound")
+
+    endpoints = Endpoints(UnsupportedClient())  # type: ignore[arg-type]
+    result = await Backfiller(endpoints, repo, scopes=("ap",)).run({"ap": 600}, now=1_000)
+
+    coverage = repo._conn.execute(
+        "SELECT status, detail FROM ingest_coverage WHERE kind='report' AND scope='ap'"
+    ).fetchall()
+    assert [row["status"] for row in coverage] == ["unrecoverable"]
+    assert "ReportUnavailable" in coverage[0]["detail"]
+    assert repo.latest_ingest_coverage_end(kind="report", scope="ap") is None
+    assert result.errors == 1
+
+
+@pytest.mark.asyncio
+async def test_stat_report_unsupported_is_distinct_from_supported_empty():
+    class UnsupportedClient:
+        calls = 0
+
+        async def get_data(self, endpoint, params):
+            self.calls += 1
+            raise UnifiError("404 api.err.NotFound")
+
+    unsupported_client = UnsupportedClient()
+    unsupported = Endpoints(unsupported_client)  # type: ignore[arg-type]
+    with pytest.raises(ReportUnavailable):
+        await unsupported.stat_report(FIVEMIN, "ap", start_ms=0, end_ms=300_000)
+    with pytest.raises(ReportUnavailable):
+        await unsupported.stat_report(FIVEMIN, "ap", start_ms=0, end_ms=300_000)
+    assert unsupported_client.calls == 1  # sticky unsupported capability
+
+    class EmptyClient:
+        async def get_data(self, endpoint, params):
+            return []
+
+    supported = Endpoints(EmptyClient())  # type: ignore[arg-type]
+    assert await supported.stat_report(FIVEMIN, "ap", start_ms=0, end_ms=300_000) == []
 
 
 def test_user_signal_maps_to_collector_rssi_metric():

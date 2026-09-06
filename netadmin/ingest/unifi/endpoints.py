@@ -6,8 +6,10 @@ returns parsed pydantic models from :mod:`netadmin.ingest.unifi.models`.
 
 The collector is GET-only (S1): every read here is issued as an idempotent GET,
 its query carried on the URL. Some routes are, on some firmware, only served over
-POST; under the literal GET-only contract those are reported UNAVAILABLE (the
-method degrades to ``[]`` and latches off for the session) rather than POSTed to.
+POST; under the literal GET-only contract those are reported UNAVAILABLE (report
+reads raise :class:`ReportUnavailable` and latch off for the session) rather than
+POSTed to. This keeps an unsupported report source distinct from a supported read
+whose authoritative result is genuinely empty.
 The controller is never mutated from this module -- the sole mutation seam is the
 approved fix writer.
 
@@ -89,6 +91,16 @@ def _route_absent(exc: UnifiError) -> bool:
 
 REPORT_INTERVALS = frozenset({"5minutes", "hourly", "daily"})
 REPORT_SCOPES = frozenset({"ap", "user", "gw", "site"})
+
+
+class ReportUnavailable(UnifiError):
+    """The controller does not expose ``stat/report`` through a GET read.
+
+    This is a capability result, not an empty report result. Callers that track
+    history coverage must therefore record the requested interval as unavailable
+    instead of advancing a successful-read cursor.
+    """
+
 
 # Sensible default attr sets per report scope. Callers may override.
 DEFAULT_REPORT_ATTRS: dict[str, list[str]] = {
@@ -224,7 +236,7 @@ class Endpoints:
         return events
 
     # --------------------------------------------------------------- #
-    # reports (POST, attrs + start + end in ms)
+    # reports (GET, attrs + start + end in ms)
     # --------------------------------------------------------------- #
     async def stat_report(
         self,
@@ -235,7 +247,12 @@ class Endpoints:
         end_ms: int,
         attrs: Optional[list[str]] = None,
     ) -> list[ReportRow]:
-        """``stat/report/{interval}.{scope}`` over ``[start_ms, end_ms]``."""
+        """``stat/report/{interval}.{scope}`` over ``[start_ms, end_ms]``.
+
+        Returns a list (including an authoritative empty list) only when the GET
+        route was successfully read. Raises :class:`ReportUnavailable` when this
+        controller does not serve reports over GET.
+        """
         if interval not in REPORT_INTERVALS:
             raise ValueError(
                 f"interval must be one of {sorted(REPORT_INTERVALS)}, got {interval!r}"
@@ -243,7 +260,7 @@ class Endpoints:
         if scope not in REPORT_SCOPES:
             raise ValueError(f"scope must be one of {sorted(REPORT_SCOPES)}, got {scope!r}")
         if self._report_disabled:
-            return []
+            raise ReportUnavailable("stat/report is unavailable over GET on this controller")
         selected = attrs if attrs is not None else DEFAULT_REPORT_ATTRS[scope]
         if "time" not in selected:
             selected = [*selected, "time"]
@@ -260,7 +277,9 @@ class Endpoints:
                 "collector never POSTs to the controller.",
                 exc,
             )
-            return []
+            raise ReportUnavailable(
+                "stat/report is unavailable over GET on this controller"
+            ) from exc
         return [ReportRow.model_validate(r) for r in rows]
 
     async def stat_report_5min(
