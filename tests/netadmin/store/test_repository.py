@@ -1373,12 +1373,13 @@ def test_unresolved_events_ap_flood_does_not_starve_repairable_client(repo: Repo
     for i in range(600):
         repo.record_event(
             ts=1000 + i, key="EVT_AP_Lost_Contact", entity_id=ap,
-            related_entity_id=None, native_id=f"apev-{i}",
+            related_entity_id=None, native_id=f"apev-{i}", data={"ap": "ap:mac"},
         )
-    # A repairable client event arriving later: its client is not yet in inventory.
+    # A repairable client event arriving later: its client is named in the payload
+    # (so it can resolve) but is not yet in inventory.
     client_ev = repo.record_event(
         ts=9000, key="EVT_WU_Disconnected", entity_id=None,
-        related_entity_id=None, native_id="cliev",
+        related_entity_id=None, native_id="cliev", data={"user": "cli:mac"},
     )
 
     rows = repo.unresolved_events(limit=500)
@@ -1392,9 +1393,70 @@ def test_unresolved_events_keeps_client_with_pending_related(repo: Repository) -
     """A client event whose primary (client) resolved but whose from-AP is still
     pending (related NULL) IS repairable and must still be selected."""
     client = repo.upsert_entity(Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=1000)
+    # The from-AP is named in the payload but not yet in inventory (still pending):
+    # its identity exists, so the row is genuinely repairable and must be selected.
     ev = repo.record_event(
         ts=2000, key="EVT_WU_Roam", entity_id=client,
-        related_entity_id=None, native_id="roamev",
+        related_entity_id=None, native_id="roamev", data={"ap_from": "apx:mac"},
     )
     returned = {int(r["id"]) for r in repo.unresolved_events(limit=500)}
     assert ev in returned
+
+
+def test_reconcile_parks_unresolvable_and_reaches_newer_repairable(repo: Repository) -> None:
+    """P2: 500 OLDER client events with a resolved client but NO from-AP in the
+    payload can NEVER resolve their related reference.  Being oldest, the prior
+    filter re-selected them every pass, filled the LIMIT window, and starved a
+    newer, genuinely-repairable client event -- while dishonestly reporting 500
+    repairs each pass.  The fix parks rows with no resolvable identity, so the
+    newer event is reached and enriched, and the reported count reflects only the
+    single real enrichment (not 500)."""
+    from netadmin.ingest.events import EventNormalizer
+
+    old_client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli-old:mac"), ts=500
+    )
+    # 500 older client events: client resolved, related NULL, and the payload
+    # names NO AP/switch -- there is nothing to resolve the from-AP from, ever.
+    for i in range(500):
+        repo.record_event(
+            ts=1000 + i, key="EVT_WU_Disconnected", entity_id=old_client,
+            related_entity_id=None, native_id=f"oldev-{i}",
+            data={"key": "EVT_WU_Disconnected", "time": (1000 + i) * 1000,
+                  "user": "cli-old:mac"},
+        )
+    # A newer, genuinely repairable client event: its from-AP IS in inventory now.
+    new_client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli-new:mac"), ts=8000
+    )
+    new_ap = repo.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="ap-new:mac"), ts=8000
+    )
+    newer_ev = repo.record_event(
+        ts=9000, key="EVT_WU_Connected", entity_id=new_client,
+        related_entity_id=None, native_id="newev",
+        data={"key": "EVT_WU_Connected", "time": 9000 * 1000,
+              "user": "cli-new:mac", "ap": "ap-new:mac"},
+    )
+
+    # Selection makes fair progress: the 500 unresolvable rows are parked, so the
+    # newer repairable row (which the old LIMIT-500 window would have starved) is
+    # the only thing returned.
+    selected = {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+    assert selected == {newer_ev}
+
+    # End-to-end reconcile: the reported repair count is the ONE real enrichment,
+    # not 500, and the newer event's related reference is actually filled.
+    repaired = EventNormalizer(repo).reconcile_unresolved(limit=500)
+    assert repaired == 1
+
+    row = repo._conn.execute(
+        "SELECT related_entity_id FROM events WHERE id=?", (newer_ev,)
+    ).fetchone()
+    assert row["related_entity_id"] == new_ap
+    # The parked 500 remain untouched (still NULL) -- never falsely counted.
+    still_null = repo._conn.execute(
+        "SELECT COUNT(*) AS n FROM events WHERE related_entity_id IS NULL "
+        "AND entity_id=?", (old_client,)
+    ).fetchone()["n"]
+    assert still_null == 500
