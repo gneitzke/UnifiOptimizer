@@ -380,10 +380,34 @@ async def revert_fix(request: Request, issue_id: int, body: RevertBody) -> dict[
     finally:
         await _close(seams, owns)
 
-    # Honor the WriteResult: a revert whose controller write did not succeed is a
-    # failure, not a success. Surfacing it as 200 would tell the operator the
-    # before-state was restored when the controller in fact rejected the write and
-    # the change still stands.
+    # An AMBIGUOUS revert outcome is NOT a definitive rejection (C2). The writer
+    # could not confirm whether the restore landed (a lost response, or a 401 it may
+    # have landed under), so the change state is UNKNOWN -- it may already be rolled
+    # back. Collapsing this into 502 "the change was not rolled back" asserts a
+    # falsehood: that the change definitively still stands. Mirror the apply path's
+    # ambiguity handling instead -- surface ``status:"unknown"`` / ``ambiguous:true``
+    # with the detail and a code that does NOT claim the change is still applied,
+    # leaving the operator to reconcile via a read. Only a DEFINITIVE rejection
+    # (a non-2xx / ``meta.rc=error`` the writer is sure about) is the 502 below.
+    if not write.ok and isinstance(write.data, dict) and write.data.get("ambiguous"):
+        updated = store.get_change(body.change_id)
+        detail = write.data.get("error") or "revert outcome unknown (ambiguous)"
+        return {
+            "status": "unknown",
+            "ambiguous": True,
+            "detail": (
+                f"revert of change {body.change_id} could not be confirmed ({detail}); "
+                "the rollback may or may not have landed — reconcile via a read before "
+                "retrying, do not assume the change still stands"
+            ),
+            "change": _change_dict(updated) if updated is not None else None,
+            "verification": _verification_dict(service, issue_id),
+        }
+
+    # Honor the WriteResult: a revert whose controller write was DEFINITIVELY
+    # rejected is a failure, not a success. Surfacing it as 200 would tell the
+    # operator the before-state was restored when the controller in fact rejected
+    # the write and the change still stands.
     if not write.ok:
         raise HTTPException(
             status_code=502,
@@ -395,6 +419,7 @@ async def revert_fix(request: Request, issue_id: int, body: RevertBody) -> dict[
 
     updated = store.get_change(body.change_id)
     return {
+        "status": "reverted",
         "change": _change_dict(updated) if updated is not None else None,
         "verification": _verification_dict(service, issue_id),
     }
