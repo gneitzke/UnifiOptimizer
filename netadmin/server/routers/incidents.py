@@ -159,8 +159,12 @@ async def list_incidents(
     now = int(time.time())
 
     def _all_members_suppressed(incident_id: int) -> bool:
-        members = store.list_incident_members(incident_id)
-        rows = [all_issues.get(int(m["issue_id"])) for m in members]
+        # C5: judge the list-visibility of an incident by its CURRENT members
+        # only. A cleared/reassigned historical member is no longer part of this
+        # incident, so it must neither keep it visible nor hide it -- otherwise a
+        # fully-suppressed current incident wrongly stays listed.
+        issue_ids = store.current_incident_issue_ids(incident_id)
+        rows = [all_issues.get(int(iid)) for iid in issue_ids]
         rows = [r for r in rows if r is not None]
         return bool(rows) and all(row_is_suppressed(r, now) for r in rows)
 
@@ -253,8 +257,13 @@ async def get_incident(request: Request, incident_id: int) -> dict[str, Any]:
             symptoms.append(built)
 
     incident = dict(row)
-    incident["member_count"] = len(members)
-    incident["symptom_count"] = sum(1 for m in members if m["role"] != "root")
+    # C5: counts describe the incident's CURRENT shape (cleared members are shown
+    # in the member list above, with current=False, but must not inflate the
+    # headline counts the way the historical membership would).
+    incident["member_count"] = sum(1 for m in members if m["cleared_ts"] is None)
+    incident["symptom_count"] = sum(
+        1 for m in members if m["cleared_ts"] is None and m["role"] != "root"
+    )
 
     root_issue_id = int(row["root_issue_id"])
     root_issue = issues_by_id.get(root_issue_id)

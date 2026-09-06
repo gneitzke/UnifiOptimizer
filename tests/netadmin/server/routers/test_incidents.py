@@ -240,6 +240,35 @@ async def test_incident_drops_only_when_all_members_suppressed(
     assert body["suppressed_excluded"] == 1
 
 
+async def test_c5_cleared_member_excluded_from_counts_and_list_suppression(
+    incident_app, incident_store
+) -> None:
+    """C5 residual: a symptom that CLEARS must drop out of the detail headline
+    counts, and must not keep a fully-suppressed *current* incident visible."""
+    import time as _t
+
+    inc_id = incident_store.incident_id_for_issue(incident_store.root_id)
+    assert inc_id is not None
+    # Reconcile to root-only membership -> the symptom is cleared (kept as history).
+    incident_store.reconcile_incident_members(
+        inc_id,
+        [{"issue_id": incident_store.root_id, "role": "root", "rule": "", "rationale": ""}],
+        ts=int(_t.time()),
+    )
+    async with await _client(incident_app) as c:
+        detail = (await c.get(f"/api/incidents/{inc_id}")).json()["incident"]
+        # Counts reflect CURRENT membership (root only), not the historical 2/1.
+        assert detail["member_count"] == 1
+        assert detail["symptom_count"] == 0
+    # The cleared symptom is unsuppressed, but it is no longer a current member,
+    # so suppressing the only current member (root) must drop the incident.
+    _suppress(incident_store, incident_store.root_id)
+    async with await _client(incident_app) as c:
+        body = (await c.get("/api/incidents")).json()
+    detectors = {i["root"]["detector_key"] for i in body["incidents"]}
+    assert "wifi.mesh_uplink" not in detectors
+
+
 # --- bulk incident suppress / unsuppress (Gitea #50) ------------------------- #
 
 
