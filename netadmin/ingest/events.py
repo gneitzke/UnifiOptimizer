@@ -417,6 +417,13 @@ class EventListener:
         # existence of a running task.
         self.connection_state: str = "reconnecting"
         self.on_connection_state: Optional[Callable[[str], None]] = None
+        # D5: fired whenever this listener proves storage is healthy (a heartbeat =
+        # connected AND draining successfully). The supervisor points this at its
+        # rescued-buffer drain so events rescued from a prior dead listener are
+        # persisted promptly DURING this replacement listener's life -- not left
+        # queued until this listener itself dies. Best-effort, never on the data
+        # path: a raising hook is swallowed.
+        self.on_healthy_drain: Optional[Callable[[], None]] = None
         # The socket listener reports state through this hook; setattr is safe on
         # both the real ws listener and the test doubles.
         setattr(self._ws, "on_state", self._relay_ws_state)
@@ -507,17 +514,28 @@ class EventListener:
         loop never race on the buffer in a single-threaded event loop.
         """
         # First fold in any raw events whose normalize-read has since recovered,
-        # so a blip'd event is flushed the moment storage returns.
+        # so a blip'd event is flushed the moment storage returns. This may leave
+        # events STUCK in ``_pending_raw`` (and (re)set ``_storage_error``) if the
+        # entity-resolution read is still failing.
         self._drain_pending_raw()
-        if not self._batch:
-            return 0
-        batch = list(self._batch)
-        # C7's enrich-aware writer dedupes replayed events while filling links.
-        # Crucially, no buffer entry is removed until SQLite committed.
-        inserted = self._repo.record_events_enriching_entities(batch)
-        del self._batch[: len(batch)]
-        self._storage_error = None
-        self.written += inserted
+        inserted = 0
+        if self._batch:
+            batch = list(self._batch)
+            # C7's enrich-aware writer dedupes replayed events while filling links.
+            # Crucially, no buffer entry is removed until SQLite committed. A write
+            # failure raises out here; the caller records it as ``_storage_error``.
+            inserted = self._repo.record_events_enriching_entities(batch)
+            del self._batch[: len(batch)]
+            self.written += inserted
+        # D2 (normalization-read outage earns no false coverage): draining is
+        # "successful" only when NOTHING is stuck in the raw retry buffer. Clear a
+        # stale storage error -- so heartbeats (gated on an empty raw buffer AND no
+        # active error) can resume -- ONLY once ``_pending_raw`` is truly empty.
+        # While a raw event is still stuck, ``_drain_pending_raw`` has kept
+        # ``_storage_error`` set, so the heartbeat stays suppressed and the
+        # unprocessed span is never credited as observed.
+        if not self._pending_raw:
+            self._storage_error = None
         return inserted
 
     def _maybe_heartbeat(self, *, now: Optional[float] = None) -> None:
@@ -530,8 +548,22 @@ class EventListener:
         ``heartbeat_interval`` so a 2 s flush cadence does not flood ``poll_runs``.
         Best-effort: a failed heartbeat write is not a data-path error (coverage
         merely gets no positive evidence for this tick), it never raises out.
+
+        D2 (normalization-read outage must earn no coverage): a heartbeat is
+        positive proof the feed was CONNECTED *and draining successfully*. Draining
+        is successful only when the raw retry buffer is empty (nothing consumed off
+        the socket is stuck awaiting re-normalization) and no storage error is
+        active. While a raw event is retained after a normalize-read blip, the feed
+        has UNPROCESSED history: crediting coverage over that span would let an
+        event-based detector treat unprocessed events as observed and false-clear a
+        live issue (the B4 harm). So no beat fires until the raw buffer drains and
+        the read recovers -- coverage correctly ends at the last truly-drained beat
+        and detectors freeze to UNKNOWN over the unprocessed span. Heartbeats
+        resume the moment reads recover and the raw buffer empties.
         """
         if self.connection_state != "connected":
+            return
+        if self._pending_raw or self._storage_error is not None:
             return
         ts = int(time.time()) if now is None else int(now)
         if (
@@ -545,6 +577,15 @@ class EventListener:
             logger.exception("Could not record WS liveness heartbeat")
             return
         self._last_heartbeat_ts = ts
+        # D5: this beat proves storage is healthy right now. Give the supervisor a
+        # chance to hand off any events rescued from a prior listener while THIS
+        # listener is still alive, instead of stranding them until it dies.
+        hook = self.on_healthy_drain
+        if hook is not None:
+            try:
+                hook()
+            except Exception:  # noqa: BLE001 - rescue drain must never break draining
+                logger.exception("Rescued-event drain hook failed")
 
     async def _periodic_flush(self) -> None:
         assert self._flush_interval is not None
@@ -878,6 +919,11 @@ class WsSupervisor:
             listener = self._factory()
             # R3: report the listener's REAL connection state, not an assumption.
             listener.on_connection_state = self._on_listener_state
+            # D5: drain rescued events DURING this listener's life. The listener
+            # fires this whenever it proves storage healthy (a heartbeat), so
+            # recovered storage persists rescued events promptly rather than
+            # leaving them queued until this replacement listener itself dies.
+            listener.on_healthy_drain = self._drain_pending
             self._record("started", ok=True)
             start = monotonic()
             clean = True
@@ -895,8 +941,18 @@ class WsSupervisor:
                 # STRING reflects the stop. B4: coverage does not depend on this
                 # -- the liveness heartbeats already stopped, so coverage ends at
                 # the last beat whether or not this row is written.
-                self._record("disconnected", ok=True)
-                self._rescue_pending(listener)
+                try:
+                    self._record("disconnected", ok=True)
+                    self._rescue_pending(listener)
+                finally:
+                    # D5: a FINAL drain BEFORE propagating the cancel. Shutdown
+                    # cancels this loop mid-attempt, bypassing the post-loop
+                    # ``_drain_pending``; without a drain here the rescued events
+                    # (and this dying listener's just-rescued batch) would be
+                    # stranded even when storage is healthy at shutdown. Guarded
+                    # (``_drain_pending`` swallows its own storage errors), so the
+                    # cancel always propagates.
+                    self._drain_pending()
                 raise
             except Exception as exc:  # noqa: BLE001 - firewall: any death is recoverable
                 clean = False
