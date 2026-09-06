@@ -186,6 +186,28 @@ def test_failed_coverage_minute_attributed_to_the_ap(repo: Repository) -> None:
     assert weak[0]["attributed_entity_id"] == ap
 
 
+def test_mid_bucket_roam_splits_weak_minutes_between_sample_time_aps(
+    repo: Repository,
+) -> None:
+    """Each weak RSSI sample belongs to the AP attached at its own timestamp."""
+    ap1 = seed_ap(repo, "ap-1")
+    ap2 = seed_ap(repo, "ap-2")
+    client = seed_client(repo, "c-mid-bucket-roamer", parent_id=ap2)
+    repo.record_state_change(client, "ap_mac", "ap-1", ts=0)
+    repo.record_state_change(client, "ap_mac", "ap-2", ts=120)
+    make_active(repo, client, 0)
+    rssi(repo, client, [(30, -85.0), (90, -85.0), (150, -85.0), (210, -85.0), (270, -85.0)])
+
+    SleMinutesJob(repo).run_bucket(0)
+
+    weak_by_ap = {
+        row["attributed_entity_id"]: row["minutes"]
+        for row in _rows(repo, 0, sle=SLE_COVERAGE, entity_id=client)
+        if row["classifier"] == CLS_WEAK_SIGNAL
+    }
+    assert weak_by_ap == {ap1: 2.0, ap2: 3.0}
+
+
 def test_historical_roam_attributes_each_bucket_to_its_ap_and_radio(
     repo: Repository,
 ) -> None:

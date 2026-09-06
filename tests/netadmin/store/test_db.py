@@ -45,8 +45,8 @@ def test_migration_sets_user_version(tmp_db_path: Path) -> None:
     conn = db.connect(tmp_db_path)
     assert db.schema_version(conn) == 0
     applied = db.apply_migrations(conn)
-    assert applied == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-    assert db.schema_version(conn) == 11
+    assert applied[:10] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    assert db.schema_version(conn) == db.latest_migration_version()
     conn.close()
 
 
@@ -119,10 +119,10 @@ def test_migration_idempotent(tmp_db_path: Path) -> None:
     first = db.apply_migrations(conn)
     second = db.apply_migrations(conn)
     third = db.apply_migrations(conn)
-    assert first == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    assert first[:10] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     assert second == []  # nothing re-applied
     assert third == []
-    assert db.schema_version(conn) == 11
+    assert db.schema_version(conn) == db.latest_migration_version()
     conn.close()
 
 
@@ -151,7 +151,7 @@ def test_migration_0010_backfills_existing_incident_member_joined_ts(
     conn.execute("ALTER TABLE incident_members DROP COLUMN cleared_ts")
     conn.execute("PRAGMA user_version=9")
 
-    assert db.apply_migrations(conn) == [10, 11]
+    assert db.apply_migrations(conn)[0] == 10
     member = conn.execute("SELECT * FROM incident_members").fetchone()
     assert member["joined_ts"] == 100
     assert member["cleared_ts"] is None
@@ -170,7 +170,9 @@ def test_migration_0011_creates_ingest_coverage_table(tmp_db_path: Path) -> None
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ingest_coverage'"
     ).fetchone()
 
-    assert db.apply_migrations(conn) == [11]
+    # Rewinding to v10 leaves every later migration (0011 and the concurrently
+    # merged 0012) pending; 0011 is the one that creates this table.
+    assert 11 in db.apply_migrations(conn)
     assert conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ingest_coverage'"
     ).fetchone() is not None
@@ -178,7 +180,46 @@ def test_migration_0011_creates_ingest_coverage_table(tmp_db_path: Path) -> None
         "SELECT 1 FROM sqlite_master WHERE type='index' "
         "AND name='idx_ingest_coverage_lookup'"
     ).fetchone() is not None
-    assert db.schema_version(conn) == 11
+    assert db.schema_version(conn) == db.latest_migration_version()
+
+
+def test_migration_0012_preserves_populated_sle_minutes_and_splits_attribution(
+    tmp_db_path: Path,
+) -> None:
+    """A pre-0012 cell remains intact while a second AP can share its cell."""
+    conn = db.connect(tmp_db_path)
+    db.apply_migrations(conn)
+    conn.execute("DROP TABLE sle_minutes")
+    conn.execute(
+        "CREATE TABLE sle_minutes ("
+        "bucket_ts INTEGER NOT NULL, sle TEXT NOT NULL, classifier TEXT NOT NULL, "
+        "entity_id INTEGER NOT NULL, attributed_entity_id INTEGER, minutes REAL NOT NULL, "
+        "PRIMARY KEY (bucket_ts, sle, classifier, entity_id)"
+        ") WITHOUT ROWID"
+    )
+    conn.execute(
+        "INSERT INTO sle_minutes VALUES (0, 'coverage', 'weak_signal', 7, 11, 2.0)"
+    )
+    conn.execute(
+        "INSERT INTO sle_minutes VALUES (0, 'coverage', 'ok', 7, NULL, 3.0)"
+    )
+    # 0011 is owned by a concurrent change and does not alter this table; this
+    # reconstructed shape is precisely the schema immediately before 0012.
+    conn.execute("PRAGMA user_version=11")
+
+    assert db.apply_migrations(conn) == [12]
+    conn.execute(
+        "INSERT INTO sle_minutes VALUES (0, 'coverage', 'weak_signal', 7, 12, 3.0)"
+    )
+    rows = conn.execute(
+        "SELECT classifier, attributed_entity_id, minutes FROM sle_minutes "
+        "ORDER BY classifier"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        ("ok", 0, 3.0),
+        ("weak_signal", 11, 2.0),
+        ("weak_signal", 12, 3.0),
+    ]
     conn.close()
 
 
@@ -215,7 +256,8 @@ def test_migration_0005_retires_legacy_rogue_ap_issues(tmp_db_path: Path) -> Non
     # along too -- it is schema-only and touches none of the rows asserted here,
     # as does 0008 (sticky_client, a third taxonomy this fixture never seeds), and
     # 0009 (suppression columns; none of these seeded rows carry a live snooze).
-    assert db.apply_migrations(conn) == [5, 6, 7, 8, 9, 10, 11]
+    applied = db.apply_migrations(conn)
+    assert applied[:6] == [5, 6, 7, 8, 9, 10]
 
     rows = conn.execute(
         "SELECT state, resolved_ts FROM issues WHERE detector_key = 'wifi.rogue_ap'"
@@ -293,7 +335,8 @@ def test_migration_0006_retires_plan_level_channel_plan_issues(tmp_db_path: Path
     # 0007 (app_meta) rides along too -- schema-only, touches none of the rows
     # asserted below -- and so does 0008, which retires a different detector, and
     # 0009 (suppression columns; none of these seeded rows carry a live snooze).
-    assert db.apply_migrations(conn) == [6, 7, 8, 9, 10, 11]
+    applied = db.apply_migrations(conn)
+    assert applied[:5] == [6, 7, 8, 9, 10]
 
     states = dict(
         conn.execute(
@@ -377,7 +420,8 @@ def test_migration_0008_retires_per_ap_sticky_client_issues(tmp_db_path: Path) -
 
     # 0009 (suppression columns) rides along; none of these seeded rows carry a
     # live snooze, so it leaves them untouched and writes no audit event.
-    assert db.apply_migrations(conn) == [8, 9, 10, 11]
+    applied = db.apply_migrations(conn)
+    assert applied[:3] == [8, 9, 10]
 
     # Every sticky fingerprint is retired: the ap dim lives only inside the hash,
     # so SQL cannot tell the two-AP rows from the legacy dims={} one, and
@@ -622,7 +666,8 @@ def test_migration_0009_carries_live_snoozes_into_suppression(tmp_db_path: Path)
     conn.execute("PRAGMA user_version=8")  # rewind to the pre-suppression schema
     _seed_snoozes_pre_0009(conn)
 
-    assert db.apply_migrations(conn) == [9, 10, 11]
+    applied = db.apply_migrations(conn)
+    assert applied[:2] == [9, 10]
 
     # The three suppression columns now exist.
     cols = {r[1] for r in conn.execute("PRAGMA table_info(issues)").fetchall()}

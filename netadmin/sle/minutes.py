@@ -117,35 +117,19 @@ class BucketResult:
     active_clients: int = 0
     rows_written: int = 0
     wan_evaluated: bool = False
-    # (sle, classifier, entity_id) -> minutes, exactly as written this bucket.
-    minutes: dict[tuple[str, str, int], float] = field(default_factory=dict)
+    # (sle, classifier, entity_id, attributed_entity_id) -> minutes, exactly as
+    # written this bucket.
+    minutes: dict[tuple[str, str, int, Optional[int]], float] = field(default_factory=dict)
 
 
 @dataclass
 class _Cell:
-    """Accumulated minutes for one (sle, classifier, entity) with attribution.
-
-    ``attributions`` tallies minutes per candidate ``attributed_entity_id`` so a
-    client that roamed mid-bucket (samples pinned on two APs, same classifier)
-    still writes one row, blamed on the entity that owned the most of the minutes.
-    """
+    """Accumulated minutes for one fully attributed SLE cell."""
 
     minutes: float = 0.0
-    attributions: dict[Optional[int], float] = field(default_factory=lambda: defaultdict(float))
 
-    def add(self, minutes: float, attributed: Optional[int]) -> None:
+    def add(self, minutes: float) -> None:
         self.minutes += minutes
-        self.attributions[attributed] += minutes
-
-    @property
-    def attributed_entity_id(self) -> Optional[int]:
-        if not self.attributions:
-            return None
-        # Deterministic tie-break: most minutes, then lowest id (None sorts last).
-        return max(
-            self.attributions,
-            key=lambda k: (self.attributions[k], -(k if k is not None else 1 << 62)),
-        )
 
 
 class SleMinutesJob:
@@ -221,7 +205,10 @@ class SleMinutesJob:
         bucket_ts = bucket_of(int(bucket_ts), b)
         bucket_end = bucket_ts + b
 
-        cells: dict[tuple[str, str, int], _Cell] = defaultdict(_Cell)
+        # Attribution is part of the cell identity. In particular coverage
+        # samples on either side of a roam retain the AP resolved at each sample
+        # timestamp instead of being reduced to a bucket-level majority AP.
+        cells: dict[tuple[str, str, int, Optional[int]], _Cell] = defaultdict(_Cell)
 
         # Shared per-bucket WAN judgement (attributed to the gateway), computed
         # once and applied to every active client below.
@@ -953,7 +940,7 @@ class SleMinutesJob:
     ) -> None:
         if minutes <= 0:
             return
-        cells[(sle, classifier, entity_id)].add(minutes, attributed)
+        cells[(sle, classifier, entity_id, attributed)].add(minutes)
 
     def _write(
         self, bucket_ts: int, cells: dict, result: BucketResult, *, clear_existing: bool = False
@@ -973,15 +960,15 @@ class SleMinutesJob:
         with self.repo.transaction():
             if clear_existing:
                 self.repo.delete_sle_minutes(bucket_ts)
-            for (sle, classifier, entity_id), cell in cells.items():
+            for (sle, classifier, entity_id, attributed_entity_id), cell in cells.items():
                 self.repo.upsert_sle_minute(
                     bucket_ts=bucket_ts,
                     sle=sle,
                     classifier=classifier,
                     entity_id=entity_id,
                     minutes=cell.minutes,
-                    attributed_entity_id=cell.attributed_entity_id,
+                    attributed_entity_id=attributed_entity_id,
                 )
-                result.minutes[(sle, classifier, entity_id)] = cell.minutes
+                result.minutes[(sle, classifier, entity_id, attributed_entity_id)] = cell.minutes
                 written += 1
         return written

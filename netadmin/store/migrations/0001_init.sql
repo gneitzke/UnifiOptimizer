@@ -96,9 +96,11 @@ CREATE TABLE IF NOT EXISTS sle_minutes (
   sle TEXT NOT NULL,                   -- coverage | roaming | capacity | connect | wan | infra
   classifier TEXT NOT NULL,            -- 'ok' or the failure classifier
   entity_id INTEGER NOT NULL,          -- the client (or device for infra)
-  attributed_entity_id INTEGER,        -- the AP/port/cable the failure is pinned on
+  -- 0 is the internal identity for an unattributed row; repository reads expose
+  -- it as NULL. WITHOUT ROWID primary-key columns cannot themselves be NULL.
+  attributed_entity_id INTEGER NOT NULL,
   minutes REAL NOT NULL,
-  PRIMARY KEY (bucket_ts, sle, classifier, entity_id)
+  PRIMARY KEY (bucket_ts, sle, classifier, entity_id, attributed_entity_id)
 ) WITHOUT ROWID;
 
 -- Applied config changes (replaces data/change_history.json; keeps revert)

@@ -1972,7 +1972,7 @@ class Repository:
             "SELECT attributed_entity_id AS eid, SUM(minutes) AS m FROM sle_minutes "
             "WHERE bucket_ts>=? AND bucket_ts<? "
             f"{clause}"
-            "AND classifier != 'ok' AND attributed_entity_id IS NOT NULL "
+            "AND classifier != 'ok' AND attributed_entity_id != 0 "
             "GROUP BY attributed_entity_id",
             params,
         ).fetchall()
@@ -2309,20 +2309,24 @@ class Repository:
         minutes: float,
         attributed_entity_id: Optional[int] = None,
     ) -> None:
-        """Set the minutes for one (bucket, sle, classifier, client) cell.
+        """Set the minutes for one fully attributed SLE cell.
 
         Replaces rather than accumulates: the SLE engine computes a bucket's
         minutes and writes them idempotently, so a recompute of the same bucket
         overwrites cleanly.
         """
+        # ``sle_minutes`` is a WITHOUT ROWID table, whose primary-key columns
+        # are necessarily non-null. Keep the public/reader representation of an
+        # unknown attribution as NULL while using 0 for its storage identity.
+        attributed_key = 0 if attributed_entity_id is None else int(attributed_entity_id)
         with self._write() as conn:
             conn.execute(
                 "INSERT INTO sle_minutes "
                 "(bucket_ts, sle, classifier, entity_id, attributed_entity_id, minutes) "
                 "VALUES (?,?,?,?,?,?) "
-                "ON CONFLICT(bucket_ts, sle, classifier, entity_id) DO UPDATE SET "
-                "  minutes=excluded.minutes, attributed_entity_id=excluded.attributed_entity_id",
-                (bucket_ts, sle, classifier, entity_id, attributed_entity_id, minutes),
+                "ON CONFLICT(bucket_ts, sle, classifier, entity_id, attributed_entity_id) "
+                "DO UPDATE SET minutes=excluded.minutes",
+                (bucket_ts, sle, classifier, entity_id, attributed_key, minutes),
             )
 
     def add_sle_minutes(
@@ -2336,15 +2340,15 @@ class Repository:
         attributed_entity_id: Optional[int] = None,
     ) -> None:
         """Accumulate minutes into a cell (for incremental attribution)."""
+        attributed_key = 0 if attributed_entity_id is None else int(attributed_entity_id)
         with self._write() as conn:
             conn.execute(
                 "INSERT INTO sle_minutes "
                 "(bucket_ts, sle, classifier, entity_id, attributed_entity_id, minutes) "
                 "VALUES (?,?,?,?,?,?) "
-                "ON CONFLICT(bucket_ts, sle, classifier, entity_id) DO UPDATE SET "
-                "  minutes = minutes + excluded.minutes, "
-                "  attributed_entity_id = COALESCE(excluded.attributed_entity_id, attributed_entity_id)",
-                (bucket_ts, sle, classifier, entity_id, attributed_entity_id, minutes),
+                "ON CONFLICT(bucket_ts, sle, classifier, entity_id, attributed_entity_id) "
+                "DO UPDATE SET minutes = minutes + excluded.minutes",
+                (bucket_ts, sle, classifier, entity_id, attributed_key, minutes),
             )
 
     def delete_sle_minutes(self, bucket_ts: int) -> int:
@@ -2384,7 +2388,12 @@ class Repository:
 
         sql = "SELECT "
         if cols:
-            sql += ", ".join(cols) + ", "
+            sql += ", ".join(
+                "NULLIF(attributed_entity_id, 0) AS attributed_entity_id"
+                if col == "attributed_entity_id"
+                else col
+                for col in cols
+            ) + ", "
         sql += "SUM(minutes) AS minutes FROM sle_minutes WHERE bucket_ts>=? AND bucket_ts<?"
         if cols:
             sql += " GROUP BY " + ", ".join(cols) + " ORDER BY " + ", ".join(cols)
