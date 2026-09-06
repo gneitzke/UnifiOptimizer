@@ -1077,6 +1077,148 @@ async def test_apply_refuses_transient_dispatch_with_unrelated_valid_before(stor
 
 
 # --------------------------------------------------------------------------- #
+# S2 (round 3): the inverse is derived from the DISPATCHED change, never from a
+# trusted step.after. A forged after==before cannot make the revert a no-op.
+# --------------------------------------------------------------------------- #
+async def test_apply_refuses_noop_step_whose_after_equals_before(store):
+    # A step that dispatches nothing its before-state does not already hold (payload
+    # channel == before channel), with after also set == before, is a NO-OP apply:
+    # there is nothing to revert, and a "revert" would merely re-send the current
+    # value. The gate derives the inverse from the DISPATCHED payload vs before and
+    # refuses a no-op as non-revertible (S2 r3). Nothing is sent.
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+    endpoint = f"rest/device/{AP_ID}"
+    before = {
+        "method": "PUT",
+        "endpoint": endpoint,
+        "body": {"radio_table": [{"radio": "ng", "channel": 1}]},
+    }
+    step = FixStep(
+        action=ActionType.CHANNEL_CHANGE,
+        target_entity_type=EntityType.RADIO,
+        target_native_id=f"{AP_MAC}:ng",
+        description="no-op apply, after forged == before",
+        risk=RiskLevel.LOW,
+        method="PUT",
+        endpoint=endpoint,
+        payload={"radio_table": [{"radio": "ng", "channel": 1}]},  # == before: changes nothing
+        precondition=Precondition(target_native_id=f"{AP_MAC}:ng", expected={}),
+        before=before,
+        after=before,  # forged: after set equal to before
+        revertible=True,
+    )
+    plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "forged", steps=[step])
+    with pytest.raises(SafetyViolation):
+        await applier.apply(
+            plan,
+            dry_run=False,
+            confirm_token=plan_confirm_token(plan),
+            current_state={f"{AP_MAC}:ng": {"channel": 1}},
+        )
+    assert writer.call_count == 0
+    assert store.list_changes() == []
+
+
+async def test_forged_after_equals_before_still_reverts_to_the_original(store):
+    # The verifier's round-3 repro: ``after`` is set == ``before`` to DISGUISE a real
+    # channel 3 -> 1 change. If the inverse trusted ``after``, the derived reverse
+    # would touch nothing and the "revert" would be a no-op that re-sends 1 (the
+    # already-applied value), never restoring 3. The gate + the recorded ledger +
+    # revert now all derive the inverse from the DISPATCHED payload vs before, so the
+    # step is genuinely revertible and its revert actually restores 3.
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+    endpoint = f"rest/device/{AP_ID}"
+    before = {
+        "method": "PUT",
+        "endpoint": endpoint,
+        "body": {"radio_table": [{"radio": "ng", "channel": 3}]},
+    }
+    step = FixStep(
+        action=ActionType.CHANNEL_CHANGE,
+        target_entity_type=EntityType.RADIO,
+        target_native_id=f"{AP_MAC}:ng",
+        description="real 3->1, after forged == before",
+        risk=RiskLevel.MEDIUM,
+        method="PUT",
+        endpoint=endpoint,
+        payload={"radio_table": [{"radio": "ng", "channel": 1}]},  # real change: 3 -> 1
+        precondition=Precondition(target_native_id=f"{AP_MAC}:ng", expected={"channel": 3}),
+        before=before,
+        after=before,  # forged: after == before, would make a trusted reverse a no-op
+        revertible=True,
+    )
+    plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "forged", steps=[step])
+    result = await applier.apply(
+        plan,
+        dry_run=False,
+        confirm_token=plan_confirm_token(plan),
+        current_state={f"{AP_MAC}:ng": {"channel": 3}},
+    )
+    assert result.applied is True
+    change_id = result.change_ids[0]
+
+    # The ledger recorded the ACTUAL dispatched after (channel 1), not the forged one.
+    after = json.loads(store.get_change(change_id)["after_json"])
+    assert after["body"]["radio_table"][0]["channel"] == 1
+
+    # Revert restores the ORIGINAL channel 3 (derived from before, not trusted after).
+    live = {"ng": {"radio": "ng", "channel": 1}}
+    revert = await applier.revert(change_id, current_radios=live)
+    assert revert.ok
+    last = writer.calls[-1]
+    assert next(r for r in last.body["radio_table"] if r["radio"] == "ng")["channel"] == 3
+
+
+async def test_legit_power_round_trip_applies_and_reverts(store):
+    # A legitimate tx-power step-down (high -> medium) must remain revertible and its
+    # revert must restore high -- the fix must not over-refuse genuine round trips.
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+    endpoint = f"rest/device/{AP_ID}"
+    step = FixStep(
+        action=ActionType.TX_POWER_STEP_DOWN,
+        target_entity_type=EntityType.RADIO,
+        target_native_id=f"{AP_MAC}:ng",
+        description="step power high -> medium",
+        risk=RiskLevel.LOW,
+        method="PUT",
+        endpoint=endpoint,
+        payload={"radio_table": [{"radio": "ng", "tx_power_mode": "medium"}]},
+        precondition=Precondition(
+            target_native_id=f"{AP_MAC}:ng", expected={"tx_power_mode": "high"}
+        ),
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "tx_power_mode": "high"}]},
+        },
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "tx_power_mode": "medium"}]},
+        },
+        revertible=True,
+    )
+    plan = FixPlan("wifi.tx_power_loud", f"{AP_MAC}:ng", "legit", steps=[step])
+    result = await applier.apply(
+        plan,
+        dry_run=False,
+        confirm_token=plan_confirm_token(plan),
+        current_state={f"{AP_MAC}:ng": {"tx_power_mode": "high"}},
+    )
+    assert result.applied is True
+    change_id = result.change_ids[0]
+
+    live = {"ng": {"radio": "ng", "tx_power_mode": "medium"}}
+    revert = await applier.revert(change_id, current_radios=live)
+    assert revert.ok
+    last = writer.calls[-1]
+    assert next(r for r in last.body["radio_table"] if r["radio"] == "ng")["tx_power_mode"] == "high"
+
+
+# --------------------------------------------------------------------------- #
 # P3: the process-wide device-lock registry must not retain closed event loops
 # --------------------------------------------------------------------------- #
 async def test_closed_event_loops_are_not_retained_by_the_lock_registry(store):

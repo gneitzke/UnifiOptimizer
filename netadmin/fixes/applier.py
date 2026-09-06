@@ -493,15 +493,31 @@ class Applier:
     # Internals
     # ------------------------------------------------------------------ #
     def _record_before(self, plan: FixPlan, step: FixStep, now: int) -> int:
-        """Insert the before-state ledger row (interim status) prior to sending."""
+        """Insert the before-state ledger row (interim status) prior to sending.
+
+        The stored ``after`` is the ACTUAL dispatched operation
+        (``step.method``/``endpoint``/``payload``), never the planner-supplied
+        ``step.after``. :meth:`revert` derives the fields to roll back from
+        ``after`` vs ``before``; recording the real dispatch there means a forged or
+        stale ``step.after`` (e.g. one set equal to ``before`` to disguise a change)
+        can never make the later revert a no-op that re-sends the current value
+        instead of restoring the original (S2). For every legitimate step
+        ``step.after.body`` already equals ``step.payload``, so this is a no-op for
+        them and only closes the forgery seam.
+        """
         entity_id = None
         row = self._store.find_entity(step.target_entity_type, step.target_native_id)
         if row is not None:
             entity_id = int(row["entity_id"])
+        dispatched_after = {
+            "method": step.method,
+            "endpoint": step.endpoint,
+            "body": step.payload or {},
+        }
         return self._store.insert_change(
             action=step.action.value,
             before=step.before or {},
-            after=step.after or {},
+            after=dispatched_after,
             status=_STATUS_APPLYING,
             ts=now,
             issue_id=plan.issue_id,
@@ -603,9 +619,20 @@ class Applier:
         power-cycle, say) but happens to carry an unrelated, valid-looking
         radio-restore before-body would sail through: its derived reverse table comes
         out empty (the dispatched payload has no ``radio_table`` to invert) and an
-        empty reverse trivially passes every downstream rail. Three things must hold:
-        the dispatched op is itself a restorable radio-config PUT; the stored before
-        restores that SAME endpoint; and the derived reverse is non-empty.
+        empty reverse trivially passes every downstream rail.
+
+        Crucially, the inverse is derived from the ACTUAL dispatched change, never
+        from the claimed ``step.after``: the touched fields are those where the
+        dispatched payload differs from the recorded ``before``, and the reverse
+        restores exactly those to their before-values. A forged ``after == before``
+        would otherwise empty the touched set and turn the "revert" into a no-op that
+        re-sends the already-applied value (S2 round 3).
+
+        Five things must hold: the dispatched op is itself a restorable radio-config
+        PUT; the stored before restores that SAME endpoint; the dispatched payload
+        actually changes at least one field vs ``before`` (a no-op apply has nothing
+        to revert); the derived reverse is non-empty; and that reverse genuinely
+        restores a before-value rather than merely re-sending the current one.
         """
         # (1) The dispatched op must itself be a restorable whole-``radio_table``
         # config PUT to ``rest/device/<id>``. This is the thing a revert would have
@@ -669,18 +696,69 @@ class Applier:
             for r in (dispatched_radios or [])
             if isinstance(r, dict) and r.get("radio") is not None
         }
-        after_body = step.after.get("body") if isinstance(step.after, dict) else None
-        try:
-            fresh_table = self._fresh_restore_table(
-                -1, body, after_body if isinstance(after_body, dict) else {}, current_radios
+        before_radios = {
+            str(r.get("radio")): r
+            for r in (body.get("radio_table") or [])
+            if isinstance(r, dict) and r.get("radio") is not None
+        }
+        # (3) Derive the inverse from the ACTUAL DISPATCHED change, never from the
+        # claimed ``step.after``. The fields this apply MODIFIES are those where the
+        # dispatched payload differs from the recorded ``before``; the revert must
+        # restore exactly those to their before-values. Trusting ``step.after`` let a
+        # forged ``after == before`` collapse the "touched" set to empty, so the
+        # derived reverse re-sent the current (already-applied) value and restored
+        # nothing -- e.g. apply channel 3 -> 1, then "revert" by sending 1 again
+        # (S2 round 3). So the effective after IS the dispatched payload.
+        touched: dict[str, dict[str, tuple[Any, Any]]] = {}
+        for radio_code, disp_entry in current_radios.items():
+            b = before_radios.get(radio_code, {})
+            for field, disp_val in disp_entry.items():
+                if field == "radio":
+                    continue
+                before_val = b.get(field)
+                if before_val != disp_val:
+                    touched.setdefault(radio_code, {})[field] = (before_val, disp_val)
+        # An apply that changes nothing its before-state does not already hold is a
+        # NO-OP: there is nothing to revert, so it must not be treated as a safely
+        # revertible mutation (a no-op "revert" that re-sends the current value is not
+        # a revert). Requires at least one touched field where before != dispatched.
+        if not touched:
+            raise SafetyViolation(
+                f"step '{step.description}' dispatches nothing its before-state does not "
+                "already hold (a no-op apply); there is nothing to revert -- refusing to "
+                "treat a no-op as a safely-revertible mutation"
             )
-            # (3) The derived inverse must actually reverse the dispatched op. An
-            # empty reverse table inverts nothing and would trivially pass every rail
-            # below -- treat it as no genuine revert, not as a free pass.
+        # Build the reverse table with the DISPATCHED payload as the effective after,
+        # so the touched fields are inverted back to their before-values regardless of
+        # what ``step.after`` claims.
+        dispatched_body = {"radio_table": [dict(r) for r in dispatched_radios if isinstance(r, dict)]}
+        try:
+            fresh_table = self._fresh_restore_table(-1, body, dispatched_body, current_radios)
+            # The derived inverse must actually reverse the dispatched op. An empty
+            # reverse table inverts nothing and would trivially pass every rail below.
             if not fresh_table:
                 raise SafetyViolation(
                     f"step '{step.description}' derived reverse is empty; it inverts "
                     "nothing -- refusing to apply a change with no genuine revert"
+                )
+            # The reverse must, for at least one touched field, send the BEFORE value
+            # rather than the current (post-apply) value -- i.e. it genuinely restores
+            # the original state instead of re-sending what is already live.
+            fresh_by_radio = {str(e.get("radio")): e for e in fresh_table}
+            restores = False
+            for radio_code, fields in touched.items():
+                rev_entry = fresh_by_radio.get(radio_code, {})
+                for field, (before_val, disp_val) in fields.items():
+                    if rev_entry.get(field) == before_val and before_val != disp_val:
+                        restores = True
+                        break
+                if restores:
+                    break
+            if not restores:
+                raise SafetyViolation(
+                    f"step '{step.description}' derived reverse does not restore the "
+                    "before-state (it merely re-sends the current value) -- refusing to "
+                    "apply a change with no genuine revert"
                 )
             self._assert_revert_min_rssi_safe(-1, fresh_table, current_radios, is_mesh_uplink)
         except SafetyViolation:
