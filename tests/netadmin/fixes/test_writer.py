@@ -332,20 +332,112 @@ async def test_d7_parseable_error_envelope_stays_definitive_rejection():
     await client.aclose()
 
 
+# --------------------------------------------------------------------------- #
+# Verifier round 11 (#w11a-1): an UNPARSEABLE 4xx is AMBIGUOUS, not a definitive
+# failure. Positive-proof principle: a 4xx is a confirmed rejection ONLY when its
+# body is a PARSED controller rejection (meta.rc=error). A 408 timeout page, or a
+# 403 carrying HTML/invalid JSON, has no parsed rejection -- so its outcome is
+# UNKNOWN, exactly like an unparseable 5xx. Before the fix EVERY 4xx was a
+# definitive failure, which permitted an identical replay and let a revert claim
+# "the change was not rolled back" (a falsehood).
+# --------------------------------------------------------------------------- #
 @respx.mock
-async def test_4xx_non_json_mutation_response_stays_a_definitive_failure():
-    # Symmetric guard: a 4xx CLIENT error is a definitive rejection even with an
-    # unparseable body -- the controller received and refused the request before
-    # applying it, so it did not land and is NOT ambiguous. (A 5xx/504 is treated
-    # differently: see the D7 test below -- a gateway failure is ambiguous.)
+async def test_w11a1_unparseable_408_4xx_is_ambiguous_not_definitive_failure():
     _mock_login()
     respx.put(f"{API}/rest/device/dev123").mock(
-        return_value=httpx.Response(400, text="<html>bad request</html>")
+        return_value=httpx.Response(408, text="<html>request timeout</html>")
+    )
+    client = await _client()
+    writer = RealControllerWriter(client)
+    res = await writer.put("rest/device/dev123", {"radio_table": []})
+    assert res.ok is False
+    assert res.status_code == 408
+    # No PARSED rejection -> outcome UNKNOWN (ambiguous), never a definitive failure.
+    assert isinstance(res.data, dict) and res.data.get("ambiguous") is True
+    await client.aclose()
+
+
+@respx.mock
+async def test_w11a1_403_invalid_json_4xx_is_ambiguous_not_definitive_failure():
+    _mock_login()
+    respx.put(f"{API}/rest/device/dev123").mock(
+        return_value=httpx.Response(403, text="}{ not json")
+    )
+    client = await _client()
+    writer = RealControllerWriter(client)
+    res = await writer.put("rest/device/dev123", {"radio_table": []})
+    assert res.ok is False
+    assert res.status_code == 403
+    assert isinstance(res.data, dict) and res.data.get("ambiguous") is True
+    await client.aclose()
+
+
+@respx.mock
+async def test_w11a1_parsed_rejection_4xx_stays_a_definitive_failure():
+    # The narrow definitive case survives: a 4xx whose body IS a parsed meta.rc=error
+    # envelope is a rejection the controller confirmed -- a definitive failure, NOT
+    # ambiguous, so the caller may safely treat the change as not applied.
+    _mock_login()
+    respx.put(f"{API}/rest/device/dev123").mock(
+        return_value=httpx.Response(
+            400, json={"meta": {"rc": "error", "msg": "api.err.InvalidObject"}, "data": []}
+        )
     )
     client = await _client()
     writer = RealControllerWriter(client)
     res = await writer.put("rest/device/dev123", {"radio_table": []})
     assert res.ok is False
     assert res.status_code == 400
+    assert not (isinstance(res.data, dict) and res.data.get("ambiguous"))
+    await client.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# Verifier round 11 (#w11a-2): a 2xx confirms SUCCESS only with a POSITIVE success
+# envelope (meta.rc=ok). An empty ``{}`` or ``meta.rc="pending"`` on 200 does NOT
+# positively confirm completion, so it is AMBIGUOUS (unknown), never a confirmed
+# 'applied'. Before the fix ANY dict on a 2xx was accepted as success.
+# --------------------------------------------------------------------------- #
+@respx.mock
+async def test_w11a2_empty_dict_2xx_is_ambiguous_not_confirmed_success():
+    _mock_login()
+    respx.put(f"{API}/rest/device/dev123").mock(return_value=httpx.Response(200, json={}))
+    client = await _client()
+    writer = RealControllerWriter(client)
+    res = await writer.put("rest/device/dev123", {"radio_table": []})
+    assert res.ok is False  # an empty body does not positively confirm success
+    assert res.status_code == 200
+    assert isinstance(res.data, dict) and res.data.get("ambiguous") is True
+    await client.aclose()
+
+
+@respx.mock
+async def test_w11a2_rc_pending_2xx_is_ambiguous_not_confirmed_success():
+    _mock_login()
+    respx.put(f"{API}/rest/device/dev123").mock(
+        return_value=httpx.Response(200, json={"meta": {"rc": "pending"}, "data": []})
+    )
+    client = await _client()
+    writer = RealControllerWriter(client)
+    res = await writer.put("rest/device/dev123", {"radio_table": []})
+    assert res.ok is False  # rc != "ok" is not a positive confirmation
+    assert res.status_code == 200
+    assert isinstance(res.data, dict) and res.data.get("ambiguous") is True
+    await client.aclose()
+
+
+@respx.mock
+async def test_w11a2_rc_ok_2xx_stays_confirmed_success():
+    # The genuine success case survives: a 2xx carrying meta.rc=ok is a positive
+    # confirmation of completion -> ok, never demoted to ambiguous.
+    _mock_login()
+    respx.put(f"{API}/rest/device/dev123").mock(
+        return_value=httpx.Response(200, json={"meta": {"rc": "ok"}, "data": []})
+    )
+    client = await _client()
+    writer = RealControllerWriter(client)
+    res = await writer.put("rest/device/dev123", {"radio_table": [{"radio": "ng", "channel": 6}]})
+    assert res.ok is True
+    assert res.status_code == 200
     assert not (isinstance(res.data, dict) and res.data.get("ambiguous"))
     await client.aclose()
