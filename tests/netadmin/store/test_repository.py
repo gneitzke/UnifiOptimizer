@@ -1403,6 +1403,73 @@ def test_unresolved_events_keeps_client_with_pending_related(repo: Repository) -
     assert ev in returned
 
 
+def test_w15a4_bool_port_event_not_falsely_resolvable_against_int_port(
+    repo: Repository,
+) -> None:
+    """#w15a-4: a bool-port STP row must not be falsely 'resolvable' against a real
+    integer port, or it floats to the head of the reconcile window forever and
+    starves newer repairable rows.
+
+    The normalizer stores a bool ``port: true`` STP event's native_id as
+    ``"<sw>:True"`` (pre-fix) while the resolvability SQL coerced the same JSON
+    boolean to ``"<sw>:1"``. With a real integer port ``"<sw>:1"`` in inventory the
+    SQL called the row resolvable, but reconcile could NEVER fill it (the
+    normalizer's ``"<sw>:True"`` matches no entity) -- the row was retained even
+    after its attempts were exhausted, filling the LIMIT window and starving a
+    newer, genuinely-repairable row. After the fix, both sides treat a bool port as
+    NOT a port index (routed to the switch); with the switch absent the bool row is
+    correctly unresolvable and, once parked, never starves the newer row.
+    """
+    from netadmin.ingest.events import EventNormalizer
+    from netadmin.store.repository import _EVENT_RECONCILE_MAX_ATTEMPTS
+
+    unknown_sw = "02:00:de:ad:be:ef"  # switch deliberately NOT in inventory
+    # A real INTEGER port "<sw>:1" exists -- the entity the buggy SQL matched.
+    repo.upsert_entity(
+        Entity(entity_type=EntityType.PORT, native_id=f"{unknown_sw}:1"), ts=500
+    )
+    bool_ev = repo.record_event(
+        ts=1000, key="EVT_SW_StpPortBlocking", entity_id=None, related_entity_id=None,
+        native_id="stp-bool",
+        data={"key": "EVT_SW_StpPortBlocking", "time": 1000 * 1000,
+              "sw": unknown_sw, "port": True},
+    )
+    assert bool_ev is not None
+    # Park it: exhaust its attempts so it is retained ONLY if (falsely) resolvable.
+    for _ in range(_EVENT_RECONCILE_MAX_ATTEMPTS):
+        repo.bump_event_reconcile_attempts([bool_ev])
+
+    # A newer, genuinely repairable STP row: its INTEGER port IS in inventory.
+    good_sw = "02:00:11:22:33:aa"
+    good_port = repo.upsert_entity(
+        Entity(entity_type=EntityType.PORT, native_id=f"{good_sw}:2"), ts=8000
+    )
+    newer = repo.record_event(
+        ts=9000, key="EVT_SW_StpPortBlocking", entity_id=None, related_entity_id=None,
+        native_id="stp-good",
+        data={"key": "EVT_SW_StpPortBlocking", "time": 9000 * 1000,
+              "sw": good_sw, "port": 2},
+    )
+    assert newer is not None
+
+    # The bool row is NOT falsely resolvable, so the parked row does not starve the
+    # window: with limit=1, only the genuinely-resolvable newer row is selected.
+    # (Pre-fix, the bool row is falsely resolvable, older by ts, and wins the slot.)
+    selected = {int(r["id"]) for r in repo.unresolved_events(limit=1)}
+    assert selected == {newer}
+
+    # End-to-end: reconcile fills the newer row's real port; the bool row is never
+    # falsely repaired and stays NULL.
+    repaired = EventNormalizer(repo).reconcile_unresolved(limit=500)
+    assert repaired == 1
+    assert repo._conn.execute(
+        "SELECT entity_id FROM events WHERE id=?", (newer,)
+    ).fetchone()["entity_id"] == good_port
+    assert repo._conn.execute(
+        "SELECT entity_id FROM events WHERE id=?", (bool_ev,)
+    ).fetchone()["entity_id"] is None
+
+
 def test_reconcile_parks_unresolvable_and_reaches_newer_repairable(repo: Repository) -> None:
     """P2: 500 OLDER client events with a resolved client but NO from-AP in the
     payload can NEVER resolve their related reference.  Being oldest, the prior

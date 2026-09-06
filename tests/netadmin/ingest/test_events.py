@@ -206,6 +206,45 @@ def test_stp_port_event_null_entity_when_port_absent_then_reconciles(repo: Repos
     assert linked and int(linked[0]["entity_id"]) == pid
 
 
+def test_w15a4_bool_port_is_not_a_port_index_routes_to_switch(repo: Repository) -> None:
+    """#w15a-4: a non-integer/bool ``port`` (``port: true``) is NOT a port index.
+
+    ``str(True)`` -> ``"True"`` would build native_id ``"<sw>:True"`` while the
+    repository's resolvability SQL renders the same JSON boolean as ``"<sw>:1"``
+    (SQLite coerces bool -> 1). The two native_ids DISAGREE, so with a real integer
+    port 1 present the row is falsely "resolvable" against the wrong entity, never
+    fills, and starves newer events. The fix: a bool/garbage port is attributed to
+    the SWITCH (consistently with the SQL), never routed to a bogus port entity.
+    """
+    ev = Event.model_validate(
+        {"_id": "stp-bool", "key": "EVT_SW_StpPortBlocking",
+         "time": 1_721_600_000_000, "sw": SWITCH_MAC, "port": True}
+    )
+    rec = EventNormalizer(repo).normalize(ev)
+    assert rec is not None
+    # Attributed to the SWITCH (entity present in inventory), NOT a "<sw>:True" port
+    # entity (which never exists) -- so entity_id resolves, related is None.
+    assert rec["entity_id"] == entity_id(repo, EntityType.SWITCH, SWITCH_MAC)
+    assert rec["related_entity_id"] is None
+
+
+def test_w15a4_int_port_still_routes_to_port_entity(repo: Repository) -> None:
+    """Control for #w15a-4: a genuine INTEGER port index still routes to the PORT
+    entity, native_id ``"<sw>:<idx>"`` -- byte-identical to what the SQL derives."""
+    port_nid = f"{SWITCH_MAC}:1"
+    pid = repo.upsert_entity(
+        Entity(entity_type=EntityType.PORT, native_id=port_nid, name="p1"), ts=1_000_000
+    )
+    ev = Event.model_validate(
+        {"_id": "stp-int1", "key": "EVT_SW_StpPortBlocking",
+         "time": 1_721_600_000_000, "sw": SWITCH_MAC, "port": 1}
+    )
+    rec = EventNormalizer(repo).normalize(ev)
+    assert rec is not None
+    assert rec["entity_id"] == pid
+    assert rec["related_entity_id"] == entity_id(repo, EntityType.SWITCH, SWITCH_MAC)
+
+
 def test_ap_event_resolves_to_ap(repo: Repository) -> None:
     rec = EventNormalizer(repo).normalize(event_by_key("EVT_AP_RadarDetected"))
     assert rec is not None
@@ -1942,3 +1981,64 @@ async def test_w14a3_catchup_success_still_records_complete(repo: Repository) ->
     assert inserted == 0
     assert repo.observed_event_coverage(now - 3600, now) == 1.0
     assert repo.failed_ingest_coverage(kind="event_history", scope="site") == []
+
+
+# --------------------------------------------------------------------------- #
+# #w15a-3: catch-up must record a FAILED hole for ANY exception raised during the
+# read/parse of the window -- not just the enumerated (UnifiError, httpx.HTTPError).
+# Two concrete classes that are in NEITHER and previously slipped through, leaving
+# the coverage ledger EMPTY (neither complete NOR failed -> silently never retried
+# nor observed):
+#   * httpx.CookieConflict -- a httpx exception that is NOT an HTTPError subclass;
+#   * pydantic.ValidationError -- raised when a malformed stat/event row fails Event
+#     validation while the response is parsed (endpoints.py).
+# Both must now record a durable FAILED hole AND re-raise so the collector firewall
+# marks the poll failed.
+# --------------------------------------------------------------------------- #
+def _sample_validation_error() -> "Exception":
+    """A genuine pydantic ValidationError, as a malformed event row would raise."""
+    import pydantic
+
+    class _Row(pydantic.BaseModel):
+        idx: int
+
+    try:
+        _Row(idx="not-an-int")
+    except pydantic.ValidationError as exc:  # pragma: no cover - construction path
+        return exc
+    raise AssertionError("expected a ValidationError")  # pragma: no cover
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.CookieConflict("multiple TOKEN cookies for the controller origin"),
+        _sample_validation_error(),
+    ],
+    ids=["CookieConflict", "ValidationError"],
+)
+async def test_w15a3_catchup_non_http_failure_records_failed_hole_and_reraises(
+    repo: Repository, exc: BaseException
+) -> None:
+    import httpx as _httpx
+    import pydantic as _pydantic
+
+    from netadmin.ingest.unifi.auth import UnifiError
+
+    # Precondition of the bug: NEITHER class is covered by the old enumerated except.
+    assert not isinstance(exc, (UnifiError, _httpx.HTTPError))
+    assert isinstance(exc, (_httpx.CookieConflict, _pydantic.ValidationError))
+
+    ep = _RaisingEndpoints(exc)
+    now = 1_721_700_000
+    # The read/parse FAILED: catch-up must re-raise (never swallow) so the collector
+    # firewall marks the poll failed.
+    with pytest.raises(type(exc)):
+        await catchup_events(repo, ep, now=now)
+    assert ep.calls == 1
+    # And it must have recorded a durable FAILED hole first: no fabricated coverage,
+    # the window reads 0.0, and the next sweep will retry it.
+    assert repo.observed_event_coverage(now - 3600, now) == 0.0
+    failed = repo.failed_ingest_coverage(kind="event_history", scope="site")
+    assert failed and any(int(r["end_ts"]) == now for r in failed)

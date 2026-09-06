@@ -1180,14 +1180,35 @@ class Repository:
         port_keys_sql = ",".join(
             "'" + k.replace("'", "''") + "'" for k in sorted(_PORT_SCOPED_SW_EVENT_KEYS)
         )
-        # The normalizer reads _field(event,"port") then falls back to "port_idx",
-        # and routes to the PORT whenever the chosen value is NOT None -- it does
-        # NOT test truthiness here (0 and "" are valid port indices), so this uses a
-        # plain COALESCE / IS NOT NULL, NOT the empty-string-collapsing _mac(). A
-        # missing key is SQL NULL, matching Python None exactly.
+        # #4/#w15a-4: mirror the normalizer's port-index handling EXACTLY. The
+        # normalizer reads ``$.port`` then falls back to ``$.port_idx``, and treats the
+        # chosen value as a port index ONLY when it is a genuine ``int`` and NOT a
+        # ``bool`` -- a ``bool`` (``port: true``) is NOT a port-scoped event and routes
+        # to the SWITCH. SQL must agree byte-for-byte or a bool/garbage port desyncs
+        # the two native_ids (Python ``str(True)`` -> ``"<sw>:True"`` vs SQLite bool
+        # coercion -> ``"<sw>:1"``), leaving a row falsely "resolvable" that never fills
+        # and starves newer events. So:
+        #   * choose the SAME source the normalizer chooses -- ``$.port`` when present
+        #     (JSON non-null, matching Python's ``is None`` test), else ``$.port_idx``;
+        #     do NOT COALESCE past a present-but-non-integer ``$.port`` (the normalizer
+        #     stops at ``$.port`` once it is present), and
+        #   * accept it ONLY when its ``json_type`` is ``'integer'`` -- a JSON boolean
+        #     is ``json_type`` ``'true'``/``'false'`` (never ``'integer'``), a string is
+        #     ``'text'``, a float ``'real'``: all reject to NULL, exactly as the
+        #     normalizer coerces them to ``None`` and routes to the switch.
+        # For an ACCEPTED integer, ``json_extract`` renders it identically to Python's
+        # ``str(int)`` (``0`` -> ``"0"``, ``5`` -> ``"5"``), so the concatenated port
+        # native_id is byte-identical on both sides. A rejected value yields NULL, so
+        # the resolvability CASE falls to the switch branch (``port_idx IS NOT NULL``
+        # is false), matching the normalizer.
         port_idx = (
-            "COALESCE(json_extract(ev.data,'$.port'),"
-            " json_extract(ev.data,'$.port_idx'))"
+            "CASE"
+            "  WHEN json_extract(ev.data,'$.port') IS NOT NULL"
+            "    THEN CASE WHEN json_type(ev.data,'$.port')='integer'"
+            "              THEN json_extract(ev.data,'$.port') END"
+            "  ELSE CASE WHEN json_type(ev.data,'$.port_idx')='integer'"
+            "            THEN json_extract(ev.data,'$.port_idx') END"
+            " END"
         )
         # native_id the normalizer builds for the port: "<sw_mac>:<port_idx>". The
         # switch MAC is non-empty here (this expression is only consulted under the
