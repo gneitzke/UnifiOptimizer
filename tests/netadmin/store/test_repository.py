@@ -1599,3 +1599,83 @@ def test_unresolved_events_degrades_when_attempt_column_absent(
     # bump is a safe no-op when the column is absent.
     assert rw.bump_event_reconcile_attempts([resolvable_ev]) == 0
     rw.close()
+
+
+def test_wrong_precedence_mac_is_not_resolvable_and_does_not_starve(
+    repo: Repository,
+) -> None:
+    """Finding #9: the SQL ``resolvable`` predicate must mirror the NORMALIZER's
+    per-column precedence, not merely "some candidate MAC exists".
+
+    500 older non-roam client events each name an ``ap`` that is NOT in inventory
+    and an ``sw`` that IS. The normalizer routes a non-roam client event's related
+    reference to the AP when ``ap`` is present -- it never falls through to the
+    switch -- so these rows can NEVER resolve. The old predicate flagged them
+    resolvable because the switch existed, so (being ordered resolvable-first)
+    they filled the LIMIT-500 window ahead of a newer, genuinely-resolvable row
+    whose AP *is* in inventory, starving it: 0 real repairs, newer ref left NULL.
+    With the precedence-faithful predicate the 500 are correctly NOT resolvable,
+    the newer row floats to the front and is the one that resolves."""
+    from netadmin.ingest.events import EventNormalizer
+
+    old_client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli-old:mac"), ts=500
+    )
+    # The switch these older events name IS in inventory -- but it is the WRONG
+    # MAC: the normalizer would use the (absent) ap, never this switch.
+    repo.upsert_entity(Entity(entity_type=EntityType.SWITCH, native_id="sw:mac"), ts=500)
+    for i in range(500):
+        repo.record_event(
+            ts=1000 + i, key="EVT_WU_Disconnected", entity_id=old_client,
+            related_entity_id=None, native_id=f"wrongprec-{i}",
+            data={"key": "EVT_WU_Disconnected", "time": (1000 + i) * 1000,
+                  "user": "cli-old:mac", "ap": "absent-ap:mac", "sw": "sw:mac"},
+        )
+    # A newer, genuinely repairable non-roam client event: its AP IS in inventory.
+    new_client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli-new:mac"), ts=8000
+    )
+    new_ap = repo.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="ap-new:mac"), ts=8000
+    )
+    newer_ev = repo.record_event(
+        ts=9000, key="EVT_WU_Connected", entity_id=new_client,
+        related_entity_id=None, native_id="newev",
+        data={"key": "EVT_WU_Connected", "time": 9000 * 1000,
+              "user": "cli-new:mac", "ap": "ap-new:mac"},
+    )
+
+    # LIMIT exactly the flood size: under the old (wrong) predicate all 501 rows
+    # were "resolvable" and ordered by ts, so the newest (ts=9000) fell off the
+    # 500-row window and was starved. The precedence-faithful predicate marks the
+    # 500 not-resolvable, so the one truly-resolvable row leads the window.
+    selected = repo.unresolved_events(limit=500)
+    assert int(selected[0]["id"]) == newer_ev
+
+    # End-to-end: exactly ONE real enrichment (the newer row); the 500 wrong-MAC
+    # rows are neither filled nor falsely counted.
+    repaired = EventNormalizer(repo).reconcile_unresolved(limit=500)
+    assert repaired == 1
+    row = repo._conn.execute(
+        "SELECT related_entity_id FROM events WHERE id=?", (newer_ev,)
+    ).fetchone()
+    assert row["related_entity_id"] == new_ap
+    still_null = repo._conn.execute(
+        "SELECT COUNT(*) AS n FROM events WHERE related_entity_id IS NULL "
+        "AND entity_id=?", (old_client,)
+    ).fetchone()["n"]
+    assert still_null == 500
+
+
+def test_unresolved_events_degrades_when_table_absent(tmp_db_path: Path) -> None:
+    """Finding #9: on a database whose ``events`` table is absent (dropped, or a
+    query-only replica that never provisioned it) the reconcile read must degrade
+    to empty rather than raising OperationalError ("no such table"). The guard is
+    on the missing TABLE, not just a missing column."""
+    rw = Repository.open(tmp_db_path)
+    with rw._write() as conn:
+        conn.execute("DROP TABLE events")
+    assert not rw._table_exists("events")
+    # Must not raise -- returns nothing, the read path degrades safely.
+    assert rw.unresolved_events(limit=500) == []
+    rw.close()
