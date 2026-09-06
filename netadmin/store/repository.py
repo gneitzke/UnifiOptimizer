@@ -72,7 +72,14 @@ DAY_SECONDS = 86400
 # a genuine outage still opens one. Coverage ends at the LAST heartbeat, so a
 # shutdown / crash / failed close simply stops the beats and cannot over-credit.
 _WS_HEARTBEAT_LABEL = "heartbeat"
-_WS_HEARTBEAT_MAX_GAP_S = 150
+# The flusher beats every ~30 s while connected AND draining. Bridge a gap only
+# up to ~2.5x that cadence: one missed beat plus jitter still reads as continuous
+# observation, but two or more consecutive misses (>=~90 s of no positive
+# liveness -- a stall, a disconnect the beats already stopped reflecting, an
+# outage) must NOT be bridged, or a down feed over-credits coverage and can
+# false-clear a real event-based issue. Keep this a small multiple of the
+# heartbeat interval in events.py; do not widen it back toward the window size.
+_WS_HEARTBEAT_MAX_GAP_S = 75
 
 # Entity types a failed SLE minute can be traced to at all (section 8). A client
 # owns its own failed minutes (``sle_minutes.entity_id``); an AP, switch,

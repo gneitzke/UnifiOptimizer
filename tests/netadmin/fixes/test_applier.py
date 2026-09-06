@@ -491,6 +491,38 @@ async def test_min_rssi_tightening_is_refused(store):
         await applier.apply(plan, dry_run=False, confirm_token=plan_confirm_token(plan))
 
 
+async def test_apply_refuses_change_touching_non_revertible_field(store):
+    """Verifier round 4: the revert restores only radio_table. A payload that ALSO
+    changes another top-level field (here ``disabled`` False->True) has no complete
+    inverse -- the revert would channel-restore but silently leave ``disabled`` set
+    and still mark the change reverted. Refuse it up front, with zero dispatch."""
+    endpoint = f"rest/device/{AP_ID}"
+    step = FixStep(
+        action=ActionType.CHANNEL_CHANGE,
+        target_entity_type=EntityType.RADIO,
+        target_native_id=f"{AP_MAC}:ng",
+        description="channel + disabled",
+        risk=RiskLevel.LOW,
+        method="PUT",
+        endpoint=endpoint,
+        # channel 3 -> 1 (revertible) BUT also disabled False -> True (not restorable)
+        payload={"radio_table": [{"radio": "ng", "channel": 1}], "disabled": True},
+        precondition=Precondition(target_native_id=f"{AP_MAC}:ng", expected={}),
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 3}], "disabled": False},
+        },
+        after={"method": "PUT", "endpoint": endpoint, "body": {}},
+    )
+    plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "mixed", steps=[step])
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+    with pytest.raises(SafetyViolation):
+        await applier.apply(plan, dry_run=False, confirm_token=plan_confirm_token(plan))
+    assert writer.call_count == 0
+
+
 async def test_min_rssi_removal_is_advisory_not_executed(store, ap_device):
     # The genuine removal is surfaced as an advisory recommendation, never applied
     # as an irreversible write (re-enabling min-RSSI is barred, so it has no revert).

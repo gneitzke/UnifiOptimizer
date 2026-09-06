@@ -1218,6 +1218,27 @@ def test_observed_event_coverage_credits_healthy_connected_ws(repo: Repository) 
     assert cov <= 1.0
 
 
+def test_observed_event_coverage_does_not_bridge_a_real_outage(repo: Repository) -> None:
+    """B4(f) (verifier round 4): heartbeats that resume after an outage must NOT
+    bridge the gap. A feed connected only ~30 s out of every 180 s (down or
+    reconnecting the rest of the time) must read as mostly UNCOVERED -- otherwise
+    a real event-based issue false-resolves across the outage. The old 150 s
+    bridge spanned these gaps and reported ~97% coverage; the tightened bridge
+    (~2.5x the 30 s beat cadence) leaves the outages as real holes."""
+    now = 2_000_000
+    start = now - 3600
+    # Two beats 30 s apart, then a 150 s silent gap (5 missed beats), repeating.
+    t = start
+    while t < now:
+        repo.record_ws_heartbeat(ts=t)
+        repo.record_ws_heartbeat(ts=t + 30)
+        t += 180
+    cov = repo.observed_event_coverage(start, now)
+    # ~30 covered out of every 180 -> well under the 0.9 event-gap sufficiency
+    # floor, so event-based verdicts correctly freeze to UNKNOWN.
+    assert cov < 0.3
+
+
 def test_observed_event_coverage_no_heartbeats_credits_nothing(
     repo: Repository,
 ) -> None:

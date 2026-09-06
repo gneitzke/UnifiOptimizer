@@ -728,6 +728,24 @@ class Applier:
                 "already hold (a no-op apply); there is nothing to revert -- refusing to "
                 "treat a no-op as a safely-revertible mutation"
             )
+        # The revert restores ONLY ``radio_table`` (see :meth:`revert`, which sends
+        # ``restore_body = {"radio_table": ...}``). If this apply also changes any
+        # OTHER top-level field the payload carries (e.g. ``disabled``, ``led_override``),
+        # that change has NO inverse -- the revert would silently leave it in place while
+        # marking the change reverted. Only a whole-``radio_table`` config change is
+        # revertible, so refuse an apply that mutates anything else (verifier round 4).
+        full_dispatched_body = step.payload if isinstance(step.payload, Mapping) else {}
+        non_revertible = sorted(
+            k
+            for k, v in full_dispatched_body.items()
+            if k != "radio_table" and v != body.get(k)
+        )
+        if non_revertible:
+            raise SafetyViolation(
+                f"step '{step.description}' also changes field(s) {non_revertible} outside "
+                "radio_table; the revert restores only radio_table, so this change has no "
+                "complete inverse -- refusing to apply a not-fully-revertible change"
+            )
         # Build the reverse table with the DISPATCHED payload as the effective after,
         # so the touched fields are inverted back to their before-values regardless of
         # what ``step.after`` claims.
