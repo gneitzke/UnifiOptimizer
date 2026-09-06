@@ -1137,6 +1137,25 @@ class Applier:
             for r in (intended_after_body.get("radio_table") or [])
             if isinstance(r, dict) and r.get("radio") is not None
         }
+        # A change that ADDS a radio (present in the step's intended-after table,
+        # absent from its before-state) has no clean whole-table inverse under this
+        # model (#D8): the revert rolls back only the fields it TOUCHED, so it removes
+        # the added radio's fields but leaves the radio entry itself behind -- the
+        # added radio survives while the row is marked 'reverted'. Symmetric with the
+        # delete-radio refusal (a dropped radio has no inverse either): the planner
+        # never adds radios, so refuse it at apply time rather than mark a dishonest
+        # revert. Judged on the step's INTENDED after (before + its delta), never on
+        # ``merged_radios`` -- the merged table also carries a concurrent operator's
+        # live-added radio, which merge-at-dispatch preserves (#1) and the revert
+        # correctly leaves untouched; that is not a radio THIS step adds.
+        added_radios = sorted(code for code in after_radios if code not in before_radios)
+        if added_radios:
+            raise SafetyViolation(
+                f"step '{step.description}' ADDS radio(s) {added_radios} not present in its "
+                "before-state; a whole-table revert would strip their fields but leave the "
+                "radio entries behind -- the added radio has no complete inverse, refusing "
+                "to apply a not-fully-revertible change"
+            )
         touched: dict[str, dict[str, tuple[Any, Any]]] = {}
         for radio_code, aentry in after_radios.items():
             b = before_radios.get(radio_code, {})
@@ -1294,7 +1313,28 @@ class Applier:
                     continue  # radio absent from live -> merge/clobber guard handles it
                 for field in fields:
                     if field not in live_entry:
-                        continue  # field absent from live is not a divergence to overwrite
+                        # A field the delta will SEND that is ABSENT from fresh live.
+                        # If the recorded ``before`` HELD this field (a value we
+                        # reviewed against and would restore on revert), its
+                        # disappearance means the device's shape changed since review
+                        # (#D1): we can neither confirm the before-value the human
+                        # reviewed nor guarantee a clean revert -- the merge would
+                        # silently re-add the field, and a later revert would write a
+                        # now-stale before-value. Refuse as drift. (A field ``before``
+                        # also lacked -- the delta is genuinely ADDING it, consistent
+                        # with live -- is not a divergence and is left to the merge.)
+                        if field in before_entry:
+                            drift.append(
+                                (
+                                    step,
+                                    f"step '{step.description}' would set radio '{code}' "
+                                    f"field '{field}', but that field is absent from fresh "
+                                    "live though the reviewed before-state held it "
+                                    f"({before_entry.get(field)!r}); the device's shape "
+                                    "changed -- its before-value can no longer be confirmed",
+                                )
+                            )
+                        continue
                     before_val = before_entry.get(field)
                     live_val = live_entry.get(field)
                     if live_val != before_val:

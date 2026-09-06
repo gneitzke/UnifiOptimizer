@@ -2065,3 +2065,135 @@ async def test_round8_5_cancelled_mid_send_revert_blocks_replay(store):
         await applier.revert(change_id, state_reader=_reader)
     assert writer.puts == 1  # exactly one dispatch, never replayed
     assert store.get_change(change_id)["status"] == "reverting"
+
+
+# --------------------------------------------------------------------------- #
+# Verifier round 9, D1: a delta field DELETED from fresh live (that the reviewed
+# before HELD) is drift. The precondition asserts only the headline attribute, so a
+# bundled delta field whose live value has VANISHED escapes it -- and the earlier
+# delta-field guard only compared present fields, skipping absent ones. The device's
+# shape has changed since review: the before-value can no longer be confirmed, and a
+# later revert would write a now-stale value. Refuse (PreconditionDrift), send nothing.
+# --------------------------------------------------------------------------- #
+async def test_d1_delta_field_absent_from_live_is_drift(store):
+    endpoint = f"rest/device/{AP_ID}"
+    step = FixStep(
+        action=ActionType.CHANNEL_CHANGE,
+        target_entity_type=EntityType.RADIO,
+        target_native_id=f"{AP_MAC}:ng",
+        description="channel move + bundled power delta",
+        risk=RiskLevel.MEDIUM,
+        method="PUT",
+        endpoint=endpoint,
+        # Delta: channel 3->1 AND tx_power_mode high->medium.
+        payload={"radio_table": [{"radio": "ng", "channel": 1, "tx_power_mode": "medium"}]},
+        precondition=_radio_pre(f"{AP_MAC}:ng", {"channel": 3}),  # channel-only
+        before={"method": "PUT", "endpoint": endpoint,
+                "body": {"radio_table": [{"radio": "ng", "channel": 3, "tx_power_mode": "high"}]}},
+        after={"method": "PUT", "endpoint": endpoint,
+               "body": {"radio_table": [{"radio": "ng", "channel": 1, "tx_power_mode": "medium"}]}},
+        revertible=True,
+    )
+    plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "d1", steps=[step])
+    writer = _RecordingLiveWriter()
+    applier = Applier(store, writer)
+    # Fresh live: channel STILL 3 (precondition holds) but tx_power_mode is GONE --
+    # the device's shape changed since the plan was reviewed.
+    live = {"ng": {"radio": "ng", "channel": 3}}
+
+    async def _reader():
+        cur = {f"{AP_MAC}:ng": {"channel": 3}}  # channel precondition still satisfied
+        full = {AP_ID: {k: dict(v) for k, v in live.items()}}
+        return cur, full, set()
+
+    with pytest.raises(PreconditionDrift):
+        await applier.apply(
+            plan, dry_run=False, confirm_token=plan_confirm_token(plan), state_reader=_reader
+        )
+    assert writer.puts == []  # refused before any dispatch -- no stale-before revert armed
+
+
+# --------------------------------------------------------------------------- #
+# Verifier round 9, D8: a change that ADDS a radio (present in dispatched/after,
+# absent from before) has no complete whole-table inverse -- the revert rolls back
+# the added radio's fields but leaves the radio entry behind, so the added radio
+# survives while the row is marked 'reverted'. Refuse it AT APPLY, symmetric with the
+# delete-radio refusal; nothing is dispatched.
+# --------------------------------------------------------------------------- #
+async def test_d8_change_that_adds_a_radio_is_refused_at_apply(store):
+    endpoint = f"rest/device/{AP_ID}"
+    step = FixStep(
+        action=ActionType.CHANNEL_CHANGE,
+        target_entity_type=EntityType.RADIO,
+        target_native_id=f"{AP_MAC}:ng",
+        description="ng channel move AND adds na",
+        risk=RiskLevel.MEDIUM,
+        method="PUT",
+        endpoint=endpoint,
+        # before has ONLY ng; payload changes ng.channel AND adds a brand-new na radio.
+        payload={"radio_table": [{"radio": "ng", "channel": 1, "ht": 20},
+                                 {"radio": "na", "channel": 36}]},
+        precondition=_radio_pre(f"{AP_MAC}:ng", {"channel": 3}),
+        before={"method": "PUT", "endpoint": endpoint,
+                "body": {"radio_table": [{"radio": "ng", "channel": 3, "ht": 20}]}},
+        after={"method": "PUT", "endpoint": endpoint,
+               "body": {"radio_table": [{"radio": "ng", "channel": 1, "ht": 20},
+                                        {"radio": "na", "channel": 36}]}},
+        revertible=True,
+    )
+    plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "d8", steps=[step])
+    writer = _RecordingLiveWriter()
+    applier = Applier(store, writer)
+    live = {"ng": {"radio": "ng", "channel": 3, "ht": 20}}  # live knows only ng
+
+    async def _reader():
+        cur = {f"{AP_MAC}:ng": {"channel": 3}}
+        full = {AP_ID: {k: dict(v) for k, v in live.items()}}
+        return cur, full, set()
+
+    with pytest.raises(SafetyViolation, match="[Aa]dd"):
+        await applier.apply(
+            plan, dry_run=False, confirm_token=plan_confirm_token(plan), state_reader=_reader
+        )
+    assert writer.puts == []  # refused up front -- no half-revertible added radio dispatched
+
+
+async def test_d8_concurrent_live_added_radio_is_still_preserved_not_refused(store):
+    # Guard against over-refusal: a radio the concurrent OPERATOR added to live (not
+    # this step) must still be PRESERVED by merge-at-dispatch (#1), not mistaken for a
+    # step-added radio. The step touches only ng; na appeared in live out-of-band.
+    endpoint = f"rest/device/{AP_ID}"
+    step = FixStep(
+        action=ActionType.CHANNEL_CHANGE,
+        target_entity_type=EntityType.RADIO,
+        target_native_id=f"{AP_MAC}:ng",
+        description="ng channel move only",
+        risk=RiskLevel.MEDIUM,
+        method="PUT",
+        endpoint=endpoint,
+        payload={"radio_table": [{"radio": "ng", "channel": 1, "ht": 20}]},
+        precondition=_radio_pre(f"{AP_MAC}:ng", {"channel": 3}),
+        before={"method": "PUT", "endpoint": endpoint,
+                "body": {"radio_table": [{"radio": "ng", "channel": 3, "ht": 20}]}},
+        after={"method": "PUT", "endpoint": endpoint,
+               "body": {"radio_table": [{"radio": "ng", "channel": 1, "ht": 20}]}},
+        revertible=True,
+    )
+    plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "d8-ok", steps=[step])
+    writer = _RecordingLiveWriter()
+    applier = Applier(store, writer)
+    # na appeared in live since the plan was built; the STEP never mentions it.
+    live = {"ng": {"radio": "ng", "channel": 3, "ht": 20},
+            "na": {"radio": "na", "channel": 40, "ht": 80}}
+
+    async def _reader():
+        cur = {f"{AP_MAC}:ng": {"channel": 3}}
+        full = {AP_ID: {k: dict(v) for k, v in live.items()}}
+        return cur, full, set()
+
+    result = await applier.apply(
+        plan, dry_run=False, confirm_token=plan_confirm_token(plan), state_reader=_reader
+    )
+    assert result.applied is True  # NOT refused -- na is a live-carried radio, not step-added
+    dispatched_codes = {r["radio"] for r in writer.puts[0]["radio_table"]}
+    assert dispatched_codes == {"ng", "na"}  # the concurrent na is preserved

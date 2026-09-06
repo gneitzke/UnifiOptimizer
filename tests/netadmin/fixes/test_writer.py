@@ -207,9 +207,70 @@ async def test_non_json_2xx_mutation_response_is_ambiguous_not_definitive_failur
     await client.aclose()
 
 
+# --------------------------------------------------------------------------- #
+# Verifier round 9, D6: a post-send httpx.ReadError/WriteError on a MUTATION means
+# the socket faulted AFTER the request bytes went out -- the write may have landed --
+# so the outcome is AMBIGUOUS (unknown), not a clean 'failed'. Before the fix these
+# were absent from the client's transport-ambiguity tuple, so they escaped as an
+# unhandled exception the applier recorded as a definite failure with one PUT sent.
+# --------------------------------------------------------------------------- #
 @respx.mock
-async def test_non_2xx_non_json_mutation_response_stays_a_definitive_failure():
-    # Symmetric guard: a NON-2xx unparseable body is a real rejection, NOT ambiguous.
+async def test_d6_post_send_read_error_on_mutation_is_ambiguous_not_failed():
+    _mock_login()
+    route = respx.put(f"{API}/rest/device/dev123").mock(
+        side_effect=httpx.ReadError("connection reset after send")
+    )
+    client = await _client()
+    writer = RealControllerWriter(client)
+    res = await writer.put("rest/device/dev123", {"radio_table": [{"radio": "ng"}]})
+
+    assert route.call_count == 1  # dispatched exactly once -- never retried
+    assert res.ok is False
+    assert isinstance(res.data, dict) and res.data.get("ambiguous") is True
+    await client.aclose()
+
+
+@respx.mock
+async def test_d6_post_send_write_error_on_mutation_is_ambiguous_not_failed():
+    _mock_login()
+    route = respx.put(f"{API}/rest/device/dev123").mock(
+        side_effect=httpx.WriteError("broken pipe mid-send")
+    )
+    client = await _client()
+    writer = RealControllerWriter(client)
+    res = await writer.put("rest/device/dev123", {"radio_table": [{"radio": "ng"}]})
+
+    assert route.call_count == 1
+    assert res.ok is False
+    assert isinstance(res.data, dict) and res.data.get("ambiguous") is True
+    await client.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# Verifier round 9, D7: an unparseable gateway 504 (and other 5xx) on a MUTATION is
+# AMBIGUOUS, not a definitive rejection. A gateway timeout does NOT establish the
+# write failed -- it may have landed upstream of the failing hop. Before the fix a
+# non-2xx unparseable body was a definitive failure, which let a revert claim "the
+# change was not rolled back" (a falsehood) and permitted a replay (a second PUT).
+# --------------------------------------------------------------------------- #
+@respx.mock
+async def test_d7_gateway_504_unparseable_on_mutation_is_ambiguous():
+    _mock_login()
+    respx.put(f"{API}/rest/device/dev123").mock(
+        return_value=httpx.Response(504, text="<html>gateway timeout</html>")
+    )
+    client = await _client()
+    writer = RealControllerWriter(client)
+    res = await writer.put("rest/device/dev123", {"radio_table": []})
+    assert res.ok is False
+    assert res.status_code == 504
+    # The gateway timeout does not confirm a rejection -> outcome UNKNOWN, not failed.
+    assert isinstance(res.data, dict) and res.data.get("ambiguous") is True
+    await client.aclose()
+
+
+@respx.mock
+async def test_d7_5xx_unparseable_on_mutation_is_ambiguous():
     _mock_login()
     respx.put(f"{API}/rest/device/dev123").mock(
         return_value=httpx.Response(500, text="<html>error</html>")
@@ -219,5 +280,44 @@ async def test_non_2xx_non_json_mutation_response_stays_a_definitive_failure():
     res = await writer.put("rest/device/dev123", {"radio_table": []})
     assert res.ok is False
     assert res.status_code == 500
+    assert isinstance(res.data, dict) and res.data.get("ambiguous") is True
+    await client.aclose()
+
+
+@respx.mock
+async def test_d7_parseable_error_envelope_stays_definitive_rejection():
+    # The narrow definitive case survives: a 504 (or any status) whose body is a
+    # PARSEABLE meta.rc=error envelope is a rejection the controller confirmed --
+    # a definitive failure, NOT ambiguous.
+    _mock_login()
+    respx.put(f"{API}/rest/device/dev123").mock(
+        return_value=httpx.Response(
+            502, json={"meta": {"rc": "error", "msg": "api.err.ServerBusy"}, "data": []}
+        )
+    )
+    client = await _client()
+    writer = RealControllerWriter(client)
+    res = await writer.put("rest/device/dev123", {"radio_table": []})
+    assert res.ok is False
+    assert res.status_code == 502
+    assert not (isinstance(res.data, dict) and res.data.get("ambiguous"))
+    await client.aclose()
+
+
+@respx.mock
+async def test_4xx_non_json_mutation_response_stays_a_definitive_failure():
+    # Symmetric guard: a 4xx CLIENT error is a definitive rejection even with an
+    # unparseable body -- the controller received and refused the request before
+    # applying it, so it did not land and is NOT ambiguous. (A 5xx/504 is treated
+    # differently: see the D7 test below -- a gateway failure is ambiguous.)
+    _mock_login()
+    respx.put(f"{API}/rest/device/dev123").mock(
+        return_value=httpx.Response(400, text="<html>bad request</html>")
+    )
+    client = await _client()
+    writer = RealControllerWriter(client)
+    res = await writer.put("rest/device/dev123", {"radio_table": []})
+    assert res.ok is False
+    assert res.status_code == 400
     assert not (isinstance(res.data, dict) and res.data.get("ambiguous"))
     await client.aclose()

@@ -115,40 +115,56 @@ class RealControllerWriter:
         except Exception:  # noqa: BLE001 - a non-JSON body cannot confirm success
             data = None
 
-        http_ok = status is not None and 200 <= int(status) < 300
-        # A mutation counts as confirmed success ONLY when the HTTP status is 2xx,
-        # the body is a JSON envelope we could parse, AND that envelope does not
-        # report an error (R1). A 200 carrying ``meta.rc="error"`` is a failure.
+        status_int = int(status) if status is not None else None
+        http_ok = status_int is not None and 200 <= status_int < 300
+        is_client_error = status_int is not None and 400 <= status_int < 500
         confirmed_json = isinstance(data, dict)
-        # A 2xx whose body we could NOT parse as a JSON envelope (an HTML page, a
-        # proxy/gateway response) is AMBIGUOUS, not a definitive failure (#6): the
-        # controller ACCEPTED the request (2xx) but we cannot confirm the mutation's
-        # outcome from the body, so the write may well have landed. Surface it exactly
-        # like a lost response -- ``ok=False`` with ``data={"ambiguous": True, ...}`` --
-        # so the applier records it as unknown (not "reverted"/"failed"), the API never
-        # claims "the change was not rolled back", and no automatic replay is allowed.
-        # A NON-2xx unparseable body stays a definitive failure (a real rejection).
-        if http_ok and not confirmed_json:
-            _log.warning(
-                "unparseable 2xx mutation response: %s %s (status=%s); outcome unknown",
-                method,
-                endpoint,
-                status,
-            )
-            return WriteResult(
-                ok=False,
-                status_code=status,
-                data={
-                    "ambiguous": True,
-                    "error": (
-                        "controller returned a non-JSON (unparseable) 2xx body; "
-                        "mutation outcome unknown -- reconcile via a read"
-                    ),
-                },
-            )
-        envelope_ok = confirmed_json and envelope_error(data) is None
-        ok = http_ok and envelope_ok
-        return WriteResult(ok=ok, status_code=status, data=data)
+        # A parseable classic envelope that reports ``meta.rc="error"`` is a rejection
+        # the controller CONFIRMED, at any HTTP status (R1): a 200 carrying that body
+        # failed just as surely as a 400 carrying it.
+        envelope_err = envelope_error(data) if confirmed_json else None
+
+        # --- The unified mutation-outcome classification (D6/D7). -----------------
+        # A mutation outcome is DEFINITIVELY REJECTED only when we have positive proof
+        # it did not land: a parseable ``meta.rc=error`` envelope, or a 4xx client error
+        # (the controller received and refused the request before applying it). These
+        # are the ONLY definitive failures; the caller may retry/replay them safely.
+        if envelope_err is not None or is_client_error:
+            return WriteResult(ok=False, status_code=status, data=data)
+
+        # CONFIRMED SUCCESS: a 2xx with a parseable envelope that reports no error.
+        if http_ok and confirmed_json:
+            return WriteResult(ok=True, status_code=status, data=data)
+
+        # Everything else is AMBIGUOUS (outcome UNKNOWN), never a definitive failure:
+        #   * a 2xx whose body we could NOT parse (an HTML/proxy page) -- the controller
+        #     ACCEPTED the request (2xx) but the body cannot confirm the outcome (#6);
+        #   * a gateway 504 / other 5xx / any non-2xx whose body does not CONFIRM a
+        #     rejection (D7) -- a gateway timeout does NOT establish the write failed;
+        #     the mutation may well have landed upstream of the failing hop.
+        # Surface it exactly like a lost response -- ``ok=False`` with
+        # ``data={"ambiguous": True, ...}`` -- so the applier records it as unknown (not
+        # "reverted"/"failed"), the API never claims "the change was not rolled back",
+        # and no automatic replay is allowed.
+        _log.warning(
+            "ambiguous mutation response: %s %s (status=%s); outcome unknown -- "
+            "not a definitive rejection",
+            method,
+            endpoint,
+            status,
+        )
+        return WriteResult(
+            ok=False,
+            status_code=status,
+            data={
+                "ambiguous": True,
+                "error": (
+                    f"controller returned an unconfirmable response (status={status}); "
+                    "the body does not confirm a rejection, so the mutation outcome is "
+                    "unknown -- reconcile via a read, do not assume it did not land"
+                ),
+            },
+        )
 
 
 class FakeControllerWriter:
