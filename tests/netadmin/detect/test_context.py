@@ -100,6 +100,29 @@ def test_entities_filters_by_type(repo: Repository, ap_entity_id: int) -> None:
     assert _ctx(repo).entities(EntityType.CLIENT) == []
 
 
+def test_entities_skips_inventory_only_rogue_bss_rows(repo: Repository) -> None:
+    # The collector upserts neighbour BSSes as ``rogue_bss`` inventory rows whose
+    # entity_type is deliberately NOT an EntityType. Enumerating every entity (the
+    # daily config-audit pass) must skip them, not raise ``ValueError`` coercing
+    # "rogue_bss" into EntityType -- a single such row used to crash detect_daily.
+    repo.upsert_entity(Entity(entity_type=EntityType.AP, native_id="ap", site_id="default"), ts=NOW)
+    repo.upsert_entity(
+        Entity(entity_type="rogue_bss", native_id="00:11:22:33:44:55", site_id="default"),  # type: ignore[arg-type]
+        ts=NOW,
+    )
+    everything = _ctx(repo).entities()  # no type filter -> the crash path
+    assert [e.entity_type for e in everything] == [EntityType.AP]
+
+
+def test_entities_skips_unknown_type_without_raising(repo: Repository) -> None:
+    # Any future inventory-only / drifted type is dropped (and logged), never fatal.
+    repo.upsert_entity(
+        Entity(entity_type="mystery_widget", native_id="x", site_id="default"),  # type: ignore[arg-type]
+        ts=NOW,
+    )
+    assert _ctx(repo).entities() == []
+
+
 # ---------------------------------------------------------------------- #
 # coverage
 # ---------------------------------------------------------------------- #

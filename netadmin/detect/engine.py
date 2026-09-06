@@ -610,7 +610,14 @@ def schedule_detection(
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
     from apscheduler.triggers.cron import CronTrigger
 
-    sched = scheduler or AsyncIOScheduler(timezone=timezone.utc)
+    from netadmin.ingest.collector import MISFIRE_GRACE_S
+
+    # Only reached when no shared scheduler is supplied (tests); the live daemon
+    # passes the collector's scheduler, which already carries this grace default.
+    sched = scheduler or AsyncIOScheduler(
+        timezone=timezone.utc,
+        job_defaults={"misfire_grace_time": MISFIRE_GRACE_S},
+    )
     base = now or datetime.now(timezone.utc)
     cfg = engine.config
     fast_s = (

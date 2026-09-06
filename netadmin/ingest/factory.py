@@ -563,8 +563,29 @@ def _add_prune_job(scheduler: Any, store: Repository, *, prune_hour: int) -> Non
     from apscheduler.triggers.cron import CronTrigger
 
     async def _prune() -> None:
-        deleted = store.prune()
-        logger.info("nightly retention prune deleted %s", deleted)
+        # Record a poll_run like every other analysis job so health can see the
+        # prune actually ran (without this it sits UNKNOWN forever -- a nightly
+        # cron that never reports success reads identically to one that never
+        # fired). The prune body must never kill the scheduler, so a failure is
+        # caught, logged, and recorded as a failed run.
+        ts = _utcnow_ts()
+        start = time.monotonic()
+        ok = False
+        error: Optional[str] = None
+        try:
+            deleted = store.prune()
+            ok = True
+            logger.info("nightly retention prune deleted %s", deleted)
+        except Exception as exc:  # noqa: BLE001 - the prune must not crash the scheduler
+            error = repr(exc)[:500]
+            logger.exception("nightly retention prune failed")
+        duration_ms = int((time.monotonic() - start) * 1000)
+        try:
+            store.record_poll_run(
+                job=_RETENTION_PRUNE_JOB, ok=ok, ts=ts, duration_ms=duration_ms, error=error
+            )
+        except Exception:  # noqa: BLE001 - accounting must never kill the cycle
+            logger.exception("failed to record poll_run for %s", _RETENTION_PRUNE_JOB)
 
     scheduler.add_job(
         _prune,

@@ -61,15 +61,36 @@ function StatusDot({ status }: { status: JobHealth['status'] }) {
 }
 
 function JobRow({ job }: { job: JobHealth }) {
+  // A failing job's reason (from poll_runs.error) is the whole point of the
+  // panel for that row: a red dot that says only "never" leaves the user
+  // shelling into the box to find out why. Show it inline, wrapped, in the
+  // failing tone, with the full text on hover.
+  const showError = job.status === 'failing' && !!job.last_error;
   return (
-    <div className="flex items-center justify-between gap-3 py-1">
-      <span className="t-caption flex items-center gap-1.5 min-w-0" style={{ color: 'var(--fg)' }}>
-        <StatusDot status={job.status} />
-        <span className="truncate">{job.job}</span>
-      </span>
-      <span className="t-caption tnum shrink-0" style={{ color: 'var(--fg-subtle)' }}>
-        {job.last_success_age_s === 'UNKNOWN' ? 'never' : `${formatDuration(job.last_success_age_s)} ago`}
-      </span>
+    <div className="flex flex-col gap-0.5 py-1">
+      <div className="flex items-center justify-between gap-3">
+        <span
+          className="t-caption flex items-center gap-1.5 min-w-0"
+          style={{ color: 'var(--fg)' }}
+        >
+          <StatusDot status={job.status} />
+          <span className="truncate">{job.job}</span>
+        </span>
+        <span className="t-caption tnum shrink-0" style={{ color: 'var(--fg-subtle)' }}>
+          {job.last_success_age_s === 'UNKNOWN'
+            ? 'never'
+            : `${formatDuration(job.last_success_age_s)} ago`}
+        </span>
+      </div>
+      {showError && (
+        <span
+          className="t-micro pl-3 break-words"
+          style={{ color: 'var(--sev-p1)' }}
+          title={job.last_error}
+        >
+          {job.last_error}
+        </span>
+      )}
     </div>
   );
 }

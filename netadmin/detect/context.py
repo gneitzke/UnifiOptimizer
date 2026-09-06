@@ -83,8 +83,32 @@ def _row_get(row: Any, key: str) -> Any:
         return None
 
 
-def _entity_from_row(row: Any) -> Entity:
-    """Decode an ``entities`` row into an :class:`Entity` (``meta`` JSON parsed)."""
+# Inventory-only ``entities`` rows that are deliberately NOT an :class:`EntityType`
+# (the collector upserts neighbour BSSes as ``rogue_bss`` rows so the wifi detector
+# can read them through its own decoder -- see ``ingest.collector`` /
+# ``detect.detectors.wifi``). They share the ``entities`` table but are not domain
+# entities, so the detect layer's ``Entity`` view must skip them rather than choke
+# coercing an unknown string into ``EntityType`` (a single ``rogue_bss`` row would
+# otherwise raise ``ValueError`` and take down the whole daily config-audit pass,
+# which enumerates *every* entity type).
+_ENTITY_TYPE_VALUES: frozenset[str] = frozenset(t.value for t in EntityType)
+_KNOWN_NON_ENTITY_TYPES: frozenset[str] = frozenset({"rogue_bss"})
+
+
+def _entity_from_row(row: Any) -> Optional[Entity]:
+    """Decode an ``entities`` row into an :class:`Entity`, or ``None`` to skip it.
+
+    Returns ``None`` for inventory-only rows whose ``entity_type`` is not a member
+    of :class:`EntityType` (e.g. ``rogue_bss``). A recognised non-entity type is
+    dropped silently; a genuinely unexpected one is logged once so a real schema
+    drift stays visible instead of silently vanishing -- but neither aborts the
+    caller, so one stray row can never crash a detector pass.
+    """
+    etype = _row_get(row, "entity_type")
+    if etype not in _ENTITY_TYPE_VALUES:
+        if etype not in _KNOWN_NON_ENTITY_TYPES:
+            _log.warning("skipping entities row with unknown entity_type %r", etype)
+        return None
     raw_meta = _row_get(row, "meta")
     meta: dict[str, Any] = {}
     if raw_meta:
@@ -246,7 +270,7 @@ class DetectorContext:
         the store.
         """
         rows = self.repo.list_entities(entity_type, site_id=self.site_id)
-        return [_entity_from_row(row) for row in rows]
+        return [e for e in (_entity_from_row(row) for row in rows) if e is not None]
 
     # ------------------------------------------------------------------ #
     # Coverage (the honest gap signal)

@@ -80,6 +80,17 @@ JOB_WLANCONF = "wlanconf"
 JOB_ALARMS = "alarms"
 JOB_ANOMALIES = "anomalies"
 
+# Grace period (seconds) for a job whose scheduled fire time slipped because the
+# single event-loop thread was busy with another pass. APScheduler's built-in
+# default is 1 s, so on a large store -- where a detect/correlate pass can hold
+# the loop several seconds -- an interval job that lands mid-pass is silently
+# DROPPED as a misfire and never records a ``poll_runs`` row (this is exactly how
+# ``sle_minutes`` and ``anomalies`` went dark on the live daemon: every run missed
+# by 4-27 s and was discarded). Every job is ``coalesce=True`` + ``max_instances=1``,
+# so a generous grace only ever runs the delayed cycle ONCE when the loop frees up
+# -- late accounting is still correct accounting, and infinitely better than none.
+MISFIRE_GRACE_S = 300
+
 # entities.entity_type for neighbor / rogue BSS rows (ARCHITECTURE.md 5.1). These
 # are stored as inventory entities: the entities table has no type CHECK and
 # ``upsert_entity`` str()-coerces a non-enum type, so this needs no schema or
@@ -610,7 +621,10 @@ def build_scheduler(
     """
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-    sched = scheduler or AsyncIOScheduler(timezone=timezone.utc)
+    sched = scheduler or AsyncIOScheduler(
+        timezone=timezone.utc,
+        job_defaults={"misfire_grace_time": MISFIRE_GRACE_S},
+    )
     now = datetime.now(timezone.utc)
 
     jobs = [

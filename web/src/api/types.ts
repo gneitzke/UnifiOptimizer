@@ -130,6 +130,12 @@ export interface JobHealth {
   last_success_age_s: number | 'UNKNOWN';
   consecutive_failures: number;
   status: 'ok' | 'stale' | 'failing' | 'UNKNOWN';
+  /** Reason the job is currently failing, from the most recent failed run
+   * (`poll_runs.error`). Only present while `status === 'failing'`; absent once
+   * the job recovers. */
+  last_error?: string;
+  /** Epoch seconds of that most recent failed run. Present with `last_error`. */
+  last_failure_ts?: number;
 }
 
 export interface Health {

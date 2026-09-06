@@ -64,6 +64,41 @@ async def test_build_components_wires_all_scheduler_jobs(repo: Repository) -> No
     assert isinstance(built.probes, ProbeRunner)
 
 
+async def test_scheduler_jobs_carry_a_misfire_grace(repo: Repository) -> None:
+    # A run whose fire time slips because the loop was busy must NOT be dropped as
+    # a misfire (APScheduler's 1 s default silently killed sle_minutes/anomalies on
+    # the live daemon). Every job inherits the generous grace default.
+    from netadmin.ingest.collector import MISFIRE_GRACE_S
+
+    built = build_components(_configured(), repo)
+    # Defaults are merged onto pending jobs when the scheduler processes its
+    # jobstore; start paused so that happens without running any job body.
+    built.scheduler.start(paused=True)
+    try:
+        for job_id in ("sle_minutes", "anomalies", "baseline", "correlate", "detect_fast"):
+            job = built.scheduler.get_job(job_id)
+            assert job is not None, f"{job_id} not scheduled"
+            assert job.misfire_grace_time == MISFIRE_GRACE_S, job_id
+    finally:
+        built.scheduler.shutdown(wait=False)
+
+
+async def test_retention_prune_records_a_poll_run(repo: Repository) -> None:
+    # The nightly prune records a poll_run like every other job, so health can see
+    # it ran instead of pinning it UNKNOWN forever.
+    built = build_components(_configured(), repo)
+    try:
+        job = built.scheduler.get_job("retention_prune")
+        assert job is not None
+        await job.func()  # run the prune body directly
+    finally:
+        if built.scheduler.running:
+            built.scheduler.shutdown(wait=False)
+    rows = repo.read_poll_runs("retention_prune", 0, 2**63 - 1)
+    assert rows, "prune recorded no poll_run"
+    assert int(rows[-1]["ok"]) == 1
+
+
 class _FakeSleJob:
     """Records ``run_range`` calls; ``cfg.bucket_seconds`` mirrors the real job."""
 

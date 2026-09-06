@@ -4,6 +4,38 @@ All notable changes to UnifiOptimizer are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] — 2026-09-06
+
+A reliability release. Five failures found by running the daemon against a real
+network for a week — not by the test suite — where a large, long-lived store
+exposed scheduling and coercion edges that small fixtures never reach. All are
+backward compatible.
+
+### Fixed
+
+- The daily detection pass (`detect_daily`) crashed every night with
+  `ValueError: 'rogue_bss' is not a valid EntityType`. The rogue-AP scanner stores
+  neighbour BSSes as `rogue_bss` inventory rows that are deliberately not an
+  `EntityType`; the daily config audit enumerates every entity type and choked
+  coercing the first such row. The detector's entity view now skips inventory-only
+  rows (and logs any genuinely unknown type) instead of aborting the whole pass.
+- `sle_minutes` and `anomalies` silently stopped running on a busy daemon. Both
+  jobs were being dropped by APScheduler's 1-second misfire window whenever a
+  detect/correlate pass held the single event loop a few seconds past their fire
+  time — on a large store, every run. Jobs now carry a generous misfire grace, so
+  a slipped run executes once when the loop frees instead of vanishing.
+- `retention_prune` reported `UNKNOWN` in `/api/health` forever: the nightly prune
+  ran but never recorded a `poll_runs` row, so health could not tell a prune that
+  ran from one that never fired. It now records each run.
+- `/api/health` now reports *why* a job is failing (`last_error` / `last_failure_ts`
+  from the most recent failed run), and the dashboard's source-health panel shows
+  that reason inline. Previously the surface said a job was "failing" but the cause
+  was only readable by shelling into the host and querying the database.
+- The container image pinned `mcp>=1.2` with no upper bound, so a fresh build
+  resolved mcp 2.0 and the `/mcp` mount died at import (`'Server' object has no
+  attribute 'list_tools'`, a 503). Pinned to `mcp>=1.2,<2` to match the packaging
+  extra until the server is ported to the 2.x API.
+
 ## [0.8.0] — 2026-09-06
 
 A safety and correctness release. Every controller-facing and incident-facing

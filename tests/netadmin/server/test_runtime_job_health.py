@@ -58,3 +58,40 @@ def test_owned_job_that_has_never_run_is_unknown() -> None:
     snapshot = {"last_ok_ts": {"fast_sta": None}, "last_run_ts": {}, "consecutive_failures": {}}
     health = _job_health(None, None, "fast_sta", 1_000_100, snapshot)
     assert health["status"] == UNKNOWN
+
+
+class _FailingStore:
+    """A job that succeeded once, then failed its last N runs with an error."""
+
+    def __init__(self, now: int) -> None:
+        self._now = now
+
+    def read_poll_runs(self, job: str, start: int, end: int) -> list[dict]:
+        return [
+            {"ts": self._now - 400, "ok": 1, "job": job, "error": None},
+            {"ts": self._now - 200, "ok": 0, "job": job, "error": "boom old"},
+            {
+                "ts": self._now - 100,
+                "ok": 0,
+                "job": job,
+                "error": "ValueError(\"'rogue_bss' is not a valid EntityType\")",
+            },
+        ]
+
+
+def test_failing_job_surfaces_last_error_and_failure_ts() -> None:
+    """Health says WHY a job fails, from the most recent failed poll_run."""
+    now = 1_000_100
+    health = _job_health(_FailingStore(now), None, "detect_daily", now, None)
+    assert health["status"] == "failing"
+    assert health["consecutive_failures"] == 2
+    assert health["last_error"] == "ValueError(\"'rogue_bss' is not a valid EntityType\")"
+    assert health["last_failure_ts"] == now - 100
+
+
+def test_healthy_job_has_no_last_error() -> None:
+    """A currently-ok job never carries a stale error from an earlier hiccup."""
+    now = 1_000_100
+    health = _job_health(_Store(now), None, "detect_daily", now, None)
+    assert health["status"] == "ok"
+    assert "last_error" not in health

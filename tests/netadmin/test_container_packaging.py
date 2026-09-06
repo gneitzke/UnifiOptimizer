@@ -147,9 +147,12 @@ def test_compose_has_a_commented_mcp_token_passthrough():
 def test_daemon_dockerfile_installs_the_mcp_extra():
     """Both container paths ship the optional MCP SDK (docs/MCP_SERVER.md) so
     /mcp works without a rebuild once NETADMIN_MCP_TOKEN is set. It must stay
-    an extra, never inflate the pinned 11-dependency core list elsewhere."""
+    an extra, never inflate the pinned 11-dependency core list elsewhere. The
+    ``<2`` upper bound is load-bearing: mcp 2.0 dropped the low-level
+    ``Server.list_tools()`` API the server registers, so an unbounded install
+    resolves 2.0 on a fresh build and /mcp 503s at import."""
     text = DAEMON_DOCKERFILE.read_text(encoding="utf-8")
-    assert '"mcp>=1.2"' in text
+    assert '"mcp>=1.2,<2"' in text
 
 
 # --------------------------------------------------------------------------

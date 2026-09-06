@@ -50,7 +50,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     DB_PATH=/app/data/netadmin.db \
     NETADMIN_INSTALL_METHOD=container \
-    NETADMIN_VERSION=0.8.0
+    NETADMIN_VERSION=0.8.1
 
 WORKDIR /app
 
@@ -63,6 +63,12 @@ WORKDIR /app
 # whether the package is present (netadmin/server/mcp_mount.py). The heavier
 # legacy-CLI deps in requirements.txt (matplotlib, requests, jose, urllib3<2)
 # are intentionally excluded — the daemon imports none of them.
+# The `<2` bound on mcp is load-bearing and must match pyproject's `[mcp]` extra:
+# mcp 2.0 removed the low-level `Server.list_tools()`/`call_tool()` decorators that
+# netadmin/mcp/server.py registers, so an unbounded `mcp>=1.2` resolves 2.0 on a
+# fresh build and the /mcp mount dies at import with
+# `'Server' object has no attribute 'list_tools'` (a 503). Keep the upper bound
+# until the server is ported to the 2.x API.
 RUN pip install --no-cache-dir \
       "httpx>=0.27" \
       "pydantic>=2" \
@@ -75,7 +81,7 @@ RUN pip install --no-cache-dir \
       "uvicorn[standard]>=0.24" \
       "dnspython>=2" \
       "aiomqtt>=2" \
-      "mcp>=1.2"
+      "mcp>=1.2,<2"
 
 # Application source (build context = git-archive tar + prebuilt web/dist; the tar
 # excludes every gitignored secret: data/secrets.env, data/*.db*, *.env).

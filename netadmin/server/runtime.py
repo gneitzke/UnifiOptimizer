@@ -309,12 +309,30 @@ def _job_health(
         if int(r["ok"]) == 1:
             last_ok_ts = int(r["ts"])
     consecutive_failures = 0
+    last_error: Optional[str] = None
+    last_failure_ts: Optional[int] = None
     for r in reversed(rows):
         if int(r["ok"]) == 1:
             break
         consecutive_failures += 1
+        if last_failure_ts is None:  # most recent failure (rows are ascending)
+            last_failure_ts = int(r["ts"])
+            try:
+                err = r["error"]
+            except (KeyError, IndexError):  # pragma: no cover - SELECT * always has it
+                err = None
+            last_error = str(err) if err else None
 
     result["consecutive_failures"] = consecutive_failures
+    # Surface the reason a job is failing (from ``poll_runs.error``) so the health
+    # document -- and the dashboard reading it -- says WHY, not just THAT. Without
+    # this the only way to see a crash like the daily pass's rogue_bss ValueError
+    # was to shell into the box and read the DB; the reason is already recorded, so
+    # report it. Only attached while the job is actually failing to avoid pinning a
+    # stale error to a job that has since recovered.
+    if consecutive_failures > 0 and last_error is not None:
+        result["last_error"] = last_error
+        result["last_failure_ts"] = last_failure_ts
     if last_ok_ts is None:
         # Ran but never succeeded in the window: failing, not unknown.
         result["status"] = "failing"
