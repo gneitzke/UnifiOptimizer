@@ -433,6 +433,47 @@ async def test_d6_get_read_error_is_still_retried():
     await client.aclose()
 
 
+# --------------------------------------------------------------------------- #
+# #w10a-1 -- a post-send RESPONSE-DECODING failure on a MUTATION is AMBIGUOUS.
+# The controller answered HTTP 200 (the request was fully sent), but the body is
+# undecodable (corrupt gzip / truncated stream). httpx raises httpx.DecodingError
+# while READING the body -- a RequestError that is NOT a TransportError and so is
+# absent from _RETRYABLE_EXC. The write may have landed, so it must surface as an
+# ambiguous outcome (exactly ONE dispatch, never a clean failure), not leak out as
+# an unhandled DecodingError the applier records as "failed".
+# --------------------------------------------------------------------------- #
+@respx.mock
+async def test_w10a1_mutation_response_decode_error_is_ambiguous_single_dispatch():
+    _mock_login()
+    # httpx raises DecodingError while READING/decoding the response body (corrupt
+    # gzip) -- AFTER the PUT was fully sent and the controller answered. Simulated
+    # exactly like the D6 ReadError tests, via a side_effect the transport raises.
+    route = respx.put(f"{HOST}/proxy/network/api/s/{SITE}/rest/device/abc").mock(
+        side_effect=httpx.DecodingError("Error -3 while decompressing data")
+    )
+    client = _client(max_retries=3)
+    with pytest.raises(UnifiAmbiguousOutcomeError, match="read/decoded"):
+        await client.request("PUT", "rest/device/abc", json_body={"x": 1}, allow_mutation=True)
+    assert route.call_count == 1  # exactly one dispatch -- never replayed
+    await client.aclose()
+
+
+@respx.mock
+async def test_w10a1_get_response_decode_error_keeps_existing_behavior():
+    # Symmetric guard: a decode failure on an idempotent GET keeps its EXISTING
+    # behavior -- it propagates as httpx.DecodingError (not silently swallowed as an
+    # ambiguous mutation outcome). GET reads are unaffected by the mutation-only rule.
+    _mock_login()
+    route = respx.get(DEVICE).mock(
+        side_effect=httpx.DecodingError("Error -3 while decompressing data")
+    )
+    client = _client(max_retries=3)
+    with pytest.raises(httpx.DecodingError):
+        await client.get_data("stat/device")
+    assert route.call_count == 1  # a decode error is not a retryable transport error
+    await client.aclose()
+
+
 @respx.mock
 async def test_get_still_retried_on_transport_error():
     # The C2 fix must not break GET retries: a GET recovers after transient errors.

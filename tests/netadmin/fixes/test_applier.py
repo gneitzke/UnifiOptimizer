@@ -2197,3 +2197,148 @@ async def test_d8_concurrent_live_added_radio_is_still_preserved_not_refused(sto
     assert result.applied is True  # NOT refused -- na is a live-carried radio, not step-added
     dispatched_codes = {r["radio"] for r in writer.puts[0]["radio_table"]}
     assert dispatched_codes == {"ng", "na"}  # the concurrent na is preserved
+
+
+# --------------------------------------------------------------------------- #
+# #w10a-2: an AMBIGUOUS apply must not be replayable with the same confirm token.
+# A GET showing the before-state does NOT exclude an earlier timed-out mutation
+# still processing upstream, so re-applying risks a double-apply. Before the fix a
+# second apply (same token, unchanged snapshot) dispatched AGAIN -- two 'unknown'
+# rows. The fix refuses the new apply while an uncertain change for the same
+# target/issue stands, the apply-side mirror of the revert eligibility recheck.
+# --------------------------------------------------------------------------- #
+async def test_w10a2_ambiguous_apply_cannot_be_replayed_with_same_token(store, ap_device):
+    from netadmin.fixes.models import WriteResult
+
+    # Register the radio entity so the ledger row carries a real entity_id -- exactly
+    # as production ingest does -- and the guard resolves the target.
+    store.upsert_entity(radio_entity("ng"))
+
+    ambiguous = WriteResult(
+        ok=False, status_code=None, data={"ambiguous": True, "error": "outcome unknown; not retried"}
+    )
+    writer = FakeControllerWriter(response=ambiguous)
+    applier = Applier(store, writer)
+    # issue_id left None: the ledger row still carries the resolved entity_id, so the
+    # apply-replay guard blocks on the physical target -- exactly the production path.
+    plan = _channel_plan(ap_device)
+    token = plan_confirm_token(plan)
+
+    first = await applier.apply(
+        plan, dry_run=False, confirm_token=token, current_state=_state_ok()
+    )
+    assert first.steps[0].status == "unknown"
+    assert store.list_changes()[0]["status"] == "unknown"
+    assert writer.call_count == 1  # dispatched exactly once so far
+
+    # SAME token, SAME unchanged snapshot: the replay must be REFUSED, not dispatched.
+    with pytest.raises(FixError) as exc:
+        await applier.apply(
+            plan, dry_run=False, confirm_token=token, current_state=_state_ok()
+        )
+    assert "unresolved" in str(exc.value) or "uncertain" in str(exc.value)
+    # No second dispatch, and still exactly ONE ledger row -- no duplicate 'unknown'.
+    assert writer.call_count == 1
+    assert len(store.list_changes()) == 1
+
+
+async def test_w10a2_reverting_change_blocks_a_fresh_apply_on_same_target(store, ap_device):
+    # An in-flight/interrupted revert (status 'reverting') is likewise unresolved: a
+    # fresh apply on that same target must refuse, not race a mutation the revert may
+    # still be performing.
+    store.upsert_entity(radio_entity("ng"))
+    entity = store.find_entity(EntityType.RADIO, f"{AP_MAC}:ng")
+    store.insert_change(
+        action="wifi.channel_change",
+        before={"method": "PUT", "endpoint": f"rest/device/{AP_ID}",
+                "body": {"radio_table": [{"radio": "ng", "channel": 3}]}},
+        after={"method": "PUT", "endpoint": f"rest/device/{AP_ID}",
+               "body": {"radio_table": [{"radio": "ng", "channel": 1}]}},
+        status="reverting",
+        ts=1,
+        entity_id=int(entity["entity_id"]),
+    )
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+    plan = _channel_plan(ap_device)
+    with pytest.raises(FixError):
+        await applier.apply(
+            plan, dry_run=False, confirm_token=plan_confirm_token(plan), current_state=_state_ok()
+        )
+    assert writer.call_count == 0  # nothing dispatched over the unresolved revert
+
+
+# --------------------------------------------------------------------------- #
+# #w10a-3: a rejected REVERT must not promote an UNCERTAIN apply to 'applied'.
+# A definitively-rejected restore proves only that the restore failed; it says
+# NOTHING about whether the original (uncertain) apply landed. Before the fix the
+# rejection branch unconditionally wrote 'applied', fabricating a confirmation the
+# system never had. The fix keeps the change at its PRIOR state.
+# --------------------------------------------------------------------------- #
+async def test_w10a3_rejected_revert_leaves_unknown_apply_unknown(store):
+    from netadmin.fixes.models import WriteResult
+
+    endpoint = f"rest/device/{AP_ID}"
+    change_id = store.insert_change(
+        action="wifi.channel_change",
+        before={"method": "PUT", "endpoint": endpoint,
+                "body": {"radio_table": [{"radio": "ng", "channel": 3}]}},
+        after={"method": "PUT", "endpoint": endpoint,
+               "body": {"radio_table": [{"radio": "ng", "channel": 1}]}},
+        status="unknown",  # the forward apply outcome was NEVER confirmed
+        ts=1,
+    )
+
+    class _RejectingWriter:
+        def __init__(self):
+            self.puts = 0
+
+        async def put(self, ep, body):
+            self.puts += 1
+            # A DEFINITIVE rejection (HTTP 400, no 'ambiguous' marker).
+            return WriteResult(ok=False, status_code=400, data={"error": "rejected"})
+
+        async def post(self, ep, body):  # pragma: no cover - unused
+            return await self.put(ep, body)
+
+    writer = _RejectingWriter()
+    applier = Applier(store, writer)
+    live = {"ng": {"radio": "ng", "channel": 1}}
+    write = await applier.revert(change_id, current_radios=live)
+
+    assert write.ok is False and write.status_code == 400
+    assert writer.puts == 1
+    # The rejected restore does NOT prove the uncertain apply succeeded: stay 'unknown',
+    # NEVER promote to 'applied'.
+    assert store.get_change(change_id)["status"] == "unknown"
+
+
+async def test_w10a3_rejected_revert_of_applied_change_stays_applied(store):
+    # Control: a genuinely CONFIRMED apply ('applied') whose revert is rejected DOES
+    # roll back to 'applied' -- it legitimately still stands and is retryable.
+    from netadmin.fixes.models import WriteResult
+
+    endpoint = f"rest/device/{AP_ID}"
+    change_id = store.insert_change(
+        action="wifi.channel_change",
+        before={"method": "PUT", "endpoint": endpoint,
+                "body": {"radio_table": [{"radio": "ng", "channel": 3}]}},
+        after={"method": "PUT", "endpoint": endpoint,
+               "body": {"radio_table": [{"radio": "ng", "channel": 1}]}},
+        status="applied",
+        ts=1,
+    )
+
+    class _RejectingWriter:
+        async def put(self, ep, body):
+            return WriteResult(ok=False, status_code=400, data={"error": "rejected"})
+
+        async def post(self, ep, body):  # pragma: no cover - unused
+            return await self.put(ep, body)
+
+    applier = Applier(store, _RejectingWriter())
+    live = {"ng": {"radio": "ng", "channel": 1}}
+    write = await applier.revert(change_id, current_radios=live)
+
+    assert write.ok is False
+    assert store.get_change(change_id)["status"] == "applied"

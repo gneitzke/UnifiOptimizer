@@ -110,6 +110,22 @@ _STATUS_REVERT_UNKNOWN = "revert_unknown"
 # re-dispatch, so a cancelled-mid-send revert can never be replayed as if fresh (#5).
 _STATUS_REVERTING = "reverting"
 
+# The UNCERTAIN / unresolved ledger states: a mutation was dispatched (or its send
+# was interrupted) and its outcome is NOT confirmed. A change sitting in any of these
+# means an earlier mutation on that target is still unreconciled:
+#   * ``applying``       -- interim: the process died between record and send-return;
+#   * ``unknown``        -- an ambiguous forward apply (lost response / 401);
+#   * ``reverting``      -- a restore dispatched, outcome not yet known (or interrupted);
+#   * ``revert_unknown`` -- an ambiguous restore.
+# A NEW apply against the same target must REFUSE while one of these stands (#w10a-2):
+# a GET showing the before-state does NOT prove an earlier timed-out mutation is not
+# still processing upstream, so re-dispatching risks a DOUBLE-apply. The prior outcome
+# must be reconciled by a human first -- never auto-replayed. This is the apply-side
+# mirror of the revert eligibility recheck (:meth:`_assert_revertible_status`).
+_UNCERTAIN_STATUSES = frozenset(
+    {_STATUS_APPLYING, _STATUS_UNKNOWN, _STATUS_REVERTING, _STATUS_REVERT_UNKNOWN}
+)
+
 
 # Process-wide per-device lock registry (C1). Two request-scoped appliers in the
 # same process each build their own :class:`Applier`, so the serialization locks
@@ -323,6 +339,15 @@ class Applier:
             if state_reader is not None:
                 current_state, full_state, mesh_uplinks = await state_reader()
 
+            # Apply-replay guard (#w10a-2), UNDER THE LOCK and mirroring the revert
+            # eligibility recheck. Before dispatching, refuse if ANY target this plan
+            # would mutate already carries an UNCERTAIN change (an earlier apply/revert
+            # whose outcome was never confirmed). Re-dispatching against an unresolved
+            # prior mutation risks a double-apply -- a GET showing the before-state does
+            # not prove a timed-out earlier write is not still processing upstream. The
+            # human must reconcile the prior outcome first; we never auto-replay it.
+            self._assert_no_uncertain_change(plan)
+
             # Merge-at-dispatch (P1 root cause). A ``rest/device`` PUT replaces the
             # ENTIRE ``radio_table``, so sending a plan-time snapshot re-sends every
             # untouched field/radio at its stale value -- which (a) lets step 2 of a
@@ -531,7 +556,8 @@ class Applier:
             fresh_row = self._store.get_change(change_id)
             if fresh_row is None:
                 raise FixError(f"no change with id {change_id}")
-            self._assert_revertible_status(change_id, fresh_row["status"])
+            prior_status = fresh_row["status"]
+            self._assert_revertible_status(change_id, prior_status)
             # Read-modify-write is atomic under the lock (C1): read fresh live state
             # HERE, not before acquiring it, so a concurrent revert's committed write
             # is visible and cannot be clobbered by a stale table.
@@ -601,13 +627,78 @@ class Applier:
                 )
             else:
                 # A DEFINITIVE failure (non-2xx / meta.rc=error): the restore did not
-                # land, so roll the interim 'reverting' back to 'applied' for a
-                # legitimate retry -- the change genuinely still stands.
-                self._store.update_change_status(change_id, _STATUS_APPLIED)
+                # land, so roll the interim 'reverting' back to the change's PRIOR
+                # state -- NOT unconditionally to 'applied' (#w10a-3). A rejected
+                # RESTORE proves only that the restore failed; it says NOTHING about
+                # whether the ORIGINAL apply succeeded. If the apply was confirmed
+                # ('applied'), it stays 'applied' and is legitimately retryable. But if
+                # the apply outcome was itself never confirmed ('unknown'), promoting
+                # it to 'applied' here would fabricate certainty the system never had --
+                # upgrading an uncertain apply into a confirmed one via a revert
+                # rejection. An uncertain apply must stay 'unknown'; only a genuinely
+                # 'applied' change rolls back to 'applied'.
+                restored = _STATUS_UNKNOWN if prior_status == _STATUS_UNKNOWN else _STATUS_APPLIED
+                self._store.update_change_status(change_id, restored)
                 _log.warning(
-                    "revert of change %s failed (status=%s)", change_id, write.status_code
+                    "revert of change %s failed (status=%s); left status=%s "
+                    "(a rejected restore does not confirm the original apply)",
+                    change_id,
+                    write.status_code,
+                    restored,
                 )
         return write
+
+    def _assert_no_uncertain_change(self, plan: FixPlan) -> None:
+        """Refuse a fresh apply while any target carries an UNRESOLVED change (#w10a-2).
+
+        The apply-side of the concurrent/duplicate-mutation guard, and the mirror of
+        :meth:`_assert_revertible_status` on the revert path. For each device/radio this
+        plan would mutate, look up its ledger entity and scan its change rows: if one is
+        in an UNCERTAIN state (:data:`_UNCERTAIN_STATUSES` -- an ambiguous apply, an
+        in-flight/interrupted or ambiguous revert), the prior mutation's outcome was
+        never confirmed. Dispatching a NEW mutation against that same target could
+        double-apply an earlier write that a timed-out response left still processing
+        upstream, so refuse: the operator must reconcile the live state via a read and
+        resolve the stale row before a new apply is allowed. Runs UNDER THE DEVICE LOCK
+        (its caller holds it), so a concurrent apply's just-recorded uncertain row is
+        visible here rather than raced past.
+        """
+        def _refuse_if_uncertain(rows: Iterable[Any], target: str) -> None:
+            for change in rows:
+                status = change["status"] if "status" in change.keys() else None
+                if status in _UNCERTAIN_STATUSES:
+                    raise FixError(
+                        f"target '{target}' has an unresolved change "
+                        f"(id {int(change['id'])}, status '{status}') whose outcome was "
+                        "never confirmed; refusing to apply a new mutation over it -- "
+                        "reconcile the live state via a read and resolve that change "
+                        "first, do not replay an uncertain outcome"
+                    )
+
+        # (a) Per physical target (device/radio): the strongest identity, and the one
+        # that holds in production where ingest has registered the entity. A resolved
+        # entity's uncertain ledger row blocks a new mutation on that exact target.
+        seen: set[int] = set()
+        for step in plan.steps:
+            row = self._store.find_entity(step.target_entity_type, step.target_native_id)
+            if row is None:
+                continue
+            entity_id = int(row["entity_id"])
+            if entity_id in seen:
+                continue
+            seen.add(entity_id)
+            _refuse_if_uncertain(
+                self._store.list_changes(entity_id=entity_id), step.target_native_id
+            )
+        # (b) By issue: a re-apply presents the SAME confirm token => the SAME plan and
+        # issue, so an ambiguous change this very issue produced blocks its own replay
+        # even if the entity is not separately registered. Only when the plan carries an
+        # issue id (a NULL issue_id would over-match every unattributed change).
+        if plan.issue_id is not None:
+            target = plan.steps[0].target_native_id if plan.steps else f"issue {plan.issue_id}"
+            _refuse_if_uncertain(
+                self._store.list_changes(issue_id=plan.issue_id), target
+            )
 
     @staticmethod
     def _assert_revertible_status(
