@@ -1154,3 +1154,209 @@ def test_d_real_gap_still_freezes(repo: Repository) -> None:
     cov = repo.observed_event_coverage(start, now)
     assert cov < EVENT_COVERAGE_MIN
     assert cov < 0.2
+
+
+# --------------------------------------------------------------------------- #
+# D2 (normalization-read outage earns no false coverage): a WS event consumed off
+# the socket whose entity-resolution READ is still failing sits RETAINED RAW,
+# unprocessed. ``_drain_pending_raw`` swallows the read error and ``_flush``
+# returns an empty batch, so the periodic loop used to emit a HEARTBEAT anyway --
+# crediting observed coverage across a span of UNPROCESSED history. An event-based
+# detector then reads that span as observed and can false-clear a live issue (the
+# B4 harm). A heartbeat (positive liveness = connected AND draining successfully)
+# must NOT fire while a raw event is stuck; coverage ends at the last truly-drained
+# beat and resumes once the read recovers and the raw buffer empties.
+# --------------------------------------------------------------------------- #
+def test_d2_no_heartbeat_while_raw_event_pending_renormalization(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    real_find = repo.find_entity
+
+    def locked_find(etype: EntityType, mac: str) -> Any:
+        raise sqlite3.OperationalError("database is locked")
+
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=0.0)
+    listener.connection_state = "connected"
+
+    # One consumed-but-unnormalized event is retained RAW because its entity read
+    # blipped (exactly as the consumer loop does on a transient read error).
+    ev = Event.model_validate(
+        {"_id": "d2", "key": "EVT_WU_Connected", "time": 1_721_600_000_000, "user": CLIENT_MAC}
+    )
+    listener._pending_raw.append(ev)
+
+    # The read stays down across the whole [100, 160] span. Each tick flushes
+    # (raw stays stuck) then tries to beat.
+    monkeypatch.setattr(repo, "find_entity", locked_find)
+    for t in (100, 130, 160):
+        listener._flush()  # drains raw -> still stuck, keeps _storage_error set
+        listener._maybe_heartbeat(now=t)
+        listener._last_heartbeat_ts = None  # remove rate-limit as the only guard
+
+    beats = [r for r in repo.read_poll_runs("ws", 0, 10_000) if r["error"] == "heartbeat"]
+    assert beats == []  # NO positive liveness while a raw event is unprocessed
+    # The unprocessed span is NOT credited as observed -> detectors freeze there.
+    assert repo.observed_event_coverage(100, 161) == 0.0
+    assert listener._pending_raw  # still stuck
+
+    # Reads recover: the raw event re-normalizes, the buffer empties, and the very
+    # next tick resumes heartbeats.
+    monkeypatch.setattr(repo, "find_entity", real_find)
+    listener._flush()
+    assert listener._pending_raw == []
+    assert listener._storage_error is None
+    listener._maybe_heartbeat(now=200)
+    beats = [r for r in repo.read_poll_runs("ws", 0, 10_000) if r["error"] == "heartbeat"]
+    assert len(beats) == 1 and int(beats[0]["ts"]) == 200
+    # The retained event itself was persisted once the read came back.
+    assert {r["native_id"] for r in repo.read_events(0, 2_000_000_000)} == {"d2"}
+
+
+# --------------------------------------------------------------------------- #
+# D5 (rescued events must not strand). (1) When storage recovers DURING a
+# replacement listener's life, the events rescued from a prior dead listener must
+# be persisted PROMPTLY -- not left queued until this new listener itself dies. The
+# supervisor now drains rescued buffers whenever a listener proves storage healthy
+# (a heartbeat), mid-life. The repro left persisted IDs == ['new'] with the rescued
+# event still pending after recovery.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_d5_rescued_events_drain_during_replacement_listener_life(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    rescued_ev = Event.model_validate(
+        {"_id": "rescued", "key": "EVT_X", "time": 1_721_600_000_000}
+    )
+    new_ev = Event.model_validate({"_id": "new", "key": "EVT_X", "time": 1_721_600_000_100})
+
+    real_store = repo.record_events_enriching_entities
+    storage = {"down": True}
+
+    def flaky(rows: object) -> int:
+        if storage["down"]:
+            raise sqlite3.OperationalError("database is locked")
+        return real_store(rows)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repo, "record_events_enriching_entities", flaky)
+
+    sup: WsSupervisor
+    snap: dict[str, Any] = {}
+
+    class _MidlifeRecovers:
+        """Replacement listener: storage recovers during its life. It persists its
+        OWN new event and, via the supervisor's healthy-drain hook, must flush the
+        rescued events too -- all BEFORE it returns/dies."""
+
+        def __init__(self) -> None:
+            self.on_connection_state: Optional[Any] = None
+            self.on_healthy_drain: Optional[Any] = None
+            self.terminal_state: Optional[str] = None
+
+        def pending_records(self) -> list[dict[str, Any]]:
+            return []
+
+        def pending_raw_records(self) -> list[Event]:
+            return []
+
+        async def run(self) -> int:
+            if self.on_connection_state is not None:
+                self.on_connection_state("connected")
+            # Storage has recovered mid-life: this listener commits its own event ...
+            storage["down"] = False
+            record = EventNormalizer(repo).normalize(new_ev)
+            assert record is not None
+            repo.record_events_enriching_entities([record])
+            # ... and signals a healthy drain (as a heartbeat would). The supervisor
+            # must hand off the rescued events NOW.
+            if self.on_healthy_drain is not None:
+                self.on_healthy_drain()
+            # Snapshot mid-life -- before this listener returns/dies.
+            snap["pending"] = list(sup._pending)
+            snap["stored"] = {r["native_id"] for r in repo.read_events(0, 2_000_000_000)}
+            sup.stop()
+            return 0
+
+    attempt = {"n": 0}
+
+    def factory() -> Any:
+        attempt["n"] += 1
+        if attempt["n"] == 1:
+            # Buffers `rescued`, every flush fails -> dies with it uncommitted.
+            return EventListener(FakeWs([rescued_ev]), repo, flush_interval=None)
+        return _MidlifeRecovers()
+
+    async def fake_sleep(delay: float) -> None:
+        # Storage is STILL down at the start-of-loop drain for attempt 2, so the
+        # rescued event is only drainable from inside the replacement's life.
+        pass
+
+    sup = WsSupervisor(factory, repo, backoff_base=0.0, max_restarts=5, sleep=fake_sleep)
+    await asyncio.wait_for(sup.run(), timeout=5.0)
+
+    # Rescued event was persisted DURING the replacement's life (mid-life snapshot),
+    # alongside the listener's own new event -- not left pending.
+    assert snap["pending"] == []
+    assert snap["stored"] == {"new", "rescued"}
+
+
+# --------------------------------------------------------------------------- #
+# D5 (2): cancellation/shutdown must drain rescued events, not strand them. The
+# cancel path rescued the dying listener's batch then raised immediately, bypassing
+# the post-loop drain -- so buffered events sat stranded through shutdown even when
+# storage was healthy. A FINAL drain in a finally BEFORE propagating the cancel
+# persists both the previously-rescued events and the dying listener's batch.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_d5_cancellation_drains_rescued_events(repo: Repository) -> None:
+    normalizer = EventNormalizer(repo)
+    rescued = normalizer.normalize(
+        Event.model_validate({"_id": "rescued", "key": "EVT_X", "time": 1_721_600_000_000})
+    )
+    dying = normalizer.normalize(
+        Event.model_validate({"_id": "dying", "key": "EVT_X", "time": 1_721_600_000_100})
+    )
+    assert rescued is not None and dying is not None
+
+    sup: WsSupervisor
+    started = asyncio.Event()
+
+    class _Blocks:
+        """A listener that connects, holds a buffered event, then blocks until the
+        supervisor is cancelled (shutdown)."""
+
+        def __init__(self) -> None:
+            self.on_connection_state: Optional[Any] = None
+            self.on_healthy_drain: Optional[Any] = None
+            self.terminal_state: Optional[str] = None
+
+        def pending_records(self) -> list[dict[str, Any]]:
+            return [dying]
+
+        def pending_raw_records(self) -> list[Event]:
+            return []
+
+        async def run(self) -> int:
+            if self.on_connection_state is not None:
+                self.on_connection_state("connected")
+            started.set()
+            await asyncio.Event().wait()  # block until cancelled
+            return 0  # pragma: no cover
+
+    sup = WsSupervisor(lambda: _Blocks(), repo, backoff_base=0.0)
+    # An event rescued from an EARLIER listener is already queued on the supervisor.
+    sup._pending = [rescued]
+
+    task = asyncio.create_task(sup.run())
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # Shutdown drained BOTH the previously-rescued event and the dying listener's
+    # batch instead of stranding them.
+    assert {r["native_id"] for r in repo.read_events(0, 2_000_000_000)} == {"rescued", "dying"}
+    assert sup._pending == []
