@@ -710,6 +710,69 @@ async def test_r2_pending_batch_survives_storage_blip_and_restart(
     assert {r["native_id"] for r in stored} == {f"e{i}" for i in range(N)}
 
 
+# --------------------------------------------------------------------------- #
+# P1 (queue-OVERFLOW boundary): the event that trips the ``_max_pending`` guard
+# must not be lost when the capacity-triggered flush raises. With N one past the
+# bound, the old code consumed the boundary event, ran the at-capacity flush
+# (which raised, storage down), and dropped that one event BEFORE it was ever
+# appended -- so rescue recovered N-1, permanently losing the last event that has
+# no stat/event recovery source. All N must persist across the blip + restart.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_p1_overflow_boundary_event_survives_storage_blip_and_restart(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 1001 with batch_size=100 -> _max_pending == max(1000, 400) == 1000, so the
+    # last event (e1000) is the one that trips the overflow guard while storage
+    # is down. Before the fix this event alone was stranded.
+    N = 1001
+    events = [
+        Event.model_validate({"_id": f"e{i}", "key": "EVT_X", "time": 1_721_600_000_000 + i})
+        for i in range(N)
+    ]
+
+    real = repo.record_events_enriching_entities
+    storage = {"down": True}
+
+    def flaky(rows: object) -> int:
+        if storage["down"]:
+            import sqlite3
+
+            raise sqlite3.OperationalError("database is locked")
+        return real(rows)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repo, "record_events_enriching_entities", flaky)
+
+    attempt = {"n": 0}
+
+    def factory() -> EventListener:
+        attempt["n"] += 1
+        if attempt["n"] == 1:
+            # Every flush fails: the first listener overflows its bounded queue
+            # while storage is down and dies with the WHOLE batch uncommitted --
+            # including the boundary event that trips ``_max_pending``.
+            return EventListener(FakeWs(events), repo, flush_interval=None, batch_size=100)
+        return EventListener(FakeWs([]), repo, flush_interval=None)
+
+    sup: WsSupervisor
+
+    async def fake_sleep(delay: float) -> None:
+        storage["down"] = False
+        if attempt["n"] >= 2:
+            sup.stop()
+
+    sup = WsSupervisor(factory, repo, backoff_base=0.0, max_restarts=5, sleep=fake_sleep)
+    await asyncio.wait_for(sup.run(), timeout=5.0)
+
+    # Zero loss: all 1001 persist, INCLUDING the overflow-boundary event e1000,
+    # and no rescued record is left stranded on the supervisor.
+    stored = repo.read_events(0, 2_000_000_000)
+    assert len(stored) == N
+    assert {r["native_id"] for r in stored} == {f"e{i}" for i in range(N)}
+    assert "e1000" in {r["native_id"] for r in stored}
+    assert sup._pending == []
+
+
 @pytest.mark.asyncio
 async def test_r2_pending_survives_when_health_accounting_also_fails(
     repo: Repository, monkeypatch: pytest.MonkeyPatch

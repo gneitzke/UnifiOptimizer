@@ -488,15 +488,31 @@ class EventListener:
             async for event in self._ws.events():
                 record = self._normalizer.normalize(event)
                 if record is not None:
-                    if len(self._batch) >= self._max_pending:
-                        # A bounded queue makes sustained storage loss visible
-                        # instead of consuming unbounded RAM.  The still-pending
-                        # batch is retained for this listener instance.
-                        self._flush()
-                        if len(self._batch) >= self._max_pending:
-                            raise RuntimeError("WS event storage queue is full")
+                    # Buffer the consumed event BEFORE any flush. A WS event has
+                    # no stat/event recovery source, so once it is pulled off the
+                    # generator it must live in the retained buffer before a flush
+                    # that could raise (storage down) can strand it. Previously the
+                    # capacity-triggered flush ran while this event was still only
+                    # a local ``record``: at the exact overflow boundary that flush
+                    # raised and the just-consumed event was lost, never reaching
+                    # the batch the supervisor rescues. Appending first guarantees a
+                    # capacity raise carries THIS event out with the rest of the
+                    # batch, so nothing is dropped across the storage blip.
                     self._batch.append(record)
-                    if len(self._batch) >= self._batch_size:
+                    if len(self._batch) > self._max_pending:
+                        # A bounded queue makes sustained storage loss visible
+                        # instead of consuming unbounded RAM. Attempt to drain; the
+                        # just-appended event is already retained, so a raise here
+                        # loses nothing -- the whole batch (including it) is kept
+                        # for rescue by the supervisor.
+                        try:
+                            self._flush()
+                        except Exception as exc:
+                            self._storage_error = exc
+                            logger.exception("WS event storage flush failed; retaining batch")
+                        if len(self._batch) > self._max_pending:
+                            raise RuntimeError("WS event storage queue is full")
+                    elif len(self._batch) >= self._batch_size:
                         try:
                             self._flush()
                         except Exception as exc:
