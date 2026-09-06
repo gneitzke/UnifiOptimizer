@@ -1184,32 +1184,72 @@ def test_open_read_only_never_migrates(tmp_db_path: Path) -> None:
 # B4: observed_event_coverage -- the honest event-feed gap signal
 # ---------------------------------------------------------------------------
 def test_observed_event_coverage_credits_healthy_connected_ws(repo: Repository) -> None:
-    """B4(b): a healthy WS-only deployment that is CONNECTED and observing reads as
+    """B4(c): a healthy WS-only deployment that is CONNECTED and observing reads as
     covered even with NO history-catchup coverage rows -- 'no catch-up rows yet'
-    must not mean 'frozen forever'. The supervisor recorded a single 'started'
-    liveness row when it connected (before the window) and nothing since (still up).
+    must not mean 'frozen forever'. The supervisor recorded a 'connected'
+    transition when its socket handshake completed (before the window) and no
+    closing row since (still up), so coverage runs through end_ts.
     """
     now = 2_000_000
     start = now - 3600
-    repo.record_poll_run(job="ws", ok=True, ts=start - 100, error="started", source="live")
+    repo.record_poll_run(job="ws", ok=True, ts=start - 100, error="connected", source="live")
     assert repo.observed_event_coverage(start, now) == pytest.approx(1.0)
 
 
-def test_observed_event_coverage_ws_started_inside_window(repo: Repository) -> None:
-    """A WS that connected partway through the window covers only from that point."""
+def test_observed_event_coverage_started_never_connected_credits_nothing(
+    repo: Repository,
+) -> None:
+    """B4(a): the P1 fix. A pre-handshake 'started' liveness row is NOT a connect:
+    a socket that entered the subscription but never completed a handshake (a
+    dangling 'started') must credit ZERO coverage. Under the old code this stale
+    'started' read as 100% covered and could false-clear real event issues."""
     now = 2_000_000
     start = now - 3600
+    # 'started' before the window and a second 'started' inside it: no 'connected'
+    # transition ever fired, so the feed was never observed.
+    repo.record_poll_run(job="ws", ok=True, ts=start - 100, error="started", source="live")
     repo.record_poll_run(job="ws", ok=True, ts=start + 1800, error="started", source="live")
+    assert repo.observed_event_coverage(start, now) == 0.0
+
+
+def test_observed_event_coverage_ws_connected_inside_window(repo: Repository) -> None:
+    """A WS whose handshake completed partway through the window covers only from
+    that point -- and the 'started' that preceded the handshake credits nothing."""
+    now = 2_000_000
+    start = now - 3600
+    # started fires first (entering the subscription), then connected at +1800.
+    repo.record_poll_run(job="ws", ok=True, ts=start + 900, error="started", source="live")
+    repo.record_poll_run(job="ws", ok=True, ts=start + 1800, error="connected", source="live")
     assert repo.observed_event_coverage(start, now) == pytest.approx(0.5, abs=1e-6)
 
 
-def test_observed_event_coverage_large_gap_reads_as_uncovered(repo: Repository) -> None:
-    """B4(c): a real large gap still freezes. The WS connected then dropped 600 s
-    into the hour and never reconnected; no history catch-up rows exist. Coverage
-    is ~0.167, well below the sufficiency floor, so the detector will UNKNOWN."""
+def test_observed_event_coverage_connect_then_disconnect_ends_interval(
+    repo: Repository,
+) -> None:
+    """B4(b): connect-then-disconnect credits ONLY the connected span, not through
+    end_ts. The WS handshake completed 100 s before the hour, then an INTERNAL
+    drop moved it to 'reconnecting' (a 'disconnected' row) 600 s in and it never
+    reconnected. Coverage is ~0.167, well below the sufficiency floor -> UNKNOWN.
+    The old code left the interval open through end_ts (a false 100%)."""
     now = 2_000_000
     start = now - 3600
-    repo.record_poll_run(job="ws", ok=True, ts=start - 100, error="started", source="live")
+    repo.record_poll_run(job="ws", ok=True, ts=start - 100, error="connected", source="live")
+    repo.record_poll_run(
+        job="ws", ok=True, ts=start + 600, error="disconnected", source="live"
+    )
+    cov = repo.observed_event_coverage(start, now)
+    assert cov == pytest.approx(600 / 3600, abs=1e-6)
+    assert cov < 0.9
+
+
+def test_observed_event_coverage_large_gap_reads_as_uncovered(repo: Repository) -> None:
+    """B4(c): a real large gap still freezes. The WS connected then the listener
+    DIED (terminal error row) 600 s into the hour and never reconnected; no
+    history catch-up rows exist. Coverage is ~0.167 -> UNKNOWN. Any non-'connected'
+    row (here a terminal error) closes the interval."""
+    now = 2_000_000
+    start = now - 3600
+    repo.record_poll_run(job="ws", ok=True, ts=start - 100, error="connected", source="live")
     repo.record_poll_run(
         job="ws", ok=False, ts=start + 600, error="ConnectionResetError: peer", source="live"
     )
@@ -1223,7 +1263,7 @@ def test_observed_event_coverage_unions_ws_and_history(repo: Repository) -> None
     counted: WS covers the first 600 s, a catch-up row the last 600 s -> ~0.33."""
     now = 2_000_000
     start = now - 3600
-    repo.record_poll_run(job="ws", ok=True, ts=start - 50, error="started", source="live")
+    repo.record_poll_run(job="ws", ok=True, ts=start - 50, error="connected", source="live")
     repo.record_poll_run(job="ws", ok=False, ts=start + 600, error="died", source="live")
     repo.record_ingest_coverage(
         kind="event_history", scope="site", interval="retained",

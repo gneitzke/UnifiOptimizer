@@ -522,8 +522,20 @@ class WsSupervisor:
 
         Called by the listener when its handshake succeeds ("connected") or it
         drops/backs off ("reconnecting"). Never inferred from the task existing.
+
+        B4: persist the REAL connection transition so event-coverage credit
+        derives from actually-connected intervals, not the pre-handshake
+        ``started`` marker. A ``connected`` row OPENS a covered interval at the
+        moment the handshake completes; any other state ("reconnecting" on an
+        internal drop, an error, a backoff) writes a ``disconnected`` row that
+        CLOSES it. A socket that never handshakes therefore emits no
+        ``connected`` row and credits nothing, and a mid-window drop ends the
+        covered interval at the drop rather than running through end_ts.
         """
+        if state == self.state:
+            return
         self.state = state
+        self._record("connected" if state == "connected" else "disconnected", ok=True)
 
     def _drain_pending(self) -> None:
         """R2: retry events rescued from a replaced listener.
@@ -551,9 +563,20 @@ class WsSupervisor:
             self._pending.extend(leftover)
 
     def _record(self, label: str, *, ok: bool, duration_ms: Optional[int] = None) -> None:
-        self._repo.record_poll_run(
-            job="ws", ok=ok, error=label, duration_ms=duration_ms, source="live"
-        )
+        """R2: health accounting is best-effort observability, never the data path.
+
+        A failure writing this ``poll_runs`` liveness row (e.g. the same storage
+        outage that killed the listener) must never propagate out of the
+        supervisor loop -- doing so would skip the pending-record rescue/drain and
+        strand buffered events that have no ``stat/event`` recovery source. Swallow
+        and log so the event hand-off always runs.
+        """
+        try:
+            self._repo.record_poll_run(
+                job="ws", ok=ok, error=label, duration_ms=duration_ms, source="live"
+            )
+        except Exception:  # noqa: BLE001 - accounting must never break the data path
+            logger.exception("Could not record WS poll_run (%s); continuing", label)
 
     async def run(self) -> None:
         backoff = self._backoff_base
@@ -600,10 +623,14 @@ class WsSupervisor:
                     clean = False
                     error = "unsupported"
             duration_ms = int((monotonic() - start) * 1000)
-            self._record(error or "stopped", ok=clean, duration_ms=duration_ms)
-            # R2: before discarding this listener, take custody of anything it
-            # buffered but could not commit (a storage failure during its run).
+            # R2: take custody of anything this dying listener buffered but could
+            # not commit BEFORE writing any health accounting. The rescue must
+            # never sit behind the terminal ``_record`` -- if both the event
+            # store and the accounting write are failing, an accounting raise
+            # ahead of the rescue would strand the buffered batch. Rescue first,
+            # then account (and ``_record`` is itself guarded, belt and braces).
             self._rescue_pending(listener)
+            self._record(error or "stopped", ok=clean, duration_ms=duration_ms)
 
             if self._stop.is_set():
                 break

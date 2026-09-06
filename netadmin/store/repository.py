@@ -1129,19 +1129,21 @@ class Repository:
         ).fetchone()
         return None if row is None or row["end_ts"] is None else int(row["end_ts"])
 
-    # B4: intervals during which the WS event feed was CONNECTED and observing,
-    # derived from the supervisor's ``job='ws'`` liveness rows in ``poll_runs``.
-    # The supervisor writes a ``started`` transition (error='started') when it
-    # enters the subscription and a terminal transition (stopped / error /
-    # unsupported) when the attempt ends; between the two the socket was up and
-    # observing (a quiet healthy socket writes no event rows but is still
-    # covered). A ``started`` with no terminator after it is a *currently* live
-    # connection, covered through ``end_ts``. This is the healthy-WS-only signal:
-    # a live feed reads as covered even before it has written any history-catchup
-    # coverage row, so 'no catch-up rows yet' never means 'frozen forever'.
+    # B4: intervals during which the WS event feed was actually CONNECTED and
+    # observing, derived from the supervisor's ``job='ws'`` liveness rows in
+    # ``poll_runs``. Coverage opens ONLY on a ``connected`` transition -- the row
+    # the supervisor writes the moment the socket handshake completes (R3) -- and
+    # closes on the next non-``connected`` row: a ``disconnected`` transition on
+    # an internal drop, or the terminal stopped/error/unsupported row when the
+    # listener dies. The pre-handshake ``started`` marker is deliberately NOT a
+    # connect: a socket that never handshaked (a dangling ``started``) credits
+    # NOTHING, and a mid-window drop ends the covered interval at the drop rather
+    # than running through ``end_ts``. A ``connected`` with no closing row after
+    # it is a genuinely still-live connection, covered through ``end_ts`` -- the
+    # healthy-WS-only signal, so 'no catch-up rows yet' never means 'frozen'.
     def _ws_connected_intervals(self, start_ts: int, end_ts: int) -> list[tuple[int, int]]:
         def _is_connect(row: sqlite3.Row) -> bool:
-            return (row["error"] or "") == "started"
+            return (row["error"] or "") == "connected"
 
         # The single latest ws transition strictly before the window fully
         # determines whether the feed was already connected entering it.
