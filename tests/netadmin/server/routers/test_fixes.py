@@ -353,8 +353,11 @@ async def test_revert_ambiguous_outcome_is_reported_unknown_not_a_definitive_rej
     # The detail must NOT assert the change definitively still stands.
     assert "was not rolled back" not in body["detail"]
     # The ledger row was not flipped to "reverted" (the write was unconfirmed), but
-    # nor is it a clean failure the operator can ignore -- reconcile via a read.
-    assert fix_env.store.get_change(change_id)["status"] == "applied"
+    # nor is it left plain "applied" -- that would let a second concurrent revert
+    # replay the restore (#2). It is recorded terminal-uncertain ("revert_unknown"):
+    # a restore was dispatched once, its outcome is unknown, and a further revert is
+    # refused until the operator reconciles via a read.
+    assert fix_env.store.get_change(change_id)["status"] == "revert_unknown"
 
 
 async def test_revert_change_not_on_issue_is_404(fix_env) -> None:

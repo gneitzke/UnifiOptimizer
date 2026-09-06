@@ -21,27 +21,34 @@ row. A real apply is gated behind, in order:
    any drift aborts the whole plan before a single call goes out. An empty
    precondition is only "satisfied" when the target was actually read; a target
    missing from the fresh snapshot is drift, never a free pass.
-#. a whole-``radio_table`` clobber guard: because a ``rest/device`` PUT replaces the
-   entire table, the payload re-sends every field the fix did *not* target at its
-   snapshot value; if any such field has diverged from live since, sending it would
-   silently overwrite a concurrent change, so that too is drift.
+Then, past the gates, each step's PUT body is built by **merge-at-dispatch**: because
+a ``rest/device`` PUT replaces the *entire* ``radio_table``, sending a plan-time
+snapshot re-sends every untouched field/radio at its stale value. Instead the body is
+assembled inside the lock by applying only the step's intended per-radio field delta
+onto the FRESH live table -- carried forward across a plan's steps -- so step 2 of a
+multi-step plan merges onto step 1's committed result (never undoing it), a concurrent
+operator's untouched-field change is preserved rather than overwritten, and a radio
+present in live but absent from the snapshot is kept rather than deleted. A merge that
+would *drop* a radio the change's before-state defined is refused (the change could not
+be fully reverted).
 
-The last two gates are the *binding*, live-state-dependent validation, and they run
-**inside** the per-device lock against state read after the lock is held -- the
-read -> validate -> write is one atomic critical section per device. Only past all
-gates does it, per step: resolve the entity, write the before-state to the
-``changes`` ledger, send through the writer, and mark the row applied/failed.
-Before-state is captured first so a revert is always possible; a step's failure
-stops the plan rather than pressing on mutating. Apply and revert are serialized per
-target device so two operations on the same device can never interleave: a second
-apply validates against the first's committed write (never a stale pre-lock
-snapshot), and a second revert re-reads the row's status under the lock and refuses
-once the first has marked it reverted, so a mutation is never replayed.
+The precondition re-check is the *binding*, live-state-dependent validation, and it
+runs **inside** the per-device lock against state read after the lock is held -- the
+read -> merge -> write is one atomic critical section per device. Only past the gates
+does it, per step: resolve the entity, write the before-state to the ``changes``
+ledger, send the merged body through the writer, and mark the row applied/failed.
+Before-state is captured first so a revert is always possible; a step's failure stops
+the plan rather than pressing on mutating. Apply and revert are serialized per target
+device so two operations on the same device can never interleave: a second apply
+merges onto the first's committed write (never a stale pre-lock snapshot), and a
+second revert re-reads the row's status under the lock and refuses once the first has
+marked it reverted (or left it revert-uncertain), so a mutation is never replayed.
 """
 
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import time
 import weakref
@@ -88,6 +95,12 @@ _STATUS_REVERTED = "reverted"
 # is NOT "failed" -- the write may have taken -- so it is never mistaken for either
 # a clean failure or a confirmed apply, and the operator reconciles via a GET (C2).
 _STATUS_UNKNOWN = "unknown"
+# Terminal-but-uncertain for a REVERT: the restore was dispatched exactly once and
+# its outcome is unknown (a lost response / a 401 it may have landed under). Like
+# _STATUS_UNKNOWN for a forward apply, it is NOT "reverted" (the restore may not
+# have taken) and NOT "applied" (a restore was attempted) -- so a second concurrent
+# revert reads this and REFUSES to re-dispatch, never replaying the mutation (#2).
+_STATUS_REVERT_UNKNOWN = "revert_unknown"
 
 
 # Process-wide per-device lock registry (C1). Two request-scoped appliers in the
@@ -316,21 +329,35 @@ class Applier:
                     f"{len(drifted)} step(s) drifted from expected state; plan aborted", drifted
                 )
 
-            # Gate 6b: whole-``radio_table`` clobber guard (C1). A ``rest/device`` PUT
-            # replaces the entire radio_table, so the payload re-sends every UNTOUCHED
-            # field at its snapshot value. If a concurrent apply committed a change to
-            # one of those fields since the snapshot, re-sending it would silently undo
-            # that change -- abort as drift. Only runs when full live state is
-            # available (``state_reader`` supplied it); a caller that passed only the
-            # narrow precondition ``current_state`` skips it (single-op, no race).
-            if full_state is not None:
-                self._assert_no_stale_overwrite(plan, full_state)
+            # Merge-at-dispatch (P1 root cause). A ``rest/device`` PUT replaces the
+            # ENTIRE ``radio_table``, so sending a plan-time snapshot re-sends every
+            # untouched field/radio at its stale value -- which (a) lets step 2 of a
+            # multi-step plan re-send step 1's radio at its OLD value and undo it (#5),
+            # and (b) lets a concurrent operator's change to an untouched field be
+            # overwritten, or a radio added to live be DELETED (#1). Instead, each
+            # step's body is built HERE, inside the lock, by applying ONLY the step's
+            # intended per-radio field delta onto the FRESH live table:
+            #
+            #   * across a plan's steps the live table is carried forward in-memory
+            #     (``carried``), so step 2 merges onto step 1's committed result and
+            #     cannot clobber it (#5);
+            #   * untouched fields keep their live value and radios present in live but
+            #     absent from the snapshot are preserved by construction (#1).
+            #
+            # The base is fresh live (``full_state``, read under the lock) when a
+            # ``state_reader`` supplied it; otherwise the step's own before-snapshot
+            # (a single-op caller with no concurrency). The device lock means no
+            # external write lands mid-plan, so the in-memory carry-forward is exact.
+            carried: dict[str, dict[str, dict[str, Any]]] = {}
 
             for step in plan.steps:
-                change_id = self._record_before(plan, step, now)
+                dev_key = _endpoint_device(step.endpoint)
+                base = self._merge_base(step, dev_key, carried, full_state)
+                dispatch_body, merged = self._merge_step_onto(step, base)
+                change_id = self._record_before(plan, step, now, dispatch_body)
                 change_ids.append(change_id)
                 try:
-                    write = await self._dispatch(step)
+                    write = await self._dispatch_raw(step.method, step.endpoint, dispatch_body)
                 except Exception as exc:  # noqa: BLE001 - a transport failure is a step failure
                     self._store.update_change_status(change_id, _STATUS_FAILED)
                     results.append(StepResult(step, _STATUS_FAILED, change_id, None, str(exc)))
@@ -339,6 +366,10 @@ class Applier:
                     break
 
                 if write.ok:
+                    # Carry the just-written table forward so a later step on the SAME
+                    # device merges onto THIS result, not the pre-plan snapshot (#5).
+                    if merged is not None:
+                        carried[dev_key] = merged
                     self._store.update_change_status(change_id, _STATUS_APPLIED)
                     results.append(StepResult(step, _STATUS_APPLIED, change_id, write))
                 elif _write_is_ambiguous(write):
@@ -425,8 +456,7 @@ class Applier:
         row = self._store.get_change(change_id)
         if row is None:
             raise FixError(f"no change with id {change_id}")
-        if row["status"] == _STATUS_REVERTED:
-            raise FixError(f"change {change_id} already reverted")
+        self._assert_revertible_status(change_id, row["status"])
 
         before = json.loads(row["before_json"]) if row["before_json"] else {}
         after = json.loads(row["after_json"]) if row["after_json"] else {}
@@ -449,8 +479,7 @@ class Applier:
             fresh_row = self._store.get_change(change_id)
             if fresh_row is None:
                 raise FixError(f"no change with id {change_id}")
-            if fresh_row["status"] == _STATUS_REVERTED:
-                raise FixError(f"change {change_id} already reverted")
+            self._assert_revertible_status(change_id, fresh_row["status"])
             # Read-modify-write is atomic under the lock (C1): read fresh live state
             # HERE, not before acquiring it, so a concurrent revert's committed write
             # is visible and cannot be clobbered by a stale table.
@@ -497,11 +526,42 @@ class Applier:
             write = await self._dispatch_raw(method, str(endpoint), restore_body)
             if write.ok:
                 self._store.update_change_status(change_id, _STATUS_REVERTED, reverted_ts=now)
+            elif _write_is_ambiguous(write):
+                # #2: the restore was dispatched but its outcome is unknown (a lost
+                # response, or a 401 it may have landed under). Record it as terminal-
+                # uncertain UNDER THE LOCK so a second concurrent revert re-reads this
+                # status and REFUSES to re-dispatch -- an ambiguous first revert must
+                # block the second from replaying the mutation. It is NOT 'reverted'
+                # (the restore may not have taken); the operator reconciles via a read.
+                self._store.update_change_status(change_id, _STATUS_REVERT_UNKNOWN)
+                _log.warning(
+                    "revert of change %s ambiguous; marked revert_unknown to block replay",
+                    change_id,
+                )
             else:
+                # A DEFINITIVE failure (non-2xx / meta.rc=error): the restore did not
+                # land, so leave the row 'applied' for a legitimate retry.
                 _log.warning(
                     "revert of change %s failed (status=%s)", change_id, write.status_code
                 )
         return write
+
+    @staticmethod
+    def _assert_revertible_status(change_id: int, status: Any) -> None:
+        """Refuse a revert whose row is already reverted or revert-uncertain (#2).
+
+        ``reverted`` is a completed rollback; ``revert_unknown`` is a rollback that was
+        already dispatched once with an unconfirmed outcome. Re-dispatching either would
+        replay the mutation, so both are refused -- the second of two concurrent reverts
+        sees the first's terminal (or terminal-uncertain) status under the lock and stops.
+        """
+        if status == _STATUS_REVERTED:
+            raise FixError(f"change {change_id} already reverted")
+        if status == _STATUS_REVERT_UNKNOWN:
+            raise FixError(
+                f"change {change_id} revert was already attempted with an unknown/ambiguous "
+                "outcome; not replaying -- reconcile the live state via a read first"
+            )
 
     @staticmethod
     def _fresh_restore_table(
@@ -520,6 +580,13 @@ class Applier:
         live value is neither the value we set nor the value we would restore has
         been changed by someone else -- that is a conflict, and we refuse rather
         than silently overwrite it.
+
+        A radio present in ``before`` but ABSENT from ``after`` was DELETED by the
+        dispatched change (its whole-table PUT dropped it). Its inverse iterates only
+        ``after`` entries, so the deletion would never enter the touched set and the
+        revert would silently leave the radio gone while marking the row 'reverted'
+        (#6). Detect it and refuse: a change that deleted a radio has no complete
+        inverse from ``radio_table`` alone, so it is not fully revertible.
         """
         before_radios = {
             r.get("radio"): r for r in (before_body.get("radio_table") or []) if isinstance(r, dict)
@@ -527,6 +594,16 @@ class Applier:
         after_radios = {
             r.get("radio"): r for r in (after_body.get("radio_table") or []) if isinstance(r, dict)
         }
+        deleted_radios = sorted(
+            str(code) for code in before_radios if code not in after_radios
+        )
+        if deleted_radios:
+            raise SafetyViolation(
+                f"revert of change {change_id} cannot complete: the applied change dropped "
+                f"radio(s) {deleted_radios} that its before-state defined, so restoring only "
+                "the radios it touched would leave them absent -- this change is not fully "
+                "revertible"
+            )
         touched: dict[Any, set[str]] = {}
         for radio, aentry in after_radios.items():
             bentry = before_radios.get(radio, {})
@@ -568,19 +645,35 @@ class Applier:
     # ------------------------------------------------------------------ #
     # Internals
     # ------------------------------------------------------------------ #
-    def _record_before(self, plan: FixPlan, step: FixStep, now: int) -> int:
+    def _record_before(
+        self, plan: FixPlan, step: FixStep, now: int, dispatched_body: Mapping[str, Any]
+    ) -> int:
         """Insert the before-state ledger row (interim status) prior to sending.
 
-        The stored ``after`` is the ACTUAL dispatched operation
-        (``step.method``/``endpoint``/``payload``), never the planner-supplied
-        ``step.after``. :meth:`revert` derives the fields to roll back from
-        ``after`` vs ``before``; recording the real dispatch there means a forged or
-        stale ``step.after`` (e.g. one set equal to ``before`` to disguise a change)
-        can never make the later revert a no-op that re-sends the current value
-        instead of restoring the original (S2). For every legitimate step
-        ``step.after.body`` already equals ``step.payload``, so this is a no-op for
-        them and only closes the forgery seam.
+        The stored ``after`` is the ACTUAL dispatched operation, never the
+        planner-supplied ``step.after``. :meth:`revert` derives the fields to roll
+        back from ``after`` vs ``before``; recording the real dispatch means a forged
+        or stale ``step.after`` (e.g. one set equal to ``before`` to disguise a
+        change) can never make the later revert a no-op that re-sends the current
+        value instead of restoring the original (S2).
+
+        The recorded ``after`` is the step's before-body with ONLY the step's field
+        delta applied -- NOT the raw merged bytes on the wire. The merged bytes carry
+        live values for fields the step never touched (merge-at-dispatch preserves a
+        concurrent operator's work); recording those would make revert think WE
+        changed them and try to roll them back, clobbering that work. Recording
+        before+delta keeps ``after``-vs-``before`` equal to exactly the fields this
+        step changed, so revert restores those and leaves everything else at its
+        current live value.
         """
+        _ = dispatched_body  # the wire bytes carry live values for untouched fields;
+        # the recorded after is before+delta (see docstring), not the raw merge.
+        after_body = self._intended_after_body(step)
+        return self._insert_change_row(plan, step, now, after_body)
+
+    def _insert_change_row(
+        self, plan: FixPlan, step: FixStep, now: int, after_body: Mapping[str, Any]
+    ) -> int:
         entity_id = None
         row = self._store.find_entity(step.target_entity_type, step.target_native_id)
         if row is not None:
@@ -588,7 +681,7 @@ class Applier:
         dispatched_after = {
             "method": step.method,
             "endpoint": step.endpoint,
-            "body": step.payload or {},
+            "body": dict(after_body),
         }
         return self._store.insert_change(
             action=step.action.value,
@@ -600,8 +693,145 @@ class Applier:
             entity_id=entity_id,
         )
 
-    async def _dispatch(self, step: FixStep) -> WriteResult:
-        return await self._dispatch_raw(step.method, step.endpoint, step.payload)
+    # ------------------------------------------------------------------ #
+    # Merge-at-dispatch (P1 root cause)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _step_radio_delta(step: FixStep) -> dict[str, dict[str, Any]]:
+        """The per-radio ``{field: new_value}`` this step *intends* to set.
+
+        Derived from the step's own payload vs its recorded before-body -- the fields
+        where the payload differs from before, per radio. This is the "intended
+        change" that merge-at-dispatch layers onto the fresh live table, and the delta
+        that :meth:`_intended_after_body` records so a revert rolls back exactly it.
+        The ``radio`` key itself is never a delta field.
+        """
+        payload = step.payload if isinstance(step.payload, Mapping) else {}
+        payload_radios = payload.get("radio_table") or []
+        before_body = (step.before or {}).get("body") if isinstance(step.before, dict) else {}
+        before_radios = {
+            str(r.get("radio")): r
+            for r in ((before_body or {}).get("radio_table") or [])
+            if isinstance(r, dict) and r.get("radio") is not None
+        }
+        delta: dict[str, dict[str, Any]] = {}
+        for r in payload_radios:
+            if not isinstance(r, dict) or r.get("radio") is None:
+                continue
+            code = str(r["radio"])
+            brow = before_radios.get(code, {})
+            fields = {k: v for k, v in r.items() if k != "radio" and brow.get(k) != v}
+            if fields:
+                delta[code] = fields
+        return delta
+
+    @staticmethod
+    def _intended_after_body(step: FixStep) -> dict[str, Any]:
+        """The step's before-body with its field delta applied (the recorded after).
+
+        Structurally identical to ``before`` -- same radios, same top-level keys --
+        with only the fields the step changes set to their new value. Keeping the full
+        before shape (rather than the delta alone) means ``after`` and ``before`` name
+        the same radios, so the revert's deleted-radio guard never false-fires, and
+        ``after``-vs-``before`` is exactly this step's change.
+        """
+        before_body = (step.before or {}).get("body") if isinstance(step.before, dict) else None
+        delta = Applier._step_radio_delta(step)
+        if not isinstance(before_body, dict) or not isinstance(
+            before_body.get("radio_table"), list
+        ):
+            # No restorable before radio_table (a gated radio step always has one);
+            # fall back to the raw payload so nothing is silently dropped.
+            return dict(step.payload or {})
+        body = copy.deepcopy(before_body)
+        existing: set[str] = set()
+        for entry in body.get("radio_table", []):
+            if not isinstance(entry, dict):
+                continue
+            code = str(entry.get("radio"))
+            existing.add(code)
+            if code in delta:
+                entry.update(delta[code])
+        for code, fields in delta.items():
+            if code not in existing:
+                body.setdefault("radio_table", []).append({"radio": code, **fields})
+        return body
+
+    def _merge_base(
+        self,
+        step: FixStep,
+        dev_key: str,
+        carried: Mapping[str, dict[str, dict[str, Any]]],
+        full_state: Optional[Mapping[str, Mapping[str, Mapping[str, Any]]]],
+    ) -> Optional[dict[str, dict[str, Any]]]:
+        """The ``{radio_code: {attr: value}}`` table this step's delta merges onto.
+
+        Preference order: the table carried forward from an earlier step on the SAME
+        device (so step 2 merges onto step 1's committed result, #5); else the fresh
+        live table read under the lock (``full_state``, which also carries a concurrent
+        operator's untouched-field/added-radio changes, #1); else the step's own
+        before-snapshot (a single-op caller that passed no ``state_reader``). Returns
+        ``None`` only when there is no radio_table to merge (a non-radio step), so the
+        caller sends the payload unchanged.
+        """
+        if dev_key in carried:
+            return carried[dev_key]
+        base: dict[str, dict[str, Any]] = {}
+        if full_state is not None and dev_key in full_state:
+            for code, entry in full_state[dev_key].items():
+                if entry is not None:
+                    base[str(code)] = dict(entry)
+        else:
+            before_body = (step.before or {}).get("body") if isinstance(step.before, dict) else None
+            radios = before_body.get("radio_table") if isinstance(before_body, dict) else None
+            for r in radios or []:
+                if isinstance(r, dict) and r.get("radio") is not None:
+                    base[str(r["radio"])] = dict(r)
+        if not base:
+            return None
+        return base
+
+    def _merge_step_onto(
+        self, step: FixStep, base: Optional[Mapping[str, dict[str, Any]]]
+    ) -> tuple[dict[str, Any], Optional[dict[str, dict[str, Any]]]]:
+        """Build the whole-``radio_table`` PUT body by merging the step's delta onto
+        ``base``. Returns ``(dispatch_body, merged_table)``; ``merged_table`` is the
+        carry-forward state for the next step (``None`` when no merge happened).
+
+        A radio present in the step's before-state must survive the merge: if the live
+        base no longer carries it, the whole-table PUT would DELETE it and the change
+        could never be fully reverted (the deleted radio has no inverse). That is an
+        anomalous device state (a radio vanished between plan and apply), so refuse
+        rather than dispatch a not-fully-revertible write (defends the revertibility
+        invariant; the revert side detects the same class for older rows, #6).
+        """
+        if base is None:
+            return dict(step.payload or {}), None
+        delta = self._step_radio_delta(step)
+        merged: dict[str, dict[str, Any]] = {code: dict(entry) for code, entry in base.items()}
+        for code, fields in delta.items():
+            if code in merged:
+                merged[code].update(fields)
+            else:
+                merged[code] = {"radio": code, **fields}
+        for code, entry in merged.items():
+            entry.setdefault("radio", code)
+        before_body = (step.before or {}).get("body") if isinstance(step.before, dict) else {}
+        before_codes = {
+            str(r.get("radio"))
+            for r in ((before_body or {}).get("radio_table") or [])
+            if isinstance(r, dict) and r.get("radio") is not None
+        }
+        dropped = sorted(c for c in before_codes if c not in merged)
+        if dropped:
+            raise SafetyViolation(
+                f"step '{step.description}' would drop radio(s) {dropped} present in its "
+                "before-state (no longer in live state) from a whole-table PUT; the "
+                "resulting change could not be fully reverted -- refusing"
+            )
+        body = {k: v for k, v in (step.payload or {}).items() if k != "radio_table"}
+        body["radio_table"] = list(merged.values())
+        return body, merged
 
     async def _dispatch_raw(
         self, method: str, endpoint: str, body: Mapping[str, Any]
@@ -893,72 +1123,6 @@ class Applier:
             if any(k not in live or live[k] != v for k, v in expected.items()):
                 drifted.append(step)
         return drifted
-
-    @staticmethod
-    def _assert_no_stale_overwrite(
-        plan: FixPlan,
-        full_state: Mapping[str, Mapping[str, Mapping[str, Any]]],
-    ) -> None:
-        """Refuse a whole-``radio_table`` PUT that would clobber a field changed since
-        the plan was built (C1 apply race).
-
-        The narrow precondition re-check only asserts the ONE attribute a fix targets.
-        But a ``rest/device`` PUT replaces the entire ``radio_table``, so the payload
-        carries the whole captured device snapshot with just the target field changed
-        -- every OTHER field it re-sends equals its value at snapshot time (the step's
-        recorded ``before``). If, by the time the per-device lock is held, a concurrent
-        apply has committed a change to one of those untouched fields, re-sending the
-        snapshot value would silently undo it. This compares each payload field against
-        fresh live state (read under the lock) and aborts the whole plan as drift when
-        an untouched field has diverged -- so the second of two concurrent applies
-        fails rather than overwriting the first's committed change with stale bytes.
-
-        ``full_state`` maps each target device key (:func:`_endpoint_device`) to the
-        whole live ``{radio_code: {attr: value}}``. A target device (or radio) missing
-        from it is unverifiable, and -- exactly as the precondition re-check treats a
-        missing snapshot -- counts as drift: we never mutate on unverified state.
-        """
-        drifted: list[FixStep] = []
-        for step in plan.steps:
-            payload_radios = step.payload.get("radio_table") if step.payload else None
-            if not payload_radios:
-                continue  # not a whole-table PUT -- nothing to clobber here
-            live_radios = full_state.get(_endpoint_device(step.endpoint))
-            if live_radios is None:
-                drifted.append(step)  # unverifiable device -> drift
-                continue
-            before_body = (step.before or {}).get("body", {}) if step.before else {}
-            before_radios = {
-                r.get("radio"): r for r in (before_body.get("radio_table") or [])
-            }
-            conflict = False
-            for entry in payload_radios:
-                radio = entry.get("radio")
-                live = live_radios.get(radio)
-                if live is None:
-                    conflict = True  # radio vanished / unreadable -> unverified
-                    break
-                before_entry = before_radios.get(radio, {})
-                for field, payload_val in entry.items():
-                    if field == "radio":
-                        continue
-                    if payload_val != before_entry.get(field):
-                        continue  # the field this step intends to change (or add)
-                    # An UNTOUCHED field the PUT will re-send at its snapshot value;
-                    # if live has diverged, sending it would overwrite a newer change.
-                    if field in live and live[field] != payload_val:
-                        conflict = True
-                        break
-                if conflict:
-                    break
-            if conflict:
-                drifted.append(step)
-        if drifted:
-            raise PreconditionDrift(
-                f"{len(drifted)} step(s) would overwrite a field changed since the plan "
-                "was built (a concurrent apply); plan aborted",
-                drifted,
-            )
 
     @staticmethod
     def _assert_min_rssi_safe(plan: FixPlan) -> None:
