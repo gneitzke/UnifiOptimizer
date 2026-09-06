@@ -40,6 +40,24 @@ def test_adapter_satisfies_protocol(store_repo) -> None:
     assert isinstance(store_repo, IssueRepository)  # runtime_checkable structural check
 
 
+def test_get_entity_tolerates_inventory_only_rogue_bss(store_repo) -> None:
+    # "Foreign AP broadcasting our SSID" issues are keyed to the collector's
+    # rogue_bss inventory rows, whose entity_type is deliberately NOT an
+    # EntityType. Parentage inhibition calls get_entity on them during
+    # reconciliation; it must return the row, not raise ValueError coercing
+    # "rogue_bss" -- that crash took down the whole daily pass's issue step even
+    # after the detectors ran fine.
+    from netadmin.domain.entities import Entity
+
+    eid = store_repo._store.upsert_entity(
+        Entity(entity_type="rogue_bss", native_id="00:11:22:33:44:55", site_id="default"),  # type: ignore[arg-type]
+        ts=TS,
+    )
+    ent = store_repo.get_entity(eid)
+    assert ent is not None
+    assert ent.entity_type == "rogue_bss"  # kept raw, exactly as the store holds it
+
+
 def test_full_lifecycle_on_real_store(store_repo, make_finding) -> None:
     engine = _engine(store_repo)
     finding = make_finding(native_id="integration-port")

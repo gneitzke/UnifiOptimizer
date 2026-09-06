@@ -66,10 +66,28 @@ def _issue_from_row(row: sqlite3.Row) -> Issue:
     )
 
 
+def _coerce_entity_type(value: object) -> object:
+    """``EntityType`` when ``value`` names one, else the raw string.
+
+    An issue can legitimately reference an inventory-only entity that is
+    deliberately not an :class:`EntityType` -- the "Foreign AP broadcasting our
+    SSID" issues are keyed to the collector's ``rogue_bss`` rows. Parentage
+    inhibition just walks ``parent_id``, so it needs the row back, not a crash:
+    coercing "rogue_bss" through ``EntityType()`` raised ``ValueError`` and took
+    down the whole daily pass's issue-reconciliation step. The collector already
+    stores these rows with a raw-string ``entity_type`` (``ingest.collector``), so
+    keeping it raw here round-trips the same value the store holds.
+    """
+    try:
+        return EntityType(value)
+    except ValueError:
+        return value
+
+
 def _entity_from_row(row: sqlite3.Row) -> Entity:
     """Rehydrate an :class:`Entity` from an ``entities`` row (parentage walks)."""
     return Entity(
-        entity_type=EntityType(row["entity_type"]),
+        entity_type=_coerce_entity_type(row["entity_type"]),  # type: ignore[arg-type]
         native_id=row["native_id"],
         site_id=row["site_id"],
         entity_id=row["entity_id"],
