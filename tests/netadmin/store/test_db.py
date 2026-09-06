@@ -38,6 +38,9 @@ def _rewind_below_0009(conn: sqlite3.Connection, version: int) -> None:
     conn.execute("DROP INDEX idx_incident_members_current_issue")
     for col in ("joined_ts", "cleared_ts"):
         conn.execute(f"ALTER TABLE incident_members DROP COLUMN {col}")
+    # 0013 (events.reconcile_attempts) is another forward-only ADD COLUMN; drop it
+    # too so the rewound-and-reapplied chain runs 0013 against its pre-0013 shape.
+    conn.execute("ALTER TABLE events DROP COLUMN reconcile_attempts")
     conn.execute(f"PRAGMA user_version={version}")
 
 
@@ -149,6 +152,9 @@ def test_migration_0010_backfills_existing_incident_member_joined_ts(
     conn.execute("DROP INDEX idx_incident_members_current_issue")
     conn.execute("ALTER TABLE incident_members DROP COLUMN joined_ts")
     conn.execute("ALTER TABLE incident_members DROP COLUMN cleared_ts")
+    # 0013 (events.reconcile_attempts) rode along in the full apply; drop it so the
+    # reapplied chain re-runs 0013 cleanly instead of duplicating the column.
+    conn.execute("ALTER TABLE events DROP COLUMN reconcile_attempts")
     conn.execute("PRAGMA user_version=9")
 
     assert db.apply_migrations(conn)[0] == 10
@@ -165,6 +171,9 @@ def test_migration_0011_creates_ingest_coverage_table(tmp_db_path: Path) -> None
     db.apply_migrations(conn)
     # Reconstruct a pre-0011 database: drop the table and rewind to v10.
     conn.execute("DROP TABLE ingest_coverage")
+    # 0013 (events.reconcile_attempts) also rode along; drop its column so the
+    # reapplied chain re-runs 0013 cleanly instead of duplicating the column.
+    conn.execute("ALTER TABLE events DROP COLUMN reconcile_attempts")
     conn.execute("PRAGMA user_version=10")
     assert not conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ingest_coverage'"
@@ -205,9 +214,13 @@ def test_migration_0012_preserves_populated_sle_minutes_and_splits_attribution(
     )
     # 0011 is owned by a concurrent change and does not alter this table; this
     # reconstructed shape is precisely the schema immediately before 0012.
+    # 0013 (events.reconcile_attempts) rode along in the full apply above; drop its
+    # column so the reapplied chain re-runs it cleanly rather than duplicating it.
+    conn.execute("ALTER TABLE events DROP COLUMN reconcile_attempts")
     conn.execute("PRAGMA user_version=11")
 
-    assert db.apply_migrations(conn) == [12]
+    # Rewinding to v11 leaves both 0012 and the later 0013 pending.
+    assert db.apply_migrations(conn) == [12, 13]
     conn.execute(
         "INSERT INTO sle_minutes VALUES (0, 'coverage', 'weak_signal', 7, 12, 3.0)"
     )
@@ -663,6 +676,9 @@ def test_migration_0009_carries_live_snoozes_into_suppression(tmp_db_path: Path)
     conn.execute("DROP INDEX idx_incident_members_current_issue")
     for col in ("joined_ts", "cleared_ts"):
         conn.execute(f"ALTER TABLE incident_members DROP COLUMN {col}")
+    # 0013 rode along in the full apply above; drop its column so the reapplied
+    # chain re-runs it cleanly rather than duplicating the column.
+    conn.execute("ALTER TABLE events DROP COLUMN reconcile_attempts")
     conn.execute("PRAGMA user_version=8")  # rewind to the pre-suppression schema
     _seed_snoozes_pre_0009(conn)
 

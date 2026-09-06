@@ -81,6 +81,19 @@ _WS_HEARTBEAT_LABEL = "heartbeat"
 # heartbeat interval in events.py; do not widen it back toward the window size.
 _WS_HEARTBEAT_MAX_GAP_S = 75
 
+# C7/P2: how many reconcile passes a row may be *selected without being filled*
+# before it is parked (stops consuming the oldest-first LIMIT window). It is a
+# retry budget for a "pending from-AP" whose named MAC has not yet reached
+# inventory: high enough that a genuinely-pending row is retried across many
+# catch-up/flush cycles before being set aside, but bounded so a MAC that never
+# appears cannot starve newer repairable rows indefinitely. A parked row is NOT
+# discarded -- ``unresolved_events`` still re-checks it for resolvability every
+# pass, so the moment its AP finally appears it is selected and repaired
+# regardless of how many times it was tried (see the ``resolvable OR attempts <
+# cap`` selection). Only rows that remain unresolvable past this many attempts
+# are held out of the window.
+_EVENT_RECONCILE_MAX_ATTEMPTS = 12
+
 # Entity types a failed SLE minute can be traced to at all (section 8). A client
 # owns its own failed minutes (``sle_minutes.entity_id``); an AP, switch,
 # gateway or radio is what the engine pins them on
@@ -1064,23 +1077,131 @@ class Repository:
     # ``ap_from``, ``user``, ...), the same ones the normalizer resolves from, so
     # this parks by identity presence rather than guessing from a denormalized
     # column.
+    #
+    # P2 fair progress. The eligibility predicate above still admits a row whose
+    # named MAC is present in the payload but NOT YET in inventory -- a legitimate
+    # "pending from-AP" that may resolve later. But a flood of such rows, being
+    # oldest, still fills the oldest-first ``LIMIT`` window on every pass and
+    # starves a newer row whose MAC *is* already in inventory (0 repairs, newer
+    # ref left NULL). Two mechanisms make progress fair without losing a genuine
+    # pending row:
+    #   1. RESOLVABILITY PREFERENCE. Each candidate MAC is joined to ``entities``
+    #      (by site + type, exactly as the normalizer's ``find_entity`` resolves),
+    #      yielding a ``resolvable`` flag: 1 when a currently-NULL reference could
+    #      be filled *this pass* because its MAC is already in inventory. Rows are
+    #      ordered ``resolvable DESC`` first, so a resolvable newer row is never
+    #      blocked behind any number of not-yet-resolvable older ones. The moment a
+    #      pending row's AP appears it becomes resolvable and floats to the front
+    #      -- so a real pending row still resolves within one further pass
+    #      (requirement 2), regardless of how long it waited.
+    #   2. BOUNDED RETRY. ``reconcile_attempts`` (migration 0013) counts passes
+    #      that selected a row without filling it. A still-unresolvable row is held
+    #      out of the window once it crosses ``_EVENT_RECONCILE_MAX_ATTEMPTS`` --
+    #      ``resolvable = 1 OR attempts < cap`` -- so a MAC that NEVER appears stops
+    #      consuming the LIMIT forever. Parking is not terminal: the ``resolvable``
+    #      disjunct re-admits the row unconditionally the pass its AP shows up, so a
+    #      long-delayed pending row is never lost. The counter is bumped by the
+    #      reconcile caller via :meth:`bump_event_reconcile_attempts` (a write path;
+    #      the selection itself issues no write, so it is safe read-only).
+    # Both the attempt column and the candidate joins degrade safely: on a database
+    # not yet migrated to 0013 the counter reads as a constant 0 (every row under
+    # cap), leaving the resolvability preference -- the actual anti-starvation fix
+    # -- fully in force. No DDL is issued on this read path.
     def unresolved_events(self, *, limit: int = 500) -> list[sqlite3.Row]:
+        attempts = (
+            "ev.reconcile_attempts"
+            if self._column_exists("events", "reconcile_attempts")
+            else "0"
+        )
+        site = self.site_id
+        # resolvable: a currently-NULL reference the normalizer could fill this
+        # pass because the payload's named MAC is already an entity. Mirrors
+        # EventNormalizer._entities routing: primary picks user/client -> ap -> sw
+        # -> gw by precedence; a client-scoped row (user/client named) can also
+        # fill its from-AP even before its own client entity exists.
+        resolvable = (
+            "CASE"
+            # primary reference fillable
+            "  WHEN ev.entity_id IS NULL AND ("
+            "    CASE"
+            "      WHEN COALESCE(json_extract(ev.data,'$.user'),"
+            "                    json_extract(ev.data,'$.client')) IS NOT NULL"
+            "        THEN ecli.entity_id IS NOT NULL"
+            "      WHEN json_extract(ev.data,'$.ap') IS NOT NULL"
+            "        THEN eap.entity_id IS NOT NULL"
+            "      WHEN json_extract(ev.data,'$.sw') IS NOT NULL"
+            "        THEN esw.entity_id IS NOT NULL"
+            "      WHEN json_extract(ev.data,'$.gw') IS NOT NULL"
+            "        THEN egw.entity_id IS NOT NULL"
+            "      ELSE 0"
+            "    END) THEN 1"
+            # related (from-AP / switch) reference fillable -- only client-scoped
+            "  WHEN ev.related_entity_id IS NULL"
+            "   AND COALESCE(json_extract(ev.data,'$.user'),"
+            "               json_extract(ev.data,'$.client')) IS NOT NULL"
+            "   AND (eapf.entity_id IS NOT NULL OR esw.entity_id IS NOT NULL)"
+            "     THEN 1"
+            "  ELSE 0 END"
+        )
+        sql = (
+            "WITH cand AS ("
+            "  SELECT ev.id AS id, ev.data AS data, ev.ts AS ts,"
+            f"        {attempts} AS attempts,"
+            f"        ({resolvable}) AS resolvable"
+            "  FROM events ev"
+            "  LEFT JOIN entities en ON en.entity_id = ev.entity_id"
+            "  LEFT JOIN entities ecli ON ecli.site_id=? AND ecli.entity_type='client'"
+            "       AND ecli.native_id = COALESCE(json_extract(ev.data,'$.user'),"
+            "                                      json_extract(ev.data,'$.client'))"
+            "  LEFT JOIN entities eap ON eap.site_id=? AND eap.entity_type='ap'"
+            "       AND eap.native_id = json_extract(ev.data,'$.ap')"
+            "  LEFT JOIN entities esw ON esw.site_id=? AND esw.entity_type='switch'"
+            "       AND esw.native_id = json_extract(ev.data,'$.sw')"
+            "  LEFT JOIN entities egw ON egw.site_id=? AND egw.entity_type='gateway'"
+            "       AND egw.native_id = json_extract(ev.data,'$.gw')"
+            "  LEFT JOIN entities eapf ON eapf.site_id=? AND eapf.entity_type='ap'"
+            "       AND eapf.native_id = COALESCE(json_extract(ev.data,'$.ap_from'),"
+            "                                     json_extract(ev.data,'$.ap'))"
+            "  WHERE (ev.entity_id IS NULL AND ("
+            "          json_extract(ev.data, '$.user')   IS NOT NULL"
+            "       OR json_extract(ev.data, '$.client') IS NOT NULL"
+            "       OR json_extract(ev.data, '$.ap')     IS NOT NULL"
+            "       OR json_extract(ev.data, '$.sw')     IS NOT NULL"
+            "       OR json_extract(ev.data, '$.gw')     IS NOT NULL))"
+            "     OR (ev.related_entity_id IS NULL AND en.entity_type = 'client' AND ("
+            "          json_extract(ev.data, '$.ap_from') IS NOT NULL"
+            "       OR json_extract(ev.data, '$.ap')      IS NOT NULL"
+            "       OR json_extract(ev.data, '$.sw')      IS NOT NULL))"
+            ") "
+            "SELECT id, data FROM cand "
+            "WHERE resolvable = 1 OR attempts < ? "
+            "ORDER BY resolvable DESC, ts, id LIMIT ?"
+        )
         return self._conn.execute(
-            "SELECT ev.id AS id, ev.data AS data FROM events ev "
-            "LEFT JOIN entities en ON en.entity_id = ev.entity_id "
-            "WHERE (ev.entity_id IS NULL AND ("
-            "        json_extract(ev.data, '$.user')   IS NOT NULL "
-            "     OR json_extract(ev.data, '$.client') IS NOT NULL "
-            "     OR json_extract(ev.data, '$.ap')     IS NOT NULL "
-            "     OR json_extract(ev.data, '$.sw')     IS NOT NULL "
-            "     OR json_extract(ev.data, '$.gw')     IS NOT NULL)) "
-            "   OR (ev.related_entity_id IS NULL AND en.entity_type = 'client' AND ("
-            "        json_extract(ev.data, '$.ap_from') IS NOT NULL "
-            "     OR json_extract(ev.data, '$.ap')      IS NOT NULL "
-            "     OR json_extract(ev.data, '$.sw')      IS NOT NULL)) "
-            "ORDER BY ev.ts, ev.id LIMIT ?",
-            (max(1, limit),),
+            sql,
+            (site, site, site, site, site, _EVENT_RECONCILE_MAX_ATTEMPTS, max(1, limit)),
         ).fetchall()
+
+    # P2 fair progress: record that a reconcile pass selected these events but did
+    # not fill them, so a permanently-unresolvable "pending from-AP" is eventually
+    # parked out of the oldest-first LIMIT window (see :meth:`unresolved_events`).
+    # This is the WRITE half of the bounded-retry mechanism; the selection read
+    # never writes, so it stays safe on a read-only connection. A no-op when the
+    # 0013 column is absent (older schema) -- the resolvability preference alone
+    # still prevents starvation there.
+    def bump_event_reconcile_attempts(self, event_ids: Sequence[int]) -> int:
+        if not event_ids:
+            return 0
+        if not self._column_exists("events", "reconcile_attempts"):
+            return 0
+        with self._write() as conn:
+            placeholders = ",".join("?" for _ in event_ids)
+            cur = conn.execute(
+                "UPDATE events SET reconcile_attempts = reconcile_attempts + 1 "
+                f"WHERE id IN ({placeholders})",
+                tuple(int(i) for i in event_ids),
+            )
+            return cur.rowcount
 
     # C7: fill only absent references; an event's original attribution is never
     # overwritten by a later, potentially less-specific controller payload.
@@ -1108,6 +1229,18 @@ class Repository:
                 (entity_id, related_entity_id, event_id, entity_id, related_entity_id),
             )
             return cur.rowcount > 0
+
+    def _column_exists(self, table: str, column: str) -> bool:
+        """True when ``table`` has a column named ``column``.
+
+        Like :meth:`_table_exists`, this is a read-path probe: it lets a query
+        that wants a column added by a later migration degrade gracefully (fall
+        back to a constant) when run against a database not yet migrated to that
+        version, instead of raising ``no such column``. It issues no DDL, so it
+        is safe on a read-only connection.
+        """
+        rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(str(r["name"]) == column for r in rows)
 
     def _table_exists(self, name: str) -> bool:
         """True when ``name`` is a real table in this database.

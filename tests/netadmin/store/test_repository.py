@@ -1460,3 +1460,142 @@ def test_reconcile_parks_unresolvable_and_reaches_newer_repairable(repo: Reposit
         "AND entity_id=?", (old_client,)
     ).fetchone()["n"]
     assert still_null == 500
+
+
+def test_reconcile_reaches_newer_resolvable_behind_pending_flood(repo: Repository) -> None:
+    """P2 (residual): the prior fix parked rows that name NO candidate MAC, but a
+    row that DOES name a from-AP simply NOT YET in inventory is a legitimate
+    pending row -- it must keep being retried in case its AP appears. A flood of
+    500 such pending rows (oldest) still filled the oldest-first LIMIT window on
+    every pass and starved a newer row whose AP already IS in inventory: three
+    passes each selected the same 500, returned 0 repairs, and left the newer
+    ref NULL. Fair progress orders currently-resolvable rows first, so the newer
+    resolvable row is reached and enriched no matter how many not-yet-resolvable
+    older rows precede it, and the pending flood reports no false repairs."""
+    from netadmin.ingest.events import EventNormalizer
+
+    old_client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli-old:mac"), ts=500
+    )
+    # 500 older client roam events: client resolved, related NULL, and the payload
+    # NAMES a from-AP that is simply NOT (yet) in inventory -- genuinely pending,
+    # not junk. The prior fix keeps selecting these (right), but they must not
+    # starve a newer row that CAN resolve now.
+    for i in range(500):
+        repo.record_event(
+            ts=1000 + i, key="EVT_WU_Roam", entity_id=old_client,
+            related_entity_id=None, native_id=f"pendev-{i}",
+            data={"key": "EVT_WU_Roam", "time": (1000 + i) * 1000,
+                  "user": "cli-old:mac", "ap_from": "absent-ap:mac"},
+        )
+    # A newer roam event whose from-AP IS already in inventory -> resolvable now.
+    new_client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli-new:mac"), ts=8000
+    )
+    new_ap = repo.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="ap-new:mac"), ts=8000
+    )
+    newer_ev = repo.record_event(
+        ts=9000, key="EVT_WU_Roam", entity_id=new_client,
+        related_entity_id=None, native_id="newev",
+        data={"key": "EVT_WU_Roam", "time": 9000 * 1000,
+              "user": "cli-new:mac", "ap_from": "ap-new:mac"},
+    )
+
+    # Resolvability preference floats the newer resolvable row to the FRONT of the
+    # oldest-first window, so it is selected even behind 500 older pending rows.
+    selected = repo.unresolved_events(limit=500)
+    assert int(selected[0]["id"]) == newer_ev
+    assert newer_ev in {int(r["id"]) for r in selected}
+
+    # End-to-end reconcile: exactly ONE real enrichment (the newer row), and the
+    # 500 pending rows are neither filled nor falsely counted.
+    repaired = EventNormalizer(repo).reconcile_unresolved(limit=500)
+    assert repaired == 1
+    row = repo._conn.execute(
+        "SELECT related_entity_id FROM events WHERE id=?", (newer_ev,)
+    ).fetchone()
+    assert row["related_entity_id"] == new_ap
+    still_null = repo._conn.execute(
+        "SELECT COUNT(*) AS n FROM events WHERE related_entity_id IS NULL "
+        "AND entity_id=?", (old_client,)
+    ).fetchone()["n"]
+    assert still_null == 500
+
+
+def test_pending_row_parks_after_cap_then_resolves_when_ap_appears(
+    repo: Repository,
+) -> None:
+    """A pending from-AP that NEVER appears must eventually stop consuming the
+    LIMIT window (bounded retry), yet a pending row whose AP DOES later appear
+    must still resolve. Both are the same row over time: it is retried, parked
+    once its attempt budget is spent, and un-parked the instant its AP shows up."""
+    from netadmin.ingest.events import EventNormalizer
+    from netadmin.store.repository import _EVENT_RECONCILE_MAX_ATTEMPTS
+
+    client = repo.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500
+    )
+    ev = repo.record_event(
+        ts=1000, key="EVT_WU_Roam", entity_id=client, related_entity_id=None,
+        native_id="pending", data={"key": "EVT_WU_Roam", "time": 1000 * 1000,
+                                    "user": "cli:mac", "ap_from": "late-ap:mac"},
+    )
+
+    # While its AP is absent the row is still selected (it may yet resolve) and a
+    # reconcile makes no false repair.
+    assert ev in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+    assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 0
+
+    # Simulate the reconcile caller recording each fruitless pass (the caller bumps
+    # the rows it selected but could not fill). Once the attempt budget is spent
+    # the still-unresolvable row is parked out of the window.
+    for _ in range(_EVENT_RECONCILE_MAX_ATTEMPTS):
+        repo.bump_event_reconcile_attempts([ev])
+    assert ev not in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+
+    # Its AP finally appears: the row is resolvable again and re-admitted despite
+    # its spent attempt budget, then repaired on the next pass (requirement 2).
+    late_ap = repo.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="late-ap:mac"), ts=9000
+    )
+    assert ev in {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+    assert EventNormalizer(repo).reconcile_unresolved(limit=500) == 1
+    row = repo._conn.execute(
+        "SELECT related_entity_id FROM events WHERE id=?", (ev,)
+    ).fetchone()
+    assert row["related_entity_id"] == late_ap
+
+
+def test_unresolved_events_degrades_when_attempt_column_absent(
+    tmp_db_path: Path,
+) -> None:
+    """The bounded-retry column (0013) is optional: on a database migrated only to
+    0012 the counter reads as a constant 0 and the resolvability preference alone
+    still prevents starvation -- and the read issues no DDL."""
+    rw = Repository.open(tmp_db_path)
+    with rw._write() as conn:
+        conn.execute("ALTER TABLE events DROP COLUMN reconcile_attempts")
+    assert not rw._column_exists("events", "reconcile_attempts")
+
+    client = rw.upsert_entity(
+        Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=500
+    )
+    ap = rw.upsert_entity(Entity(entity_type=EntityType.AP, native_id="ap:mac"), ts=500)
+    for i in range(3):
+        rw.record_event(
+            ts=1000 + i, key="EVT_WU_Roam", entity_id=client, related_entity_id=None,
+            native_id=f"pend-{i}", data={"key": "EVT_WU_Roam", "time": (1000 + i) * 1000,
+                                         "user": "cli:mac", "ap_from": "absent:mac"},
+        )
+    resolvable_ev = rw.record_event(
+        ts=5000, key="EVT_WU_Roam", entity_id=client, related_entity_id=None,
+        native_id="ok", data={"key": "EVT_WU_Roam", "time": 5000 * 1000,
+                               "user": "cli:mac", "ap_from": "ap:mac"},
+    )
+    # No column, no raise -- and the resolvable row is still ranked first.
+    selected = rw.unresolved_events(limit=500)
+    assert int(selected[0]["id"]) == resolvable_ev
+    # bump is a safe no-op when the column is absent.
+    assert rw.bump_event_reconcile_attempts([resolvable_ev]) == 0
+    rw.close()
