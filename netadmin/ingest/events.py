@@ -395,6 +395,23 @@ async def catchup_events(
     normalizer = normalizer or EventNormalizer(repo)
     now_s = int(time.time()) if now is None else int(now)
     explicit_cursor = since_ts is not None
+    # CURSOR STRANDING (#w19a): a failed/partial event-history hole whose entire
+    # span has aged beyond the controller's retention window can NEVER be re-read,
+    # yet as a still-retryable row it pins ``latest_ingest_coverage_end`` (capped at
+    # the earliest failed/partial start) FOREVER -- even after 31 days the cursor
+    # never advances. Give such truly-expired holes terminal 'unrecoverable'
+    # handling (a status the completion cursor does NOT block on) so they stop
+    # capping it, mirroring the backfill retention-floor rule. A partially-expired
+    # hole is left alone: its still-fetchable tail is legitimately retryable.
+    retention_floor = now_s - _CATCHUP_MAX_WITHIN_HOURS * 3600
+    for hole in repo.failed_ingest_coverage(kind="event_history", scope="site"):
+        if int(hole["end_ts"]) <= retention_floor:
+            repo.record_ingest_coverage(
+                kind="event_history", scope="site", interval=str(hole["interval"]),
+                start_ts=int(hole["start_ts"]), end_ts=int(hole["end_ts"]),
+                status="unrecoverable",
+                detail="event-history retention elapsed before retry",
+            )
     # C3: only a completed *history read* can advance this cursor.  A newer WS
     # arrival says nothing about whether the event log's older interval was
     # recovered, so max_event_ts must never participate here.
@@ -680,6 +697,11 @@ class EventListener:
                 logger.exception(
                     "Dropping unstorable retained WS event (malformed payload)"
                 )
+                # #w19a-4: a retained raw event that now RAISES a permanent
+                # (non-transient) normalize error is dropped -- and, like the
+                # consumer-loop path, that drop severs coverage: count it so the
+                # next beat opportunity records a break rather than bridging.
+                self._unusable_dropped_since_beat += 1
                 continue
             if record is not None:
                 self._batch.append(record)
@@ -767,7 +789,6 @@ class EventListener:
         # UNKNOWN over the drop span. A later clean tick (marker back to 0) beats
         # again and reopens coverage, exactly like the raw-retry recovery path.
         if self._unusable_dropped_since_beat:
-            self._unusable_dropped_since_beat = 0
             # #w18a-2: suppressing this beat is NOT enough. The next clean beat
             # ~one flush later still lands within ``_WS_HEARTBEAT_MAX_GAP_S`` of the
             # last clean beat, so ``_ws_observed_intervals`` would BRIDGE the drop
@@ -776,11 +797,26 @@ class EventListener:
             # coverage). Record a durable coverage BREAK so the heartbeat chain is
             # SEVERED, exactly like a socket disconnect: coverage ends at the last
             # clean beat and only resumes after a subsequent CLEAN drain beats again.
-            # Best-effort -- a failed break write is not a data-path error.
+            #
+            # #w19a-2 (marker must survive an uncommitted break): RETAIN the drop
+            # marker until the break write DURABLY commits. The prior order cleared
+            # ``_unusable_dropped_since_beat`` FIRST and then attempted the break --
+            # so a break write that raised (a transient sqlite OperationalError) lost
+            # the marker while the sever never landed, and the next CLEAN beat bridged
+            # the drop span (coverage ~0.99, a false clear). Attempt the break FIRST;
+            # only clear the marker AFTER it succeeds. On failure keep the marker AND
+            # keep suppressing the beat (return without clearing), so the NEXT tick
+            # retries the break and coverage stays SEVERED until a break actually
+            # commits -- a failed break write must never let coverage bridge.
             try:
                 self._repo.record_ws_break(ts=ts)
             except Exception:  # noqa: BLE001 - liveness accounting must never break draining
-                logger.exception("Could not record WS coverage break")
+                logger.exception(
+                    "Could not record WS coverage break; retaining drop marker so the "
+                    "next tick retries the break and coverage stays severed"
+                )
+                return
+            self._unusable_dropped_since_beat = 0
             return
         # D5: this beat proves storage is healthy right now. Give the supervisor a
         # chance to hand off any events rescued from a prior listener while THIS
@@ -873,6 +909,21 @@ class EventListener:
                         logger.exception(
                             "Dropping unstorable WS event (malformed payload)"
                         )
+                        # #w19a-4 (a normalize EXCEPTION must not bypass drop
+                        # accounting): a normalize() that RAISES for a single,
+                        # permanently-unprocessable event (a malformed/undecodable
+                        # payload -- e.g. a roam frame whose object-valued ap_from
+                        # raises during entity resolution) is exactly as unstorable
+                        # as normalize()->None, and must sever coverage the SAME way.
+                        # Previously it was logged and dropped WITHOUT bumping the
+                        # marker, so no WS break fired and a clean beat bridged the
+                        # span (0 stored, 0 breaks, ~0.998 coverage -- a false clear).
+                        # Count it as an unusable drop so the next flush tick records
+                        # a break (#w18a-2/#w19a-2). This is the PERMANENT per-event
+                        # branch ONLY; the TRANSIENT storage error below is still
+                        # retained + re-raised for retry and must NOT be turned into
+                        # a silent drop.
+                        self._unusable_dropped_since_beat += 1
                         continue
                     self._storage_error = exc
                     self._pending_raw.append(event)

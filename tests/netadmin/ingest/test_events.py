@@ -2384,3 +2384,170 @@ async def test_w15a3_catchup_non_http_failure_records_failed_hole_and_reraises(
     assert repo.observed_event_coverage(now - 3600, now) == 0.0
     failed = repo.failed_ingest_coverage(kind="event_history", scope="site")
     assert failed and any(int(r["end_ts"]) == now for r in failed)
+
+
+# --------------------------------------------------------------------------- #
+# #w19a-2 (drop marker must survive an uncommitted break): the unusable-drop
+# marker was cleared BEFORE the WS break write committed, so a failed break write
+# (a transient sqlite blip) lost the marker and a later CLEAN beat then BRIDGED
+# the drop span (~0.989 coverage -- a false clear). The marker must be retained
+# until the break DURABLY commits: attempt the break FIRST, clear only on success,
+# and on failure keep the marker AND keep suppressing the beat so the next tick
+# retries the break and coverage stays SEVERED.
+# --------------------------------------------------------------------------- #
+def test_w19a2_failed_break_write_keeps_coverage_severed(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=30.0)
+    listener.connection_state = "connected"
+    # Two clean beats establish a covered run.
+    listener._maybe_heartbeat(now=1000)
+    listener._maybe_heartbeat(now=1030)
+    # One unusable event is dropped this period.
+    listener._unusable_dropped_since_beat += 1
+
+    # The break write BLIPS (transient sqlite error) on its FIRST attempt, then
+    # recovers -- exactly the round-19 #2 failure the prior order lost.
+    armed = {"fail": True}
+    real_break = repo.record_ws_break
+
+    def flaky_break(*, ts: Optional[int] = None) -> None:
+        if armed["fail"]:
+            armed["fail"] = False
+            raise sqlite3.OperationalError("database is locked")
+        real_break(ts=ts)
+
+    monkeypatch.setattr(repo, "record_ws_break", flaky_break)
+
+    listener._maybe_heartbeat(now=1060)  # break write FAILS
+    # RED-GREEN: the marker is RETAINED (not cleared) and no beat was emitted, so
+    # the drop still severs; pre-fix the marker was cleared and the break was lost.
+    assert listener._unusable_dropped_since_beat == 1
+    assert armed["fail"] is False  # the failure path was actually exercised
+
+    # Next tick: storage recovered, the break is RETRIED and durably commits.
+    listener._maybe_heartbeat(now=1062)
+    assert listener._unusable_dropped_since_beat == 0
+    listener._maybe_heartbeat(now=1092)  # clean beat resumes after the sever
+
+    # A break was durably recorded, so the post-drop beat does NOT bridge back:
+    # coverage is the pre-drop run only (~0.32), far below the bridged ~0.989 the
+    # lost-break bug fabricated and below the detector sufficiency floor.
+    breaks = [r for r in repo.read_poll_runs("ws", 0, 100_000) if r["error"] == "unusable"]
+    assert len(breaks) == 1
+    cov = repo.observed_event_coverage(1000, 1093)
+    assert cov < 0.5
+    assert cov < EVENT_COVERAGE_MIN
+
+
+# --------------------------------------------------------------------------- #
+# #w19a-4 (a normalize EXCEPTION must not bypass drop accounting): a normalize()
+# that RAISES for a single, permanently-unprocessable event (a malformed payload)
+# was logged and dropped WITHOUT counting it -- so no WS break fired and a clean
+# beat bridged the span (0 stored, 0 breaks, ~0.998 coverage). It must be treated
+# the SAME as normalize()->None: counted as an unusable drop that severs coverage.
+# A TRANSIENT storage error stays retained+re-raised, never a silent drop.
+# --------------------------------------------------------------------------- #
+class _MalformedNormalizer(EventNormalizer):
+    """normalize() raises a PERMANENT per-event error (a malformed payload)."""
+
+    def normalize(self, event: Event) -> Optional[dict[str, Any]]:
+        raise ValueError("object-valued ap_from cannot resolve to an entity")
+
+
+class _TransientNormalizer(EventNormalizer):
+    """normalize() raises a TRANSIENT storage error (an entity-read blip)."""
+
+    def normalize(self, event: Event) -> Optional[dict[str, Any]]:
+        raise sqlite3.OperationalError("database is locked")
+
+
+@pytest.mark.asyncio
+async def test_w19a4_normalize_raise_counts_as_drop_and_severs(repo: Repository) -> None:
+    events = [event_by_key("EVT_WU_Roam") for _ in range(3)]
+    listener = EventListener(
+        FakeWs(events), repo, normalizer=_MalformedNormalizer(repo),
+        flush_interval=None, heartbeat_interval=30.0,
+    )
+    listener.connection_state = "connected"
+    written = await listener.run()
+
+    assert written == 0
+    assert repo.read_events(0, 2_000_000_000) == []
+    # RED-GREEN: each raising normalize is counted as an unusable drop (pre-fix the
+    # marker stayed 0 -- a silent discard).
+    assert listener._unusable_dropped_since_beat == 3
+
+    # The accounted drop severs coverage: the next beat opportunity records a BREAK,
+    # not a heartbeat, so the drop span is left UNcovered (detector -> UNKNOWN).
+    listener.connection_state = "connected"
+    listener._maybe_heartbeat(now=1_000)
+    beats = [r for r in repo.read_poll_runs("ws", 0, 100_000) if r["error"] == "heartbeat"]
+    breaks = [r for r in repo.read_poll_runs("ws", 0, 100_000) if r["error"] == "unusable"]
+    assert beats == [] and len(breaks) == 1
+
+
+@pytest.mark.asyncio
+async def test_w19a4_transient_normalize_error_is_retained_not_dropped(
+    repo: Repository,
+) -> None:
+    ev = event_by_key("EVT_WU_Roam")
+    listener = EventListener(
+        FakeWs([ev]), repo, normalizer=_TransientNormalizer(repo), flush_interval=None
+    )
+    listener.connection_state = "connected"
+    written = await listener.run()
+
+    assert written == 0
+    # A TRANSIENT storage error is NOT a drop: the event is retained RAW for retry
+    # and the storage error is surfaced -- it must never be counted as unusable, or
+    # a storage blip would silently sever coverage AND lose an unrecoverable event.
+    assert len(listener._pending_raw) == 1
+    assert listener._unusable_dropped_since_beat == 0
+    assert listener._storage_error is not None
+
+
+# --------------------------------------------------------------------------- #
+# #w19a (cursor stranding, catch-up integration): a failed/partial event-history
+# hole aged beyond the retention window can never be re-read, yet as a retryable
+# row it pins the completion cursor forever. The next catch-up sweep must give it
+# terminal 'unrecoverable' handling so it stops capping the cursor.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_w19a_expired_event_hole_becomes_unrecoverable_on_next_sweep(
+    repo: Repository,
+) -> None:
+    now = 100_000_000
+    old = now - 40 * 24 * 3600  # 40 days ago -- beyond the ~30-day retention window
+    # A complete prefix, a failed (now-expired) hole right after it, and recent
+    # complete coverage the hole is capping the cursor short of.
+    repo.record_ingest_coverage(
+        kind="event_history", scope="site", interval="retained",
+        start_ts=old - 3600, end_ts=old, status="complete",
+    )
+    repo.record_ingest_coverage(
+        kind="event_history", scope="site", interval="retained",
+        start_ts=old, end_ts=old + 3600, status="failed",
+    )
+    # The failed hole pins the cursor at its start (old), short of the real history.
+    assert repo.latest_ingest_coverage_end(kind="event_history", scope="site") == old
+    assert (old, old + 3600) in {
+        (int(r["start_ts"]), int(r["end_ts"]))
+        for r in repo.failed_ingest_coverage(kind="event_history", scope="site")
+    }
+
+    # A catch-up sweep (empty authoritative read) runs. It retires the expired hole
+    # to 'unrecoverable' (terminal, does not cap the cursor).
+    await catchup_events(repo, FakeEndpoints([]), now=now)
+
+    assert (old, old + 3600) not in {
+        (int(r["start_ts"]), int(r["end_ts"]))
+        for r in repo.failed_ingest_coverage(kind="event_history", scope="site")
+    }
+    row = repo.connection.execute(
+        "SELECT status FROM ingest_coverage WHERE start_ts=? AND end_ts=?",
+        (old, old + 3600),
+    ).fetchone()
+    assert row is not None and row["status"] == "unrecoverable"
+    # The cursor is no longer pinned at the expired hole -- it advanced past it.
+    assert repo.latest_ingest_coverage_end(kind="event_history", scope="site") > old
