@@ -1360,3 +1360,204 @@ async def test_d5_cancellation_drains_rescued_events(repo: Repository) -> None:
     # batch instead of stranding them.
     assert {r["native_id"] for r in repo.read_events(0, 2_000_000_000)} == {"rescued", "dying"}
     assert sup._pending == []
+
+
+# --------------------------------------------------------------------------- #
+# BUG#4 (heartbeat must not credit coverage over the SUPERVISOR's undrained
+# buffers): a replacement listener with EMPTY local buffers used to emit
+# heartbeats while the supervisor still held a rescued RAW event stuck behind a
+# failing entity-resolution read -- the heartbeat was committed BEFORE the drain
+# hook ran and the hook's failed reads were swallowed, so coverage was credited
+# over a span of unprocessed history (the repro: 11 beats, ~0.997 coverage). A
+# heartbeat asserts the whole pipeline is drained: it must be suppressed while ANY
+# rescued event (normalized OR raw) is stuck upstream, not just in this listener's
+# local buffer.
+# --------------------------------------------------------------------------- #
+def test_bug4_no_heartbeat_while_supervisor_holds_stuck_rescued_event(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    real_find = repo.find_entity
+
+    def locked_find(etype: EntityType, mac: str) -> Any:
+        raise sqlite3.OperationalError("database is locked")
+
+    # A rescued RAW event lives on the SUPERVISOR; its entity read blips, so it
+    # cannot be re-normalized/persisted while storage is down.
+    stuck = Event.model_validate(
+        {"_id": "stuck", "key": "EVT_WU_Connected", "time": 1_721_600_000_000, "user": CLIENT_MAC}
+    )
+    sup = WsSupervisor(lambda: EventListener(FakeWs([]), repo), repo, backoff_base=0.0)
+    sup._pending_raw = [stuck]
+
+    # A healthy, EMPTY replacement listener wired to the supervisor's drain +
+    # pipeline-blocked hooks exactly as WsSupervisor.run() wires them.
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=0.0)
+    listener.connection_state = "connected"
+    listener.on_healthy_drain = sup._drain_pending
+    listener.pipeline_blocked = sup._pending_blocked
+
+    monkeypatch.setattr(repo, "find_entity", locked_find)
+    for t in (100, 130, 160, 190):
+        listener._maybe_heartbeat(now=t)
+        listener._last_heartbeat_ts = None  # rate-limit is not the guard under test
+
+    beats = [r for r in repo.read_poll_runs("ws", 0, 10_000) if r["error"] == "heartbeat"]
+    assert beats == []  # NO positive liveness while a rescued event is stuck
+    assert repo.observed_event_coverage(100, 191) == 0.0
+    assert sup._pending_raw  # the rescued raw event is still blocked upstream
+
+    # Read recovers: the drain hook re-normalizes and persists the rescued event,
+    # the pipeline is truly drained, and the very next beat is allowed.
+    monkeypatch.setattr(repo, "find_entity", real_find)
+    listener._maybe_heartbeat(now=300)
+    beats = [r for r in repo.read_poll_runs("ws", 0, 10_000) if r["error"] == "heartbeat"]
+    assert len(beats) == 1 and int(beats[0]["ts"]) == 300
+    assert sup._pending_raw == [] and sup._pending == []
+    assert {r["native_id"] for r in repo.read_events(0, 2_000_000_000)} == {"stuck"}
+
+
+# --------------------------------------------------------------------------- #
+# BUG#5 (shutdown DURING backoff loses the final drain): D5 fixed cancellation
+# during ``listener.run()``, but a cancel landing during the between-listeners
+# backoff ``sleep`` lands OUTSIDE that inline handler and used to unwind straight
+# past the post-loop drain -- stranding a rescued event even though storage had
+# recovered by shutdown. The whole supervise loop is now wrapped so a cancel
+# anywhere triggers one best-effort final drain. Production SupervisorTask.stop()
+# uses exactly this cancellation path.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_bug5_shutdown_during_backoff_drains_rescued_event(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    real = repo.record_events_enriching_entities
+    storage = {"down": True}
+
+    def flaky(rows: object) -> int:
+        if storage["down"]:
+            raise sqlite3.OperationalError("database is locked")
+        return real(rows)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repo, "record_events_enriching_entities", flaky)
+
+    ev = Event.model_validate({"_id": "blip", "key": "EVT_X", "time": 1_721_600_000_000})
+
+    attempt = {"n": 0}
+
+    def factory() -> EventListener:
+        attempt["n"] += 1
+        # Attempt 1 buffers the event and dies with it uncommitted (storage down),
+        # so the supervisor rescues it onto ``_pending``. It never gets to attempt 2.
+        events = [ev] if attempt["n"] == 1 else []
+        return EventListener(FakeWs(events), repo, flush_interval=None, batch_size=1)
+
+    in_backoff = asyncio.Event()
+
+    async def fake_sleep(delay: float) -> None:
+        # Storage RECOVERS while the supervisor sits in the between-listeners
+        # backoff; then we block here so the shutdown cancel lands MID-BACKOFF,
+        # outside the inline run()-cancel handler.
+        storage["down"] = False
+        in_backoff.set()
+        await asyncio.Event().wait()
+
+    sup = WsSupervisor(factory, repo, backoff_base=0.0, max_restarts=5, sleep=fake_sleep)
+    task = asyncio.create_task(sup.run())
+    await asyncio.wait_for(in_backoff.wait(), timeout=2.0)
+
+    # Cancel mid-backoff (the production SupervisorTask.stop() path).
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The outer finally ran one final drain despite the cancel landing in the
+    # backoff sleep: the rescued event is persisted, not stranded (repro: 0 stored).
+    assert {r["native_id"] for r in repo.read_events(0, 2_000_000_000)} == {"blip"}
+    assert sup._pending == []
+
+
+# --------------------------------------------------------------------------- #
+# BUG#6 (mixed rescue buffers violate the aggregate cap and evict NEWER events):
+# ``_enforce_pending_bound`` capped the raw and normalized queues INDEPENDENTLY,
+# so cap=3 with 3 old raw + 3 new normalized retained SIX; and recovery appends
+# the old (re-normalized) raw events BEHIND the newer normalized ones, then a
+# blind prefix delete discarded the NEWER events (4-6) while the old (1-3)
+# survived. The cap must bound the AGGREGATE of both buffers, and drop-oldest must
+# evict the genuinely oldest across BOTH buffers by event time.
+# --------------------------------------------------------------------------- #
+def test_bug6_aggregate_cap_evicts_true_oldest_across_both_buffers(
+    repo: Repository,
+) -> None:
+    normalizer = EventNormalizer(repo)
+
+    def norm(_id: str, ts_ms: int) -> dict[str, Any]:
+        rec = normalizer.normalize(
+            Event.model_validate({"_id": _id, "key": "EVT_X", "time": ts_ms})
+        )
+        assert rec is not None
+        return rec
+
+    # 3 OLD raw events (times 1-3 s) + 3 NEW normalized events (times 4-6 s).
+    old_raw = [
+        Event.model_validate({"_id": f"old{i}", "key": "EVT_X", "time": 1_721_600_000_000 + i * 1000})
+        for i in (1, 2, 3)
+    ]
+    new_norm = [norm(f"new{i}", 1_721_600_000_000 + i * 1000) for i in (4, 5, 6)]
+
+    sup = WsSupervisor(lambda: EventListener(FakeWs([]), repo), repo, pending_max=3)
+    sup._pending = list(new_norm)
+    sup._pending_raw = list(old_raw)
+
+    # AGGREGATE cap: 6 retained across the two buffers must clamp to 3 -- the old
+    # independent-cap logic left all SIX (3 + 3, each within its own cap of 3).
+    sup._enforce_pending_bound()
+    total = len(sup._pending) + len(sup._pending_raw)
+    assert total == 3
+    assert sup.dropped == 3
+    # TRUE-OLDEST eviction: the three OLD raw events go; the three NEWER normalized
+    # survive (not the reverse a blind prefix delete would produce).
+    assert sup._pending_raw == []
+    assert {r["native_id"] for r in sup._pending} == {"new4", "new5", "new6"}
+
+
+def test_bug6_recovery_keeps_newer_events_not_prefix(
+    repo: Repository,
+) -> None:
+    """The prompt's exact repro: recovery re-normalizes rescued RAW events and
+    appends them BEHIND newer normalized ones; a prefix delete then discarded the
+    newer survivors. With the aggregate/true-oldest fix the drain persists the
+    NEWER events and drops the genuinely-oldest raw ones."""
+    normalizer = EventNormalizer(repo)
+
+    def norm(_id: str, ts_ms: int) -> dict[str, Any]:
+        rec = normalizer.normalize(
+            Event.model_validate({"_id": _id, "key": "EVT_X", "time": ts_ms})
+        )
+        assert rec is not None
+        return rec
+
+    old_raw = [
+        Event.model_validate({"_id": f"old{i}", "key": "EVT_X", "time": 1_721_600_000_000 + i * 1000})
+        for i in (1, 2, 3)
+    ]
+    new_norm = [norm(f"new{i}", 1_721_600_000_000 + i * 1000) for i in (4, 5, 6)]
+
+    sup = WsSupervisor(lambda: EventListener(FakeWs([]), repo), repo, pending_max=3)
+    # Newer normalized already queued; older raw arrives to be re-normalized behind
+    # them on the healthy drain.
+    sup._pending = list(new_norm)
+    sup._pending_raw = list(old_raw)
+
+    # Storage is healthy: the drain re-normalizes the raw events (appending them
+    # behind the newer ones), clamps to the aggregate cap, and persists survivors.
+    sup._drain_pending()
+
+    stored = {r["native_id"] for r in repo.read_events(0, 2_000_000_000)}
+    # The NEWER events survived and were persisted; the genuinely-oldest raw ones
+    # were the ones dropped (repro persisted {old1, old2, old3} instead).
+    assert stored == {"new4", "new5", "new6"}
+    assert sup.dropped == 3
+    assert sup._pending == [] and sup._pending_raw == []
