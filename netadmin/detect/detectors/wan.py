@@ -854,6 +854,16 @@ class WanFlappingDetector:
         )
         since = ctx.now_ts - window_s
 
+        # B4: this verdict is built ENTIRELY from EVT_GW_WANTransition *events* --
+        # there is no poll/metric arm. A gap in the event feed drops transitions, so
+        # a still-flapping WAN reads as "< threshold transitions" and the P1
+        # false-resolves. A healthy gateway *poll* proves nothing about the event
+        # feed, so freeze to UNKNOWN (never clear) unless event-source coverage is
+        # substantially complete over the window -- the same gate client.flaky /
+        # wifi.roam_quality / .dfs apply to their event-derived verdicts.
+        if not ctx.event_coverage_ok(window_s):
+            return UNKNOWN
+
         events = ctx.events(keys={EVT_WAN_TRANSITION}, since_ts=since)
         gateways = _gateways(ctx)
         if not events and not gateways:

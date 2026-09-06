@@ -60,6 +60,18 @@ _MS_THRESHOLD = 100_000_000_000
 _CATCHUP_MARGIN_HOURS = 1
 _CATCHUP_MAX_WITHIN_HOURS = 30 * 24  # events are pruned at ~30 days locally
 
+# Switch events whose semantic scope is a single PORT, not the whole switch, and
+# whose consuming detector compares against PORT entity ids (wired.stp_loop reads
+# ``EVT_SW_StpPortBlocking`` at port scope). These must be attributed to the PORT
+# entity (native_id ``"<switch_mac>:<port_idx>"`` -- how ingest keys ports, see
+# netadmin/ingest/mapping.py), or the detector's port-id comparison never matches
+# a switch-attributed event and the rule silently never fires (#4). NOT every
+# port-bearing switch event belongs here: EVT_SW_PoeOverload names a port in its
+# message but is a switch-budget event that ``wired.poe_budget`` queries at SWITCH
+# scope, so it stays switch-attributed. Membership tracks the consuming detector's
+# scope, not the mere presence of a ``port`` field.
+_PORT_SCOPED_SW_EVENT_KEYS = frozenset({"EVT_SW_StpPortBlocking"})
+
 # P1: a SYSTEM-WIDE ceiling on the events the supervisor holds in memory while
 # storage is down. The per-listener ``_max_pending`` bounds ONE listener's batch,
 # but the supervisor rescues each dead listener's batch onto ``_pending`` and then
@@ -202,6 +214,24 @@ class EventNormalizer:
         if ap_mac:
             return self._resolve(EntityType.AP, ap_mac), None, ap_mac
         if sw_mac:
+            # A PORT-scoped switch event (e.g. EVT_SW_StpPortBlocking) is attributed
+            # to the PORT entity, not the switch, so a port-scoped detector's
+            # port-id comparison matches. The port's native_id is "<sw_mac>:<idx>"
+            # -- exactly how ingest/mapping.py keys ports -- so the resolved id is
+            # the real port entity. Related is the parent switch. When the port
+            # entity is not in inventory yet, entity_id resolves None and the event
+            # persists with a null entity; reconcile_unresolved re-links it once the
+            # device poll creates the port (the same late-link path clients use).
+            port_idx = _field(event, "port")
+            if port_idx is None:
+                port_idx = _field(event, "port_idx")
+            if key in _PORT_SCOPED_SW_EVENT_KEYS and port_idx is not None:
+                port_nid = f"{sw_mac}:{port_idx}"
+                return (
+                    self._resolve(EntityType.PORT, port_nid),
+                    self._resolve(EntityType.SWITCH, sw_mac),
+                    port_nid,
+                )
             return self._resolve(EntityType.SWITCH, sw_mac), None, sw_mac
         if gw_mac:
             return self._resolve(EntityType.GATEWAY, gw_mac), None, gw_mac

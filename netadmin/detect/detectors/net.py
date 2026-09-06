@@ -33,6 +33,7 @@ from netadmin.detect.detectors._rssi import (
     _samples,
     sticky_per_ap_rssi,
 )
+from netadmin.detect.context import EVENT_COVERAGE_MIN
 from netadmin.detect.engine import COVERAGE_MIN, UNKNOWN, DetectorResult, EvalResult
 from netadmin.domain.entities import Entity, Finding
 from netadmin.domain.types import Cadence, EntityType, Severity
@@ -279,18 +280,25 @@ class FirmwareRegressionDetector:
 
         # Per-device regression assessment.
         regressed: list[dict[str, Any]] = []
+        unknown_devices: set[int] = set()
         for device in devices:
             upgrade = self._latest_upgrade(ctx, device, lookback_s, settle_s)
             if upgrade is None:
                 continue
-            result = self._assess(
+            result, unknown = self._assess(
                 ctx, device, upgrade, compare_s, settle_s, factor, min_post_per_hour
             )
             if result is not None:
                 regressed.append(result)
+            elif unknown:
+                unknown_devices.add(device.entity_id)
 
         if not regressed:
-            return []
+            # DetectorResult.of returns a bare [] when nothing is frozen (the poll
+            # arm judged everything and the event feed was whole), preserving plain
+            # clear semantics; otherwise it freezes the disconnect-arm-unjudgeable
+            # devices so their open regression issues do not resolve across the gap.
+            return DetectorResult.of([], unknown_devices)
 
         # Fleet correlation: same model + same new firmware version across devices.
         fleet_counts: dict[tuple[str, str], int] = {}
@@ -333,7 +341,7 @@ class FirmwareRegressionDetector:
                     confounders_checked=confounders,
                 )
             )
-        return findings
+        return DetectorResult.of(findings, unknown_devices)
 
     def _latest_upgrade(
         self, ctx: Any, device: Entity, lookback_s: int, settle_s: int
@@ -363,33 +371,64 @@ class FirmwareRegressionDetector:
         settle_s: int,
         factor: float,
         min_post_per_hour: float,
-    ) -> Optional[dict[str, Any]]:
+    ) -> tuple[Optional[dict[str, Any]], bool]:
+        """Assess one device. Returns ``(regression|None, disc_arm_unjudgeable)``.
+
+        The second element is ``True`` when no regression fired but the EVENT-derived
+        disconnect arm could not be judged (an event-feed gap on a compared window),
+        so the caller freezes the device UNKNOWN rather than clearing a possibly-open
+        regression by absence.
+        """
         up_ts = upgrade["ts"]
         pre_start = up_ts - compare_s
         post_start = up_ts + settle_s
         post_end = min(ctx.now_ts, up_ts + compare_s)
         if post_end <= post_start:
-            return None
+            return None, False
 
-        pre_rate = self._disconnects_per_hour(ctx, device, pre_start, up_ts)
-        post_rate = self._disconnects_per_hour(ctx, device, post_start, post_end)
+        # Port-error arm: POLL-derived (port rx/tx error series), already covered by
+        # the fast_device coverage gate in evaluate(). Judged unconditionally.
         pre_errors = self._port_errors(ctx, device, pre_start, up_ts)
         post_errors = self._port_errors(ctx, device, post_start, post_end)
-
-        disc_regressed = post_rate >= min_post_per_hour and post_rate > factor * max(pre_rate, 1e-9)
         err_regressed = post_errors > factor * max(pre_errors, 1e-9) and post_errors > 0
-        if not (disc_regressed or err_regressed):
-            return None
-        return {
-            "device": device,
-            "model": device.model or "unknown",
-            "version": upgrade["version"],
-            "upgrade_ts": up_ts,
-            "pre_rate": pre_rate,
-            "post_rate": post_rate,
-            "pre_errors": pre_errors,
-            "post_errors": post_errors,
-        }
+
+        # Disconnect arm: EVENT-derived. The pre/post comparison is only valid when
+        # BOTH compared windows were substantially observed by the event feed. An
+        # UNobserved pre-window has zero *recorded* disconnects and reads as a
+        # pristine zero baseline, so any post-upgrade disconnects manufacture a
+        # regression that never happened (B4). Require event coverage over the pre
+        # AND the post window (arbitrary historical spans, so measured with explicit
+        # bounds, gated on the same EVENT_COVERAGE_MIN floor the now-relative
+        # ctx.event_coverage_ok helper uses). Below the floor the arm is frozen.
+        pre_cov = ctx.repo.observed_event_coverage(pre_start, up_ts)
+        post_cov = ctx.repo.observed_event_coverage(post_start, post_end)
+        disc_arm_ok = pre_cov >= EVENT_COVERAGE_MIN and post_cov >= EVENT_COVERAGE_MIN
+
+        pre_rate = post_rate = 0.0
+        disc_regressed = False
+        if disc_arm_ok:
+            pre_rate = self._disconnects_per_hour(ctx, device, pre_start, up_ts)
+            post_rate = self._disconnects_per_hour(ctx, device, post_start, post_end)
+            disc_regressed = post_rate >= min_post_per_hour and post_rate > factor * max(
+                pre_rate, 1e-9
+            )
+
+        if disc_regressed or err_regressed:
+            return {
+                "device": device,
+                "model": device.model or "unknown",
+                "version": upgrade["version"],
+                "upgrade_ts": up_ts,
+                "pre_rate": pre_rate,
+                "post_rate": post_rate,
+                "pre_errors": pre_errors,
+                "post_errors": post_errors,
+            }, False
+        # No regression fired. If the disconnect arm could not be judged (event-feed
+        # gap on a compared window), we cannot honestly clear a possibly-open
+        # regression issue for this device -> report it UNKNOWN. The poll error arm
+        # having produced no regression is not enough to clear on its own here.
+        return None, not disc_arm_ok
 
     def _disconnects_per_hour(self, ctx: Any, device: Entity, start: int, end: int) -> float:
         """Disconnect events attributed to this device (as related AP) per hour."""

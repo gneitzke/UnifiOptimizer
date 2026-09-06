@@ -45,7 +45,7 @@ from typing import Any, Iterable, Optional
 
 from netadmin.detect import device_kb
 from netadmin.detect.baseline import hour_label
-from netadmin.detect.engine import COVERAGE_MIN, UNKNOWN, EvalResult
+from netadmin.detect.engine import COVERAGE_MIN, UNKNOWN, DetectorResult, EvalResult
 from netadmin.domain.entities import Entity, Finding, entity_display_label
 from netadmin.domain.types import Cadence, EntityType, Severity
 from netadmin.logging import get_logger
@@ -955,12 +955,24 @@ class PoeBudgetDetector:
         event_window_s = int(ctx.threshold(self.key, "event_window_s", 900))
         poe_window_s = int(ctx.threshold(self.key, "poe_window_s", 600))
 
+        # B4: this detector has TWO independent arms. The budget-pressure arm is
+        # POLL-derived (Σ polled ``poe_power`` vs the switch's budget) and stays on
+        # the fast_device coverage gate above -- an event-feed gap says nothing
+        # about it. The overload arm is EVENT-derived (EVT_SW_PoeOverload). If the
+        # event feed had a gap, a dropped overload event reads as "no overload" and
+        # an overload-only P1 false-resolves. So we gate ONLY the overload arm on
+        # event-source coverage: when it is below the floor, a switch with no poll
+        # budget pressure is frozen (UNKNOWN) instead of cleared, while a switch the
+        # poll arm can still judge continues to emit/clear normally.
+        overload_arm_ok = ctx.event_coverage_ok(event_window_s)
+
         ports_by_switch: dict[int, list[Entity]] = {}
         for port in _ports(ctx):
             if port.parent_id is not None:
                 ports_by_switch.setdefault(port.parent_id, []).append(port)
 
         findings: list[Finding] = []
+        unknown_switches: set[int] = set()
         for switch in _switches_by_id(ctx).values():
             draw = 0.0
             measured = False
@@ -987,6 +999,14 @@ class PoeBudgetDetector:
 
             over_warn = pct is not None and pct >= warn_pct
             if not over_warn and not overload:
+                # Neither arm fired this cycle. If the event feed was NOT
+                # substantially observed, "no overload event" is unproven -- a real
+                # overload could have been dropped in the gap -- so an overload-based
+                # issue on this switch must not clear by absence. Freeze the switch
+                # (UNKNOWN) rather than resolve. The poll budget arm is unaffected:
+                # when it has a verdict (over_warn) we fall through and emit below.
+                if not overload_arm_ok:
+                    unknown_switches.add(switch.entity_id)
                 continue
 
             critical = bool(overload) or (pct is not None and pct >= crit_pct)
@@ -1010,7 +1030,7 @@ class PoeBudgetDetector:
                     confounders,
                 )
             )
-        return findings
+        return DetectorResult.of(findings, unknown_switches)
 
 
 # ====================================================================== #

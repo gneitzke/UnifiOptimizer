@@ -153,10 +153,57 @@ def test_roam_entity_is_client_related_is_from_ap(repo: Repository) -> None:
 
 
 def test_switch_event_resolves_to_switch(repo: Repository) -> None:
+    # EVT_SW_PoeOverload names a port in its message but is a switch-BUDGET event
+    # that wired.poe_budget queries at SWITCH scope, so it stays switch-attributed
+    # even though it carries port=5. (Guards against blanket port-rerouting.)
     rec = EventNormalizer(repo).normalize(event_by_key("EVT_SW_PoeOverload"))
     assert rec is not None
     assert rec["entity_id"] == entity_id(repo, EntityType.SWITCH, SWITCH_MAC)
     assert rec["related_entity_id"] is None
+
+
+def test_stp_port_event_resolves_to_port_entity(repo: Repository) -> None:
+    """#4: a PORT-scoped switch event (STP port-blocking) with switch mac + port
+    idx is attributed to the PORT entity (native_id "<sw_mac>:<idx>"), related to
+    the parent switch -- so the port-scoped wired.stp_loop detector's port-id
+    comparison matches. Previously it resolved to the switch and the rule was dead.
+    """
+    port_nid = f"{SWITCH_MAC}:5"
+    pid = repo.upsert_entity(
+        Entity(entity_type=EntityType.PORT, native_id=port_nid, name="p5"), ts=1_000_000
+    )
+    ev = Event.model_validate(
+        {"_id": "stp-x", "key": "EVT_SW_StpPortBlocking", "time": 1_721_600_000_000,
+         "sw": SWITCH_MAC, "port": 5}
+    )
+    rec = EventNormalizer(repo).normalize(ev)
+    assert rec is not None
+    assert rec["entity_id"] == pid
+    assert rec["related_entity_id"] == entity_id(repo, EntityType.SWITCH, SWITCH_MAC)
+    assert rec["native_id"] == "stp-x"
+
+
+def test_stp_port_event_null_entity_when_port_absent_then_reconciles(repo: Repository) -> None:
+    """When the port entity is not in inventory yet, the STP event persists with a
+    null entity (tolerated, not dropped) and reconcile links it once the port is
+    created -- the same late-link path client events use.
+    """
+    ev = Event.model_validate(
+        {"_id": "stp-late", "key": "EVT_SW_StpPortBlocking", "time": 1_721_600_000_000,
+         "sw": SWITCH_MAC, "port": 7}
+    )
+    norm = EventNormalizer(repo)
+    rec = norm.normalize(ev)
+    assert rec is not None and rec["entity_id"] is None  # port 7 not created yet
+    assert repo.record_event(**rec) is not None
+    # Inventory catches up; reconcile fills the link.
+    pid = repo.upsert_entity(
+        Entity(entity_type=EntityType.PORT, native_id=f"{SWITCH_MAC}:7", name="p7"), ts=1_000_000
+    )
+    norm.reconcile_unresolved()
+    rows = repo.read_events(*FULL)
+    linked = [r for r in rows if r["key"] == "EVT_SW_StpPortBlocking"]
+    assert linked and int(linked[0]["entity_id"]) == pid
 
 
 def test_ap_event_resolves_to_ap(repo: Repository) -> None:
