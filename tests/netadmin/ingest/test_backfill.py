@@ -495,6 +495,135 @@ async def test_finding7_clipped_failed_retry_retires_original_no_redundant_refet
     assert statuses[(5460, 6000)] == "complete"
 
 
+@pytest.mark.asyncio
+async def test_finding3_cancel_during_clipped_fetch_does_not_lose_recoverable_hole(
+    repo: Repository,
+):
+    """Round-12 durability: a cancel during the clipped retry must not lose the hole.
+
+    Finding #3 regression: the retention-clipped retry retired the ORIGINAL
+    failed [c_lo, c_hi) row BEFORE the clipped fetch completed. A cancellation
+    between retire and fetch-completion left the recoverable slice
+    [clip_start, c_hi) recorded NOWHERE -- the original 'failed' row was gone and
+    its 'complete' replacement never written -- so the next run made ZERO
+    requests and the hole was permanently lost.
+
+    Scenario (from the finding): failed [4800,5700), complete [5700,6000),
+    retention floor 5400. A CancelledError raised during the clipped [5400,5700)
+    fetch tears the run down mid-flight (CancelledError is a BaseException, so it
+    is NOT swallowed by the per-chunk Exception firewall). The split-first fix
+    must leave [5400,5700) durably 'failed', so the NEXT run STILL retries it.
+    """
+    tnow = 6000  # closed 5-minute bucket boundary (6000 % 300 == 0)
+    ret = 600  # retention_floor = 6000 - 600 = 5400, landing inside [4800,5700)
+
+    def cov_rows():
+        return repo._conn.execute(
+            "SELECT interval, start_ts, end_ts, status FROM ingest_coverage "
+            "WHERE kind='report' AND scope='ap' ORDER BY start_ts, end_ts"
+        ).fetchall()
+
+    # The pre-existing ledger: an actual failed fetch plus an adjacent complete
+    # slice, exactly as the finding derives it from a real repository cursor.
+    repo.record_ingest_coverage(
+        kind="report", scope="ap", interval=FIVEMIN,
+        start_ts=4800, end_ts=5700, status="failed", detail="boom",
+    )
+    repo.record_ingest_coverage(
+        kind="report", scope="ap", interval=FIVEMIN,
+        start_ts=5700, end_ts=6000, status="complete",
+    )
+
+    class CancelDuringFetch(FakeEndpoints):
+        """Raises CancelledError on the first report request (the clipped retry)."""
+
+        def __init__(self):
+            super().__init__()
+            self.cancelled = False
+
+        async def stat_report(self, interval, scope, *, start_ms, end_ms, attrs):
+            self.calls.append({"start_ms": start_ms, "end_ms": end_ms})
+            if not self.cancelled:
+                self.cancelled = True
+                raise __import__("asyncio").CancelledError()
+            return []
+
+    ep = CancelDuringFetch()
+    bf = Backfiller(ep, repo, scopes=("ap",), fivemin_retention_s=ret)
+
+    # The run is torn down mid-flight by the cancellation during the clipped fetch.
+    with pytest.raises(__import__("asyncio").CancelledError):
+        await bf.run({"ap": tnow}, now=tnow)
+
+    # The retry did clip to the still-fetchable window before being cancelled.
+    assert ep.calls == [{"start_ms": 5400 * 1000, "end_ms": 5700 * 1000}]
+
+    # DURABILITY: despite the cancel BEFORE the fetch completed, the recoverable
+    # slice [5400,5700) survives as a 'failed' hole (split-first, then retire);
+    # the pre-clip slice is unrecoverable and the untouched complete slice remains.
+    rows = [(r["interval"], r["start_ts"], r["end_ts"], r["status"]) for r in cov_rows()]
+    assert rows == [
+        (FIVEMIN, 4800, 5400, "unrecoverable"),
+        (FIVEMIN, 5400, 5700, "failed"),
+        (FIVEMIN, 5700, 6000, "complete"),
+    ]
+    # The regression's tell was a lost hole -> zero requests next run. The hole is
+    # NOT lost: the next run STILL retries [5400,5700) (and now succeeds).
+    ep.calls.clear()
+    await bf.run({"ap": tnow}, now=tnow)
+    assert ep.calls == [{"start_ms": 5400 * 1000, "end_ms": 5700 * 1000}]
+    assert repo.failed_ingest_coverage(kind="report", scope="ap") == []
+    statuses = {(r["start_ts"], r["end_ts"]): r["status"] for r in cov_rows()}
+    assert statuses[(5400, 5700)] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_finding3_success_path_preserves_round11_end_state(repo: Repository):
+    """The non-cancelled success path still ends unrecoverable+complete, no refetch.
+
+    Same scenario as the cancel test (failed [4800,5700), complete [5700,6000),
+    floor 5400) but with a working endpoint: the split-first ordering must not
+    regress round-11. The clipped retry lands 'complete', leaving exactly the
+    unrecoverable pre-clip slice plus complete slices, no residual 'failed' row,
+    and a subsequent run makes NO redundant request.
+    """
+    tnow = 6000
+    ret = 600
+
+    def cov_rows():
+        return repo._conn.execute(
+            "SELECT interval, start_ts, end_ts, status FROM ingest_coverage "
+            "WHERE kind='report' AND scope='ap' ORDER BY start_ts, end_ts"
+        ).fetchall()
+
+    repo.record_ingest_coverage(
+        kind="report", scope="ap", interval=FIVEMIN,
+        start_ts=4800, end_ts=5700, status="failed", detail="boom",
+    )
+    repo.record_ingest_coverage(
+        kind="report", scope="ap", interval=FIVEMIN,
+        start_ts=5700, end_ts=6000, status="complete",
+    )
+
+    ep = FakeEndpoints()  # empty-but-successful retry
+    bf = Backfiller(ep, repo, scopes=("ap",), fivemin_retention_s=ret)
+    await bf.run({"ap": tnow}, now=tnow)
+
+    rows = [(r["interval"], r["start_ts"], r["end_ts"], r["status"]) for r in cov_rows()]
+    assert rows == [
+        (FIVEMIN, 4800, 5400, "unrecoverable"),
+        (FIVEMIN, 5400, 5700, "complete"),
+        (FIVEMIN, 5700, 6000, "complete"),
+    ]
+    assert repo.failed_ingest_coverage(kind="report", scope="ap") == []
+    assert [(c["start_ms"], c["end_ms"]) for c in ep.calls] == [(5400 * 1000, 5700 * 1000)]
+
+    # No redundant refetch on a subsequent run.
+    ep.calls.clear()
+    await bf.run({"ap": tnow}, now=tnow)
+    assert ep.calls == []
+
+
 def test_user_signal_maps_to_collector_rssi_metric():
     # Report "signal" (dBm) must land on the collector's canonical "rssi" series
     # (mapping.py stores Client.signal as "rssi"), never a divergent "signal".
