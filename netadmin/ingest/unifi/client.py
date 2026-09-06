@@ -57,6 +57,18 @@ _RETRYABLE_EXC = (
     httpx.WriteError,
     httpx.RemoteProtocolError,
 )
+# Failures raised while READING or DECODING a response body -- i.e. AFTER the full
+# request was already sent and the controller answered (a corrupt/undecodable body:
+# bad gzip, a truncated chunked stream). httpx surfaces these as ``DecodingError``,
+# a ``RequestError`` that is deliberately NOT a ``TransportError`` and so is absent
+# from ``_RETRYABLE_EXC`` above. On a MUTATION the outcome is UNKNOWN, never a
+# definitive failure: the request landed at the controller (it replied), the reply
+# just cannot be decoded, so the write may well have taken (D6/#w10a-1). It is
+# classified exactly like a lost response / an ambiguous 5xx -- ambiguous, never
+# retried, never a clean "failed". A GET keeps its existing behavior: the error
+# propagates to the caller unchanged (a read that cannot be decoded is a read
+# failure, and a GET is safely re-issued by the caller, not silently ambiguous).
+_POST_SEND_READ_EXC = (httpx.DecodingError,)
 
 
 def envelope_error(payload: Any) -> Optional[str]:
@@ -451,6 +463,22 @@ class UnifiClient:
                 resp = await self._http.request(
                     method, url, params=params, json=json_body, headers=headers
                 )
+            except _POST_SEND_READ_EXC as exc:
+                # A read/decode failure of the RESPONSE body -- the request was fully
+                # sent and the controller answered, only the answer could not be
+                # decoded (#w10a-1). On a MUTATION the write may have landed, so this
+                # is AMBIGUOUS, never a definitive failure: surface it exactly like a
+                # lost response so the caller records "unknown" and reconciles via a
+                # GET, and never retries (a retry could double-apply). A GET keeps its
+                # existing behavior: the error propagates for the caller to re-issue.
+                if not idempotent:
+                    raise UnifiAmbiguousOutcomeError(
+                        f"{method_u} {endpoint} response could not be read/decoded "
+                        f"({type(exc).__name__}: {exc}); the request was sent and the "
+                        "write may have landed. Not retried. Reconcile controller "
+                        "state via GET before any further attempt."
+                    ) from exc
+                raise
             except _RETRYABLE_EXC as exc:
                 if not idempotent:
                     # Ambiguous outcome on a mutation: do NOT retry (C2). The write

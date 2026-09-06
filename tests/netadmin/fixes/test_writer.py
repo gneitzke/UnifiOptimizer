@@ -247,6 +247,34 @@ async def test_d6_post_send_write_error_on_mutation_is_ambiguous_not_failed():
 
 
 # --------------------------------------------------------------------------- #
+# #w10a-1: a post-send RESPONSE-DECODING failure on a MUTATION is AMBIGUOUS, not a
+# definitive failure. The controller answered HTTP 200 (the PUT was fully sent) but
+# the body is corrupt gzip; httpx raises DecodingError while READING it -- a
+# RequestError that is NOT a TransportError, so it escaped _RETRYABLE_EXC. Before the
+# fix it leaked out of the client as an unhandled DecodingError and the applier
+# recorded 'failed' despite no rejection evidence; the write may have landed.
+# --------------------------------------------------------------------------- #
+@respx.mock
+async def test_w10a1_post_send_decode_error_on_mutation_is_ambiguous_not_failed():
+    _mock_login()
+    # httpx raises DecodingError while reading/decoding the (corrupt gzip) body, after
+    # the PUT was fully sent -- simulated via a side_effect the transport raises.
+    route = respx.put(f"{API}/rest/device/dev123").mock(
+        side_effect=httpx.DecodingError("Error -3 while decompressing data")
+    )
+    client = await _client()
+    writer = RealControllerWriter(client)
+    res = await writer.put("rest/device/dev123", {"radio_table": [{"radio": "ng"}]})
+
+    assert route.call_count == 1  # dispatched exactly once -- never retried
+    assert res.ok is False
+    # Ambiguous, NOT a clean failure: the decode failure is post-send, so the write
+    # may have landed. The applier records this as "unknown", never "failed".
+    assert isinstance(res.data, dict) and res.data.get("ambiguous") is True
+    await client.aclose()
+
+
+# --------------------------------------------------------------------------- #
 # Verifier round 9, D7: an unparseable gateway 504 (and other 5xx) on a MUTATION is
 # AMBIGUOUS, not a definitive rejection. A gateway timeout does NOT establish the
 # write failed -- it may have landed upstream of the failing hop. Before the fix a
