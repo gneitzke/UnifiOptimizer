@@ -1260,6 +1260,61 @@ def test_mesh_uplink_unknown_on_low_coverage(repo: Repository) -> None:
     assert MeshUplinkDetector().evaluate(_ctx(repo)) is UNKNOWN
 
 
+def test_mesh_uplink_warn_does_not_escalate_on_uncovered_event_window(
+    repo: Repository,
+) -> None:
+    """B4: lost-contact events on an *unobserved* event feed must not escalate.
+
+    Polling is healthy (P3-worthy warn RSSI, no hop corroboration) but the event
+    source was never observed over the window (event coverage 0.0). The two
+    lost-contact events are then untrustworthy -- an aged-out / down feed, not
+    proof of reconnect cycles -- so the finding must fall back to the poll/RSSI-
+    derived P3 and report no reconnect corroboration, not the P2 it would reach
+    on a trusted feed.
+    """
+    _seed_poll_only(repo, jobs=("fast_device",))  # poll healthy, event coverage 0.0
+    ap1 = mk_ap(repo, "ap-1", uplink_type="wireless", uplink_hops=1)
+    gauge(repo, ap1, "uplink_rssi", [-67.0] * 8)  # warn band, poll-derived P3
+    for ts in (NOW - 400, NOW - 200):
+        repo.record_event(ts=ts, key="EVT_AP_Lost_Contact", entity_id=ap1)
+
+    findings = MeshUplinkDetector().evaluate(_ctx(repo))
+    assert len(findings) == 1
+    assert findings[0].severity is Severity.P3
+    assert findings[0].evidence["reconnect_cycles"] == 0
+    assert findings[0].evidence["corroborated"] is False
+
+
+def test_mesh_uplink_warn_escalates_on_covered_event_window(repo: Repository) -> None:
+    """B4 counterpart: the SAME lost-contact events on a substantially-complete
+    event feed DO escalate the warn-band finding to P2, exactly as before the
+    gate. This pins that the gate suppresses only the untrusted-feed case."""
+    seed_cov(repo, jobs=("fast_device",))  # poll + healthy event coverage
+    ap1 = mk_ap(repo, "ap-1", uplink_type="wireless", uplink_hops=1)
+    gauge(repo, ap1, "uplink_rssi", [-67.0] * 8)  # warn band
+    for ts in (NOW - 400, NOW - 200):
+        repo.record_event(ts=ts, key="EVT_AP_Lost_Contact", entity_id=ap1)
+
+    findings = MeshUplinkDetector().evaluate(_ctx(repo))
+    assert len(findings) == 1
+    assert findings[0].severity is Severity.P2
+    assert findings[0].evidence["reconnect_cycles"] == 2
+    assert findings[0].evidence["corroborated"] is True
+
+
+def test_mesh_uplink_bad_rssi_unaffected_by_event_gap(repo: Repository) -> None:
+    """B4 non-regression: the poll/RSSI-only path is unchanged by the gate. A
+    sustained bad-band uplink is P2 on its RSSI alone, so it still fires P2 even
+    with the event feed entirely unobserved (event coverage 0.0)."""
+    _seed_poll_only(repo, jobs=("fast_device",))  # event coverage 0.0
+    ap1 = mk_ap(repo, "ap-1", uplink_type="wireless")
+    gauge(repo, ap1, "uplink_rssi", [-75.0] * 8)  # bad band, RSSI-derived P2
+
+    findings = MeshUplinkDetector().evaluate(_ctx(repo))
+    assert len(findings) == 1
+    assert findings[0].severity is Severity.P2
+
+
 # ====================================================================== #
 # threshold override wiring (spot-check the settings seam)
 # ====================================================================== #
