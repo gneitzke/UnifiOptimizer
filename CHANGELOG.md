@@ -6,7 +6,7 @@ All notable changes to UnifiOptimizer are recorded here. The format follows
 
 ## [0.8.1] — 2026-09-06
 
-A reliability release. Five failures found by running the daemon against a real
+A reliability release. Six failures found by running the daemon against a real
 network for a week — not by the test suite — where a large, long-lived store
 exposed scheduling and coercion edges that small fixtures never reach. All are
 backward compatible.
@@ -19,6 +19,13 @@ backward compatible.
   `EntityType`; the daily config audit enumerates every entity type and choked
   coercing the first such row. The detector's entity view now skips inventory-only
   rows (and logs any genuinely unknown type) instead of aborting the whole pass.
+- The same crash had a second site in the issue-engine reconciliation step that
+  only running the real daily pass against a live store surfaced: the
+  "Foreign AP broadcasting our SSID" issues are keyed to those `rogue_bss` rows,
+  so the parentage-inhibition lookup (`get_entity`) coerced the type and failed
+  the pass *after* every detector had already produced findings. An issue
+  legitimately references its `rogue_bss` entity, so the lookup now returns the
+  row with its raw type (as the collector stores it) rather than excluding it.
 - `sle_minutes` and `anomalies` silently stopped running on a busy daemon. Both
   jobs were being dropped by APScheduler's 1-second misfire window whenever a
   detect/correlate pass held the single event loop a few seconds past their fire
