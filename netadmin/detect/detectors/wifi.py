@@ -1806,6 +1806,15 @@ class MeshUplinkDetector:
         reconnect_min = int(ctx.threshold(self.key, "reconnect_min", 2))
 
         start = ctx.now_ts - window_s
+        # The RSSI/hop-count detection is poll-derived and always trustworthy, but
+        # the reconnect-cycle corroboration is built from *lost-contact events*.
+        # An aged-out or unobserved event window drops those events, so an event
+        # gap must never manufacture escalation: gate the event corroboration on
+        # event coverage the same way the sibling event-based detectors freeze
+        # (``pingpong_roamer`` / ``roam_quality`` / ``dfs_recurring``). Below the
+        # floor we treat the reconnect evidence as absent (0), falling back to the
+        # poll/RSSI-derived severity rather than escalating on untrustworthy data.
+        events_trusted = ctx.event_coverage_ok(window_s)
         findings: list[Finding] = []
         for ap in ctx.entities(EntityType.AP):
             if ap.entity_id is None:
@@ -1826,13 +1835,17 @@ class MeshUplinkDetector:
             hops = _as_int(ctx.repo.current_state(ap.entity_id, "uplink_hops")) or _as_int(
                 ap.meta.get("uplink_hops")
             )
-            reconnects = len(
+            reconnects_observed = len(
                 [
                     e
                     for e in ctx.events(entity_id=ap.entity_id, since_ts=start)
                     if str(e["key"] or "").endswith(_LOST_CONTACT_SUFFIX)
                 ]
             )
+            # Trust the reconnect count only when the event feed was substantially
+            # complete; an unobserved window must not read as "no reconnects" *or*
+            # as corroborating reconnects, so it contributes no escalation.
+            reconnects = reconnects_observed if events_trusted else 0
             corroborated = (hops is not None and hops >= deep_hops) or reconnects >= reconnect_min
 
             if _fraction_below(rssi, bad_rssi) >= sustained_frac:
