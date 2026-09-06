@@ -94,23 +94,35 @@ export function IncidentRow({
           {loadingSymptoms && symptoms === null ? (
             <Skeleton className="h-5 w-2/3" />
           ) : (
-            (symptoms ?? []).map((m) => (
-              <li key={m.issue.id} className="flex items-center gap-2 py-1">
-                <SeverityGlyph severity={m.issue.severity} size={10} />
-                <Link
-                  to={`/issues/${m.issue.id}`}
-                  className="t-caption truncate hover:underline"
-                  style={{ color: 'var(--fg-muted)' }}
-                >
-                  {m.issue.title}
-                </Link>
-                {m.entity && (
-                  <span className="t-micro truncate" style={{ color: 'var(--fg-subtle)' }}>
-                    · <EntityLink entity={m.entity} muted />
-                  </span>
-                )}
-              </li>
-            ))
+            // C5: `getIncident` returns the incident's full historical symptom
+            // list, but the "+N related" count above is `incident.symptom_count`
+            // — the backend's CURRENT-membership count (cleared_ts IS NULL),
+            // same source IncidentDetailPage's header uses. Filtering this list
+            // to `current !== false` (mirroring IncidentDetailPage's
+            // `currentMembers`) keeps the expanded list in agreement with that
+            // count instead of listing cleared/former symptoms as if they were
+            // still part of the incident. `current !== false` treats an older
+            // payload without the flag as current, matching api.ts's
+            // optional-field contract.
+            (symptoms ?? [])
+              .filter((m) => m.current !== false)
+              .map((m) => (
+                <li key={m.issue.id} className="flex items-center gap-2 py-1">
+                  <SeverityGlyph severity={m.issue.severity} size={10} />
+                  <Link
+                    to={`/issues/${m.issue.id}`}
+                    className="t-caption truncate hover:underline"
+                    style={{ color: 'var(--fg-muted)' }}
+                  >
+                    {m.issue.title}
+                  </Link>
+                  {m.entity && (
+                    <span className="t-micro truncate" style={{ color: 'var(--fg-subtle)' }}>
+                      · <EntityLink entity={m.entity} muted />
+                    </span>
+                  )}
+                </li>
+              ))
           )}
         </ul>
       )}
