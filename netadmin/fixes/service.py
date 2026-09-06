@@ -230,13 +230,29 @@ class FixService:
                 "evidence and a fresh plan."
             )
         plan = await self.build_plan(issue_id)
-        current_state, mesh_uplinks = await self._read_current_state(plan)
+        # Preview read: the mesh posture the revertibility gate needs is a static
+        # safety property, fine to read before the lock. The BINDING validation
+        # (precondition drift + whole-table clobber guard) reads fresh state INSIDE
+        # the applier's per-device lock, via ``state_reader`` below (C1): reading it
+        # here and validating that pre-lock snapshot is exactly what let a second
+        # concurrent apply overwrite the first's committed change.
+        _, mesh_uplinks, _ = await self._read_current_state(plan)
+
+        async def _fresh_state() -> tuple[
+            dict[str, dict[str, Any]], dict[str, dict[str, dict[str, Any]]], set[str]
+        ]:
+            # Called by the applier once it holds the device lock, so it observes any
+            # concurrent apply's committed write rather than a snapshot taken before.
+            # Returns the applier's (current_state, full_state, mesh_uplinks) order.
+            state, mesh, full = await self._read_current_state(plan)
+            return state, full, mesh
+
         result = await self._applier.apply(
             plan,
             dry_run=False,
             confirm_token=confirm_token,
-            current_state=current_state,
             mesh_uplinks=mesh_uplinks,
+            state_reader=_fresh_state,
         )
         # Arm on "which step(s) actually landed", NOT on "was any row written".
         # ``result.change_ids`` records EVERY attempted step, including one whose
@@ -384,8 +400,8 @@ class FixService:
 
     async def _read_current_state(
         self, plan: FixPlan
-    ) -> tuple[dict[str, dict[str, Any]], set[str]]:
-        """Fresh live precondition values (keyed by target) plus the mesh-uplink set.
+    ) -> tuple[dict[str, dict[str, Any]], set[str], dict[str, dict[str, dict[str, Any]]]]:
+        """Fresh live precondition values, the mesh-uplink set, and full radio state.
 
         Reads the device once per distinct device MAC and extracts only the
         attributes each precondition expects, type-aligned to the expected value so
@@ -398,11 +414,19 @@ class FixService:
         a mesh uplink. The applier's revertibility gate needs the AP's real mesh
         posture to dry-run the min-RSSI rail against the reverse of each step (S2),
         so it is read from the same fresh device, in the same pass.
+
+        The third element is the full live ``radio_table`` per target device key
+        (:func:`~netadmin.fixes.applier._endpoint_device`) as
+        ``{device_key: {radio_code: {attr: value}}}``. A ``rest/device`` PUT replaces
+        the whole table, so the applier's clobber guard needs every field's live
+        value -- not just the narrow precondition attrs -- to detect a payload that
+        would overwrite a field a concurrent apply changed (C1).
         """
         state: dict[str, dict[str, Any]] = {}
         mesh_uplinks: set[str] = set()
+        full_state: dict[str, dict[str, dict[str, Any]]] = {}
         if self._reader is None:
-            return state, mesh_uplinks
+            return state, mesh_uplinks, full_state
         device_cache: dict[str, Optional[dict[str, Any]]] = {}
 
         async def _device_for(mac: str) -> Optional[dict[str, Any]]:
@@ -412,8 +436,16 @@ class FixService:
 
         for step in plan.steps:
             device = await _device_for(device_mac_of(step.target_native_id))
-            if device is not None and _device_is_mesh_uplink(device):
-                mesh_uplinks.add(_endpoint_device(step.endpoint))
+            if device is not None:
+                if _device_is_mesh_uplink(device):
+                    mesh_uplinks.add(_endpoint_device(step.endpoint))
+                dev_key = _endpoint_device(step.endpoint)
+                if dev_key not in full_state:
+                    full_state[dev_key] = {
+                        str(r.get("radio")): dict(r)
+                        for r in (device.get("radio_table") or [])
+                        if r.get("radio") is not None
+                    }
 
             target = step.precondition.target_native_id
             expected = step.precondition.expected
@@ -423,7 +455,7 @@ class FixService:
             if device is None:
                 continue  # absent -> drift, refused by the applier
             state[target] = _extract_target_attrs(device, target, expected)
-        return state, mesh_uplinks
+        return state, mesh_uplinks, full_state
 
 
 # --------------------------------------------------------------------------- #

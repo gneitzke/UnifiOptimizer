@@ -617,3 +617,38 @@ async def test_apply_refuses_a_resolving_or_resolved_issue(store):
     result = await svc.apply(issue_id, confirm_token=dry.confirm_token)
     assert result.applied is True
     assert writer.call_count == 1
+
+
+# --------------------------------------------------------------------------- #
+# Concurrency: a change is reverted through FixService exactly once (P2)
+# --------------------------------------------------------------------------- #
+async def test_concurrent_service_reverts_dispatch_exactly_once(store, monkeypatch):
+    """Two concurrent ``svc.revert`` of the same change must not each replay the
+    mutation. FixService reads fresh live state inside the applier's per-device lock
+    and the applier re-checks the row's status there, so the second revert -- reaching
+    the lock after the first has committed 'reverted' -- is refused with no dispatch:
+    exactly ONE controller write, one 'reverted' row."""
+    import asyncio
+
+    _no_real_seams(monkeypatch)
+    issue_id = _seed_channel_plan_issue(store)
+    writer = FakeControllerWriter()
+    svc = _service(store, writer=writer)
+
+    dry = await svc.dry_run(issue_id)
+    result = await svc.apply(issue_id, confirm_token=dry.confirm_token)
+    change_id = result.change_ids[0]
+    calls_after_apply = writer.call_count  # the forward apply's one PUT
+
+    outcomes = await asyncio.gather(
+        svc.revert(change_id),
+        svc.revert(change_id),
+        return_exceptions=True,
+    )
+
+    oks = [o for o in outcomes if not isinstance(o, Exception)]
+    refused = [o for o in outcomes if isinstance(o, FixError)]
+    assert writer.call_count == calls_after_apply + 1  # exactly one revert PUT
+    assert len(oks) == 1 and oks[0].ok
+    assert len(refused) == 1  # the second revert refused, no dispatch
+    assert store.get_change(change_id)["status"] == "reverted"
