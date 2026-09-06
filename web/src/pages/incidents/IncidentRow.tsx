@@ -43,17 +43,23 @@ export function IncidentRow({
   //
   // C5 (round 18): count alone misses a membership REPLACEMENT at a constant
   // count (symptom A clears, symptom B joins in the same reconcile pass —
-  // `member_count`/`symptom_count` doesn't move). `IncidentSummary` carries no
-  // membership identity/version, so the best available signal is
-  // `last_seen_ts`: the correlation engine sets it from
-  // `max(member.issue.last_seen_ts)` on every reconcile (`engine.py`'s
-  // `_reconcile` — see `evidence_ts` / `prev.last_seen_ts = max(...)`), so a
-  // membership change from fresh evidence (the realistic case a replacement
-  // is triggered by) advances it even when the count doesn't. The cache key
-  // is therefore the PAIR (count, last_seen_ts), not count alone.
+  // `member_count`/`symptom_count` doesn't move).
+  //
+  // C5 (round 19): `last_seen_ts` was the round-18 proxy for that, but it is a
+  // `max`-fold over member evidence (`engine._reconcile`), so a replacement
+  // whose NEW member's evidence is OLDER than the incident's high-water mark
+  // never advances it — the row never refetches (adversarial verifier round 19,
+  // real feeder-port swap: current symptoms went 2 -> 3 while (count,
+  // last_seen_ts) stayed (1, 1300)). The list payload now carries `member_sig`,
+  // a signature of the CURRENT member id SET independent of evidence freshness
+  // (backend `_member_sig`): it changes iff membership changes and is stable
+  // otherwise. That is the authoritative membership-change signal, so the cache
+  // key keys on it (last_seen_ts is kept only as a belt-and-braces companion for
+  // an older daemon whose payload omits `member_sig`).
   const [symptomsFetchedAt, setSymptomsFetchedAt] = useState<{
     count: number;
     seen: number;
+    sig: string | undefined;
   } | null>(null);
   // C5 (round 17): tracks the signature a fetch most recently FAILED at,
   // distinct from `symptomsFetchedAt` (which now only ever records a SUCCESS
@@ -67,6 +73,7 @@ export function IncidentRow({
   const [symptomsFailedAt, setSymptomsFailedAt] = useState<{
     count: number;
     seen: number;
+    sig: string | undefined;
   } | null>(null);
   const [loadingSymptoms, setLoadingSymptoms] = useState(false);
 
@@ -75,16 +82,22 @@ export function IncidentRow({
   const headTitle = root?.title ?? incident.title;
   const href = isGroup ? `/incidents/${incident.id}` : `/issues/${incident.root_issue_id}`;
   const ongoing = `ongoing ${formatDuration(now - incident.first_seen_ts)}`;
-  const currentSignature = { count: incident.symptom_count, seen: incident.last_seen_ts };
+  const currentSignature = {
+    count: incident.symptom_count,
+    seen: incident.last_seen_ts,
+    sig: incident.member_sig,
+  };
   const stale =
     symptoms !== null &&
     (symptomsFetchedAt === null ||
       symptomsFetchedAt.count !== currentSignature.count ||
-      symptomsFetchedAt.seen !== currentSignature.seen);
+      symptomsFetchedAt.seen !== currentSignature.seen ||
+      symptomsFetchedAt.sig !== currentSignature.sig);
   const failedAtCurrent =
     symptomsFailedAt !== null &&
     symptomsFailedAt.count === currentSignature.count &&
-    symptomsFailedAt.seen === currentSignature.seen;
+    symptomsFailedAt.seen === currentSignature.seen &&
+    symptomsFailedAt.sig === currentSignature.sig;
 
   async function fetchSymptoms() {
     setLoadingSymptoms(true);
@@ -126,7 +139,8 @@ export function IncidentRow({
   // Membership can change out from under an already-expanded row (the
   // dashboard polls every 30s and keeps this component mounted across
   // refreshes) — including a REPLACEMENT that leaves `symptom_count`
-  // unchanged (C5 round 18), which `stale` now catches via `last_seen_ts`.
+  // unchanged (C5 round 18/19), which `stale` now catches via `member_sig`
+  // (the authoritative membership signal; `last_seen_ts` a fallback).
   // Refetch in place so the open list stays in agreement with the fresh
   // signature instead of waiting for a collapse/re-expand that may never
   // come. Skips a signature that has already failed (`failedAtCurrent`) so a
@@ -137,7 +151,15 @@ export function IncidentRow({
       void fetchSymptoms();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [expanded, stale, loadingSymptoms, failedAtCurrent, incident.symptom_count, incident.last_seen_ts]);
+  }, [
+    expanded,
+    stale,
+    loadingSymptoms,
+    failedAtCurrent,
+    incident.symptom_count,
+    incident.last_seen_ts,
+    incident.member_sig,
+  ]);
 
   return (
     <li style={{ borderTop: '1px solid var(--hairline)' }}>

@@ -266,6 +266,14 @@ export interface IncidentSummary {
   summary: string;
   member_count: number;
   symptom_count: number;
+  /** Opaque signature of the incident's CURRENT member issue-id set (C5 round
+   * 19). Changes iff a member is added/removed/replaced, and is stable across
+   * polls when membership is unchanged — independent of evidence timestamps, so
+   * it catches a same-count replacement whose new member's evidence is OLDER
+   * than `last_seen_ts` (which `last_seen_ts`, a max-fold, misses). The
+   * dashboard row keys its symptom-detail cache on it. Optional so an older
+   * daemon's payload still reads. */
+  member_sig?: string;
   root: IncidentRootRef | null;
   /** Client-axis minutes attributed to this incident across its lifetime —
    * the impact story, not just its duration (audit U3). Optional/assumed: not

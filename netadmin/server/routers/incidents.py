@@ -28,6 +28,7 @@ SQL lives in the store, section 4). ``async`` because the connection is loop-bou
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import time
 from typing import Any, Optional
@@ -53,6 +54,27 @@ _SEVERITY_RANK: dict[str, int] = {
 
 def _severity_rank(severity: str) -> int:
     return _SEVERITY_RANK.get(severity, len(_SEVERITY_RANK))
+
+
+def _member_sig(current_issue_ids: set[int]) -> str:
+    """A stable signature of an incident's CURRENT member issue-id SET.
+
+    C5 (round 19): the dashboard row (``web/src/pages/incidents/IncidentRow.tsx``)
+    caches its symptom detail and invalidates on a signature the list payload
+    carries. Count alone misses a same-count REPLACEMENT; ``last_seen_ts`` was the
+    round-18 proxy for it, but ``last_seen_ts`` is a ``max``-fold over member
+    evidence (``engine._reconcile``), so a replacement whose *new* member has
+    OLDER evidence than the incident's high-water mark never advances it and the
+    row never refetches (adversarial verifier round 19, real feeder-port swap:
+    current symptoms went 2 -> 3 while the (count, last_seen_ts) signature stayed
+    (1, 1300)). ``member_sig`` is derived from the current member id SET alone,
+    with no evidence timestamp in it, so it changes iff a member is added,
+    removed, or replaced, and is byte-for-byte stable across polls while
+    membership is unchanged. Order-independent (the ids are sorted first) and
+    fixed-width, so it is a cheap, opaque cache key for the client.
+    """
+    payload = ",".join(str(i) for i in sorted(current_issue_ids))
+    return hashlib.blake2b(payload.encode("utf-8"), digest_size=8).hexdigest()
 
 
 def _engine(request: Request, store: Repository) -> IssueEngine:
@@ -177,6 +199,12 @@ async def list_incidents(
         incident = dict(inc)
         incident["member_count"] = current_counts.get(int(inc["id"]), 0)
         incident["symptom_count"] = current_symptom_counts.get(int(inc["id"]), 0)
+        # C5 (round 19): the authoritative membership-change signal for the
+        # dashboard row's detail cache — a signature of the CURRENT member id set
+        # (cleared_ts IS NULL), independent of evidence freshness, so a same-count
+        # replacement whose new member has older evidence than last_seen_ts still
+        # invalidates the row. See _member_sig.
+        incident["member_sig"] = _member_sig(store.current_incident_issue_ids(int(inc["id"])))
         incident["root"] = _root_ref(int(inc["root_issue_id"]), all_issues, entity_refs)
         items.append(incident)
 

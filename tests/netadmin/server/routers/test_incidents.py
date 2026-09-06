@@ -269,6 +269,86 @@ async def test_c5_cleared_member_excluded_from_counts_and_list_suppression(
     assert "wifi.mesh_uplink" not in detectors
 
 
+async def test_c5_member_sig_tracks_membership_replacement_not_evidence(
+    incident_app, incident_store
+) -> None:
+    """C5 (round 19): the list card's ``member_sig`` must change when a current
+    member is REPLACED at constant count -- even when the replacement's evidence
+    is OLDER than the incident's ``last_seen_ts`` high-water mark, so it does not
+    advance -- and stay byte-stable across polls when membership is unchanged.
+
+    Reproduces the adversarial verifier's real feeder-port swap: the (count,
+    last_seen_ts) signature the round-18 fix keyed on stayed constant while the
+    current-member SET changed, so the dashboard row never refetched. ``member_sig``
+    is derived from the current member id set alone, with no evidence timestamp in
+    it, so it is the honest membership-change signal.
+    """
+    import time as _t
+
+    inc_id = incident_store.incident_id_for_issue(incident_store.root_id)
+    assert inc_id is not None
+
+    # Baseline: two polls with no membership change -> identical member_sig, and
+    # the incident is the seeded 2-member (root + 1 symptom) group.
+    async with await _client(incident_app) as c:
+        card1 = next(
+            i for i in (await c.get("/api/incidents")).json()["incidents"] if i["id"] == inc_id
+        )
+        card2 = next(
+            i for i in (await c.get("/api/incidents")).json()["incidents"] if i["id"] == inc_id
+        )
+    assert card1["symptom_count"] == 1
+    assert card1["member_sig"]  # present and non-empty
+    assert card1["member_sig"] == card2["member_sig"]  # stable across unchanged polls
+    seen_before = int(card1["last_seen_ts"])
+    sig_before = card1["member_sig"]
+
+    # A feeder-port swap: the old symptom clears, a NEW symptom joins in the same
+    # reconcile pass. Its evidence is deliberately OLDER than the incident's
+    # last_seen_ts high-water mark, so a max-fold signal would not move.
+    ap_id = int(incident_store.get_issue(incident_store.root_id)["entity_id"])
+    new_symptom = incident_store.insert_issue(
+        fingerprint="cov-hole-2",
+        detector_key="net.coverage_hole",
+        severity="p2",
+        state="active",
+        first_seen_ts=BASE + 300,
+        last_seen_ts=BASE + 400,  # OLDER than the incident's BASE+600 high-water mark
+        title="Coverage hole on Back Porch (feeder B)",
+        entity_id=ap_id,
+    )
+    incident_store.reconcile_incident_members(
+        inc_id,
+        [
+            {"issue_id": incident_store.root_id, "role": "root", "rule": "", "rationale": ""},
+            {
+                "issue_id": new_symptom,
+                "role": "symptom",
+                "rule": "same_device",
+                "rationale": "same AP",
+            },
+        ],
+        ts=int(_t.time()),
+    )
+
+    async with await _client(incident_app) as c:
+        card3 = next(
+            i for i in (await c.get("/api/incidents")).json()["incidents"] if i["id"] == inc_id
+        )
+    # Constant count, non-advancing last_seen_ts -- the round-18 proxy is blind here.
+    assert card3["symptom_count"] == 1
+    assert int(card3["last_seen_ts"]) == seen_before
+    # ...but the membership SET changed, so member_sig MUST change -> row refetches.
+    assert card3["member_sig"] != sig_before
+
+    # And it is stable again once membership settles.
+    async with await _client(incident_app) as c:
+        card4 = next(
+            i for i in (await c.get("/api/incidents")).json()["incidents"] if i["id"] == inc_id
+        )
+    assert card4["member_sig"] == card3["member_sig"]
+
+
 # --- bulk incident suppress / unsuppress (Gitea #50) ------------------------- #
 
 
