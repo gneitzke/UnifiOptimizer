@@ -139,7 +139,16 @@ async def list_incidents(
         if int(i["root_issue_id"]) in all_issues
     ]
     entity_refs = entity_ref_map(store, root_entity_ids)
-    counts = store.incident_member_counts([int(i["id"]) for i in incidents])
+    # C5: the card's member_count/symptom_count are the incident's PRESENT state
+    # -- current members only (cleared_ts IS NULL) -- never the append-only
+    # historical union. A symptom that cleared (resolved, or reassigned to a
+    # different root) must not keep inflating a card that is otherwise down to
+    # its root alone. Genuineness (below, via list_incidents/genuine_only) is
+    # deliberately the one place that still consults the historical union, so a
+    # once-genuine incident does not flicker out of "genuine" the moment its
+    # last symptom clears.
+    current_counts = store.current_incident_member_counts([int(i["id"]) for i in incidents])
+    current_symptom_counts = store.incident_open_symptom_counts([int(i["id"]) for i in incidents])
 
     # An incident is suppressed for attention purposes only when ALL its members
     # are (Gitea #49): a suppressed root with a live symptom keeps the incident in
@@ -162,9 +171,8 @@ async def list_incidents(
             suppressed_excluded += 1
             continue
         incident = dict(inc)
-        member_count = counts.get(int(inc["id"]), 0)
-        incident["member_count"] = member_count
-        incident["symptom_count"] = max(0, member_count - 1)
+        incident["member_count"] = current_counts.get(int(inc["id"]), 0)
+        incident["symptom_count"] = current_symptom_counts.get(int(inc["id"]), 0)
         incident["root"] = _root_ref(int(inc["root_issue_id"]), all_issues, entity_refs)
         items.append(incident)
 
@@ -212,12 +220,25 @@ async def get_incident(request: Request, incident_id: int) -> dict[str, Any]:
         if issue_row is None:
             return None
         eid = issue_row["entity_id"]
+        # C5: the detail view tells the incident's whole story, historical
+        # members included (e.g. a symptom later reassigned elsewhere still
+        # explains a chunk of the incident's past) -- but every member must
+        # carry when it joined and, if it is no longer attached, when it left,
+        # so the UI can distinguish "still part of this incident" from "was,
+        # but cleared" instead of rendering every historical row as current.
+        # ``left_ts``/``current`` mirror the frontend's IncidentMember contract
+        # (web/src/pages/shared/api.ts) rather than the raw ``cleared_ts`` column
+        # name.
+        cleared_ts = m["cleared_ts"]
         return {
             "issue": _issue_dict(issue_row),
             "entity": entity_refs.get(int(eid)) if eid is not None else None,
             "role": m["role"],
             "rule": m["rule"],
             "rationale": m["rationale"],
+            "joined_ts": m["joined_ts"],
+            "left_ts": cleared_ts,
+            "current": cleared_ts is None,
         }
 
     root_member: Optional[dict[str, Any]] = None
@@ -256,12 +277,20 @@ async def get_incident(request: Request, incident_id: int) -> dict[str, Any]:
 async def suppress_incident(
     request: Request, incident_id: int, body: IncidentSuppressBody
 ) -> dict[str, Any]:
-    """Suppress a whole incident in one action: the root and every symptom (Gitea
-    #50). Each member is suppressed *individually* — its own ``suppressed`` event,
-    stamped ``source="incident"`` so the trail distinguishes a bulk mute from a
-    per-issue one — because suppression lives on the issue row, not the incident
-    projection. Measured impact is untouched, exactly as for the per-issue route:
-    this parks attention (counts, alerts, HA sensors), never a measured number.
+    """Suppress a whole incident in one action: the root and every CURRENTLY
+    attached symptom (Gitea #50). Each member is suppressed *individually* — its
+    own ``suppressed`` event, stamped ``source="incident"`` so the trail
+    distinguishes a bulk mute from a per-issue one — because suppression lives on
+    the issue row, not the incident projection. Measured impact is untouched,
+    exactly as for the per-issue route: this parks attention (counts, alerts, HA
+    sensors), never a measured number.
+
+    C5: membership is append-only (a cleared/reassigned member keeps its
+    historical row), so this must act on
+    :meth:`Repository.current_incident_issue_ids`, not the full historical
+    ``list_incident_members`` -- otherwise suppressing an old incident would mute
+    a member that has since cleared or moved under a different root, which has
+    nothing to do with the incident being suppressed.
 
     Token-gated as a mutation (fans out on the WebSocket via the engine). 404 if
     the incident is unknown. Idempotent per member: re-suppressing an already-muted
@@ -273,10 +302,8 @@ async def suppress_incident(
     engine = _engine(request, store)
     now = int(time.time())
     count = 0
-    for member in store.list_incident_members(incident_id):
-        transition = engine.suppress(
-            int(member["issue_id"]), now, until_ts=body.until_ts, source="incident"
-        )
+    for issue_id in store.current_incident_issue_ids(incident_id):
+        transition = engine.suppress(issue_id, now, until_ts=body.until_ts, source="incident")
         if transition is not None:
             count += 1
     return {"incident_id": incident_id, "count": count}
@@ -284,17 +311,19 @@ async def suppress_incident(
 
 @router.post("/incidents/{incident_id}/unsuppress")
 async def unsuppress_incident(request: Request, incident_id: int) -> dict[str, Any]:
-    """Lift a bulk incident suppression: unsuppress the root and every symptom,
-    each writing its own ``unsuppressed`` event (Gitea #50). Mirrors
-    :func:`suppress_incident`. 404 if the incident is unknown."""
+    """Lift a bulk incident suppression: unsuppress the root and every CURRENTLY
+    attached symptom, each writing its own ``unsuppressed`` event (Gitea #50).
+    Mirrors :func:`suppress_incident`, including the C5 current-membership scope
+    (a cleared/reassigned member is not this incident's business to unsuppress
+    either). 404 if the incident is unknown."""
     store = get_store(request)
     if store.get_incident(incident_id) is None:
         raise HTTPException(status_code=404, detail=f"incident {incident_id} not found")
     engine = _engine(request, store)
     now = int(time.time())
     count = 0
-    for member in store.list_incident_members(incident_id):
-        transition = engine.unsuppress(int(member["issue_id"]), now)
+    for issue_id in store.current_incident_issue_ids(incident_id):
+        transition = engine.unsuppress(issue_id, now)
         if transition is not None:
             count += 1
     return {"incident_id": incident_id, "count": count}
