@@ -735,12 +735,29 @@ export const applyFix = (issueId: number, confirmToken: string) =>
     body: JSON.stringify({ confirm: true, confirm_token: confirmToken }),
   });
 
+/** Response for `POST .../fix/revert`. A revert is not always a clean
+ * success/failure binary: the restore write can come back HTTP 200 with
+ * `status: "unknown"` / `ambiguous: true` when the controller never
+ * confirmed the write landed (a lost response, or a 401 it may have landed
+ * under) — mirroring the apply path's ambiguity handling. The ledger's
+ * `change` is deliberately left at its prior status in that case (the router
+ * does not claim the change is definitively still applied, nor that it was
+ * reverted), so the ambiguous outcome must be read from `status`/`ambiguous`
+ * here, not inferred from `change.status`. */
+export interface FixRevertResponse {
+  status: 'reverted' | 'unknown' | (string & {});
+  ambiguous?: boolean;
+  detail?: string;
+  change: FixChange | null;
+  verification: FixVerification;
+}
+
 /** Revert a change from this issue's ledger, restoring its before-state. */
 export const revertFix = (issueId: number, changeId: number) =>
-  request<{ change: FixChange | null; verification: FixVerification }>(
-    `/api/issues/${issueId}/fix/revert`,
-    { method: 'POST', body: JSON.stringify({ change_id: changeId }) },
-  );
+  request<FixRevertResponse>(`/api/issues/${issueId}/fix/revert`, {
+    method: 'POST',
+    body: JSON.stringify({ change_id: changeId }),
+  });
 
 export const getSle = (windowS?: number, buckets?: number) =>
   request<SleResponse>(`/api/sle${qs({ window_s: windowS, buckets })}`);
