@@ -277,3 +277,100 @@ async def test_repeated_empty_close_forces_reauth(monkeypatch):
     assert login_route.call_count == 2
     assert collected[0].key == "EVT_TEST"
     await client.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# S4: the events WebSocket must NOT forward controller credentials across an
+# origin boundary. websockets follows 3xx redirects and re-sends
+# additional_headers on the new connection; a redirect to another host would
+# otherwise leak Cookie / X-CSRF-Token / X-API-KEY off-origin.
+# --------------------------------------------------------------------------- #
+class _Redirect(websockets.InvalidStatus):
+    """A 3xx handshake response with a ``Location``, shaped like InvalidStatus."""
+
+    def __init__(self, status: int, location: str) -> None:
+        self.response = SimpleNamespace(status_code=status, headers={"Location": location})
+
+
+def test_ws_connect_refuses_cross_origin_redirect_carrying_credentials():
+    # The production connector is the same-origin-guarded subclass.
+    assert ws_module.ws_connect is ws_module._SameOriginConnect
+
+    creds = {
+        "Cookie": "TOKEN=super-secret-session",
+        "X-CSRF-Token": "csrf-value",
+        "X-API-KEY": "api-key-value",
+    }
+    conn = ws_module.ws_connect(
+        "wss://ctrl.test/proxy/network/wss/s/default/events",
+        additional_headers=creds,
+    )
+
+    # A redirect to a DIFFERENT origin must be refused (returned as an error, not
+    # a new URI to follow) so the credential headers are never sent there.
+    off_origin = conn.process_redirect(_Redirect(302, "wss://evil.test/steal"))
+    assert isinstance(off_origin, websockets.exceptions.SecurityError)
+    # Cross-scheme (TLS downgrade) and cross-port are likewise off-origin.
+    assert isinstance(
+        conn.process_redirect(_Redirect(307, "ws://ctrl.test/x")),
+        websockets.exceptions.SecurityError,
+    )
+    assert isinstance(
+        conn.process_redirect(_Redirect(302, "wss://ctrl.test:8443/x")),
+        websockets.exceptions.SecurityError,
+    )
+
+    # A same-origin redirect (path rewrite on the same controller) is still
+    # honored -- the guard is about the origin boundary, not redirects per se.
+    same = conn.process_redirect(_Redirect(302, "/proxy/network/wss/s/default/events2"))
+    assert same == "wss://ctrl.test/proxy/network/wss/s/default/events2"
+
+
+# --------------------------------------------------------------------------- #
+# R3: the socket reports its ACTUAL connection state. "connected" only once the
+# handshake succeeds; "reconnecting" on a drop/backoff. A connection that never
+# handshakes must never report "connected".
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+@respx.mock
+async def test_ws_emits_connected_only_after_handshake(monkeypatch):
+    respx.get(OS_PROBE).mock(return_value=httpx.Response(401))
+    respx.post(OS_LOGIN).mock(
+        return_value=httpx.Response(
+            200,
+            headers=[("X-CSRF-Token", "c"), ("set-cookie", "TOKEN=sess-abc; Path=/")],
+            json={},
+        )
+    )
+
+    # First attempt: handshake rejected (never connects). Second: connects, yields.
+    sockets = [
+        _FakeSocket([], raise_on_enter=websockets.WebSocketException("drop")),
+        _FakeSocket([EVENT_FRAME]),
+    ]
+    calls = {"n": 0}
+
+    def fake_connect(url, **kwargs):
+        idx = calls["n"]
+        calls["n"] += 1
+        return sockets[min(idx, len(sockets) - 1)]
+
+    monkeypatch.setattr(ws_module, "ws_connect", fake_connect)
+
+    client = UnifiClient(host=HOST, username="u", password="p", verify_ssl=False)
+    listener = EventListener(client, backoff_base=0.01, backoff_max=0.01)
+
+    states: list[str] = []
+    listener.on_state = states.append
+
+    async for event in listener.events():
+        listener.stop()
+        break
+
+    # The first (failed) attempt emitted "reconnecting" and NEVER "connected";
+    # "connected" appears only after the successful handshake, and it is the
+    # first "connected" in the sequence (no premature report).
+    assert "connected" in states
+    assert states.index("reconnecting") < states.index("connected")
+    # The very first state reported was reconnecting -- not a premature connected.
+    assert states[0] == "reconnecting"
