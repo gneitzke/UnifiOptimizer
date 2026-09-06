@@ -182,3 +182,42 @@ async def test_non_json_mutation_response_is_not_confirmed_success():
     assert res.ok is False  # an HTML/non-JSON body cannot confirm the mutation
     assert res.status_code == 200
     await client.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# Verifier round 8 (#6): a non-JSON/unparseable 2xx mutation response is AMBIGUOUS
+# (outcome unknown), NOT a definitive failure. A definitive failure let a revert
+# report "the change was not rolled back" (a falsehood) and permitted a replay.
+# --------------------------------------------------------------------------- #
+@respx.mock
+async def test_non_json_2xx_mutation_response_is_ambiguous_not_definitive_failure():
+    _mock_login()
+    respx.put(f"{API}/rest/device/dev123").mock(
+        return_value=httpx.Response(200, text="<html>gateway</html>")
+    )
+    client = await _client()
+    writer = RealControllerWriter(client)
+    res = await writer.put("rest/device/dev123", {"radio_table": []})
+    assert res.ok is False  # an HTML/non-JSON body cannot confirm the mutation
+    assert res.status_code == 200
+    # The 2xx means the controller ACCEPTED the request -- the write may have landed --
+    # so the outcome is UNKNOWN (ambiguous), surfaced like a lost response, never a
+    # definitive failure the caller can treat as "the change did not happen".
+    assert isinstance(res.data, dict) and res.data.get("ambiguous") is True
+    await client.aclose()
+
+
+@respx.mock
+async def test_non_2xx_non_json_mutation_response_stays_a_definitive_failure():
+    # Symmetric guard: a NON-2xx unparseable body is a real rejection, NOT ambiguous.
+    _mock_login()
+    respx.put(f"{API}/rest/device/dev123").mock(
+        return_value=httpx.Response(500, text="<html>error</html>")
+    )
+    client = await _client()
+    writer = RealControllerWriter(client)
+    res = await writer.put("rest/device/dev123", {"radio_table": []})
+    assert res.ok is False
+    assert res.status_code == 500
+    assert not (isinstance(res.data, dict) and res.data.get("ambiguous"))
+    await client.aclose()

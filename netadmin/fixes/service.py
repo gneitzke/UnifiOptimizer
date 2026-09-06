@@ -449,12 +449,23 @@ class FixService:
 
             target = step.precondition.target_native_id
             expected = step.precondition.expected
-            if not expected or target in state:
+            if not expected:
                 continue
             device = await _device_for(device_mac_of(target))
             if device is None:
                 continue  # absent -> drift, refused by the applier
-            state[target] = _extract_target_attrs(device, target, expected)
+            # MERGE every step's expected attrs for a target, don't skip a target a
+            # prior step already read (#4). Two steps on the SAME radio (a channel
+            # move AND a power move) each assert a different attribute; skipping the
+            # second left its attribute (power) unextracted, so the applier's
+            # precondition re-check saw it missing and reported FALSE drift. Union the
+            # extracted attrs so every step's precondition is checked against a value
+            # that was actually read.
+            extracted = _extract_target_attrs(device, target, expected)
+            if target in state:
+                state[target].update(extracted)
+            else:
+                state[target] = extracted
         return state, mesh_uplinks, full_state
 
 

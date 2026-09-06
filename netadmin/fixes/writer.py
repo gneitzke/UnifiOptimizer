@@ -118,9 +118,34 @@ class RealControllerWriter:
         http_ok = status is not None and 200 <= int(status) < 300
         # A mutation counts as confirmed success ONLY when the HTTP status is 2xx,
         # the body is a JSON envelope we could parse, AND that envelope does not
-        # report an error (R1). An HTML/non-JSON body, or a 200 carrying
-        # ``meta.rc="error"``, is not a confirmed success -- it is a failure.
+        # report an error (R1). A 200 carrying ``meta.rc="error"`` is a failure.
         confirmed_json = isinstance(data, dict)
+        # A 2xx whose body we could NOT parse as a JSON envelope (an HTML page, a
+        # proxy/gateway response) is AMBIGUOUS, not a definitive failure (#6): the
+        # controller ACCEPTED the request (2xx) but we cannot confirm the mutation's
+        # outcome from the body, so the write may well have landed. Surface it exactly
+        # like a lost response -- ``ok=False`` with ``data={"ambiguous": True, ...}`` --
+        # so the applier records it as unknown (not "reverted"/"failed"), the API never
+        # claims "the change was not rolled back", and no automatic replay is allowed.
+        # A NON-2xx unparseable body stays a definitive failure (a real rejection).
+        if http_ok and not confirmed_json:
+            _log.warning(
+                "unparseable 2xx mutation response: %s %s (status=%s); outcome unknown",
+                method,
+                endpoint,
+                status,
+            )
+            return WriteResult(
+                ok=False,
+                status_code=status,
+                data={
+                    "ambiguous": True,
+                    "error": (
+                        "controller returned a non-JSON (unparseable) 2xx body; "
+                        "mutation outcome unknown -- reconcile via a read"
+                    ),
+                },
+            )
         envelope_ok = confirmed_json and envelope_error(data) is None
         ok = http_ok and envelope_ok
         return WriteResult(ok=ok, status_code=status, data=data)

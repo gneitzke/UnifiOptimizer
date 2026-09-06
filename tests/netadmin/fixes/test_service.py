@@ -652,3 +652,51 @@ async def test_concurrent_service_reverts_dispatch_exactly_once(store, monkeypat
     assert len(oks) == 1 and oks[0].ok
     assert len(refused) == 1  # the second revert refused, no dispatch
     assert store.get_change(change_id)["status"] == "reverted"
+
+
+# --------------------------------------------------------------------------- #
+# Verifier round 8 (#4): the state reader must extract EVERY attribute needed
+# across ALL steps for a radio -- merging per-radio state, not skipping a later
+# step that targets an already-seen radio (which produced false drift).
+# --------------------------------------------------------------------------- #
+async def test_round8_4_reader_merges_all_attrs_for_a_repeated_radio(store):
+    # Two steps target the SAME radio (a channel move AND a tx-power move). Step 1's
+    # precondition asserts the channel; step 2's asserts the power. The reader used to
+    # skip a target it had already read, so step 2's power attribute was never
+    # extracted and the applier's precondition re-check saw it missing -> FALSE drift.
+    # The reader must union both steps' expected attrs for the radio.
+    from netadmin.fixes.models import ActionType, FixPlan, FixStep, Precondition, RiskLevel
+
+    _seed_channel_plan_issue(store)
+    endpoint = f"rest/device/{AP_ID}"
+
+    def _step(desc, expected, payload_field, new_val):
+        return FixStep(
+            action=ActionType.CHANNEL_CHANGE,
+            target_entity_type=EntityType.RADIO,
+            target_native_id=f"{AP_MAC}:ng",
+            description=desc,
+            risk=RiskLevel.MEDIUM,
+            method="PUT",
+            endpoint=endpoint,
+            payload={"radio_table": [{"radio": "ng", payload_field: new_val}]},
+            precondition=Precondition(target_native_id=f"{AP_MAC}:ng", expected=expected),
+            before={"method": "PUT", "endpoint": endpoint,
+                    "body": {"radio_table": [{"radio": "ng", "channel": 3, "tx_power_mode": "high"}]}},
+        )
+
+    plan = FixPlan(
+        "wifi.channel_plan",
+        f"{AP_MAC}:ng",
+        "two-attr",
+        steps=[
+            _step("channel", {"channel": 3}, "channel", 1),
+            _step("power", {"tx_power_mode": "high"}, "tx_power_mode", "medium"),
+        ],
+    )
+    # make_ap_device()'s ng radio has channel 3 and tx_power_mode "high".
+    svc = _service(store)
+    state, _mesh, _full = await svc._read_current_state(plan)
+
+    # BOTH attributes were extracted for the single radio, so NEITHER step drifts.
+    assert state[f"{AP_MAC}:ng"] == {"channel": 3, "tx_power_mode": "high"}
