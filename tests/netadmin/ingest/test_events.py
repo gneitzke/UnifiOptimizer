@@ -643,6 +643,102 @@ async def test_c3_bounded_fetch_clamps_recorded_coverage(repo: Repository) -> No
 
 
 # --------------------------------------------------------------------------- #
+# #w16a-3 / #w16a-4: a read window is 'complete' only if its events were read AND
+# normalized AND persisted. A normalize/store failure records a FAILED hole (not
+# nothing); an unusable-but-read event records a NOT-complete (partial) window.
+# --------------------------------------------------------------------------- #
+def _coverage_rows(repo: Repository) -> list[Any]:
+    return repo._conn.execute(
+        "SELECT start_ts, end_ts, status, detail FROM ingest_coverage "
+        "WHERE kind='event_history' AND scope='site' ORDER BY start_ts, end_ts"
+    ).fetchall()
+
+
+class _RaisingNormalizer(EventNormalizer):
+    """A normalizer whose entity-resolution READ raises a transient storage error,
+    modelling a ``sqlite3.OperationalError`` during normalize (#w16a-3)."""
+
+    def normalize(self, event: Event) -> Optional[dict[str, Any]]:
+        raise sqlite3.OperationalError("database is locked")
+
+
+@pytest.mark.asyncio
+async def test_w16a3_normalize_storage_error_records_failed_hole(repo: Repository) -> None:
+    """#w16a-3: a storage error during NORMALIZE (an entity lookup) runs OUTSIDE
+    the old HTTP-read guard. Pre-fix it re-raised leaving ``ingest_coverage`` EMPTY
+    for the window -- neither complete NOR failed, silently never retried nor
+    observed. The window was READ but could not be normalized/persisted, so it must
+    record a durable FAILED hole and re-raise (so the collector firewall marks the
+    poll failed)."""
+    now = 1_721_700_000
+    ev = Event.model_validate({"_id": "x1", "key": "EVT_X", "time": now * 1000})
+    with pytest.raises(sqlite3.OperationalError):
+        await catchup_events(
+            repo, FakeEndpoints([ev]), normalizer=_RaisingNormalizer(repo), now=now
+        )
+    rows = _coverage_rows(repo)
+    # A durable FAILED hole was recorded (not the empty ledger the bug left) ...
+    assert len(rows) == 1
+    assert rows[0]["status"] == "failed"
+    assert "normalize/store failed" in (rows[0]["detail"] or "")
+    # ... and a failed hole is never credited as observed coverage.
+    assert repo.observed_event_coverage(now - 3600, now) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_w16a4_unusable_event_window_not_complete(repo: Repository) -> None:
+    """#w16a-4: a read HTTP-200 window whose event is UNUSABLE (has _id/key/ap but
+    NO usable timestamp -> normalize returns None) was silently skipped and then the
+    whole window credited 'complete' with ZERO stored events -- fabricating
+    observed-empty history that lets detectors false-clear. The window must instead
+    be recorded NOT complete (a partial hole), so coverage is not credited."""
+    now = 1_721_700_000
+    unusable = Event.model_validate(
+        {"_id": "lost1", "key": "EVT_AP_Lost", "ap": "02:00:99:99:99:99"}  # no time/datetime
+    )
+    inserted = await catchup_events(repo, FakeEndpoints([unusable]), now=now)
+    assert inserted == 0
+    # Nothing was stored...
+    assert repo.read_events(0, now + 1) == []
+    rows = _coverage_rows(repo)
+    # ...and the window is NOT credited complete -- it is a partial hole.
+    assert len(rows) == 1
+    assert rows[0]["status"] == "partial"
+    assert repo.observed_event_coverage(now - 3600, now) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_w16a4_empty_read_still_records_complete(repo: Repository) -> None:
+    """#w16a-4 control: a genuinely EMPTY successful read (data=[], nothing to
+    drop) is still real observed-empty history and MUST record complete."""
+    now = 1_721_700_000
+    await catchup_events(repo, FakeEndpoints([]), now=now)
+    rows = _coverage_rows(repo)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "complete"
+    # A complete empty read credits the window as observed.
+    assert repo.observed_event_coverage(now - 3600, now) == 1.0
+
+
+def test_w16a5_out_of_range_int_port_routes_to_switch(repo: Repository) -> None:
+    """#w16a-5 (normalizer half): an out-of-SQLite-signed-range integer port is NOT
+    a valid port index. Accepting it builds native_id ``"<sw>:9223372036854775808"``
+    while the SQL renders the same value as a FLOAT (``"<sw>:9.2...e+18"``) -- a
+    permanent native_id desync. The bound rejects it (routes to the SWITCH), exactly
+    and consistently with the SQL, so it is never accepted-then-mismatched."""
+    ev = Event.model_validate(
+        {"_id": "stp-huge", "key": "EVT_SW_StpPortBlocking",
+         "time": 1_721_600_000_000, "sw": SWITCH_MAC, "port": 9223372036854775808}
+    )
+    rec = EventNormalizer(repo).normalize(ev)
+    assert rec is not None
+    # Routed to the SWITCH (present in inventory), NOT a bogus huge-port entity.
+    assert rec["entity_id"] == entity_id(repo, EntityType.SWITCH, SWITCH_MAC)
+    assert rec["related_entity_id"] is None
+    assert rec["native_id"] == "stp-huge"
+
+
+# --------------------------------------------------------------------------- #
 # R3: supervisor/health state must reflect the ACTUAL socket state, reported up
 # from the listener -- never assumed because a task exists.
 # --------------------------------------------------------------------------- #
@@ -1141,6 +1237,51 @@ def test_a_flaky_not_falsely_cleared_after_shutdown(repo: Repository) -> None:
     listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=0.0)
     listener.connection_state = "connected"
     _seed_beats(listener, start, start + 300, step=60)
+    ctx = DetectorContext(
+        repo=repo, baselines=FakeBaselines(), now_ts=now, site_id="default", settings=None
+    )
+    assert FlakyClientDetector().evaluate(ctx) is UNKNOWN
+
+
+def test_w16a1_flaky_freezes_when_disconnects_sever_heartbeat_bridge(
+    repo: Repository,
+) -> None:
+    """#w16a-1 end to end (B4 re-opening): a feed CONNECTED ~32 s out of every 90 s
+    (beats at c+0, c+30) and DISCONNECTED the other ~58 s (a recorded disconnect at
+    c+32) must read as mostly UNCOVERED so a real client.flaky issue FREEZES.
+
+    The last beat of a cycle (c+30) and the first of the next (c+90) are only 60 s
+    apart -- inside the 75 s cadence bridge -- so the pure-cadence bridge joined
+    them and fabricated ~98% coverage over a feed that was down most of the time,
+    false-clearing the issue. The disconnect-aware bridge severs at c+32, so
+    coverage (~0.33) stays far below the floor and the detector returns UNKNOWN."""
+    now = 8_500_000
+    start = now - 3600
+    seed_coverage(repo, job="fast_sta", now=now, window_s=3600, interval_s=60)
+    ap = repo.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="ap-flaky", site_id="default"), ts=now
+    )
+    repo.upsert_entity(
+        Entity(
+            entity_type=EntityType.CLIENT, native_id="cc:flaky", site_id="default",
+            parent_id=ap, first_seen_ts=now - 100_000,
+        ),
+        ts=now,
+    )
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=0.0)
+    listener.connection_state = "connected"
+    c = start
+    while c < now:
+        listener._maybe_heartbeat(now=c)
+        listener._last_heartbeat_ts = None
+        listener._maybe_heartbeat(now=c + 30)
+        listener._last_heartbeat_ts = None
+        # The supervisor records the socket drop between the two beats.
+        repo.record_poll_run(job="ws", ok=True, ts=c + 32, error="disconnected", source="live")
+        c += 90
+    cov = repo.observed_event_coverage(start, now)
+    assert cov < 0.5
+    assert cov < EVENT_COVERAGE_MIN
     ctx = DetectorContext(
         repo=repo, baselines=FakeBaselines(), now_ts=now, site_id="default", settings=None
     )
