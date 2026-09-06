@@ -964,6 +964,169 @@ async def test_concurrent_reverts_read_committed_state_no_stale_overwrite(store)
     assert store.get_change(id_b)["status"] == "reverted"
 
 
+async def test_concurrent_applies_second_fails_drift_not_stale_clobber(store):
+    # P1 (apply race): two concurrent applies to the SAME device. Apply A retunes the
+    # CHANNEL (3 -> 1); apply B steps DOWN tx-power but its payload -- a whole-table
+    # PUT built from a snapshot taken before A committed -- still carries the STALE
+    # channel 3. With state capture/validation done before the lock, B's PUT lands
+    # after A's and silently undoes it while both ledger rows read 'applied'. The fix
+    # reads fresh state and runs the precondition + whole-table clobber guard INSIDE
+    # the per-device lock, so B (running second) sees A's committed channel 1, detects
+    # that its payload would overwrite it, and fails drift -- it never dispatches, and
+    # A's change survives. The two appliers share the PROCESS-wide device lock.
+    import asyncio as _asyncio
+
+    from netadmin.fixes.applier import _endpoint_device
+    from netadmin.fixes.models import WriteResult
+    from netadmin.fixes.planner import plan_fix
+
+    from .conftest import make_finding, radio_entity
+
+    dev_key = _endpoint_device(f"rest/device/{AP_ID}")
+    # Shared mutable live radio state: both applies read it (inside their lock) and
+    # the writer commits payloads through it.
+    live = {
+        "ng": {"radio": "ng", "channel": 3, "tx_power_mode": "high",
+               "min_rssi_enabled": True, "min_rssi": -75, "ht": 20},
+        "na": {"radio": "na", "channel": 36, "tx_power_mode": "auto",
+               "min_rssi_enabled": False, "min_rssi": 0, "ht": 80},
+    }
+    gate = _asyncio.Event()  # blocks the FIRST writer until the second is parked
+
+    class _LiveWriter:
+        def __init__(self) -> None:
+            self.puts: list[dict] = []
+
+        async def put(self, ep, body):
+            self.puts.append(body)
+            if not gate.is_set():
+                await gate.wait()  # hold the in-flight write open
+            for r in body["radio_table"]:
+                live[r["radio"]] = dict(r)
+            return WriteResult(ok=True, status_code=200, data={"meta": {}})
+
+        async def post(self, ep, body):  # pragma: no cover - unused
+            return await self.put(ep, body)
+
+    def _state_reader():
+        async def _r():
+            full = {dev_key: {k: dict(v) for k, v in live.items()}}
+            cur = {
+                f"{AP_MAC}:ng": {
+                    "channel": live["ng"]["channel"],
+                    "tx_power_mode": live["ng"]["tx_power_mode"],
+                }
+            }
+            return cur, full, set()
+
+        return _r
+
+    # Plan A: channel 3 -> 1 (built from the current device).
+    plan_a = _channel_plan(make_ap_device())
+    # Plan B: tx-power high -> medium; its payload is built from a snapshot that still
+    # has channel 3 -- the stale field that would clobber A.
+    finding_b = make_finding(
+        "wifi.tx_power_loud",
+        radio_entity("ng"),
+        dims={"band": "2.4"},
+        evidence={"band": "2.4", "tx_power_mode": "high"},
+    )
+    plan_b = plan_fix(finding_b, device=make_ap_device(), issue_id=None)
+    assert next(r for r in plan_b.steps[0].payload["radio_table"] if r["radio"] == "ng")[
+        "channel"
+    ] == 3  # sanity: B's payload really does carry the stale channel
+
+    writer_a, writer_b = _LiveWriter(), _LiveWriter()
+    applier_a = Applier(store, writer_a)
+    applier_b = Applier(store, writer_b)
+
+    task_a = _asyncio.create_task(
+        applier_a.apply(
+            plan_a, dry_run=False, confirm_token=plan_confirm_token(plan_a),
+            state_reader=_state_reader(),
+        )
+    )
+    for _ in range(6):
+        await _asyncio.sleep(0)  # let A take the lock and park in its blocked write
+    task_b = _asyncio.create_task(
+        applier_b.apply(
+            plan_b, dry_run=False, confirm_token=plan_confirm_token(plan_b),
+            state_reader=_state_reader(),
+        )
+    )
+    for _ in range(6):
+        await _asyncio.sleep(0)  # let B park on the (A-held) device lock
+    gate.set()  # release A's write; A commits, releases the lock, then B proceeds
+
+    res_a = await task_a
+    with pytest.raises(PreconditionDrift):
+        await task_b  # B refuses rather than overwrite A's committed channel
+
+    assert res_a.applied is True
+    assert writer_a.puts and writer_a.puts[0]["radio_table"]  # A dispatched once
+    assert writer_b.puts == []  # B never dispatched a stale PUT
+    assert live["ng"]["channel"] == 1  # A's change stands; B did not undo it
+    # Ledger is honest: only A recorded a change, and it is 'applied'.
+    changes = store.list_changes()
+    assert len(changes) == 1
+    assert changes[0]["status"] == "applied"
+
+
+async def test_concurrent_reverts_dispatch_the_mutation_exactly_once(store):
+    # P2 (revert replay): two concurrent reverts of the SAME change. Both read status
+    # 'applied' before the lock, so both would dispatch -- replaying the mutation. The
+    # fix re-reads the row's status UNDER the per-device lock: once the first revert
+    # commits 'reverted', the second re-reads that status and refuses with no dispatch.
+    # Exactly ONE PUT, one 'reverted' row.
+    import asyncio as _asyncio
+
+    from netadmin.fixes.models import WriteResult
+
+    endpoint = f"rest/device/{AP_ID}"
+    change_id = store.insert_change(
+        action="wifi.channel_change",
+        before={"method": "PUT", "endpoint": endpoint,
+                "body": {"radio_table": [{"radio": "ng", "channel": 3}]}},
+        after={"method": "PUT", "endpoint": endpoint,
+               "body": {"radio_table": [{"radio": "ng", "channel": 1}]}},
+        status="applied",
+        ts=1,
+    )
+
+    class _CountingWriter:
+        def __init__(self) -> None:
+            self.puts = 0
+
+        async def put(self, ep, body):
+            self.puts += 1
+            await _asyncio.sleep(0)
+            return WriteResult(ok=True, status_code=200, data={"meta": {}})
+
+        async def post(self, ep, body):  # pragma: no cover - unused
+            return await self.put(ep, body)
+
+    writer = _CountingWriter()
+    applier = Applier(store, writer)
+    live = {"ng": {"radio": "ng", "channel": 1}}
+
+    async def _reader():
+        return {k: dict(v) for k, v in live.items()}, False
+
+    results = await _asyncio.gather(
+        applier.revert(change_id, state_reader=_reader),
+        applier.revert(change_id, state_reader=_reader),
+        return_exceptions=True,
+    )
+
+    oks = [r for r in results if not isinstance(r, Exception)]
+    refused = [r for r in results if isinstance(r, FixError)]
+    assert writer.puts == 1  # dispatched exactly once, not replayed
+    assert len(oks) == 1 and oks[0].ok
+    assert len(refused) == 1  # the second revert was refused with no dispatch
+    assert "already reverted" in str(refused[0])
+    assert store.get_change(change_id)["status"] == "reverted"
+
+
 async def test_serialize_releases_acquired_locks_on_cancellation_mid_acquire(store):
     # NEW-BUG: cancelling a task while it acquires a SECOND device lock must release
     # the FIRST lock it already holds. Acquisition is inside try/finally, so no lock

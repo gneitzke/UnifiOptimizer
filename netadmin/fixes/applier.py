@@ -21,12 +21,22 @@ row. A real apply is gated behind, in order:
    any drift aborts the whole plan before a single call goes out. An empty
    precondition is only "satisfied" when the target was actually read; a target
    missing from the fresh snapshot is drift, never a free pass.
+#. a whole-``radio_table`` clobber guard: because a ``rest/device`` PUT replaces the
+   entire table, the payload re-sends every field the fix did *not* target at its
+   snapshot value; if any such field has diverged from live since, sending it would
+   silently overwrite a concurrent change, so that too is drift.
 
-Only past all gates does it, per step: resolve the entity, write the before-state to
-the ``changes`` ledger, send through the writer, and mark the row applied/failed.
+The last two gates are the *binding*, live-state-dependent validation, and they run
+**inside** the per-device lock against state read after the lock is held -- the
+read -> validate -> write is one atomic critical section per device. Only past all
+gates does it, per step: resolve the entity, write the before-state to the
+``changes`` ledger, send through the writer, and mark the row applied/failed.
 Before-state is captured first so a revert is always possible; a step's failure
-stops the plan rather than pressing on mutating. Apply and revert are serialized
-per target device so two operations on the same device can never interleave.
+stops the plan rather than pressing on mutating. Apply and revert are serialized per
+target device so two operations on the same device can never interleave: a second
+apply validates against the first's committed write (never a stale pre-lock
+snapshot), and a second revert re-reads the row's status under the lock and refuses
+once the first has marked it reverted, so a mutation is never replayed.
 """
 
 from __future__ import annotations
@@ -197,6 +207,7 @@ class Applier:
         confirm_token: Optional[str] = None,
         current_state: Optional[Mapping[str, Mapping[str, Any]]] = None,
         mesh_uplinks: Optional[set[str]] = None,
+        state_reader: Optional[Callable[[], Any]] = None,
         now: Optional[int] = None,
     ):
         """Dry-run render (default) or, fully gated, a real apply.
@@ -210,6 +221,18 @@ class Applier:
         (:func:`_endpoint_device`) whose device is currently a mesh uplink -- fed to
         the revertibility gate so its reverse dry-run judges the min-RSSI rail
         against the AP's real mesh posture (S2).
+
+        ``state_reader`` (C1 apply race) is the authoritative fresh-state source read
+        **inside** the per-device lock: an async callable returning ``(current_state,
+        full_state, mesh_uplinks)``, where ``full_state`` maps each target device key
+        (:func:`_endpoint_device`) to ``{radio_code: {attr: value}}`` of its whole
+        live ``radio_table``. When given, it overrides the passed ``current_state`` /
+        ``mesh_uplinks`` -- the precondition re-check, the revertibility gate, and the
+        whole-table clobber guard all run against state read after the lock is held,
+        so a second apply on the same device sees the first's committed write and
+        fails drift rather than overwriting it with its own stale snapshot. A caller
+        that has already read state (no concurrency) may pass ``current_state`` /
+        ``mesh_uplinks`` directly and omit ``state_reader``.
         """
         if dry_run:
             # The ONLY thing a dry run does: render. No writer reference exists on
@@ -221,6 +244,7 @@ class Applier:
             confirm_token=confirm_token,
             current_state=current_state or {},
             mesh_uplinks=mesh_uplinks or set(),
+            state_reader=state_reader,
             now=self._now_fn() if now is None else now,
         )
 
@@ -231,6 +255,7 @@ class Applier:
         confirm_token: Optional[str],
         current_state: Mapping[str, Mapping[str, Any]],
         mesh_uplinks: set[str],
+        state_reader: Optional[Callable[[], Any]],
         now: int,
     ) -> ApplyResult:
         # Gate 1: an advisory plan has nothing to apply.
@@ -256,29 +281,51 @@ class Applier:
                 f"plan touches {plan.device_count} devices; max is {self.max_devices}"
             )
 
-        # Gate 5: the absolute min-RSSI rail.
+        # Gate 5: the absolute min-RSSI rail. Payload-vs-before is plan-static, so it
+        # is judged before the lock like the other invariants above.
         self._assert_min_rssi_safe(plan)
-
-        # Gate 5b: the revertibility rail. The applier does not trust the planner's
-        # ``revertible`` flag -- it re-derives, per step, whether a genuine revert
-        # exists under the current contract, and refuses a one-way/irreversible
-        # write outright. Nothing that cannot be undone is ever applied.
-        self._assert_revertible(plan, mesh_uplinks)
-
-        # Gate 6: precondition re-check of every step -- any drift aborts the whole
-        # plan before a single call is sent.
-        drifted = self._precondition_drift(plan, current_state)
-        if drifted:
-            raise PreconditionDrift(
-                f"{len(drifted)} step(s) drifted from expected state; plan aborted", drifted
-            )
 
         results: list[StepResult] = []
         change_ids: list[int] = []
         applied_all = True
-        # Serialize the whole send loop against any other apply/revert touching the
-        # same device(s), so concurrent operations cannot interleave writes.
+        full_state: Optional[Mapping[str, Mapping[str, Mapping[str, Any]]]] = None
+        # Serialize the whole read -> validate -> write against any other apply/revert
+        # touching the same device(s) (C1). The state-dependent gates (revertibility's
+        # mesh posture, precondition drift, and the whole-table clobber guard) run
+        # INSIDE this lock against state read after it is held, so a second apply on
+        # the same device validates against the first's COMMITTED write instead of a
+        # snapshot taken before either -- the fix for the apply-race clobber.
         async with self._serialize(_endpoint_device(s.endpoint) for s in plan.steps):
+            # Authoritative fresh read under the lock. Reading before the lock (in
+            # the caller) and validating that stale snapshot is exactly what let a
+            # second apply overwrite the first's committed change; read it HERE.
+            if state_reader is not None:
+                current_state, full_state, mesh_uplinks = await state_reader()
+
+            # Gate 5b: the revertibility rail, judged against the fresh mesh posture.
+            # The applier does not trust the planner's ``revertible`` flag -- it
+            # re-derives, per step, whether a genuine revert exists under the current
+            # contract, and refuses a one-way/irreversible write outright.
+            self._assert_revertible(plan, mesh_uplinks)
+
+            # Gate 6: precondition re-check of every step against fresh live state --
+            # any drift aborts the whole plan before a single call is sent.
+            drifted = self._precondition_drift(plan, current_state)
+            if drifted:
+                raise PreconditionDrift(
+                    f"{len(drifted)} step(s) drifted from expected state; plan aborted", drifted
+                )
+
+            # Gate 6b: whole-``radio_table`` clobber guard (C1). A ``rest/device`` PUT
+            # replaces the entire radio_table, so the payload re-sends every UNTOUCHED
+            # field at its snapshot value. If a concurrent apply committed a change to
+            # one of those fields since the snapshot, re-sending it would silently undo
+            # that change -- abort as drift. Only runs when full live state is
+            # available (``state_reader`` supplied it); a caller that passed only the
+            # narrow precondition ``current_state`` skips it (single-op, no race).
+            if full_state is not None:
+                self._assert_no_stale_overwrite(plan, full_state)
+
             for step in plan.steps:
                 change_id = self._record_before(plan, step, now)
                 change_ids.append(change_id)
@@ -392,6 +439,18 @@ class Applier:
 
         method = str(before.get("method") or "PUT")
         async with self._serialize([_endpoint_device(str(endpoint))]):
+            # Eligibility re-check UNDER the lock (P2): the status read before the lock
+            # is stale the instant a concurrent revert of this same row commits. Two
+            # reverts both saw 'applied' outside the lock, so both would dispatch --
+            # replaying the mutation. Re-read the row now that we hold the device lock;
+            # if a first revert already flipped it to 'reverted', refuse with no
+            # dispatch. The check that gates the write must be under the same lock the
+            # write is, not before it.
+            fresh_row = self._store.get_change(change_id)
+            if fresh_row is None:
+                raise FixError(f"no change with id {change_id}")
+            if fresh_row["status"] == _STATUS_REVERTED:
+                raise FixError(f"change {change_id} already reverted")
             # Read-modify-write is atomic under the lock (C1): read fresh live state
             # HERE, not before acquiring it, so a concurrent revert's committed write
             # is visible and cannot be clobbered by a stale table.
@@ -834,6 +893,72 @@ class Applier:
             if any(k not in live or live[k] != v for k, v in expected.items()):
                 drifted.append(step)
         return drifted
+
+    @staticmethod
+    def _assert_no_stale_overwrite(
+        plan: FixPlan,
+        full_state: Mapping[str, Mapping[str, Mapping[str, Any]]],
+    ) -> None:
+        """Refuse a whole-``radio_table`` PUT that would clobber a field changed since
+        the plan was built (C1 apply race).
+
+        The narrow precondition re-check only asserts the ONE attribute a fix targets.
+        But a ``rest/device`` PUT replaces the entire ``radio_table``, so the payload
+        carries the whole captured device snapshot with just the target field changed
+        -- every OTHER field it re-sends equals its value at snapshot time (the step's
+        recorded ``before``). If, by the time the per-device lock is held, a concurrent
+        apply has committed a change to one of those untouched fields, re-sending the
+        snapshot value would silently undo it. This compares each payload field against
+        fresh live state (read under the lock) and aborts the whole plan as drift when
+        an untouched field has diverged -- so the second of two concurrent applies
+        fails rather than overwriting the first's committed change with stale bytes.
+
+        ``full_state`` maps each target device key (:func:`_endpoint_device`) to the
+        whole live ``{radio_code: {attr: value}}``. A target device (or radio) missing
+        from it is unverifiable, and -- exactly as the precondition re-check treats a
+        missing snapshot -- counts as drift: we never mutate on unverified state.
+        """
+        drifted: list[FixStep] = []
+        for step in plan.steps:
+            payload_radios = step.payload.get("radio_table") if step.payload else None
+            if not payload_radios:
+                continue  # not a whole-table PUT -- nothing to clobber here
+            live_radios = full_state.get(_endpoint_device(step.endpoint))
+            if live_radios is None:
+                drifted.append(step)  # unverifiable device -> drift
+                continue
+            before_body = (step.before or {}).get("body", {}) if step.before else {}
+            before_radios = {
+                r.get("radio"): r for r in (before_body.get("radio_table") or [])
+            }
+            conflict = False
+            for entry in payload_radios:
+                radio = entry.get("radio")
+                live = live_radios.get(radio)
+                if live is None:
+                    conflict = True  # radio vanished / unreadable -> unverified
+                    break
+                before_entry = before_radios.get(radio, {})
+                for field, payload_val in entry.items():
+                    if field == "radio":
+                        continue
+                    if payload_val != before_entry.get(field):
+                        continue  # the field this step intends to change (or add)
+                    # An UNTOUCHED field the PUT will re-send at its snapshot value;
+                    # if live has diverged, sending it would overwrite a newer change.
+                    if field in live and live[field] != payload_val:
+                        conflict = True
+                        break
+                if conflict:
+                    break
+            if conflict:
+                drifted.append(step)
+        if drifted:
+            raise PreconditionDrift(
+                f"{len(drifted)} step(s) would overwrite a field changed since the plan "
+                "was built (a concurrent apply); plan aborted",
+                drifted,
+            )
 
     @staticmethod
     def _assert_min_rssi_safe(plan: FixPlan) -> None:
