@@ -214,6 +214,44 @@ async def test_apply_confirmed_mutates_once_and_arms_verification(fix_env) -> No
     assert ng["channel"] == 1
 
 
+async def test_apply_ambiguous_outcome_is_reported_unknown_through_the_api(fix_env) -> None:
+    # C2: when the mutation's outcome is ambiguous (a lost response, or a 401 the
+    # write may have landed under), the writer returns ok=False with an "ambiguous"
+    # marker. The API must report that step as "unknown"/ambiguous WITH detail, not
+    # collapse it into a generic "failed" -- the operator has to reconcile, not
+    # assume the change never took. The verification window is NOT armed.
+    from netadmin.fixes.models import WriteResult
+
+    ambiguous = FakeControllerWriter(
+        response=WriteResult(
+            ok=False,
+            status_code=None,
+            data={
+                "ambiguous": True,
+                "error": f"PUT rest/device/{AP_ID} -> 401; not re-dispatched",
+            },
+        )
+    )
+    fix_env.app.state.fix_seams = FixSeams(reader=fix_env.reader, writer=ambiguous)
+    async with await _client(fix_env.app) as c:
+        plan = (await c.get(f"/api/issues/{fix_env.issue_id}/fix-plan")).json()
+        resp = await c.post(
+            f"/api/issues/{fix_env.issue_id}/fix/apply",
+            json={"confirm": True, "confirm_token": plan["confirm_token"]},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["applied"] is False
+    step = body["steps"][0]
+    assert step["status"] == "unknown"  # not "failed"
+    assert step["ambiguous"] is True
+    assert "401" in (step["error"] or "")
+    # Exactly one dispatch reached the writer -- the write was not replayed.
+    assert ambiguous.call_count == 1
+    # An ambiguous (unconfirmed) apply does not arm verification.
+    assert body["verification"]["status"] == "not_armed"
+
+
 async def test_apply_then_revert_restores_before_state(fix_env) -> None:
     async with await _client(fix_env.app) as c:
         plan = (await c.get(f"/api/issues/{fix_env.issue_id}/fix-plan")).json()

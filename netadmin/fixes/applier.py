@@ -72,6 +72,22 @@ _STATUS_APPLYING = "applying"
 _STATUS_APPLIED = "applied"
 _STATUS_FAILED = "failed"
 _STATUS_REVERTED = "reverted"
+# Terminal-but-uncertain: the mutation was dispatched exactly once and its outcome
+# is unknown (a lost response, or a 401 that may have landed after acceptance). It
+# is NOT "failed" -- the write may have taken -- so it is never mistaken for either
+# a clean failure or a confirmed apply, and the operator reconciles via a GET (C2).
+_STATUS_UNKNOWN = "unknown"
+
+
+# Process-wide per-device lock registry (C1). Two request-scoped appliers in the
+# same process each build their own :class:`Applier`, so the serialization locks
+# CANNOT live on the instance -- two independent locks serialize nothing. They live
+# here, shared across every applier in the process, so a revert issued by one
+# request serializes against an apply/revert issued by another. Keyed by
+# ``(event-loop id, device key)``: an :class:`asyncio.Lock` is bound to the loop
+# that created it, so a lock is never shared across event loops (each test's loop,
+# the daemon's single long-lived loop). Bounded by the device count on a given loop.
+_PROCESS_DEVICE_LOCKS: dict[tuple[int, str], "asyncio.Lock"] = {}
 
 
 class Applier:
@@ -96,10 +112,9 @@ class Applier:
         self.max_steps = max_steps
         self.max_devices = max_devices
         self._now_fn = now_fn or (lambda: int(time.time()))
-        # Per-device locks so a plan's apply and any revert on the same device are
-        # serialized -- concurrent mutations on one device must never interleave
-        # (C1). Keyed by the device id parsed from the endpoint.
-        self._device_locks: dict[str, asyncio.Lock] = {}
+        # Per-device serialization locks are PROCESS-wide, not per-instance (C1):
+        # they live in the module-level registry so two request-scoped appliers
+        # serialize against each other. See :func:`Applier._lock_for`.
 
     # ------------------------------------------------------------------ #
     # Dry run (default) -- pure render, no writer, no ledger
@@ -147,6 +162,7 @@ class Applier:
         dry_run: bool = True,
         confirm_token: Optional[str] = None,
         current_state: Optional[Mapping[str, Mapping[str, Any]]] = None,
+        mesh_uplinks: Optional[set[str]] = None,
         now: Optional[int] = None,
     ):
         """Dry-run render (default) or, fully gated, a real apply.
@@ -156,7 +172,10 @@ class Applier:
         module docstring and returns an :class:`ApplyResult`. ``current_state`` maps
         each step's precondition target native id to a flat ``{attr: value}`` of the
         freshly read live values; it is what the precondition re-check compares
-        against.
+        against. ``mesh_uplinks`` is the set of target device keys
+        (:func:`_endpoint_device`) whose device is currently a mesh uplink -- fed to
+        the revertibility gate so its reverse dry-run judges the min-RSSI rail
+        against the AP's real mesh posture (S2).
         """
         if dry_run:
             # The ONLY thing a dry run does: render. No writer reference exists on
@@ -167,6 +186,7 @@ class Applier:
             plan,
             confirm_token=confirm_token,
             current_state=current_state or {},
+            mesh_uplinks=mesh_uplinks or set(),
             now=self._now_fn() if now is None else now,
         )
 
@@ -176,6 +196,7 @@ class Applier:
         *,
         confirm_token: Optional[str],
         current_state: Mapping[str, Mapping[str, Any]],
+        mesh_uplinks: set[str],
         now: int,
     ) -> ApplyResult:
         # Gate 1: an advisory plan has nothing to apply.
@@ -208,7 +229,7 @@ class Applier:
         # ``revertible`` flag -- it re-derives, per step, whether a genuine revert
         # exists under the current contract, and refuses a one-way/irreversible
         # write outright. Nothing that cannot be undone is ever applied.
-        self._assert_revertible(plan)
+        self._assert_revertible(plan, mesh_uplinks)
 
         # Gate 6: precondition re-check of every step -- any drift aborts the whole
         # plan before a single call is sent.
@@ -239,6 +260,18 @@ class Applier:
                 if write.ok:
                     self._store.update_change_status(change_id, _STATUS_APPLIED)
                     results.append(StepResult(step, _STATUS_APPLIED, change_id, write))
+                elif _write_is_ambiguous(write):
+                    # C2: the writer could not confirm the outcome (a lost response,
+                    # or a 401 the write may have landed under). This is NOT a clean
+                    # failure -- the change may be live -- so it is recorded as
+                    # "unknown", never collapsed into generic "failed", and its
+                    # ambiguity detail is preserved end to end for the API.
+                    detail = _write_detail(write) or "mutation outcome unknown (ambiguous)"
+                    self._store.update_change_status(change_id, _STATUS_UNKNOWN)
+                    results.append(StepResult(step, _STATUS_UNKNOWN, change_id, write, detail))
+                    applied_all = False
+                    _log.warning("fix step outcome ambiguous, stopping plan: %s", detail)
+                    break
                 else:
                     self._store.update_change_status(change_id, _STATUS_FAILED)
                     results.append(
@@ -267,6 +300,7 @@ class Applier:
         *,
         current_radios: Optional[Mapping[str, Mapping[str, Any]]] = None,
         is_mesh_uplink: bool = False,
+        state_reader: Optional[Callable[[], Any]] = None,
         now: Optional[int] = None,
     ) -> WriteResult:
         """Restore a change's captured before-state through the writer -- re-gated.
@@ -295,8 +329,16 @@ class Applier:
         unrelated work applied to the device since. If a touched field has drifted
         to a third value (someone changed the very thing this change set), the
         revert refuses with :class:`PreconditionDrift` and the operator must
-        re-approve the resulting payload. The send is serialized per device against
-        any concurrent apply/revert.
+        re-approve the resulting payload.
+
+        The whole read-modify-write is **atomic** under the per-device lock (C1):
+        the fresh live state is read INSIDE the lock, via ``state_reader`` (an async
+        callable returning ``(current_radios, is_mesh_uplink)``), so two concurrent
+        reverts on the same device cannot each build their restore against the same
+        stale snapshot and have the second silently undo the first. Because the
+        device lock is process-wide, this holds even across two request-scoped
+        appliers. When no ``state_reader`` is given, the passed ``current_radios`` /
+        ``is_mesh_uplink`` are used as-is (a caller that has already read state).
         """
         now = self._now_fn() if now is None else now
         row = self._store.get_change(change_id)
@@ -314,26 +356,34 @@ class Applier:
         if self._writer is None:
             raise WriterRequired("revert requires an injected ControllerWriter")
 
-        # Re-gate a radio-config restore against fresh live state before sending.
-        restore_radios = body.get("radio_table") if isinstance(body, dict) else None
-        restore_body: Mapping[str, Any] = body
-        if restore_radios:
-            if current_radios is None:
-                raise SafetyViolation(
-                    f"revert of change {change_id} touches radio config but no fresh live "
-                    "state was read; refusing to restore on unverified state"
-                )
-            after_body = after.get("body") if isinstance(after, dict) else {}
-            fresh_table = self._fresh_restore_table(
-                change_id, body, after_body if isinstance(after_body, dict) else {}, current_radios
-            )
-            self._assert_revert_min_rssi_safe(
-                change_id, fresh_table, current_radios, is_mesh_uplink
-            )
-            restore_body = {"radio_table": fresh_table}
-
         method = str(before.get("method") or "PUT")
         async with self._serialize([_endpoint_device(str(endpoint))]):
+            # Read-modify-write is atomic under the lock (C1): read fresh live state
+            # HERE, not before acquiring it, so a concurrent revert's committed write
+            # is visible and cannot be clobbered by a stale table.
+            if state_reader is not None:
+                current_radios, is_mesh_uplink = await state_reader()
+
+            restore_radios = body.get("radio_table") if isinstance(body, dict) else None
+            restore_body: Mapping[str, Any] = body
+            if restore_radios:
+                if current_radios is None:
+                    raise SafetyViolation(
+                        f"revert of change {change_id} touches radio config but no fresh live "
+                        "state was read; refusing to restore on unverified state"
+                    )
+                after_body = after.get("body") if isinstance(after, dict) else {}
+                fresh_table = self._fresh_restore_table(
+                    change_id,
+                    body,
+                    after_body if isinstance(after_body, dict) else {},
+                    current_radios,
+                )
+                self._assert_revert_min_rssi_safe(
+                    change_id, fresh_table, current_radios, is_mesh_uplink
+                )
+                restore_body = {"radio_table": fresh_table}
+
             write = await self._dispatch_raw(method, str(endpoint), restore_body)
             if write.ok:
                 self._store.update_change_status(change_id, _STATUS_REVERTED, reverted_ts=now)
@@ -439,10 +489,18 @@ class Applier:
         raise SafetyViolation(f"unsupported mutation method: {method}")
 
     def _lock_for(self, key: str) -> asyncio.Lock:
-        lock = self._device_locks.get(key)
+        """The PROCESS-wide lock for a device key, on the current event loop (C1).
+
+        Shared across every :class:`Applier` in the process so two request-scoped
+        appliers serialize against each other, and keyed by the running loop so a
+        lock is never reused across event loops (each is bound to its creator loop).
+        """
+        loop_id = id(asyncio.get_running_loop())
+        reg_key = (loop_id, key)
+        lock = _PROCESS_DEVICE_LOCKS.get(reg_key)
         if lock is None:
             lock = asyncio.Lock()
-            self._device_locks[key] = lock
+            _PROCESS_DEVICE_LOCKS[reg_key] = lock
         return lock
 
     @asynccontextmanager
@@ -453,68 +511,94 @@ class Applier:
         same set of devices can never deadlock, and released in reverse. This is
         what serializes a plan's apply against a concurrent revert on the same
         device so their writes cannot interleave (C1).
+
+        Acquisition is inside try/finally over the locks acquired SO FAR: if a
+        cancellation (or any exception) interrupts ``acquire`` while acquiring a
+        later lock, every lock already held is released instead of being leaked --
+        a leaked lock would hang every subsequent operation on that device forever.
         """
         ordered = sorted({k for k in keys if k})
         locks = [self._lock_for(k) for k in ordered]
-        for lock in locks:
-            await lock.acquire()
+        acquired: list[asyncio.Lock] = []
         try:
+            for lock in locks:
+                await lock.acquire()
+                acquired.append(lock)
             yield
         finally:
-            for lock in reversed(locks):
+            for lock in reversed(acquired):
                 lock.release()
 
-    def _assert_revertible(self, plan: FixPlan) -> None:
-        """Refuse to apply any step that is not genuinely revertible.
+    def _assert_revertible(self, plan: FixPlan, mesh_uplinks: set[str]) -> None:
+        """Refuse to apply any step whose real revert would be refused (S2).
 
-        The applier does not trust ``step.revertible``: it re-derives the answer
-        from the step itself. A step is genuinely revertible only if it carries a
-        restorable before-state (a ``body`` and ``endpoint`` to replay) *and*
-        replaying that before-state would not itself be refused by the min-RSSI
-        rail. A transient command (a PoE power-cycle, ``before=None``) and a
-        min-RSSI removal (whose revert would re-enable min-RSSI, which the rail
-        forbids) are both one-way, so they are refused here -- they belong in an
-        advisory plan, surfaced as a recommendation, not executed as an
-        irreversible controller write.
+        The applier does not trust ``step.revertible``, and it does not settle for a
+        cheap proxy check either: it actually DERIVES the inverse operation and runs
+        it through the very same rails :meth:`revert` would -- a dry-run of the
+        reverse. A step is applied only if that reverse would pass; if the reverse
+        would be rejected, the apply is refused *up front*, so a change whose revert
+        the min-RSSI rail (or the restore builder) would later refuse is never
+        applied in the first place.
+
+        The reverse is dry-run against the state THIS apply establishes -- the
+        step's own payload becomes the "current live" table (what a revert issued
+        immediately after would read), and ``mesh_uplinks`` supplies the device's
+        real mesh posture so the mesh min-RSSI prohibition is judged truthfully. A
+        transient command (``before=None``, a PoE power-cycle) and any before-state
+        that is not a restorable radio-config PUT are one-way and refused here -- a
+        nonempty-but-irrelevant before-body (e.g. a ``cmd/devmgr`` body) does not
+        make a step revertible.
         """
         for step in plan.steps:
-            if not self._step_genuinely_revertible(step):
-                raise SafetyViolation(
-                    f"step '{step.description}' is not genuinely revertible under the "
-                    "current contract (no restorable before-state, or its revert is barred "
-                    "by the min-RSSI rail); refusing to apply a one-way change"
-                )
+            is_mesh = _endpoint_device(step.endpoint) in mesh_uplinks
+            self._assert_step_reverse_ok(step, is_mesh)
 
-    @staticmethod
-    def _step_genuinely_revertible(step: FixStep) -> bool:
+    def _assert_step_reverse_ok(self, step: FixStep, is_mesh_uplink: bool) -> None:
+        """Dry-run this step's reverse through the real revert rails; raise if refused."""
         before = step.before
         if not isinstance(before, dict):
-            return False
+            raise SafetyViolation(
+                f"step '{step.description}' has no restorable before-state; refusing to "
+                "apply a one-way change"
+            )
         body = before.get("body")
         endpoint = before.get("endpoint")
-        if not body or not endpoint:
-            return False
-        # Would replaying `before` re-enable or tighten min-RSSI relative to the
-        # state this step establishes (its payload)? If so, the revert would be
-        # refused by the rail, so the step is not genuinely revertible.
-        before_radios = {
-            r.get("radio"): r for r in (body.get("radio_table") or []) if isinstance(r, dict)
-        }
-        payload_radios = {
-            r.get("radio"): r
+        if not body or not endpoint or not isinstance(body, dict):
+            raise SafetyViolation(
+                f"step '{step.description}' has no restorable before-state; refusing to "
+                "apply a one-way change"
+            )
+        # A genuine revert is a whole-``radio_table`` config restore PUT to
+        # ``rest/device/<id>``. A nonempty-but-irrelevant before-body (a transient
+        # ``cmd/devmgr`` command body, a POST) restores no prior config and is NOT a
+        # revert, however full it looks.
+        method = str(before.get("method") or "PUT").upper()
+        restore_radios = body.get("radio_table")
+        if method != "PUT" or not _is_rest_device_endpoint(endpoint) or not restore_radios:
+            raise SafetyViolation(
+                f"step '{step.description}' before-state is not a restorable radio-config "
+                "PUT; refusing to apply a change with no genuine revert"
+            )
+        # Dry-run the reverse exactly as :meth:`revert` builds and gates it, using
+        # the payload this apply writes as the "current live" state a revert issued
+        # right afterwards would read.
+        current_radios = {
+            str(r.get("radio")): dict(r)
             for r in ((step.payload or {}).get("radio_table") or [])
-            if isinstance(r, dict)
+            if isinstance(r, dict) and r.get("radio") is not None
         }
-        for radio, bentry in before_radios.items():
-            if not _truthy(bentry.get("min_rssi_enabled")):
-                continue
-            pentry = payload_radios.get(radio, {})
-            if not _truthy(pentry.get("min_rssi_enabled")):
-                return False  # revert would re-enable min-RSSI
-            bv, pv = bentry.get("min_rssi"), pentry.get("min_rssi")
-            if isinstance(bv, (int, float)) and isinstance(pv, (int, float)) and bv > pv:
-                return False  # revert would tighten an already-set floor
-        return True
+        after_body = step.after.get("body") if isinstance(step.after, dict) else None
+        try:
+            fresh_table = self._fresh_restore_table(
+                -1, body, after_body if isinstance(after_body, dict) else {}, current_radios
+            )
+            self._assert_revert_min_rssi_safe(-1, fresh_table, current_radios, is_mesh_uplink)
+        except SafetyViolation:
+            raise
+        except PreconditionDrift as exc:  # a restore the builder itself would refuse
+            raise SafetyViolation(
+                f"step '{step.description}' reverse would be refused: {exc}"
+            ) from exc
 
     def _precondition_drift(
         self, plan: FixPlan, current_state: Mapping[str, Mapping[str, Any]]
@@ -640,6 +724,29 @@ def _endpoint_device(endpoint: str) -> str:
     if len(parts) >= 3 and parts[0] == "rest" and parts[1] == "device":
         return parts[2]
     return str(endpoint)
+
+
+def _is_rest_device_endpoint(endpoint: Any) -> bool:
+    """Whether ``endpoint`` is a ``rest/device/<id>`` config endpoint (a restorable
+    device-config target, as opposed to a transient ``cmd/...`` command path)."""
+    parts = str(endpoint).strip("/").split("/")
+    return len(parts) >= 3 and parts[0] == "rest" and parts[1] == "device" and bool(parts[2])
+
+
+def _write_is_ambiguous(write: WriteResult) -> bool:
+    """Whether a failed write is *ambiguous* (outcome unknown) rather than a clean
+    failure. The writer marks a lost/401-uncertain mutation with
+    ``data={"ambiguous": True, ...}`` (C2); everything else is a definite failure."""
+    return isinstance(write.data, dict) and bool(write.data.get("ambiguous"))
+
+
+def _write_detail(write: WriteResult) -> Optional[str]:
+    """The human-readable ambiguity/error detail the writer attached, if any."""
+    if isinstance(write.data, dict):
+        detail = write.data.get("error")
+        if detail:
+            return str(detail)
+    return None
 
 
 def _truthy(value: Any) -> bool:

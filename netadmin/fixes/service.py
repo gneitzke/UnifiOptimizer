@@ -36,7 +36,7 @@ from typing import Any, Callable, Optional
 
 from netadmin.domain.entities import Entity, Finding
 from netadmin.domain.types import EntityType, Severity
-from netadmin.fixes.applier import Applier
+from netadmin.fixes.applier import Applier, _endpoint_device
 from netadmin.fixes.models import (
     ApplyResult,
     DryRunResult,
@@ -230,12 +230,13 @@ class FixService:
                 "evidence and a fresh plan."
             )
         plan = await self.build_plan(issue_id)
-        current_state = await self._read_current_state(plan)
+        current_state, mesh_uplinks = await self._read_current_state(plan)
         result = await self._applier.apply(
             plan,
             dry_run=False,
             confirm_token=confirm_token,
             current_state=current_state,
+            mesh_uplinks=mesh_uplinks,
         )
         # Arm on "which step(s) actually landed", NOT on "was any row written".
         # ``result.change_ids`` records EVERY attempted step, including one whose
@@ -276,10 +277,15 @@ class FixService:
         read leaves the applier with no fresh state, and it refuses rather than
         restore blind.
         """
-        current_radios, is_mesh = await self._read_revert_state(change_id)
-        return await self._applier.revert(
-            change_id, current_radios=current_radios, is_mesh_uplink=is_mesh
-        )
+        # Read fresh live state INSIDE the applier's per-device lock (C1): the
+        # applier calls this back once it holds the lock, so two concurrent reverts
+        # on one device each read the other's committed result instead of racing on
+        # a snapshot taken before either write. Reading here (outside the lock) and
+        # passing the value would reintroduce the stale-snapshot clobber.
+        async def _read_state() -> tuple[Optional[dict[str, dict[str, Any]]], bool]:
+            return await self._read_revert_state(change_id)
+
+        return await self._applier.revert(change_id, state_reader=_read_state)
 
     async def _read_revert_state(
         self, change_id: int
@@ -376,32 +382,48 @@ class FixService:
             name=f"{band} GHz RF environment",
         )
 
-    async def _read_current_state(self, plan: FixPlan) -> dict[str, dict[str, Any]]:
-        """Fresh live values for every step's precondition, keyed by target.
+    async def _read_current_state(
+        self, plan: FixPlan
+    ) -> tuple[dict[str, dict[str, Any]], set[str]]:
+        """Fresh live precondition values (keyed by target) plus the mesh-uplink set.
 
         Reads the device once per distinct device MAC and extracts only the
-        attributes the precondition expects, type-aligned to the expected value so
+        attributes each precondition expects, type-aligned to the expected value so
         a controller that stringifies a channel does not read as spurious drift.
         A device we cannot read is simply absent -- the applier treats a missing
         target as drift and refuses, which is the safe outcome.
+
+        The second element is the set of target device keys
+        (:func:`~netadmin.fixes.applier._endpoint_device`) whose device is currently
+        a mesh uplink. The applier's revertibility gate needs the AP's real mesh
+        posture to dry-run the min-RSSI rail against the reverse of each step (S2),
+        so it is read from the same fresh device, in the same pass.
         """
         state: dict[str, dict[str, Any]] = {}
+        mesh_uplinks: set[str] = set()
         if self._reader is None:
-            return state
+            return state, mesh_uplinks
         device_cache: dict[str, Optional[dict[str, Any]]] = {}
+
+        async def _device_for(mac: str) -> Optional[dict[str, Any]]:
+            if mac not in device_cache:
+                device_cache[mac] = await self._reader.read_device(mac)
+            return device_cache[mac]
+
         for step in plan.steps:
+            device = await _device_for(device_mac_of(step.target_native_id))
+            if device is not None and _device_is_mesh_uplink(device):
+                mesh_uplinks.add(_endpoint_device(step.endpoint))
+
             target = step.precondition.target_native_id
             expected = step.precondition.expected
             if not expected or target in state:
                 continue
-            mac = device_mac_of(target)
-            if mac not in device_cache:
-                device_cache[mac] = await self._reader.read_device(mac)
-            device = device_cache[mac]
+            device = await _device_for(device_mac_of(target))
             if device is None:
                 continue  # absent -> drift, refused by the applier
             state[target] = _extract_target_attrs(device, target, expected)
-        return state
+        return state, mesh_uplinks
 
 
 # --------------------------------------------------------------------------- #

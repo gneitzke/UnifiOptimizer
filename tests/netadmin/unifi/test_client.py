@@ -193,6 +193,45 @@ async def test_persistent_401_fails_after_one_relogin():
 
 
 @respx.mock
+async def test_mutation_401_is_not_replayed_and_is_ambiguous():
+    # C2: a 401 on a MUTATION must NEVER be re-dispatched. Re-logging in and
+    # retrying the write could fire it a second time (the session could have been
+    # invalidated only after the controller accepted the change). Only a GET is
+    # re-dispatched after a re-login; a non-GET 401 surfaces as an ambiguous outcome
+    # with exactly ONE dispatch and no re-login.
+    respx.get(OS_PROBE).mock(return_value=httpx.Response(401))
+    login = respx.post(OS_LOGIN).mock(
+        return_value=httpx.Response(200, headers={"X-CSRF-Token": "c"}, json={})
+    )
+    put = respx.put(f"{HOST}/proxy/network/api/s/{SITE}/rest/device/abc").mock(
+        return_value=httpx.Response(401)
+    )
+    client = _client()
+    with pytest.raises(UnifiAmbiguousOutcomeError):
+        await client.request("PUT", "rest/device/abc", json_body={"x": 1}, allow_mutation=True)
+    assert put.call_count == 1  # exactly ONE dispatch -- the write is never replayed
+    assert login.call_count == 1  # initial connect only; no re-login for a mutation 401
+    await client.aclose()
+
+
+@respx.mock
+async def test_get_401_still_relogs_in_and_retries():
+    # The GET path is unchanged: a 401 re-logs in once and re-dispatches (idempotent).
+    respx.get(OS_PROBE).mock(return_value=httpx.Response(401))
+    login = respx.post(OS_LOGIN).mock(
+        return_value=httpx.Response(200, headers={"X-CSRF-Token": "c"}, json={})
+    )
+    device = respx.get(DEVICE).mock(
+        side_effect=[httpx.Response(401), httpx.Response(200, json={"data": [{"ok": 1}]})]
+    )
+    client = _client()
+    assert await client.get_data("stat/device") == [{"ok": 1}]
+    assert device.call_count == 2  # re-dispatched once after re-login
+    assert login.call_count == 2
+    await client.aclose()
+
+
+@respx.mock
 async def test_gentle_pacing_spaces_requests():
     _mock_login()
     respx.get(DEVICE).mock(return_value=httpx.Response(200, json={"data": []}))
