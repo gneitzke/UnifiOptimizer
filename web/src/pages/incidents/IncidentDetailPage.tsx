@@ -169,7 +169,13 @@ export function IncidentDetailPage() {
                   U5) — never a second gray-vs-green scheme invented here. */}
               <StatePill state={isResolved ? 'resolved' : 'active'} severity={incident.severity} />
               <span className="t-caption" style={{ color: 'var(--fg-subtle)' }}>
-                {symptoms.length} related symptom{symptoms.length === 1 ? '' : 's'}
+                {/* C5: narrate the CURRENT symptom count, not the historical
+                    list length — `incident.symptom_count` is the backend's
+                    current-membership count (cleared_ts IS NULL). The
+                    `symptoms` array below still carries cleared/former
+                    members for the list, but they must not inflate this
+                    current-state line. */}
+                {incident.symptom_count} related symptom{incident.symptom_count === 1 ? '' : 's'}
               </span>
             </div>
             <h1 className="t-page-title" style={{ color: 'var(--fg)' }}>
@@ -272,8 +278,12 @@ export function IncidentDetailPage() {
         >
           <MemberItem member={root} now={now} emphasise />
           <p className="t-caption" style={{ color: 'var(--fg-subtle)' }}>
-            Fixing this is expected to clear the {symptoms.length} symptom
-            {symptoms.length === 1 ? '' : 's'} below.
+            {/* C5: the "fixing the root clears it" guidance is a claim about
+                CURRENT membership — a cleared/former symptom already cleared
+                on its own and isn't waiting on this fix, so it must not be
+                counted here even though it still appears in the list below. */}
+            Fixing this is expected to clear the {incident.symptom_count} symptom
+            {incident.symptom_count === 1 ? '' : 's'} below.
           </p>
         </SectionCard>
       )}
