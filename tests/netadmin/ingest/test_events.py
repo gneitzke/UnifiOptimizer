@@ -1885,3 +1885,60 @@ async def test_bug6_wellformed_empty_event_response_still_records_complete(
     # A well-formed empty read is a real observation: the window is credited.
     assert repo.observed_event_coverage(now - 3600, now) == 1.0
     assert repo.failed_ingest_coverage(kind="event_history", scope="site") == []
+
+
+# --------------------------------------------------------------------------- #
+# #w14a-3: a catch-up GET that fails with a NON-UnifiError transport/response
+# exception (httpx.CloseError / DecodingError -- these propagate UNWRAPPED from the
+# client for an idempotent read) must STILL record a durable FAILED coverage hole
+# and re-raise. Catching only UnifiError left the ledger EMPTY: the window was
+# neither complete NOR failed, so it was silently never retried nor observed.
+# --------------------------------------------------------------------------- #
+class _RaisingEndpoints:
+    """A ``stat_event`` that raises a raw transport/response exception."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+        self.calls = 0
+
+    async def stat_event(
+        self, *, within_hours: Optional[int] = None, max_events: Optional[int] = None
+    ) -> list[Event]:
+        self.calls += 1
+        raise self._exc
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.CloseError("socket faulted finishing the response"),
+        httpx.DecodingError("Error -3 while decompressing data"),
+    ],
+    ids=["CloseError", "DecodingError"],
+)
+async def test_w14a3_catchup_transport_failure_records_failed_hole_and_reraises(
+    repo: Repository, exc: BaseException
+) -> None:
+    ep = _RaisingEndpoints(exc)
+    now = 1_721_700_000
+    # The read FAILED: it must re-raise so the collector firewall marks the poll failed.
+    with pytest.raises(type(exc)):
+        await catchup_events(repo, ep, now=now)
+    assert ep.calls == 1
+    # The ledger is NOT empty and NOT complete: a durable FAILED hole was recorded, so
+    # the next sweep retries it and observed_event_coverage never counts it.
+    assert repo.observed_event_coverage(now - 3600, now) == 0.0
+    failed = repo.failed_ingest_coverage(kind="event_history", scope="site")
+    assert failed and any(int(r["end_ts"]) == now for r in failed)
+
+
+@pytest.mark.asyncio
+async def test_w14a3_catchup_success_still_records_complete(repo: Repository) -> None:
+    # Control: a genuinely successful read still records COMPLETE coverage -- the
+    # broadened except adds no false failed hole.
+    now = 1_721_700_000
+    inserted = await catchup_events(repo, FakeEndpoints([]), now=now)
+    assert inserted == 0
+    assert repo.observed_event_coverage(now - 3600, now) == 1.0
+    assert repo.failed_ingest_coverage(kind="event_history", scope="site") == []

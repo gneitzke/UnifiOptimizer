@@ -37,6 +37,8 @@ from datetime import datetime, timezone
 from time import monotonic
 from typing import Any, Awaitable, Callable, Optional
 
+import httpx
+
 from netadmin.domain.types import EntityType
 from netadmin.ingest.unifi.auth import UnifiError
 from netadmin.ingest.unifi.endpoints import Endpoints
@@ -384,12 +386,20 @@ async def catchup_events(
         coverage_start = max(coverage_start, since_ts)
     try:
         events = await endpoints.stat_event(within_hours=within_hours, max_events=max_events)
-    except UnifiError as exc:
-        # BUG#6: the event read FAILED -- the controller answered without a
-        # well-formed success payload (an error envelope / unrecognized body), or
-        # a transport/auth read error surfaced. This is NOT a successful empty
-        # collection: it says nothing about the requested window, so coverage must
-        # NOT be credited for it. Record the window as a first-class FAILED hole
+    except (UnifiError, httpx.HTTPError) as exc:
+        # BUG#6 / #w14a-3: the event read FAILED -- either the controller answered
+        # without a well-formed success payload (a ``UnifiError``: error envelope /
+        # unrecognized body / auth failure), OR a raw transport/response exception
+        # surfaced that is NOT a ``UnifiError`` (an ``httpx.HTTPError`` such as
+        # ``CloseError``/``DecodingError`` on the GET -- these propagate unwrapped
+        # from the client for an idempotent read). Catching ONLY ``UnifiError`` let
+        # such a non-UnifiError read failure propagate leaving the coverage ledger
+        # EMPTY: the window was neither recorded complete NOR failed, so it was
+        # silently never retried nor observed. Both classes of read failure are the
+        # same thing here -- the requested window was NOT read. This is NOT a
+        # successful empty collection: it says nothing about the requested window, so
+        # coverage must NOT be credited for it. Record the window as a first-class
+        # FAILED hole
         # (queryable, retried on the next sweep -- never counted by
         # ``observed_event_coverage``, which unions only 'complete' spans) instead
         # of the bogus 'complete' the empty-default fabricated, then re-raise so the
