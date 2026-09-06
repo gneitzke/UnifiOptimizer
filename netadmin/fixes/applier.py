@@ -322,6 +322,23 @@ class Applier:
         # is judged before the lock like the other invariants above.
         self._assert_min_rssi_safe(plan)
 
+        # Gate 5b (S2 verifier round 15): refuse a plan whose steps OVERLAP on the same
+        # device+radio+FIELD. Merge-at-dispatch carries the first write forward, so a
+        # later step on the same field dispatches onto the first's committed value -- but
+        # the ledger records each step's OWN before-state as its ``before``. For two steps
+        # that touch the SAME field (channel 3->1 then 1->6) that means step 2's stored
+        # ``before`` is its plan-time original (3), NOT its EFFECTIVE preceding value (1,
+        # the value step 1 committed). Reverting step 2 would then restore 3 and OVERSHOOT
+        # past step 1's still-'applied' change, leaving the ledger and the device
+        # inconsistent -- a per-step independent revert is ill-defined for overlapping
+        # same-field writes. No legitimate planner emits two steps on the same field, so
+        # rather than paper over an ill-defined revert we refuse the plan up front. This is
+        # plan-static (payload-vs-before per step), so it is judged before the lock like
+        # the other invariants above. Steps on DIFFERENT radios or DIFFERENT fields of the
+        # same radio never overlap and are unaffected -- the confirmed multi-step carry-
+        # forward still applies and each such step reverts to its own before exactly.
+        self._assert_no_overlapping_field_mutation(plan)
+
         results: list[StepResult] = []
         change_ids: list[int] = []
         applied_all = True
@@ -1545,6 +1562,45 @@ class Applier:
                             )
                         )
         return drift
+
+    @staticmethod
+    def _assert_no_overlapping_field_mutation(plan: FixPlan) -> None:
+        """Refuse a plan whose steps overlap on the same device+radio+FIELD (S2 r15).
+
+        Merge-at-dispatch carries a step's committed write forward, so a later step on
+        the SAME field dispatches onto that committed value -- but the ledger records
+        each step's OWN plan-time ``before`` as its restorable state. For two steps that
+        change the SAME field (channel 3->1 then 1->6) step 2's stored ``before`` is its
+        original (3), not the effective preceding value (1) that step 1 committed. A
+        per-step revert of step 2 would then restore 3 and overshoot past step 1's
+        still-'applied' change. Such a per-step independent revert is ill-defined for
+        overlapping same-field writes, and no legitimate planner emits them, so refuse
+        the whole plan rather than dispatch a change that cannot be reverted honestly.
+
+        Overlap is judged on each step's INTENDED per-radio delta
+        (:meth:`_step_radio_delta`, payload-vs-its-own-before) keyed by
+        ``(device, radio, field)``. Two steps on DIFFERENT radios, or on DIFFERENT
+        fields of the same radio, never share a key and are allowed -- the confirmed
+        multi-step carry-forward is untouched.
+        """
+        seen: dict[tuple[str, str, str], str] = {}
+        for step in plan.steps:
+            dev_key = _endpoint_device(step.endpoint)
+            for radio_code, fields in Applier._step_radio_delta(step).items():
+                for field in fields:
+                    key = (dev_key, str(radio_code), str(field))
+                    prior = seen.get(key)
+                    if prior is not None:
+                        raise SafetyViolation(
+                            f"plan has two steps that both change field '{field}' on radio "
+                            f"'{radio_code}' of device '{dev_key}' ('{prior}' and "
+                            f"'{step.description}'); merge-at-dispatch carries the first write "
+                            "forward but each step's stored before-state is its own plan-time "
+                            "value, so a per-step revert of the later step would overshoot the "
+                            "earlier one -- refusing an overlapping same-field plan whose "
+                            "per-step revert is ill-defined"
+                        )
+                    seen[key] = step.description
 
     @staticmethod
     def _assert_min_rssi_safe(plan: FixPlan) -> None:

@@ -1686,6 +1686,163 @@ async def test_multistep_same_device_plan_does_not_self_clobber(store):
     assert [c["status"] for c in store.list_changes()] == ["applied", "applied"]
 
 
+async def test_overlapping_same_field_plan_is_refused(store):
+    # S2 verifier round 15: two steps in ONE plan touch the SAME device+radio+FIELD
+    # (ng channel 3->1, then ng channel 1->6). Merge-at-dispatch carries step 1's write
+    # forward, so step 2 would dispatch onto channel 1 -- but the ledger records each
+    # step's OWN plan-time before (step 2's before is 3, its plan-time original, NOT the
+    # effective preceding value 1). A per-step revert of step 2 would then restore 3 and
+    # OVERSHOOT past step 1's still-'applied' change. Such an overlapping same-field plan
+    # has an ill-defined per-step revert and no legitimate planner emits it, so the apply
+    # is refused UP FRONT (SafetyViolation) with no writer call and no ledger row.
+    from netadmin.fixes.models import WriteResult
+
+    endpoint = f"rest/device/{AP_ID}"
+
+    class _RecordingWriter:
+        def __init__(self):
+            self.puts = []
+
+        async def put(self, ep, body):  # pragma: no cover - must never be reached
+            self.puts.append(body)
+            return WriteResult(ok=True, status_code=200, data={"meta": {}})
+
+        async def post(self, ep, body):  # pragma: no cover - unused
+            return await self.put(ep, body)
+
+    # Faithful adversarial forge: BOTH steps carry the SAME plan-time before-state
+    # (channel 3) and the SAME precondition (channel 3), so without the guard both pass
+    # precondition/delta re-checks, both apply (step 2 merges channel 6 onto step 1's
+    # carried channel 1), and BOTH store before=3 -- the exact state that makes a per-step
+    # revert of step 2 restore 3 and overshoot step 1. The guard refuses the plan first.
+    def _ng_step(desc, new_ch):
+        before_table = [{"radio": "ng", "channel": 3, "ht": 20}]
+        payload_table = [{"radio": "ng", "channel": new_ch, "ht": 20}]
+        return FixStep(
+            action=ActionType.CHANNEL_CHANGE,
+            target_entity_type=EntityType.RADIO,
+            target_native_id=f"{AP_MAC}:ng",
+            description=desc,
+            risk=RiskLevel.MEDIUM,
+            method="PUT",
+            endpoint=endpoint,
+            payload={"radio_table": payload_table},
+            precondition=_radio_pre(f"{AP_MAC}:ng", {"channel": 3}),
+            before={"method": "PUT", "endpoint": endpoint, "body": {"radio_table": before_table}},
+            after={"method": "PUT", "endpoint": endpoint, "body": {"radio_table": payload_table}},
+            revertible=True,
+        )
+
+    # Both steps change ng.channel: an overlapping same-field plan (adversarially forged).
+    step1 = _ng_step("ng 3->1", 1)
+    step2 = _ng_step("ng 3->6", 6)
+    plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "overlap", steps=[step1, step2])
+
+    writer = _RecordingWriter()
+    applier = Applier(store, writer)
+
+    async def _reader():
+        cur = {f"{AP_MAC}:ng": {"channel": 3}}
+        full = {AP_ID: {"ng": {"radio": "ng", "channel": 3, "ht": 20}}}
+        return cur, full, set()
+
+    with pytest.raises(SafetyViolation) as exc:
+        await applier.apply(
+            plan, dry_run=False, confirm_token=plan_confirm_token(plan), state_reader=_reader
+        )
+    assert "same-field" in str(exc.value) or "both change field" in str(exc.value)
+    # Refused before any dispatch: no network call, no ledger row.
+    assert writer.puts == []
+    assert store.list_changes() == []
+
+
+async def test_two_radio_plan_applies_and_each_step_reverts_without_overshoot(store):
+    # The legitimate counterpart to the overlap refusal: a two-step plan on the SAME
+    # device but DIFFERENT radios (ng channel 3->1, na channel 36->40) still applies via
+    # carry-forward, and reverting EITHER step restores exactly THAT step's field to its
+    # own before-value, leaving the other radio's change intact (no overshoot).
+    from netadmin.fixes.models import WriteResult
+
+    endpoint = f"rest/device/{AP_ID}"
+    live = {
+        "ng": {"radio": "ng", "channel": 3, "ht": 20},
+        "na": {"radio": "na", "channel": 36, "ht": 80},
+    }
+
+    class _LiveWriter:
+        def __init__(self):
+            self.puts = []
+
+        async def put(self, ep, body):
+            self.puts.append(body)
+            for r in body["radio_table"]:
+                live[r["radio"]] = dict(r)
+            return WriteResult(ok=True, status_code=200, data={"meta": {}})
+
+        async def post(self, ep, body):  # pragma: no cover - unused
+            return await self.put(ep, body)
+
+    def _step(native, radio, old_ch, new_ch):
+        before_table = [
+            {"radio": "ng", "channel": 3, "ht": 20},
+            {"radio": "na", "channel": 36, "ht": 80},
+        ]
+        payload_table = [dict(r) for r in before_table]
+        for r in payload_table:
+            if r["radio"] == radio:
+                r["channel"] = new_ch
+        return FixStep(
+            action=ActionType.CHANNEL_CHANGE,
+            target_entity_type=EntityType.RADIO,
+            target_native_id=native,
+            description=f"{radio} {old_ch}->{new_ch}",
+            risk=RiskLevel.MEDIUM,
+            method="PUT",
+            endpoint=endpoint,
+            payload={"radio_table": payload_table},
+            precondition=_radio_pre(native, {"channel": old_ch}),
+            before={"method": "PUT", "endpoint": endpoint, "body": {"radio_table": before_table}},
+            after={"method": "PUT", "endpoint": endpoint, "body": {"radio_table": payload_table}},
+            revertible=True,
+        )
+
+    step1 = _step(f"{AP_MAC}:ng", "ng", 3, 1)
+    step2 = _step(f"{AP_MAC}:na", "na", 36, 40)
+    plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "two-radio", steps=[step1, step2])
+
+    writer = _LiveWriter()
+    applier = Applier(store, writer)
+
+    async def _apply_reader():
+        cur = {
+            f"{AP_MAC}:ng": {"channel": live["ng"]["channel"]},
+            f"{AP_MAC}:na": {"channel": live["na"]["channel"]},
+        }
+        full = {AP_ID: {k: dict(v) for k, v in live.items()}}
+        return cur, full, set()
+
+    result = await applier.apply(
+        plan, dry_run=False, confirm_token=plan_confirm_token(plan), state_reader=_apply_reader
+    )
+    assert result.applied is True
+    assert live["ng"]["channel"] == 1 and live["na"]["channel"] == 40
+    ng_change, na_change = result.change_ids
+
+    async def _revert_reader():
+        return {k: dict(v) for k, v in live.items()}, False
+
+    # Revert step 2 (na): restores na to 36 and leaves ng's change (1) untouched.
+    await applier.revert(na_change, state_reader=_revert_reader)
+    assert live["na"]["channel"] == 36  # restored to ITS own before
+    assert live["ng"]["channel"] == 1   # ng's change did not overshoot
+
+    # Revert step 1 (ng): restores ng to 3, na stays at its reverted 36.
+    await applier.revert(ng_change, state_reader=_revert_reader)
+    assert live["ng"]["channel"] == 3
+    assert live["na"]["channel"] == 36
+    assert sorted(c["status"] for c in store.list_changes()) == ["reverted", "reverted"]
+
+
 async def test_untouched_field_removed_from_live_is_not_restored(store):
     # #1: a concurrent operator has REMOVED tx_power_mode from ng in live since the
     # plan was built. The plan-time payload still carries tx_power_mode=high (an
