@@ -294,6 +294,12 @@ export interface IncidentMember {
    * (audit U3). */
   joined_ts?: number | null;
   left_ts?: number | null;
+  /** Whether this member is still attached to the incident (`cleared_ts IS NULL`
+   * server-side, C5). Cleared members are kept in the detail payload to tell the
+   * incident's full history but must not be treated as current — e.g. the
+   * "Suppress incident" action only touches current members. Optional for
+   * backward compatibility: an older payload without it is assumed current. */
+  current?: boolean;
   /** Concrete evidence backing the causal link named by `rule`/`rationale` —
    * e.g. correlated timestamps, shared entity, a metric threshold crossed.
    * Optional/assumed; falls back to `rule` + `rationale` alone when absent. */

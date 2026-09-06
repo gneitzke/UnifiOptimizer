@@ -534,21 +534,41 @@ def build_incident_dossier(
     issue_ids = [int(m["issue_id"]) for m in members]
     issues_by_id = {int(r["id"]): r for r in repo.list_issues() if int(r["id"]) in set(issue_ids)}
 
+    # C5: a member with a ``cleared_ts`` is no longer part of the incident (e.g.
+    # its symptom was resolved out, or re-attributed to a different root). The
+    # dossier still narrates it so the model sees the incident's full history,
+    # but it MUST be flagged as former/cleared rather than described as a live
+    # symptom of the current root -- otherwise narration reasons about a symptom
+    # that is already gone. The membership counts describe the current shape.
     symptom_rows: list[list[Any]] = []
+    current_symptoms = 0
+    former_symptoms = 0
     for m in members:
         if m["role"] == "root":
             continue
         issue = issues_by_id.get(int(m["issue_id"]))
         title = issue["title"] if issue is not None else f"issue {int(m['issue_id'])}"
-        symptom_rows.append([issue["detector_key"] if issue else "?", title, m["rationale"]])
+        cleared_ts = m["cleared_ts"]
+        if cleared_ts is None:
+            status = "current"
+            current_symptoms += 1
+        else:
+            status = f"former (cleared {_iso(int(cleared_ts))})"
+            former_symptoms += 1
+        symptom_rows.append(
+            [issue["detector_key"] if issue else "?", title, status, m["rationale"]]
+        )
 
+    current_root = sum(1 for m in members if m["role"] == "root" and m["cleared_ts"] is None)
+    former_note = f" + {former_symptoms} former (cleared)" if former_symptoms else ""
     lines = [
         f"# Incident: {incident['title']}",
         "",
         str(incident["summary"] or "").strip() or "_(no summary)_",
         "",
         f"- **Severity (max of members):** {str(incident['severity']).upper()}",
-        f"- **Members:** {len(members)} (1 root + {len(symptom_rows)} symptom(s))",
+        f"- **Members:** {current_root + current_symptoms} current "
+        f"({current_root} root + {current_symptoms} symptom(s)){former_note}",
         f"- **First seen:** {_iso(int(incident['first_seen_ts']))}",
     ]
     if symptom_rows:
@@ -556,7 +576,12 @@ def build_incident_dossier(
             "",
             "## Symptoms attributed to this root",
             "",
-            _table(["Detector", "Symptom", "Why it is attributed"], symptom_rows),
+            "Members flagged **former** are no longer attached to this incident "
+            "(cleared/re-attributed) and should not be treated as live symptoms.",
+            "",
+            _table(
+                ["Detector", "Symptom", "Status", "Why it is attributed"], symptom_rows
+            ),
         ]
     lines += [
         "",
