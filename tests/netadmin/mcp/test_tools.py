@@ -442,6 +442,33 @@ def test_incident_detail_marks_cleared_members_and_counts_current(tmp_db_path: A
         store.close()
 
 
+def test_overview_grouping_uses_current_membership_after_a_clear(tmp_db_path: Any) -> None:
+    """Finding #4 (MCP overview): the overview builder (a different location than
+    the list/detail) must report the CURRENT grouped count. With the historical
+    union (2) it said "1 incident grouping 2 of them" while only 1 issue is still
+    grouped and only 1 issue is open -- inflating the count past the open total.
+    Current membership (1) makes the overview agree with the incident card/list."""
+    store, inc_id, _root, _symptom = _incident_with_cleared_symptom(tmp_db_path)
+    try:
+        result = tools.call_tool(store, "netadmin_overview", {}, now=_C5_BASE + 1100)
+        summary = result["summary"]
+        # The incident stays genuine (historical union of 2), so it is still named.
+        assert "1 incident grouping" in summary
+        # ...but the count is current membership (1), NOT the historical union (2).
+        assert "grouping 1 of them" in summary
+        assert "grouping 2 of them" not in summary
+        # Internal consistency: grouped count cannot exceed the open-issue total.
+        assert "1 open issue(s)" in summary
+        # Overview agrees with the incident card (current member_count == 1).
+        card = tools.call_tool(store, "netadmin_incidents", {}, now=_C5_BASE + 1100)
+        member_count = next(
+            i for i in card["incidents"]["items"] if i["incident_id"] == inc_id
+        )["member_count"]
+        assert member_count == 1
+    finally:
+        store.close()
+
+
 # --------------------------------------------------------------------------- #
 # 6. netadmin_sle_trend
 # --------------------------------------------------------------------------- #
