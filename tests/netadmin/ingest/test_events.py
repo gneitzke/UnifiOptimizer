@@ -839,6 +839,92 @@ async def test_r2_pending_survives_when_health_accounting_also_fails(
 
 
 # --------------------------------------------------------------------------- #
+# P1 (SUSTAINED total storage failure): the rescued pending buffer must not grow
+# without bound. The old supervisor appended each dead listener's retained batch
+# to ``_pending`` and started another listener with NO aggregate ceiling, so with
+# storage continuously down and an unlimited producer the aggregate grew 1001,
+# 2002, 3003, 4004, 5005, 6006, ... until the process OOM'd and lost EVERYTHING.
+# A system-wide cap must bound memory, count the (bounded, observable) loss, and
+# still flush every retained survivor once storage returns.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_p1_sustained_storage_failure_bounds_aggregate_pending(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cap = 2500
+    per_listener = 1001  # each listener overflows its own _max_pending (1000)
+    restarts_under_outage = 6
+
+    real = repo.record_events_enriching_entities
+    storage = {"down": True}
+
+    def flaky(rows: object) -> int:
+        if storage["down"]:
+            import sqlite3
+
+            raise sqlite3.OperationalError("database is locked")
+        return real(rows)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repo, "record_events_enriching_entities", flaky)
+
+    attempt = {"n": 0}
+
+    def factory() -> EventListener:
+        attempt["n"] += 1
+        n = attempt["n"]
+        # Unique ids per restart so nothing dedupes across attempts and every
+        # produced event is a distinct row we could, in principle, lose.
+        events = [
+            Event.model_validate(
+                {
+                    "_id": f"a{n}-e{i}",
+                    "key": "EVT_X",
+                    "time": 1_721_600_000_000 + n * 10_000 + i,
+                }
+            )
+            for i in range(per_listener)
+        ]
+        # storage is down -> this listener overflows its bounded queue and dies
+        # with the WHOLE batch uncommitted, which the supervisor rescues.
+        return EventListener(FakeWs(events), repo, flush_interval=None, batch_size=100)
+
+    sup: WsSupervisor
+    sizes: list[int] = []
+
+    async def fake_sleep(delay: float) -> None:
+        # Snapshot the aggregate pending after each death's rescue+clamp.
+        sizes.append(len(sup._pending))
+        if attempt["n"] >= restarts_under_outage:
+            storage["down"] = False  # outage clears; final drain can now persist
+            sup.stop()
+
+    sup = WsSupervisor(
+        factory,
+        repo,
+        backoff_base=0.0,
+        backoff_max=0.0,
+        max_restarts=50,
+        pending_max=cap,
+        sleep=fake_sleep,
+    )
+    await asyncio.wait_for(sup.run(), timeout=10.0)
+
+    # Aggregate pending stayed BOUNDED -- it never grew 1001, 2002, 3003, ...
+    assert max(sizes) <= cap
+    assert sizes != [per_listener * (i + 1) for i in range(len(sizes))]
+    # The loss is counted and exposed (not silent). Total produced is conserved:
+    # survivors persisted + dropped == everything the producer emitted.
+    produced = per_listener * restarts_under_outage
+    assert sup.dropped > 0
+    # Nothing stranded: once storage recovered the final drain persisted the whole
+    # bounded survivor set, and _pending is empty.
+    assert sup._pending == []
+    stored = repo.read_events(0, 2_000_000_000)
+    assert len(stored) == cap  # exactly the bounded survivors persisted
+    assert len(stored) + sup.dropped == produced
+
+
+# --------------------------------------------------------------------------- #
 # B4 (positive-liveness redesign): event-source coverage is credited only across
 # spans carrying WS liveness HEARTBEATS, never through end_ts on a still-open
 # 'connected' row. These tests exercise the heartbeat mechanism end to end.

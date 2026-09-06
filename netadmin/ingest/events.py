@@ -58,6 +58,18 @@ _MS_THRESHOLD = 100_000_000_000
 _CATCHUP_MARGIN_HOURS = 1
 _CATCHUP_MAX_WITHIN_HOURS = 30 * 24  # events are pruned at ~30 days locally
 
+# P1: a SYSTEM-WIDE ceiling on the events the supervisor holds in memory while
+# storage is down. The per-listener ``_max_pending`` bounds ONE listener's batch,
+# but the supervisor rescues each dead listener's batch onto ``_pending`` and then
+# starts another -- so under SUSTAINED total storage failure with a live producer
+# that aggregate grew without bound (1001, 2002, 3003, ... -> OOM, losing
+# EVERYTHING). This cap turns that into a bounded, counted, observable loss: once
+# ``_pending`` would exceed it we evict (drop-oldest) and count the drop, so the
+# process survives and can still flush every retained event the instant storage
+# returns. It sits well above the per-listener bound so a single blip + restart
+# (the confirmed 1000-blip and 1001-overflow cases) recovers with ZERO loss.
+_SYSTEM_PENDING_MAX = 50_000
+
 
 def _to_epoch_s(event: Event) -> Optional[int]:
     """Fold a controller event timestamp to epoch **seconds**.
@@ -555,6 +567,7 @@ class WsSupervisor:
         backoff_base: float = 1.0,
         backoff_max: float = 60.0,
         max_restarts: Optional[int] = None,
+        pending_max: int = _SYSTEM_PENDING_MAX,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._factory = factory
@@ -562,6 +575,8 @@ class WsSupervisor:
         self._backoff_base = backoff_base
         self._backoff_max = backoff_max
         self._max_restarts = max_restarts
+        # P1: system-wide bound on rescued+pending events (see _SYSTEM_PENDING_MAX).
+        self._pending_max = max(1, pending_max)
         self._sleep = sleep
         self._stop = asyncio.Event()
         self.state = "reconnecting"
@@ -570,6 +585,10 @@ class WsSupervisor:
         # blip that kills the listener leaves the batch stranded otherwise; the
         # supervisor retries it on the next attempt once storage recovers.
         self._pending: list[dict[str, Any]] = []
+        # P1: count of events evicted under sustained storage failure once the
+        # aggregate pending buffer hit its system-wide cap. Exposed (not just
+        # logged) so the loss is observable rather than silent.
+        self.dropped = 0
 
     def stop(self) -> None:
         self._stop.set()
@@ -616,10 +635,48 @@ class WsSupervisor:
         self._pending = []
 
     def _rescue_pending(self, listener: EventListener) -> None:
-        """Move a dead listener's uncommitted batch onto the supervisor (R2)."""
+        """Move a dead listener's uncommitted batch onto the supervisor (R2),
+        under a SYSTEM-WIDE memory bound (P1).
+
+        The per-listener ``_max_pending`` bounds ONE batch; nothing bounded the
+        supervisor's aggregate. Under sustained total storage failure with a live
+        producer, each dead listener's rescued batch was appended and another
+        started, so ``_pending`` grew without limit (1001, 2002, 3003, ...) until
+        the process OOM'd and lost EVERYTHING. We rescue, then clamp the aggregate
+        to :attr:`_pending_max`: a bounded, counted, observable loss is correct
+        under a real outage; unbounded growth is not.
+        """
         leftover = getattr(listener, "pending_records", lambda: [])()
         if leftover:
             self._pending.extend(leftover)
+        self._enforce_pending_bound()
+
+    def _enforce_pending_bound(self) -> None:
+        """Clamp the aggregate rescued buffer to the system-wide cap (P1).
+
+        DROP-OLDEST: the just-rescued (newest) events are the likeliest to still
+        matter for a live incident, so when the aggregate overflows we evict the
+        oldest retained events, count the loss, and surface it. Everything left in
+        ``_pending`` is still flushed the instant storage returns, so recovery of
+        the bounded survivors is preserved.
+        """
+        overflow = len(self._pending) - self._pending_max
+        if overflow <= 0:
+            return
+        del self._pending[:overflow]
+        self.dropped += overflow
+        logger.error(
+            "WS pending buffer hit system-wide cap of %d under sustained storage "
+            "failure; dropped %d oldest event(s) (cumulative dropped=%d) to bound "
+            "memory. Retained %d events for recovery once storage returns.",
+            self._pending_max,
+            overflow,
+            self.dropped,
+            len(self._pending),
+        )
+        # Surface the loss to poll_runs too (best-effort; _record is guarded, so a
+        # concurrent storage outage that fails this write never breaks the rescue).
+        self._record(f"pending-overflow-dropped:{overflow}", ok=False)
 
     def _record(self, label: str, *, ok: bool, duration_ms: Optional[int] = None) -> None:
         """R2: health accounting is best-effort observability, never the data path.
