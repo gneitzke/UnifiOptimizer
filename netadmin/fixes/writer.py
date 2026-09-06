@@ -36,6 +36,24 @@ __all__ = [
 _log = get_logger("fixes.writer")
 
 
+def _envelope_confirms_success(payload: Any) -> bool:
+    """Positive proof a mutation completed: the classic UniFi success envelope.
+
+    A normal successful controller PUT/POST answers with
+    ``{"meta": {"rc": "ok", ...}, "data": [...]}``. Only ``meta.rc == "ok"`` is a
+    POSITIVE confirmation of completion; the mirror of :func:`envelope_error`. An
+    empty ``{}``, a missing ``meta``, or a ``meta.rc`` other than ``"ok"`` (e.g.
+    ``"pending"``) does NOT positively confirm success -- the outcome is unknown,
+    not a confirmed apply (#w11a-2). A non-dict body confirms nothing either.
+    """
+    if not isinstance(payload, dict):
+        return False
+    meta = payload.get("meta")
+    if isinstance(meta, dict) and str(meta.get("rc", "")).strip().lower() == "ok":
+        return True
+    return False
+
+
 @runtime_checkable
 class ControllerWriter(Protocol):
     """The mutation interface the applier depends on -- nothing wider.
@@ -117,28 +135,40 @@ class RealControllerWriter:
 
         status_int = int(status) if status is not None else None
         http_ok = status_int is not None and 200 <= status_int < 300
-        is_client_error = status_int is not None and 400 <= status_int < 500
         confirmed_json = isinstance(data, dict)
         # A parseable classic envelope that reports ``meta.rc="error"`` is a rejection
         # the controller CONFIRMED, at any HTTP status (R1): a 200 carrying that body
         # failed just as surely as a 400 carrying it.
         envelope_err = envelope_error(data) if confirmed_json else None
+        # POSITIVE proof of completion: a parseable classic envelope reporting
+        # ``meta.rc="ok"``. A normal successful controller PUT/POST returns exactly
+        # this. Nothing weaker counts (#w11a-2).
+        success_env = _envelope_confirms_success(data) if confirmed_json else False
 
-        # --- The unified mutation-outcome classification (D6/D7). -----------------
-        # A mutation outcome is DEFINITIVELY REJECTED only when we have positive proof
-        # it did not land: a parseable ``meta.rc=error`` envelope, or a 4xx client error
-        # (the controller received and refused the request before applying it). These
-        # are the ONLY definitive failures; the caller may retry/replay them safely.
-        if envelope_err is not None or is_client_error:
+        # --- The unified mutation-outcome classification (D6/D7/#w11a). ------------
+        # Positive-proof principle: an outcome is "definitely X" ONLY with positive
+        # proof of X. A DEFINITIVE FAILURE needs a PARSED controller rejection
+        # (``meta.rc=error``), at ANY HTTP status. A bare 4xx does NOT qualify on its
+        # own (#w11a-1): a 408 timeout page or a 403 carrying junk/HTML has no parsed
+        # rejection, so its outcome is UNKNOWN, not a confirmed refusal. Only a parsed
+        # rejection is a definitive failure the caller may retry/replay safely.
+        if envelope_err is not None:
             return WriteResult(ok=False, status_code=status, data=data)
 
-        # CONFIRMED SUCCESS: a 2xx with a parseable envelope that reports no error.
-        if http_ok and confirmed_json:
+        # CONFIRMED SUCCESS: a 2xx carrying a POSITIVE success envelope (meta.rc=ok).
+        # A 2xx whose body does NOT positively confirm -- an empty ``{}``, a
+        # ``meta.rc`` other than "ok" (e.g. "pending"), a missing ``meta``, or a
+        # non-JSON body -- is NOT a confirmed success (#w11a-2); it falls through to
+        # ambiguous below.
+        if http_ok and success_env:
             return WriteResult(ok=True, status_code=status, data=data)
 
         # Everything else is AMBIGUOUS (outcome UNKNOWN), never a definitive failure:
-        #   * a 2xx whose body we could NOT parse (an HTML/proxy page) -- the controller
-        #     ACCEPTED the request (2xx) but the body cannot confirm the outcome (#6);
+        #   * a 2xx whose body does not positively confirm completion -- an HTML/proxy
+        #     page, an empty ``{}``, or ``meta.rc="pending"``: the controller ACCEPTED
+        #     the request (2xx) but the body cannot confirm the outcome (#6/#w11a-2);
+        #   * an UNPARSEABLE/HTML/invalid-JSON 4xx (a 408 timeout, a 403 with junk) --
+        #     no parsed rejection, so no positive proof it did not land (#w11a-1);
         #   * a gateway 504 / other 5xx / any non-2xx whose body does not CONFIRM a
         #     rejection (D7) -- a gateway timeout does NOT establish the write failed;
         #     the mutation may well have landed upstream of the failing hop.

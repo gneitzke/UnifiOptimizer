@@ -2269,6 +2269,70 @@ async def test_w10a2_reverting_change_blocks_a_fresh_apply_on_same_target(store,
 
 
 # --------------------------------------------------------------------------- #
+# #w11a-3: the apply-replay guard must key on the physical DEVICE, not the radio.
+# A whole-radio_table PUT to rest/device/<id> replaces the ENTIRE device, so an
+# unresolved uncertain change on ONE radio (ng) of an AP must block a fresh apply
+# to ANY OTHER radio (na) on that SAME AP -- its PUT would re-send ng at its still-
+# unresolved value. Before the fix the guard compared only ledger entity_id/issue_id,
+# so a DIFFERENT radio's entity slipped past it and dispatched.
+# --------------------------------------------------------------------------- #
+async def test_w11a3_uncertain_change_on_one_radio_blocks_apply_to_sibling_radio(store):
+    endpoint = f"rest/device/{AP_ID}"
+    # Register BOTH radios as distinct entities -- exactly as production ingest does,
+    # each with its own entity_id -- so the per-entity guard cannot match ng's row to
+    # an na-only plan; only the device-keyed guard can.
+    store.upsert_entity(radio_entity("ng"))
+    store.upsert_entity(radio_entity("na"))
+    ng_entity = store.find_entity(EntityType.RADIO, f"{AP_MAC}:ng")
+
+    # An unresolved (ambiguous) apply on the ng radio of this AP still stands.
+    store.insert_change(
+        action="wifi.channel_change",
+        before={"method": "PUT", "endpoint": endpoint,
+                "body": {"radio_table": [{"radio": "ng", "channel": 3}]}},
+        after={"method": "PUT", "endpoint": endpoint,
+               "body": {"radio_table": [{"radio": "ng", "channel": 1}]}},
+        status="unknown",
+        ts=1,
+        entity_id=int(ng_entity["entity_id"]),
+    )
+
+    # A genuine, SEPARATE plan on the na radio of the SAME AP (different entity, no
+    # shared issue_id) -- the reproduction's "second radio on the same device".
+    na_step = FixStep(
+        action=ActionType.CHANNEL_CHANGE,
+        target_entity_type=EntityType.RADIO,
+        target_native_id=f"{AP_MAC}:na",
+        description="na 36->40",
+        risk=RiskLevel.MEDIUM,
+        method="PUT",
+        endpoint=endpoint,
+        payload={"radio_table": [{"radio": "na", "channel": 40}]},
+        precondition=_radio_pre(f"{AP_MAC}:na", {"channel": 36}),
+        before={"method": "PUT", "endpoint": endpoint,
+                "body": {"radio_table": [{"radio": "na", "channel": 36}]}},
+        after={"method": "PUT", "endpoint": endpoint,
+               "body": {"radio_table": [{"radio": "na", "channel": 40}]}},
+        revertible=True,
+    )
+    plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:na", "na-only", steps=[na_step])
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+
+    with pytest.raises(FixError) as exc:
+        await applier.apply(
+            plan,
+            dry_run=False,
+            confirm_token=plan_confirm_token(plan),
+            current_state={f"{AP_MAC}:na": {"channel": 36}},
+        )
+    assert AP_ID in str(exc.value)  # the refusal names the physical device
+    # Nothing dispatched over the sibling's unresolved change, and no new ledger row.
+    assert writer.call_count == 0
+    assert len(store.list_changes()) == 1
+
+
+# --------------------------------------------------------------------------- #
 # #w10a-3: a rejected REVERT must not promote an UNCERTAIN apply to 'applied'.
 # A definitively-rejected restore proves only that the restore failed; it says
 # NOTHING about whether the original (uncertain) apply landed. Before the fix the

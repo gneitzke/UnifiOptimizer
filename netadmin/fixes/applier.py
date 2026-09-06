@@ -699,6 +699,31 @@ class Applier:
             _refuse_if_uncertain(
                 self._store.list_changes(issue_id=plan.issue_id), target
             )
+        # (c) Per physical DEVICE ENDPOINT (#w11a-3). A ``rest/device/<id>`` PUT
+        # replaces the ENTIRE device (its whole ``radio_table``), so an unresolved
+        # uncertain change on ANY radio of that device -- even one recorded against a
+        # DIFFERENT radio/entity than this plan touches -- must block a new apply to
+        # it. The per-entity scan in (a) is keyed on the exact radio entity, so a
+        # sibling radio on the SAME AP (a different ``entity_id``) slips past it and
+        # this plan's whole-table PUT would re-send that radio's still-unresolved
+        # value. Key on the device the change actually DISPATCHED to (parsed from its
+        # recorded ``after`` endpoint), and refuse if it matches any device this plan
+        # would mutate. Runs under the same device lock as (a)/(b).
+        plan_devices = {_endpoint_device(step.endpoint) for step in plan.steps}
+        for change in self._store.list_changes():
+            status = change["status"] if "status" in change.keys() else None
+            if status not in _UNCERTAIN_STATUSES:
+                continue
+            dev = _change_device_endpoint(change)
+            if dev is not None and dev in plan_devices:
+                raise FixError(
+                    f"device '{dev}' has an unresolved change "
+                    f"(id {int(change['id'])}, status '{status}') on it whose outcome "
+                    "was never confirmed; a whole-radio_table PUT replaces the entire "
+                    "device, so refusing to apply a new mutation to any radio on it -- "
+                    "reconcile the live state via a read and resolve that change first, "
+                    "do not replay an uncertain outcome"
+                )
 
     @staticmethod
     def _assert_revertible_status(
@@ -1531,6 +1556,32 @@ def _endpoint_device(endpoint: str) -> str:
     if len(parts) >= 3 and parts[0] == "rest" and parts[1] == "device":
         return parts[2]
     return str(endpoint)
+
+
+def _change_device_endpoint(change: Any) -> Optional[str]:
+    """The device key a ledger change dispatched to, from its recorded ``after``.
+
+    A change row stores the actual dispatched op as ``after_json`` =
+    ``{"method", "endpoint", "body"}`` (:meth:`Applier._insert_change_row`). Parse
+    that endpoint and reduce it to its device key (:func:`_endpoint_device`) so the
+    apply-replay guard can match an uncertain change to the physical device it
+    touched -- even when it was recorded against a different radio/entity (#w11a-3).
+    Returns ``None`` when there is no parseable endpoint to key on.
+    """
+    try:
+        raw = change["after_json"] if "after_json" in change.keys() else None
+    except Exception:  # noqa: BLE001 - a row without the column is simply unkeyable
+        return None
+    if not raw:
+        return None
+    try:
+        after = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    endpoint = after.get("endpoint") if isinstance(after, dict) else None
+    if not endpoint:
+        return None
+    return _endpoint_device(str(endpoint))
 
 
 def _is_rest_device_endpoint(endpoint: Any) -> bool:
