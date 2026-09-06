@@ -20,7 +20,13 @@ infrastructure:
   intolerance), or an Apple client roam-scanning near its −70 dBm trigger.
 
 All three gate on ``fast_sta`` coverage: below 0.5 they return ``UNKNOWN`` rather
-than mistake a collection gap for a healthy (or unhealthy) client. Attribution
+than mistake a collection gap for a healthy (or unhealthy) client. The two
+event-driven verdicts (``client.flaky`` whole-detector, and ``known_pathology``'s
+``iot_pmf_11r`` arm) additionally gate on *event-source* coverage
+(``ctx.event_coverage_ok``): a healthy client poll does not prove the event feed
+ran, so an event-feed gap freezes those verdicts (UNKNOWN) rather than reading
+aged-out disconnect events as recovery and false-clearing a real issue.
+Attribution
 never enters the fingerprint ``dims`` — it is volatile and belongs in evidence —
 so a client keeps one stable issue identity as its attribution is refined.
 """
@@ -32,7 +38,7 @@ import time
 from typing import Any, Iterable, Optional
 
 from netadmin.detect import device_kb
-from netadmin.detect.engine import COVERAGE_MIN, UNKNOWN, EvalResult
+from netadmin.detect.engine import COVERAGE_MIN, UNKNOWN, DetectorResult, EvalResult
 from netadmin.domain.entities import Entity, Finding
 from netadmin.domain.types import Cadence, EntityType, Severity
 from netadmin.logging import get_logger
@@ -455,6 +461,20 @@ class KnownPathologyDetector:
         window_s = int(ctx.threshold(self.key, "window_s", 3600))
         if ctx.coverage(window_s, "fast_sta") < COVERAGE_MIN:
             return UNKNOWN
+        # B4: the iot_pmf_11r arm's verdict is built from disconnect *events*. A
+        # healthy client poll (gated above on fast_sta) does NOT prove the event
+        # feed (WebSocket / stat/event) ran; if the event source had a coverage
+        # gap over the window, aged-out disconnects read as "no disconnects" and a
+        # real, still-open iot_pmf_11r issue would be false-cleared (or its applied
+        # fix false-verified). When event-source coverage is below the factored
+        # floor (EVENT_COVERAGE_MIN, ~0.9, far above the poll-coverage
+        # COVERAGE_MIN), that event-driven arm FREEZES: each IoT-class client it
+        # would judge is marked UNKNOWN (advance nothing) rather than cleared by
+        # absence -- exactly the gate client.flaky / wifi.roam_quality / .dfs /
+        # .pingpong apply. The ios_aggressive_roam arm is poll-driven (roam_count
+        # samples), so it is deliberately NOT gated here -- it keeps the fast_sta
+        # gate above, and its behaviour is unchanged.
+        event_ok = ctx.event_coverage_ok(window_s)
 
         roam_min = int(ctx.threshold(self.key, "ios_roam_min", 5))
         disc_min = int(ctx.threshold(self.key, "iot_disconnect_min", 3))
@@ -462,13 +482,27 @@ class KnownPathologyDetector:
         since = ctx.now_ts - window_s
 
         findings: list[Finding] = []
+        unknown_entities: set[int] = set()
         for client in ctx.entities(EntityType.CLIENT):
             if client.entity_id is None:
                 continue
-            finding = self._match(ctx, client, kb, since, window_s, roam_min, disc_min)
+            finding = self._match(
+                ctx,
+                client,
+                kb,
+                since,
+                window_s,
+                roam_min,
+                disc_min,
+                event_ok=event_ok,
+                unknown_entities=unknown_entities,
+            )
             if finding is not None:
                 findings.append(finding)
-        return findings
+        # DetectorResult.of returns a bare list when nothing is frozen (the common
+        # path: healthy event feed, or a purely poll-only pass), so poll-only
+        # behaviour keeps plain list semantics.
+        return DetectorResult.of(findings, unknown_entities)
 
     def _match(
         self,
@@ -479,6 +513,9 @@ class KnownPathologyDetector:
         window_s: int,
         roam_min: int,
         disc_min: int,
+        *,
+        event_ok: bool,
+        unknown_entities: set[int],
     ) -> Optional[Finding]:
         name = (client.name or "").lower()
         oui = str((client.meta or {}).get("oui") or "").lower()
@@ -486,6 +523,13 @@ class KnownPathologyDetector:
 
         # --- IoT 2.4-only + disconnects -> PMF/11r intolerance ---
         if _matches_patterns(haystack, device_kb.section_patterns(kb, "known_2.4ghz_only")):
+            # Event-driven arm: during an event-feed gap the disconnect symptom
+            # cannot be judged. Freeze this client (advance nothing) so the engine
+            # does not clear its open iot_pmf_11r issue by absence, and do not fire
+            # a fresh one on untrustworthy event data.
+            if not event_ok:
+                unknown_entities.add(client.entity_id)
+                return None
             disconnects = len(
                 ctx.events(
                     entity_id=client.entity_id,
