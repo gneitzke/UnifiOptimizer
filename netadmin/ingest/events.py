@@ -295,6 +295,17 @@ async def catchup_events(
     if within_hours is None and since_ts is not None:
         gap_hours = max(0, now_s - since_ts) // 3600
         within_hours = min(_CATCHUP_MAX_WITHIN_HOURS, gap_hours + 1 + _CATCHUP_MARGIN_HOURS)
+    # C3: coverage may only be recorded for the span we actually read. Clamp the
+    # start forward to the tightest of every bound that limited the fetch --
+    # ``within_hours`` (how far back stat/event returned), an explicit ``since_ts``
+    # floor, and the retention cap -- so a bounded 1 h fetch never books coverage
+    # for the untouched day behind it. ``max()`` picks the *latest* (narrowest)
+    # floor; ``coverage_start`` already carries the cursor / retention baseline.
+    coverage_start = max(coverage_start, now_s - _CATCHUP_MAX_WITHIN_HOURS * 3600)
+    if within_hours is not None:
+        coverage_start = max(coverage_start, now_s - within_hours * 3600)
+    if explicit_cursor and since_ts is not None:
+        coverage_start = max(coverage_start, since_ts)
     events = await endpoints.stat_event(within_hours=within_hours, max_events=max_events)
     records: list[dict[str, Any]] = []
     for event in events:
@@ -360,6 +371,30 @@ class EventListener:
         self._storage_error: Optional[BaseException] = None
         self.terminal_state: Optional[str] = None
         self.written = 0
+        # R3: surface the low-level socket's real connection state. The ws listener
+        # calls back on connect/drop; we cache it and relay it to the supervisor
+        # (``on_connection_state``) so health reflects the handshake, not the mere
+        # existence of a running task.
+        self.connection_state: str = "reconnecting"
+        self.on_connection_state: Optional[Callable[[str], None]] = None
+        # The socket listener reports state through this hook; setattr is safe on
+        # both the real ws listener and the test doubles.
+        setattr(self._ws, "on_state", self._relay_ws_state)
+
+    def _relay_ws_state(self, state: str) -> None:
+        self.connection_state = state
+        callback = self.on_connection_state
+        if callback is not None:
+            callback(state)
+
+    def pending_records(self) -> list[dict[str, Any]]:
+        """Events buffered but NOT yet committed to storage (R2).
+
+        The supervisor rescues these when it replaces a listener that died with an
+        unflushed batch: WS events have no ``stat/event`` recovery source, so a
+        storage blip that outlives the listener must not silently drop them.
+        """
+        return list(self._batch)
 
     def _flush(self) -> int:
         """Write and clear the pending batch. Synchronous and atomic.
@@ -473,9 +508,47 @@ class WsSupervisor:
         self._sleep = sleep
         self._stop = asyncio.Event()
         self.state = "reconnecting"
+        # R2: events a dying listener buffered but could not commit live HERE, on
+        # the supervisor, not on the listener it is about to discard. A storage
+        # blip that kills the listener leaves the batch stranded otherwise; the
+        # supervisor retries it on the next attempt once storage recovers.
+        self._pending: list[dict[str, Any]] = []
 
     def stop(self) -> None:
         self._stop.set()
+
+    def _on_listener_state(self, state: str) -> None:
+        """R3: the supervisor's health follows the listener's ACTUAL socket state.
+
+        Called by the listener when its handshake succeeds ("connected") or it
+        drops/backs off ("reconnecting"). Never inferred from the task existing.
+        """
+        self.state = state
+
+    def _drain_pending(self) -> None:
+        """R2: retry events rescued from a replaced listener.
+
+        Called at each restart (storage may have recovered) and once more on
+        teardown. Kept-or-cleared atomically: on a still-failing write the batch
+        stays queued for the next attempt rather than being lost.
+        """
+        if not self._pending:
+            return
+        try:
+            self._repo.record_events_enriching_entities(self._pending)
+        except Exception:  # storage still down; keep the batch for the next try
+            logger.exception(
+                "Rescued WS batch still cannot be stored; retaining %d events",
+                len(self._pending),
+            )
+            return
+        self._pending = []
+
+    def _rescue_pending(self, listener: EventListener) -> None:
+        """Move a dead listener's uncommitted batch onto the supervisor (R2)."""
+        leftover = getattr(listener, "pending_records", lambda: [])()
+        if leftover:
+            self._pending.extend(leftover)
 
     def _record(self, label: str, *, ok: bool, duration_ms: Optional[int] = None) -> None:
         self._repo.record_poll_run(
@@ -487,18 +560,26 @@ class WsSupervisor:
         restarts = 0
         while not self._stop.is_set():
             self.state = "reconnecting"
+            # R2: retry any batch rescued from a prior listener before starting a
+            # fresh one -- storage may have recovered during the backoff.
+            self._drain_pending()
             listener = self._factory()
+            # R3: report the listener's REAL connection state, not an assumption.
+            listener.on_connection_state = self._on_listener_state
             self._record("started", ok=True)
             start = monotonic()
             clean = True
             error: Optional[str] = None
             try:
-                # Listener.run only returns after the subscription was entered;
-                # a quiet socket remains here and is healthy without frames.
-                self.state = "connected"
+                # Do NOT pre-declare "connected": the handshake has not happened
+                # yet. The listener flips us to "connected" once its socket is up
+                # (a quiet-but-connected socket still reports connected), and back
+                # to "reconnecting" on a drop -- state tracks the socket, not the
+                # mere existence of this task.
                 await listener.run()
             except asyncio.CancelledError:
                 self.state = "stopped"
+                self._rescue_pending(listener)
                 raise
             except Exception as exc:  # noqa: BLE001 - firewall: any death is recoverable
                 clean = False
@@ -520,6 +601,9 @@ class WsSupervisor:
                     error = "unsupported"
             duration_ms = int((monotonic() - start) * 1000)
             self._record(error or "stopped", ok=clean, duration_ms=duration_ms)
+            # R2: before discarding this listener, take custody of anything it
+            # buffered but could not commit (a storage failure during its run).
+            self._rescue_pending(listener)
 
             if self._stop.is_set():
                 break
@@ -529,6 +613,9 @@ class WsSupervisor:
                 break
             await self._sleep(backoff)
             backoff = self._backoff_base if clean else min(backoff * 2, self._backoff_max)
+        # R2: a final attempt to persist rescued events (storage may have come
+        # back by the time the loop ends) so a blip + shutdown does not drop them.
+        self._drain_pending()
         if self._stop.is_set():
             self.state = "stopped"
 

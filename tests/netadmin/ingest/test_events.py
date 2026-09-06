@@ -523,3 +523,184 @@ async def test_catchup_unbounded_only_when_no_cursor(repo: Repository) -> None:
     ep = RecordingEndpoints([])
     await catchup_events(repo, ep)
     assert ep.within_hours_seen == [None]
+
+
+# --------------------------------------------------------------------------- #
+# C3: recorded coverage must be clamped to the window actually fetched. A
+# bounded 1 h fetch must NOT book coverage for the untouched day behind it.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_c3_bounded_fetch_clamps_recorded_coverage(repo: Repository) -> None:
+    now = 1_721_700_000
+    day_ago = now - 24 * 3600
+    # A stale completed coverage cursor a day in the past (the catch-up baseline).
+    repo.record_ingest_coverage(
+        kind="event_history", scope="site", interval="retained",
+        start_ts=day_ago - 3600, end_ts=day_ago, status="complete",
+    )
+    # A caller-pinned 1 h bounded fetch (empty result is fine: coverage is what
+    # we assert, not inserts).
+    await catchup_events(repo, FakeEndpoints([]), within_hours=1, now=now)
+
+    # The last hour we actually read is fully covered...
+    assert repo.observed_event_coverage(now - 3600, now) == 1.0
+    # ...but the preceding day we did NOT read must not be reported covered.
+    # (The bug recorded [cursor .. now] complete, making this 1.0.)
+    assert repo.observed_event_coverage(now - 12 * 3600, now - 2 * 3600) == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# R3: supervisor/health state must reflect the ACTUAL socket state, reported up
+# from the listener -- never assumed because a task exists.
+# --------------------------------------------------------------------------- #
+class _ScriptedWs:
+    """A ws-layer double that drives ``on_state`` through a scripted sequence."""
+
+    def __init__(self, states: list[str]) -> None:
+        self._states = states
+        self.on_state = None  # set by the events.EventListener wrapper
+        self._stop = SimpleNamespaceStop()
+
+    async def events(self):  # async generator that yields no events
+        for state in self._states:
+            if self.on_state is not None:
+                self.on_state(state)
+        return
+        yield  # pragma: no cover - marks this an async generator
+
+    def stop(self) -> None:  # pragma: no cover - parity
+        self._stop.set()
+
+
+class SimpleNamespaceStop:
+    def __init__(self) -> None:
+        self._set = False
+
+    def set(self) -> None:  # pragma: no cover - parity
+        self._set = True
+
+    def is_set(self) -> bool:
+        return self._set
+
+
+@pytest.mark.asyncio
+async def test_r3_events_listener_relays_socket_state(repo: Repository) -> None:
+    # The events-layer listener must forward the ws socket's state changes to the
+    # supervisor hook (on_connection_state) and cache the latest.
+    ws = _ScriptedWs(["connected", "reconnecting"])
+    listener = EventListener(ws, repo, flush_interval=None)
+    seen: list[str] = []
+    listener.on_connection_state = seen.append
+    await listener.run()
+    assert seen == ["connected", "reconnecting"]
+    assert listener.connection_state == "reconnecting"
+
+
+@pytest.mark.asyncio
+async def test_r3_supervisor_never_connected_without_handshake(repo: Repository) -> None:
+    # A listener whose run never reports a handshake must leave the supervisor
+    # "reconnecting" -- NOT "connected" (the bug pre-declared connected).
+    observed: list[str] = []
+    sup: WsSupervisor
+
+    class _NeverHandshake:
+        def __init__(self) -> None:
+            self.on_connection_state = None
+            self.terminal_state = None
+
+        async def run(self) -> int:
+            observed.append(sup.state)  # supervisor state while a task exists, pre-handshake
+            sup.stop()
+            return 0
+
+    async def fake_sleep(delay: float) -> None:  # pragma: no cover - stop ends first
+        pass
+
+    sup = WsSupervisor(lambda: _NeverHandshake(), repo, backoff_base=0.0, sleep=fake_sleep)
+    await asyncio.wait_for(sup.run(), timeout=2.0)
+    assert observed == ["reconnecting"]  # never "connected"
+
+
+@pytest.mark.asyncio
+async def test_r3_supervisor_state_flips_connected_then_reconnecting(repo: Repository) -> None:
+    # A handshake then a mid-run disconnect must move the supervisor connected ->
+    # reconnecting, driven by the listener's callbacks.
+    seen: list[str] = []
+    sup: WsSupervisor
+
+    class _Flaky:
+        def __init__(self) -> None:
+            self.on_connection_state = None
+            self.terminal_state = None
+
+        async def run(self) -> int:
+            self.on_connection_state("connected")
+            seen.append(sup.state)
+            self.on_connection_state("reconnecting")
+            seen.append(sup.state)
+            sup.stop()
+            return 0
+
+    async def fake_sleep(delay: float) -> None:  # pragma: no cover - stop ends first
+        pass
+
+    sup = WsSupervisor(lambda: _Flaky(), repo, backoff_base=0.0, sleep=fake_sleep)
+    await asyncio.wait_for(sup.run(), timeout=2.0)
+    assert seen == ["connected", "reconnecting"]
+
+
+# --------------------------------------------------------------------------- #
+# R2: buffered-but-uncommitted events must survive a listener restart. A storage
+# blip that kills the listener then recovers must not drop the pending batch --
+# WS events have no stat/event recovery source.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_r2_pending_batch_survives_storage_blip_and_restart(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    N = 1000
+    events = [
+        Event.model_validate({"_id": f"e{i}", "key": "EVT_X", "time": 1_721_600_000_000 + i})
+        for i in range(N)
+    ]
+
+    real = repo.record_events_enriching_entities
+    storage = {"down": True}
+
+    def flaky(rows: object) -> int:
+        if storage["down"]:
+            import sqlite3
+
+            raise sqlite3.OperationalError("database is locked")
+        return real(rows)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repo, "record_events_enriching_entities", flaky)
+
+    attempt = {"n": 0}
+
+    def factory() -> EventListener:
+        attempt["n"] += 1
+        if attempt["n"] == 1:
+            # First listener buffers all N, but every flush fails: it dies with
+            # the whole batch uncommitted.
+            return EventListener(FakeWs(events), repo, flush_interval=None, batch_size=100)
+        # Later listeners have nothing new to add.
+        return EventListener(FakeWs([]), repo, flush_interval=None)
+
+    sup: WsSupervisor
+
+    async def fake_sleep(delay: float) -> None:
+        # Storage recovers during the backoff after the first death; stop once the
+        # supervisor has had a restart to drain the rescued batch.
+        storage["down"] = False
+        if attempt["n"] >= 2:
+            sup.stop()
+
+    sup = WsSupervisor(factory, repo, backoff_base=0.0, max_restarts=5, sleep=fake_sleep)
+    await asyncio.wait_for(sup.run(), timeout=5.0)
+
+    # Every buffered event is eventually persisted -- zero loss across the blip +
+    # listener replacement (the bug persisted ZERO of the 1000).
+    stored = repo.read_events(0, 2_000_000_000)
+    assert len(stored) == N
+    assert {r["native_id"] for r in stored} == {f"e{i}" for i in range(N)}
