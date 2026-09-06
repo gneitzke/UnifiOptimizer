@@ -73,6 +73,28 @@ _CATCHUP_MAX_WITHIN_HOURS = 30 * 24  # events are pruned at ~30 days locally
 _SYSTEM_PENDING_MAX = 50_000
 
 
+def _masks_cancel(exc: BaseException) -> bool:
+    """True if ``exc`` is (or masks) a propagating ``asyncio.CancelledError``.
+
+    When a ``finally`` (or other cleanup) raises an exception while a
+    ``CancelledError`` is propagating, Python links that CancelledError into the
+    new exception's ``__context__`` (implicit chaining) or ``__cause__`` (explicit
+    ``raise ... from``). Walking that chain detects a masked cancel WITHOUT
+    consulting ``current_task().cancelling()`` -- whose count is 0 when the cancel
+    arrived by awaiting an already-cancelled future, the case that defeated the
+    old count-based check (FINDING#5). A bounded walk guards against a cyclic
+    chain.
+    """
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, asyncio.CancelledError):
+            return True
+        seen.add(id(cur))
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 def _to_epoch_s(event: Event) -> Optional[int]:
     """Fold a controller event timestamp to epoch **seconds**.
 
@@ -670,6 +692,7 @@ class EventListener:
         """
         flusher: Optional[asyncio.Task[None]] = None
         completed = False
+        cancelled = False
         if self._flush_interval:
             flusher = asyncio.create_task(self._periodic_flush())
         try:
@@ -732,39 +755,47 @@ class EventListener:
                             self._storage_error = exc
                             logger.exception("WS event storage flush failed; retaining batch")
             completed = True
+        except asyncio.CancelledError:
+            # FINDING#5 root cause: a cancellation is propagating through this
+            # teardown, and it MUST win over any storage error the final flush
+            # raises. The old teardown decided "am I cancelling?" from
+            # ``current_task().cancelling() > 0`` -- but a CancelledError raised by
+            # awaiting an ALREADY-CANCELLED future carries cancelling()==0, so that
+            # count-based check missed it, the teardown flush's OperationalError
+            # REPLACED the CancelledError, and the supervisor saw an ordinary death
+            # (returned normally / restarted; task.cancelled()==False). Catching the
+            # ``asyncio.CancelledError`` ITSELF -- a separate clause from
+            # ``except Exception`` (it is a BaseException in 3.11, so an
+            # ``except Exception`` can never see it) -- is the signal, independent of
+            # HOW the cancel arose: a direct ``.cancel()``, an inherited cancel, or
+            # an already-cancelled awaited future all land here. Flag it so the
+            # shared teardown below swallows a flush storage error and re-raise so
+            # the cancel always propagates (task.cancelled()==True).
+            cancelled = True
+            raise
         finally:
             if flusher is not None:
                 flusher.cancel()
                 await asyncio.gather(flusher, return_exceptions=True)
-            # BUG#5: if this teardown is running because the task is being
-            # CANCELLED (production ``SupervisorTask.stop()`` cancels the supervise
-            # loop, and the cancel lands mid-``async for`` here), a storage failure
-            # in the final ``_flush()`` must NEVER replace the in-flight
-            # CancelledError. A raw exception raised from a ``finally`` silently
-            # REPLACES the exception propagating through it -- so an
-            # ``OperationalError`` from a teardown flush turned a shutdown into a
-            # spurious listener DEATH: the supervisor's ``except Exception`` treated
-            # it as ordinary and returned normally (task.cancelled()==False) or
-            # restarted, and the stop() was lost. Detect the cancelling state and,
-            # on a flush failure during cancellation, retain the batch (the
-            # supervisor rescues it) and let the CancelledError propagate untouched.
-            # The batch is preserved either way -- ``_flush`` removes nothing until
-            # SQLite commits -- so a normal final flush still commits and clears
-            # exactly once, and a non-cancel flush failure still RAISES so
-            # supervisor/health report it.
-            cancelling = False
-            current = asyncio.current_task()
-            if current is not None:
-                try:
-                    cancelling = current.cancelling() > 0
-                except AttributeError:  # pragma: no cover - Python < 3.11
-                    cancelling = False
+            # A storage failure in the final ``_flush()`` must NEVER replace an
+            # in-flight CancelledError. A raw exception raised from a ``finally``
+            # silently REPLACES the exception propagating through it -- so an
+            # ``OperationalError`` from a teardown flush would turn a shutdown into a
+            # spurious listener DEATH. ``cancelled`` is set only by the explicit
+            # ``except asyncio.CancelledError`` clause above, so it is true for EVERY
+            # cancel regardless of ``cancelling()`` count. On a flush failure during
+            # cancellation, retain the batch (the supervisor rescues it) and swallow
+            # the storage error so the pending CancelledError resumes propagating
+            # out of ``run`` untouched. The batch is preserved either way --
+            # ``_flush`` removes nothing until SQLite commits -- so a normal final
+            # flush still commits and clears exactly once, and a non-cancel flush
+            # failure still RAISES so supervisor/health report it.
             try:
                 self._flush()
                 self._normalizer.reconcile_unresolved()
             except Exception as exc:  # noqa: BLE001 - classified by cancel state
                 self._storage_error = exc
-                if not cancelling:
+                if not cancelled:
                     # Normal (non-shutdown) death: surface the failure as before.
                     raise
                 # Shutdown: keep the batch for the supervisor to rescue and let the
@@ -1083,16 +1114,32 @@ class WsSupervisor:
                         self._drain_pending()
                     raise
                 except Exception as exc:  # noqa: BLE001 - firewall: any death is recoverable
-                    # BUG#5 (belt-and-braces): a storage failure in listener
+                    # FINDING#5 (belt-and-braces): a storage failure in listener
                     # teardown can surface HERE as an ordinary exception even while
                     # this task is being cancelled -- if any cleanup path still lets
-                    # a non-CancelledError replace the cancel. When the task is
-                    # actually being cancelled this is a SHUTDOWN, not a listener
-                    # death: rescue + final-drain the dying listener's buffers and
-                    # re-raise CancelledError so ``stop()`` reliably stops instead of
+                    # a non-CancelledError replace the cancel. When a cancel is
+                    # actually masked this is a SHUTDOWN, not a listener death:
+                    # rescue + final-drain the dying listener's buffers and re-raise
+                    # CancelledError so ``stop()`` reliably stops instead of
                     # returning normally (task.cancelled()==False) or restarting.
+                    #
+                    # Do NOT rely solely on ``current_task().cancelling() > 0``: a
+                    # CancelledError raised by awaiting an ALREADY-CANCELLED future
+                    # carries cancelling()==0, so a count-based test alone can be
+                    # defeated (round-12 verifier). When a ``finally``-raised
+                    # exception replaces a propagating CancelledError, Python links
+                    # that CancelledError into the replacement's ``__context__`` /
+                    # ``__cause__`` chain -- so a masked cancel is detectable from the
+                    # exception itself, independent of the cancelling() count and of
+                    # HOW the cancel arose. (In practice the listener now re-raises
+                    # the CancelledError directly and this branch never fires for
+                    # FINDING#5; it remains as a robust net for any residual path.)
                     current = asyncio.current_task()
-                    if current is not None and getattr(current, "cancelling", lambda: 0)() > 0:
+                    count_cancelling = (
+                        current is not None
+                        and getattr(current, "cancelling", lambda: 0)() > 0
+                    )
+                    if count_cancelling or _masks_cancel(exc):
                         self.state = "stopped"
                         try:
                             self._rescue_pending(listener)
