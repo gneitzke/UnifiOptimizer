@@ -95,7 +95,19 @@ _WS_HEARTBEAT_MAX_GAP_S = 75
 # not connected": ``disconnected`` (``_on_listener_state`` when state !=
 # 'connected'; and the clean cancel/stop close) and ``reconnecting`` (belt-and-
 # braces, should the state word itself ever be recorded).
-_WS_DISCONNECT_LABELS = ("disconnected", "reconnecting")
+# #w18a-2 (unusable-event drop severs coverage): a run of UNUSABLE events consumed
+# off a still-connected socket -- a disconnect frame with no usable timestamp, or a
+# parser-surfaced event-frame row with no ``key``/``_id`` (#w18a-4) -- is NOT a
+# healthy, fully-observed span even though the socket never dropped. Suppressing a
+# single positive-liveness beat is not enough: the next clean beat ~2s later still
+# falls within ``_WS_HEARTBEAT_MAX_GAP_S`` of the last clean beat and BRIDGES the
+# drop span. So the consumer records a durable BREAK row (``error='unusable'``) in
+# ``poll_runs(job='ws')`` for such a span; included in the sever set below, it
+# severs the heartbeat chain exactly like a socket disconnect (via the existing
+# machinery in :meth:`_ws_observed_intervals`), so coverage ends at the last clean
+# beat and only resumes after a subsequent CLEAN drain.
+_WS_UNUSABLE_LABEL = "unusable"
+_WS_DISCONNECT_LABELS = ("disconnected", "reconnecting", _WS_UNUSABLE_LABEL)
 
 # C7/P2: how many reconcile passes a row may be *selected without being filled*
 # before it is parked (stops consuming the oldest-first LIMIT window). It is a
@@ -1451,12 +1463,20 @@ class Repository:
 
     # C4: failed report chunks remain first-class holes and are retried even
     # after a later successful chunk advances sample timestamps.
+    #
+    # #w18a-3: a 'partial' window (some rows dropped as unusable/unresolved --
+    # backfill.py, or catch-up #w16a-4) is ALSO a retryable hole, not a settled
+    # window. It must be re-fetched exactly like a 'failed' one so that once the
+    # missing device/data becomes available a re-fetch can complete it; otherwise a
+    # partial recorded before a later 'complete' chunk is stranded forever (the
+    # retry scan skipped it and the completion cursor advanced past it). Both
+    # retryable statuses are returned here; 'unrecoverable' (terminal) is not.
     def failed_ingest_coverage(
         self, *, kind: str, scope: str, interval: Optional[str] = None
     ) -> list[sqlite3.Row]:
         if not self._table_exists("ingest_coverage"):
             return []
-        clauses = ["kind=?", "scope=?", "status='failed'"]
+        clauses = ["kind=?", "scope=?", "status IN ('failed','partial')"]
         params: list[Any] = [kind, scope]
         if interval is not None:
             clauses.append("interval=?")
@@ -1467,14 +1487,43 @@ class Repository:
         ).fetchall()
 
     # C4: this is a coverage cursor, never a proxy derived from samples.
+    #
+    # #w18a-3: the cursor is the end of the contiguous COMPLETE prefix, NOT
+    # MAX(complete). A later 'complete' chunk must NOT bury an earlier retryable
+    # hole ('failed' or 'partial'): if it did, the production cursor would advance
+    # past the hole and the next sweep would only fetch newer intervals, stranding
+    # the hole forever. So the cursor may not advance past the earliest retryable
+    # hole -- history is "completely read up to T" only through the complete (or
+    # permanently-'unrecoverable') prefix that precedes every still-retryable hole.
+    # 'unrecoverable' is terminal (the span is genuinely gone), so it does NOT block
+    # the cursor -- otherwise it would freeze forever on lost history and re-fetch
+    # everything after it every cycle (round-11/12 semantics preserved).
     def latest_ingest_coverage_end(self, *, kind: str, scope: str) -> Optional[int]:
         if not self._table_exists("ingest_coverage"):
             return None
+        hole = self._conn.execute(
+            "SELECT MIN(start_ts) AS s FROM ingest_coverage "
+            "WHERE kind=? AND scope=? AND status IN ('failed','partial')",
+            (kind, scope),
+        ).fetchone()
+        hole_start = None if hole is None or hole["s"] is None else int(hole["s"])
+        if hole_start is None:
+            row = self._conn.execute(
+                "SELECT MAX(end_ts) AS end_ts FROM ingest_coverage "
+                "WHERE kind=? AND scope=? AND status='complete'", (kind, scope)
+            ).fetchone()
+            return None if row is None or row["end_ts"] is None else int(row["end_ts"])
+        # A retryable hole exists: credit only 'complete' coverage that begins
+        # before it, and never report a cursor past the hole's own start.
         row = self._conn.execute(
             "SELECT MAX(end_ts) AS end_ts FROM ingest_coverage "
-            "WHERE kind=? AND scope=? AND status='complete'", (kind, scope)
+            "WHERE kind=? AND scope=? AND status='complete' AND start_ts<?",
+            (kind, scope, hole_start),
         ).fetchone()
-        return None if row is None or row["end_ts"] is None else int(row["end_ts"])
+        end = None if row is None or row["end_ts"] is None else int(row["end_ts"])
+        if end is None:
+            return None
+        return min(end, hole_start)
 
     # B4 (positive-liveness redesign): spans the WS event feed was actually
     # observing, derived from ``job='ws'`` liveness HEARTBEATS in ``poll_runs``
@@ -1683,6 +1732,26 @@ class Repository:
         beats -- there is no close row for coverage to depend on.
         """
         self.record_poll_run(job="ws", ok=True, ts=ts, error=_WS_HEARTBEAT_LABEL, source="live")
+
+    def record_ws_break(self, *, ts: Optional[int] = None) -> None:
+        """Record a WS coverage BREAK across a span of UNUSABLE events (#w18a-2).
+
+        Written by the live WS consumer when it drained a tick during which one or
+        more events were structurally UNUSABLE -- a disconnect frame with no usable
+        timestamp, or a parser-surfaced event-frame row lacking ``key``/``_id``
+        (#w18a-4). The socket never dropped, so no ``disconnected`` row exists, yet
+        the span was NOT a fully-observed, cleanly-draining one: usable events may
+        have been discarded alongside the unusable ones. Merely suppressing one
+        positive-liveness beat leaves the next clean beat ~2s later within the
+        cadence bridge, so :meth:`_ws_observed_intervals` would BRIDGE the drop span
+        and over-credit coverage. Instead this lands a durable ``job='ws'`` break
+        row (``error='unusable'``, ``ok=0``) that the interval builder treats as a
+        disconnect: it SEVERS the heartbeat chain, so coverage ends at the last
+        clean beat before the drops and only resumes at the first clean beat after a
+        subsequent CLEAN drain -- reusing the disconnect-severing machinery rather
+        than a parallel path.
+        """
+        self.record_poll_run(job="ws", ok=False, ts=ts, error=_WS_UNUSABLE_LABEL, source="live")
 
     def read_poll_runs(
         self, job: str, start_ts: int, end_ts: int, *, ok_only: bool = False

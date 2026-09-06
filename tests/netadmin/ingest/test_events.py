@@ -1537,6 +1537,115 @@ def test_w17a2_clean_ticks_still_heartbeat_and_cover(repo: Repository) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# #w18a-2 (unusable-event drop must SEVER coverage, not just skip one beat): the
+# round-18 defect is that suppressing a single heartbeat leaves a BRIDGEABLE gap.
+# With a 30 s heartbeat cadence, a 2 s flush cadence and an unusable event every
+# 30 s, the next clean beat lands ~2 s after the last clean beat -- inside the 75 s
+# cadence bridge -- so the pure heartbeat chain BRIDGED the whole hour (0 events,
+# ~all heartbeats, ~0.99 coverage) and false-cleared a real client.flaky issue. A
+# drop must record a durable coverage BREAK that severs the chain, so coverage ends
+# at the last CLEAN beat and only resumes after a subsequent clean drain.
+# --------------------------------------------------------------------------- #
+def _drive_flush_ticks(listener, start, now, *, drop_every=None, flush_step=2):
+    """Drive realistic 2 s flush ticks through the REAL rate-limit + break gates.
+
+    When ``drop_every`` is set, an unusable event is marked ``drop_every`` seconds
+    apart (as the real run loop increments the counter on a normalize->None event),
+    reproducing the round-18 interleave WITHOUT resetting ``_last_heartbeat_ts``.
+    """
+    t = start
+    while t <= now:
+        if drop_every is not None and t > start and (t - start) % drop_every == 0:
+            listener._unusable_dropped_since_beat += 1
+        listener._flush()
+        listener._maybe_heartbeat(now=t)
+        t += flush_step
+
+
+def test_w18a2_unusable_drops_sever_coverage_no_bridge(repo: Repository) -> None:
+    """#w18a-2: unusable events every 30 s with a 30 s beat cadence and 2 s flushes
+    record coverage BREAKS between the clean beats, so the chain never bridges and
+    coverage stays well below the floor -> client.flaky FREEZES (UNKNOWN). Pre-fix
+    (suppress-only) the clean beats bridged and fabricated ~0.99 coverage."""
+    now = 9_100_000
+    start = now - 3600
+    seed_coverage(repo, job="fast_sta", now=now, window_s=3600, interval_s=60)
+    ap = repo.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="ap-w18a2", site_id="default"), ts=now
+    )
+    repo.upsert_entity(
+        Entity(
+            entity_type=EntityType.CLIENT, native_id="cc:w18a2", site_id="default",
+            parent_id=ap, first_seen_ts=now - 100_000,
+        ),
+        ts=now,
+    )
+    # Real 30 s beat cadence (NOT 0.0), so clean beats would otherwise bridge.
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=30.0)
+    listener.connection_state = "connected"
+    _drive_flush_ticks(listener, start, now, drop_every=30)
+
+    # Breaks were recorded and they sever the heartbeat chain: coverage < 0.9.
+    breaks = [r for r in repo.read_poll_runs("ws", 0, 20_000_000) if r["error"] == "unusable"]
+    assert breaks, "an unusable-drop span must record a durable coverage break"
+    cov = repo.observed_event_coverage(start, now)
+    assert cov < 0.9
+    assert cov < EVENT_COVERAGE_MIN
+    ctx = DetectorContext(
+        repo=repo, baselines=FakeBaselines(), now_ts=now, site_id="default", settings=None
+    )
+    assert FlakyClientDetector().evaluate(ctx) is UNKNOWN
+
+
+def test_w18a2_clean_stream_still_bridges_and_covers(repo: Repository) -> None:
+    """#w18a-2 control: with NO unusable drops, the same 30 s-cadence / 2 s-flush
+    feed records no breaks, the beats bridge normally, and the hour stays covered --
+    the sever machinery does not fire on a healthy stream."""
+    now = 9_200_000
+    start = now - 3600
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=30.0)
+    listener.connection_state = "connected"
+    _drive_flush_ticks(listener, start, now, drop_every=None)
+
+    assert [r for r in repo.read_poll_runs("ws", 0, 20_000_000) if r["error"] == "unusable"] == []
+    assert repo.observed_event_coverage(start, now) > 0.9
+
+
+@pytest.mark.asyncio
+async def test_w18a4_parser_unusable_frames_reach_drop_accounting_and_sever(
+    repo: Repository,
+) -> None:
+    """#w18a-4 end to end: identifiable-but-unusable rows from an EXPLICIT event
+    frame surface through the WS parser, reach the consumer's drop accounting
+    (normalize->None), and the resulting drop severs coverage (records a break, not
+    a beat). A genuine control frame stays a no-op. Pre-fix the parser silently
+    dropped the unusable rows, so the consumer never saw them: 0 stored, drop
+    counter 0, no break."""
+    from netadmin.ingest.unifi.ws import EventListener as WsEventListener
+
+    # Genuine control frame -> nothing (no false drop).
+    assert WsEventListener._parse('{"meta": {"message": "device:sync"}, "data": [{"mac": "x"}]}') == []
+    # Explicit event frame whose rows lack key/_id -> surfaced as unusable events.
+    parsed = WsEventListener._parse('{"meta": {"message": "events"}, "data": [{"foo": 1}, {"bar": 2}]}')
+    assert len(parsed) == 2  # pre-fix: [] (silently dropped)
+
+    listener = EventListener(FakeWs(parsed), repo, flush_interval=None, heartbeat_interval=30.0)
+    listener.connection_state = "connected"
+    written = await listener.run()
+
+    assert written == 0
+    assert repo.read_events(0, 2_000_000_000) == []          # nothing stored
+    assert listener._unusable_dropped_since_beat == 2         # drop accounted
+
+    # The accounted drop severs coverage: the next beat opportunity records a BREAK.
+    listener.connection_state = "connected"
+    listener._maybe_heartbeat(now=1_000)
+    beats = [r for r in repo.read_poll_runs("ws", 0, 100_000) if r["error"] == "heartbeat"]
+    breaks = [r for r in repo.read_poll_runs("ws", 0, 100_000) if r["error"] == "unusable"]
+    assert beats == [] and len(breaks) == 1
+
+
+# --------------------------------------------------------------------------- #
 # D5 (rescued events must not strand). (1) When storage recovers DURING a
 # replacement listener's life, the events rescued from a prior dead listener must
 # be persisted PROMPTLY -- not left queued until this new listener itself dies. The

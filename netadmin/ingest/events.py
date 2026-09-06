@@ -768,6 +768,19 @@ class EventListener:
         # again and reopens coverage, exactly like the raw-retry recovery path.
         if self._unusable_dropped_since_beat:
             self._unusable_dropped_since_beat = 0
+            # #w18a-2: suppressing this beat is NOT enough. The next clean beat
+            # ~one flush later still lands within ``_WS_HEARTBEAT_MAX_GAP_S`` of the
+            # last clean beat, so ``_ws_observed_intervals`` would BRIDGE the drop
+            # span and over-credit coverage across a period usable events were being
+            # discarded (the round-18 #2 defect: 0 events, all heartbeats, ~0.99
+            # coverage). Record a durable coverage BREAK so the heartbeat chain is
+            # SEVERED, exactly like a socket disconnect: coverage ends at the last
+            # clean beat and only resumes after a subsequent CLEAN drain beats again.
+            # Best-effort -- a failed break write is not a data-path error.
+            try:
+                self._repo.record_ws_break(ts=ts)
+            except Exception:  # noqa: BLE001 - liveness accounting must never break draining
+                logger.exception("Could not record WS coverage break")
             return
         # D5: this beat proves storage is healthy right now. Give the supervisor a
         # chance to hand off any events rescued from a prior listener while THIS
