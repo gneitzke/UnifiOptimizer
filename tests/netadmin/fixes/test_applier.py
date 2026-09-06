@@ -289,6 +289,36 @@ async def test_revert_of_nonrevertible_change_is_refused(store):
     assert writer.call_count == 0
 
 
+async def test_revert_of_change_with_non_radio_field_is_refused(store):
+    """Verifier round 5 (defense in depth): a ledger row whose change modified a
+    field beyond radio_table (here ``disabled``) has no complete inverse -- revert()
+    restores only radio_table. It must REFUSE rather than perform a partial revert
+    that leaves ``disabled`` changed while marking the row reverted. The apply-time
+    gate blocks creating such a change now, but an older/out-of-band row must still
+    be refused on the revert path itself."""
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+    endpoint = f"rest/device/{AP_ID}"
+    change_id = store.insert_change(
+        action="wifi.channel_plan",
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 3}], "disabled": False},
+        },
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 1}], "disabled": True},
+        },
+        status="applied",
+        ts=1,
+    )
+    with pytest.raises(SafetyViolation):
+        await applier.revert(change_id, current_radios={"ng": {"radio": "ng", "channel": 1}})
+    assert writer.call_count == 0
+
+
 async def test_revert_unknown_change_raises(store):
     applier = Applier(store, FakeControllerWriter())
     with pytest.raises(FixError):

@@ -407,6 +407,23 @@ class Applier:
                         "state was read; refusing to restore on unverified state"
                     )
                 after_body = after.get("body") if isinstance(after, dict) else {}
+                # Defense in depth (verifier round 5): restore_body below carries ONLY
+                # radio_table. If the recorded change ALSO modified another top-level
+                # field (the apply-time gate now blocks creating such a change, but an
+                # older ledger row or an out-of-band change might have one), reverting it
+                # would silently leave that field changed while marking the row reverted.
+                # Refuse rather than perform a partial, dishonest revert.
+                if isinstance(after_body, dict):
+                    non_revertible = sorted(
+                        k
+                        for k, v in after_body.items()
+                        if k != "radio_table" and v != (body.get(k) if isinstance(body, dict) else None)
+                    )
+                    if non_revertible:
+                        raise SafetyViolation(
+                            f"revert of change {change_id} restores only radio_table but the "
+                            f"change also modified {non_revertible}; refusing an incomplete revert"
+                        )
                 fresh_table = self._fresh_restore_table(
                     change_id,
                     body,
