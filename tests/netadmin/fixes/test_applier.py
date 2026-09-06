@@ -2729,3 +2729,217 @@ async def test_w12a4_assert_revertible_status_refuses_failed_and_applying():
     # A confirmed apply and an ambiguous apply remain revertible (no raise).
     Applier._assert_revertible_status(1, "applied")
     Applier._assert_revertible_status(1, "unknown")
+
+
+# --------------------------------------------------------------------------- #
+# S2 r18: a delta targeting a radio ABSENT from fresh live must be REFUSED.
+# Merge-at-dispatch may only modify radios present in the fresh live radio_table;
+# synthesizing an entry from a delta would ADD/recreate a radio the device is not
+# currently reporting (an unintended, non-revertible create). Fixed in
+# _merge_step_onto (refuse instead of synthesize) and _delta_field_drift (a
+# missing delta-target is drift, not a no-op skip).
+# --------------------------------------------------------------------------- #
+def _reader_returning(cur, full, mesh=None):
+    async def _r():
+        return cur, {k: {rk: dict(rv) for rk, rv in v.items()} for k, v in full.items()}, (mesh or set())
+
+    return _r
+
+
+async def test_apply_refuses_delta_targeting_radio_absent_from_fresh_live(store):
+    # Adversarial forged plan: a channel step on 'ng' carries a BUNDLED extra delta on
+    # 'na' (channel 40). Fresh live contains ONLY 'ng'. Before the fix, the merge
+    # synthesized an 'na' entry and the drift check skipped the missing radio, so the
+    # apply dispatched {radio:na, channel:40} -- effectively RECREATING a radio the
+    # device isn't reporting. The merge must refuse an absent-radio delta up front:
+    # no dispatch, no ledger row.
+    from netadmin.fixes.applier import _endpoint_device
+
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+    endpoint = f"rest/device/{AP_ID}"
+    dev_key = _endpoint_device(endpoint)
+    # before carries BOTH radios (na at ch36) -- so the reverse-of-'na' is a benign
+    # modify (restore 36) and the reverse-ok gate does NOT refuse it. na then VANISHES
+    # from fresh live: the only thing standing between this plan and recreating na is
+    # the merge/drift absent-radio refusal under test. This is the faithful S2 r18
+    # repro: without it, apply dispatches {radio:na, channel:40} and re-adds na.
+    before = {
+        "method": "PUT",
+        "endpoint": endpoint,
+        "body": {"radio_table": [
+            {"radio": "ng", "channel": 3},
+            {"radio": "na", "channel": 36},
+        ]},
+    }
+    step = FixStep(
+        action=ActionType.CHANNEL_CHANGE,
+        target_entity_type=EntityType.RADIO,
+        target_native_id=f"{AP_MAC}:ng",
+        description="ng channel 3->1 with forged bundled na channel 40",
+        risk=RiskLevel.MEDIUM,
+        method="PUT",
+        endpoint=endpoint,
+        # Forged: bundles a delta for 'na', a radio that has vanished from fresh live.
+        payload={"radio_table": [
+            {"radio": "ng", "channel": 1},
+            {"radio": "na", "channel": 40},
+        ]},
+        precondition=Precondition(target_native_id=f"{AP_MAC}:ng", expected={"channel": 3}),
+        before=before,
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [
+                {"radio": "ng", "channel": 1},
+                {"radio": "na", "channel": 40},
+            ]},
+        },
+        revertible=True,
+    )
+    plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "forged", steps=[step])
+    cur = {f"{AP_MAC}:ng": {"channel": 3}}
+    full = {dev_key: {"ng": {"radio": "ng", "channel": 3}}}  # fresh live: ng ONLY
+    with pytest.raises((SafetyViolation, PreconditionDrift)):
+        await applier.apply(
+            plan,
+            dry_run=False,
+            confirm_token=plan_confirm_token(plan),
+            state_reader=_reader_returning(cur, full),
+        )
+    assert writer.call_count == 0
+    assert store.list_changes() == []
+
+
+async def test_delta_field_drift_flags_a_delta_target_missing_from_live(store):
+    # Unit-level defense in depth for the drift check itself: a delta whose radio is
+    # absent from fresh live is DRIFT, not a skipped no-op.
+    from netadmin.fixes.applier import _endpoint_device
+
+    applier = Applier(store, FakeControllerWriter())
+    endpoint = f"rest/device/{AP_ID}"
+    dev_key = _endpoint_device(endpoint)
+    step = FixStep(
+        action=ActionType.CHANNEL_CHANGE,
+        target_entity_type=EntityType.RADIO,
+        target_native_id=f"{AP_MAC}:na",
+        description="delta on na, absent from live",
+        risk=RiskLevel.MEDIUM,
+        method="PUT",
+        endpoint=endpoint,
+        payload={"radio_table": [{"radio": "na", "channel": 40}]},
+        precondition=Precondition(target_native_id=f"{AP_MAC}:na", expected={}),
+        before={"method": "PUT", "endpoint": endpoint,
+                "body": {"radio_table": [{"radio": "ng", "channel": 3}]}},
+        after={"method": "PUT", "endpoint": endpoint,
+               "body": {"radio_table": [{"radio": "ng", "channel": 3}]}},
+        revertible=True,
+    )
+    plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:na", "forged", steps=[step])
+    full = {dev_key: {"ng": {"radio": "ng", "channel": 3}}}  # na absent
+    drift = applier._delta_field_drift(plan, full)
+    assert drift, "a delta targeting a radio absent from fresh live must be drift"
+    assert drift[0][0] is step
+
+
+async def test_apply_present_radio_still_applies_and_reverts(store):
+    # Regression guard: a normal channel change on a radio that IS present in fresh
+    # live still applies and round-trips through revert.
+    from netadmin.fixes.applier import _endpoint_device
+
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+    endpoint = f"rest/device/{AP_ID}"
+    dev_key = _endpoint_device(endpoint)
+    before = {
+        "method": "PUT",
+        "endpoint": endpoint,
+        "body": {"radio_table": [{"radio": "ng", "channel": 3}]},
+    }
+    step = FixStep(
+        action=ActionType.CHANNEL_CHANGE,
+        target_entity_type=EntityType.RADIO,
+        target_native_id=f"{AP_MAC}:ng",
+        description="ng channel 3->1, present in live",
+        risk=RiskLevel.MEDIUM,
+        method="PUT",
+        endpoint=endpoint,
+        payload={"radio_table": [{"radio": "ng", "channel": 1}]},
+        precondition=Precondition(target_native_id=f"{AP_MAC}:ng", expected={"channel": 3}),
+        before=before,
+        after={"method": "PUT", "endpoint": endpoint,
+               "body": {"radio_table": [{"radio": "ng", "channel": 1}]}},
+        revertible=True,
+    )
+    plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "legit", steps=[step])
+    cur = {f"{AP_MAC}:ng": {"channel": 3}}
+    full = {dev_key: {"ng": {"radio": "ng", "channel": 3}}}
+    result = await applier.apply(
+        plan,
+        dry_run=False,
+        confirm_token=plan_confirm_token(plan),
+        state_reader=_reader_returning(cur, full),
+    )
+    assert result.applied is True
+    change_id = result.change_ids[0]
+    live = {"ng": {"radio": "ng", "channel": 1}}
+    revert = await applier.revert(change_id, current_radios=live)
+    assert revert.ok
+    last = writer.calls[-1]
+    assert next(r for r in last.body["radio_table"] if r["radio"] == "ng")["channel"] == 3
+
+
+async def test_legit_multi_radio_plan_all_present_still_applies(store):
+    # A legitimate multi-radio step (both 'ng' and 'na' present in fresh live) still
+    # merges and dispatches BOTH radios -- the fix only refuses radios ABSENT from live.
+    from netadmin.fixes.applier import _endpoint_device
+
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+    endpoint = f"rest/device/{AP_ID}"
+    dev_key = _endpoint_device(endpoint)
+    before = {
+        "method": "PUT",
+        "endpoint": endpoint,
+        "body": {"radio_table": [
+            {"radio": "ng", "channel": 3},
+            {"radio": "na", "channel": 36},
+        ]},
+    }
+    step = FixStep(
+        action=ActionType.CHANNEL_CHANGE,
+        target_entity_type=EntityType.RADIO,
+        target_native_id=f"{AP_MAC}:ng",
+        description="ng 3->1 and na 36->40, both present",
+        risk=RiskLevel.MEDIUM,
+        method="PUT",
+        endpoint=endpoint,
+        payload={"radio_table": [
+            {"radio": "ng", "channel": 1},
+            {"radio": "na", "channel": 40},
+        ]},
+        precondition=Precondition(target_native_id=f"{AP_MAC}:ng", expected={"channel": 3}),
+        before=before,
+        after={"method": "PUT", "endpoint": endpoint,
+               "body": {"radio_table": [
+                   {"radio": "ng", "channel": 1},
+                   {"radio": "na", "channel": 40},
+               ]}},
+        revertible=True,
+    )
+    plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "legit-multi", steps=[step])
+    cur = {f"{AP_MAC}:ng": {"channel": 3}}
+    full = {dev_key: {
+        "ng": {"radio": "ng", "channel": 3},
+        "na": {"radio": "na", "channel": 36},
+    }}
+    result = await applier.apply(
+        plan,
+        dry_run=False,
+        confirm_token=plan_confirm_token(plan),
+        state_reader=_reader_returning(cur, full),
+    )
+    assert result.applied is True
+    sent = writer.calls[-1].body["radio_table"]
+    assert next(r for r in sent if r["radio"] == "ng")["channel"] == 1
+    assert next(r for r in sent if r["radio"] == "na")["channel"] == 40

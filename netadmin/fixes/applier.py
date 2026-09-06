@@ -1144,7 +1144,19 @@ class Applier:
             if code in merged:
                 merged[code].update(fields)
             else:
-                merged[code] = {"radio": code, **fields}
+                # The step's delta targets a radio ABSENT from the fresh live table
+                # this merges onto. Synthesizing an entry here would make the
+                # whole-table PUT ADD a radio the device is not currently reporting
+                # -- an unintended create, never a revertible modify (there is no
+                # before-value to restore, and the inverse would have to delete it).
+                # Only radios that EXIST in fresh live may be modified (S2 r18); a
+                # delta for an absent radio is drift, so refuse rather than recreate it.
+                raise SafetyViolation(
+                    f"step '{step.description}' targets radio '{code}', which is absent "
+                    "from the fresh live radio_table it merges onto; recreating a radio "
+                    "the device is not currently reporting would be an unintended add, "
+                    "not a revertible modify -- refusing"
+                )
         for code, entry in merged.items():
             entry.setdefault("radio", code)
         before_body = (step.before or {}).get("body") if isinstance(step.before, dict) else {}
@@ -1525,7 +1537,22 @@ class Applier:
                 before_entry = before_radios.get(code, {})
                 live_entry = live_radios.get(code)
                 if live_entry is None:
-                    continue  # radio absent from live -> merge/clobber guard handles it
+                    # The delta targets a radio ABSENT from the fresh live table. A
+                    # dispatch may only ever modify radios present in fresh live;
+                    # layering a delta onto a radio that isn't there would recreate a
+                    # radio the device is not currently reporting (an unintended add).
+                    # That is drift, NOT a no-op skip -- the operation the human
+                    # confirmed no longer matches the network (S2 r18). Refuse.
+                    drift.append(
+                        (
+                            step,
+                            f"step '{step.description}' would set radio '{code}', but that "
+                            "radio is absent from the fresh live radio_table; the device is "
+                            "not currently reporting it -- refusing to recreate a radio "
+                            "that is not present",
+                        )
+                    )
+                    continue
                 for field in fields:
                     if field not in live_entry:
                         # A field the delta will SEND that is ABSENT from fresh live.
