@@ -525,13 +525,23 @@ def overview(repo: Repository, params: Mapping[str, Any], now: int) -> dict[str,
     open_issues = repo.list_issues(open_only=True)
     open_incidents = repo.list_incidents(open_only=True)
     entities = _entity_map(repo, open_issues)
+    # is_genuine_incident deliberately uses the append-only HISTORICAL count so a
+    # resolved-and-cleared group stays visible as a real incident.
     incident_counts = repo.incident_member_counts([int(r["id"]) for r in open_incidents])
     genuine_incidents = [
         r
         for r in open_incidents
         if Repository.is_genuine_incident(incident_counts.get(int(r["id"]), 0))
     ]
-    grouped_issue_count = sum(incident_counts.get(int(r["id"]), 0) for r in genuine_incidents)
+    # C5: the "grouping N of them" number must describe CURRENT membership
+    # (cleared_ts IS NULL), consistent with the incident card and the fixed
+    # list/detail. Summing the historical union here let a cleared symptom keep
+    # inflating the count (e.g. "grouping 2 of them" when only 1 issue is still
+    # grouped), and could push the grouped total past the open-issue count.
+    current_counts = repo.current_incident_member_counts(
+        [int(r["id"]) for r in genuine_incidents]
+    )
+    grouped_issue_count = sum(current_counts.get(int(r["id"]), 0) for r in genuine_incidents)
 
     report = sle_scores(repo, start_ts, end_ts)
     span = end_ts - start_ts
