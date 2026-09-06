@@ -439,10 +439,15 @@ async def test_supervisor_restarts_with_capped_backoff(repo: Repository) -> None
 
     rows = repo.read_poll_runs("ws", *FULL)
     started = [r for r in rows if r["error"] == "started"]
-    failed = [r for r in rows if r["ok"] == 0]
+    # #w20a-1: an exceptional death now ALSO records a durable coverage break
+    # (error='unusable', ok=0), so the listener-death rows are the ok=0 rows that
+    # are NOT breaks -- filter the break rows out before counting the deaths.
+    breaks = [r for r in rows if r["error"] == "unusable"]
+    failed = [r for r in rows if r["ok"] == 0 and r["error"] != "unusable"]
     clean = [r for r in rows if r["error"] == "stopped" and r["ok"] == 1]
     assert len(started) == 3  # one per attempt
     assert len(failed) == 2  # the two RuntimeErrors
+    assert len(breaks) == 2  # each exceptional death severs coverage durably
     assert len(clean) == 1  # the clean third run
     assert all("RuntimeError" in r["error"] for r in failed)
 
@@ -2551,3 +2556,216 @@ async def test_w19a_expired_event_hole_becomes_unrecoverable_on_next_sweep(
     assert row is not None and row["status"] == "unrecoverable"
     # The cursor is no longer pinned at the expired hole -- it advanced past it.
     assert repo.latest_ingest_coverage_end(kind="event_history", scope="site") > old
+
+
+# --------------------------------------------------------------------------- #
+# #w20a-1 / #w20a-2 (exceptional listener termination must SEVER coverage across
+# listener replacement). Round-20 defect: a listener that dies ABNORMALLY -- a
+# storage/queue-full ``RuntimeError`` (#1) or a parser ``ValidationError`` (#2) --
+# left only the exception TEXT in poll_runs, which is NOT a recognized sever
+# label. A fresh replacement listener's heartbeats then BRIDGED straight over the
+# death and over-credited coverage (~0.989 -> a false clear). The supervisor now
+# lands a durable WS break at the death (record_ws_break -> error='unusable', a
+# recognized sever), so coverage ends at the last clean beat before the death and
+# only resumes after the replacement drains cleanly. Any pending unusable-drop
+# obligation the dying listener held is carried forward as a durable break too.
+# --------------------------------------------------------------------------- #
+class _ReplacementBeats:
+    """A replacement listener that proves the feed healthy again by writing clean
+    heartbeats at fixed times, then stops the supervisor. Exposes exactly the
+    surface WsSupervisor.run() wires onto a listener."""
+
+    def __init__(self, repo: Repository, sup_box: dict, beats: list[int]) -> None:
+        self._repo = repo
+        self._sup_box = sup_box
+        self._beats = beats
+        self.on_connection_state: Optional[Any] = None
+        self.on_healthy_drain: Optional[Any] = None
+        self.pipeline_blocked: Optional[Any] = None
+        self.terminal_state: Optional[str] = None
+
+    def pending_records(self) -> list[dict[str, Any]]:
+        return []
+
+    def pending_raw_records(self) -> list[Event]:
+        return []
+
+    async def run(self) -> int:
+        for ts in self._beats:
+            self._repo.record_ws_heartbeat(ts=ts)
+        self._sup_box["sup"].stop()
+        return 0
+
+
+async def _run_death_then_replacement(
+    repo: Repository,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    dying_listener_factory,
+    break_ts: int,
+    replacement_beats: list[int],
+) -> WsSupervisor:
+    """Seed a pre-death covered run (beats 1000, 1030), then run a supervisor whose
+    FIRST listener dies exceptionally and whose SECOND is a clean replacement. The
+    real death break defaults to ``time.time()`` (unassertable), so pin it to a
+    deterministic ``break_ts`` for the coverage assertion."""
+    repo.record_ws_heartbeat(ts=1000)
+    repo.record_ws_heartbeat(ts=1030)
+    real_break = repo.record_ws_break
+    monkeypatch.setattr(repo, "record_ws_break", lambda *, ts=None: real_break(ts=break_ts))
+
+    sup_box: dict[str, Any] = {}
+    attempt = {"n": 0}
+
+    def factory() -> Any:
+        attempt["n"] += 1
+        if attempt["n"] == 1:
+            return dying_listener_factory()
+        return _ReplacementBeats(repo, sup_box, replacement_beats)
+
+    async def fake_sleep(delay: float) -> None:
+        pass
+
+    sup = WsSupervisor(factory, repo, backoff_base=0.0, max_restarts=5, sleep=fake_sleep)
+    sup_box["sup"] = sup
+    await asyncio.wait_for(sup.run(), timeout=5.0)
+    return sup
+
+
+def _assert_incident_severed(repo: Repository) -> None:
+    """Shared assertions for #w20a-1/#w20a-2: a durable break was recorded and the
+    incident window's coverage does NOT bridge the death (severed ~0.65, far below
+    the pre-fix bridged ~0.989 and below the detector floor) -> client.flaky freezes
+    to UNKNOWN over the window."""
+    from types import SimpleNamespace
+
+    breaks = [r for r in repo.read_poll_runs("ws", 0, 100_000) if r["error"] == "unusable"]
+    assert breaks, "an exceptional death must record a durable coverage break"
+    cov = repo.observed_event_coverage(1000, 1093)
+    assert cov < 0.9
+    assert cov < EVENT_COVERAGE_MIN
+
+    # The event-coverage gate every event-based detector routes through now reads
+    # below the floor, so client.flaky returns UNKNOWN instead of a false clear.
+    seed_coverage(repo, job="fast_sta", now=1093, window_s=93, interval_s=30)
+    settings = SimpleNamespace(thresholds={"client.flaky": {"window_s": 93}}, poll=None)
+    ctx = DetectorContext(
+        repo=repo, baselines=FakeBaselines(), now_ts=1093, site_id="default",
+        settings=settings,
+    )
+    assert ctx.event_coverage_ok(93) is False
+    assert FlakyClientDetector().evaluate(ctx) is UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_w20a1_exceptional_death_severs_coverage_no_bridge(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#w20a-1: a listener that drops an unusable event (a pending break obligation)
+    then dies with a queue-full RuntimeError severs coverage across the replacement.
+    Pre-fix the marker was discarded on replacement and the terminal error row did
+    not sever, so the replacement's beats bridged the death (0.989)."""
+    def dying() -> EventListener:
+        return EventListener(
+            FakeWs(
+                [_unusable_event(0)],
+                fail=RuntimeError("WS event storage queue is full"),
+            ),
+            repo,
+            flush_interval=None,
+        )
+
+    await _run_death_then_replacement(
+        repo, monkeypatch, dying_listener_factory=dying,
+        break_ts=1060, replacement_beats=[1062, 1092],
+    )
+    _assert_incident_severed(repo)
+
+
+@pytest.mark.asyncio
+async def test_w20a2_parser_validationerror_death_severs_coverage(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#w20a-2: an explicit events frame whose row is malformed ({"key": []}) raises
+    a pydantic ValidationError inside ws._parse that unwinds the listener BEFORE any
+    disconnect/drop accounting. The exceptional termination must still sever coverage
+    (durable break), so the replacement's beats do not bridge the death (0.989)."""
+    from pydantic import ValidationError
+    from netadmin.ingest.unifi.ws import EventListener as WsEventListener
+
+    # The malformed EXPLICIT events frame genuinely raises out of _parse (key:[] is
+    # not a str), so it really does kill the listener rather than being skipped.
+    with pytest.raises(ValidationError):
+        WsEventListener._parse(
+            json.dumps({"meta": {"message": "events"}, "data": [{"key": [], "time": 1060}]})
+        )
+
+    try:
+        Event.model_validate({"key": [], "time": 1060})
+        raise AssertionError("expected ValidationError")  # pragma: no cover
+    except ValidationError as exc:
+        verr = exc
+
+    def dying() -> EventListener:
+        # The ws double raises the ValidationError out of the frame loop, exactly as
+        # a live _parse crash would, unwinding events-layer listener.run().
+        return EventListener(FakeWs([], fail=verr), repo, flush_interval=None)
+
+    await _run_death_then_replacement(
+        repo, monkeypatch, dying_listener_factory=dying,
+        break_ts=1060, replacement_beats=[1062, 1092],
+    )
+    _assert_incident_severed(repo)
+
+
+# --------------------------------------------------------------------------- #
+# #w20a-3 (falsy / non-string ap_from must be treated as ABSENT, consistently with
+# a byte-identical repository SQL predicate). The rule: an ap_from is a usable mac
+# IFF it is a NON-EMPTY str; every other value falls back to the destination `ap`.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("falsy", [False, 0, [], ""])
+def test_w20a3_falsy_ap_from_treated_as_absent(repo: Repository, falsy: Any) -> None:
+    """#w20a-3: a roam event whose ap_from is a falsy non-string (False/0/[]/"") is
+    attributed with ap_from ABSENT -- related resolves to the destination `ap`, not
+    stranded -- matching what the byte-identical SQL resolvability predicate computes."""
+    ev = Event.model_validate(
+        {
+            "_id": "roam-falsy", "key": "EVT_WU_Roam", "time": 1_721_600_000_000,
+            "user": CLIENT_MAC, "ap": AP_TO_MAC, "ap_from": falsy,
+        }
+    )
+    rec = EventNormalizer(repo).normalize(ev)
+    assert rec is not None
+    assert rec["entity_id"] == entity_id(repo, EntityType.CLIENT, CLIENT_MAC)
+    assert rec["related_entity_id"] == entity_id(repo, EntityType.AP, AP_TO_MAC)
+
+
+def test_w20a3_truthy_nonstring_ap_from_treated_as_absent(repo: Repository) -> None:
+    """#w20a-3 robustness (genuinely red-green): a TRUTHY non-string ap_from -- an int
+    or a non-empty list -- is ALSO absent. Pre-fix ``ap_from or ap`` used the int as a
+    mac (mis-resolving to None) or crashed on the unhashable-list resolution key; the
+    non-empty-str rule rejects both and falls back to the destination `ap`."""
+    for bad in (1, [AP_FROM_MAC]):
+        ev = Event.model_validate(
+            {
+                "_id": "roam-bad", "key": "EVT_WU_Roam", "time": 1_721_600_000_000,
+                "user": CLIENT_MAC, "ap": AP_TO_MAC, "ap_from": bad,
+            }
+        )
+        rec = EventNormalizer(repo).normalize(ev)
+        assert rec is not None
+        assert rec["related_entity_id"] == entity_id(repo, EntityType.AP, AP_TO_MAC)
+
+
+def test_w20a3_string_ap_from_still_used(repo: Repository) -> None:
+    """#w20a-3 control: a genuine NON-EMPTY string ap_from is still honored -- the
+    roam's related AP is the FROM ap, not the destination ap."""
+    ev = Event.model_validate(
+        {
+            "_id": "roam-ok", "key": "EVT_WU_Roam", "time": 1_721_600_000_000,
+            "user": CLIENT_MAC, "ap": AP_TO_MAC, "ap_from": AP_FROM_MAC,
+        }
+    )
+    rec = EventNormalizer(repo).normalize(ev)
+    assert rec is not None
+    assert rec["related_entity_id"] == entity_id(repo, EntityType.AP, AP_FROM_MAC)
