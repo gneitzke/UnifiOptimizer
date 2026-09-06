@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import sqlite3
 import time
 from datetime import datetime, timezone
 from time import monotonic
@@ -397,6 +398,15 @@ class EventListener:
         self._heartbeat_interval = max(0.0, heartbeat_interval)
         self._last_heartbeat_ts: Optional[int] = None
         self._batch: list[dict[str, Any]] = []
+        # P1 (normalize-read blip): events already CONSUMED off the socket whose
+        # normalization hit a *transient* storage READ error (entity-resolution
+        # lookup). A WS event has no ``stat/event`` recovery source, so it must NOT
+        # be dropped when a storage blip makes ``normalize`` raise before the event
+        # ever reaches ``_batch``. It is retained RAW here and re-normalized once
+        # the read recovers (see :meth:`_drain_pending_raw`). A genuinely malformed
+        # payload (a *non*-transient normalize error) is dropped-with-logging
+        # instead -- it can never be stored regardless of storage health.
+        self._pending_raw: list[Event] = []
         self._max_pending = max(1_000, self._batch_size * 4)
         self._storage_error: Optional[BaseException] = None
         self.terminal_state: Optional[str] = None
@@ -426,6 +436,69 @@ class EventListener:
         """
         return list(self._batch)
 
+    def pending_raw_records(self) -> list[Event]:
+        """Consumed events retained RAW because a *transient* storage READ error
+        blocked their normalization (P1).
+
+        These have been pulled off the socket but never normalized -- their
+        entity-resolution lookup raised while storage was down. The supervisor
+        rescues them alongside :meth:`pending_records` when the listener dies, and
+        re-normalizes them once storage recovers, so a normalize-read blip that
+        outlives the listener does not silently drop an unrecoverable WS event.
+        """
+        return list(self._pending_raw)
+
+    @staticmethod
+    def _is_transient_storage_error(exc: BaseException) -> bool:
+        """A storage READ blip (recoverable) vs. a permanent malformed payload.
+
+        A transient ``sqlite3.OperationalError`` (locked/busy/IO) raised by an
+        entity-resolution lookup means the event can be normalized once storage
+        recovers, so it must be RETAINED. Any other exception is treated as an
+        unstorable/malformed payload and dropped-with-logging -- retaining it would
+        just wedge the retry buffer on an event that can never be normalized.
+        """
+        return isinstance(exc, sqlite3.OperationalError)
+
+    def _drain_pending_raw(self) -> None:
+        """Re-normalize events retained after a transient normalize-read blip (P1).
+
+        Called on each consumer-loop turn and before every flush, since storage
+        may have recovered since the read failed. A raw event that now normalizes
+        moves into ``_batch``; one that normalizes to ``None`` is permanently
+        unstorable and dropped; one whose lookup still raises a transient storage
+        error is kept (in order) for the next attempt, and draining stops there --
+        if this read failed, later ones will too this tick.
+        """
+        if not self._pending_raw:
+            return
+        raws = self._pending_raw
+        self._pending_raw = []
+        for i, event in enumerate(raws):
+            try:
+                record = self._normalizer.normalize(event)
+            except Exception as exc:  # noqa: BLE001 - classified below
+                if self._is_transient_storage_error(exc):
+                    # Storage still down: keep this event and the rest, in order.
+                    self._storage_error = exc
+                    self._pending_raw.extend(raws[i:])
+                    return
+                logger.exception(
+                    "Dropping unstorable retained WS event (malformed payload)"
+                )
+                continue
+            if record is not None:
+                self._batch.append(record)
+        return
+
+    def _total_pending(self) -> int:
+        """Every consumed-but-uncommitted event: normalized batch + retained raw.
+
+        Both are held in memory and both have no ``stat/event`` recovery source, so
+        the bounded-queue guard must count them together.
+        """
+        return len(self._batch) + len(self._pending_raw)
+
     def _flush(self) -> int:
         """Write and clear the pending batch. Synchronous and atomic.
 
@@ -433,6 +506,9 @@ class EventListener:
         and clearing ``self._batch``, so the periodic flusher and the consumer
         loop never race on the buffer in a single-threaded event loop.
         """
+        # First fold in any raw events whose normalize-read has since recovered,
+        # so a blip'd event is flushed the moment storage returns.
+        self._drain_pending_raw()
         if not self._batch:
             return 0
         batch = list(self._batch)
@@ -508,7 +584,32 @@ class EventListener:
             flusher = asyncio.create_task(self._periodic_flush())
         try:
             async for event in self._ws.events():
-                record = self._normalizer.normalize(event)
+                # Retry any event whose normalization previously hit a transient
+                # storage read blip; storage may have recovered since. A recovered
+                # raw event moves into the batch here so it flushes with the rest.
+                self._drain_pending_raw()
+                try:
+                    record = self._normalizer.normalize(event)
+                except Exception as exc:  # noqa: BLE001 - classified below
+                    # normalize() does entity-resolution DB READS. A transient
+                    # storage error there must NOT drop the just-consumed event on
+                    # the floor: it has no stat/event recovery source. Retain the
+                    # RAW event for retry once the read recovers; only a genuinely
+                    # malformed/undecodable payload (a non-transient error) is
+                    # dropped-with-logging, matching normalize() returning None.
+                    if not self._is_transient_storage_error(exc):
+                        logger.exception(
+                            "Dropping unstorable WS event (malformed payload)"
+                        )
+                        continue
+                    self._storage_error = exc
+                    self._pending_raw.append(event)
+                    if self._total_pending() > self._max_pending:
+                        # Sustained read outage: bound memory. The retained raw
+                        # event stays in the buffer the supervisor rescues, so a
+                        # raise here loses nothing.
+                        raise RuntimeError("WS event storage queue is full")
+                    continue
                 if record is not None:
                     # Buffer the consumed event BEFORE any flush. A WS event has
                     # no stat/event recovery source, so once it is pulled off the
@@ -521,7 +622,7 @@ class EventListener:
                     # capacity raise carries THIS event out with the rest of the
                     # batch, so nothing is dropped across the storage blip.
                     self._batch.append(record)
-                    if len(self._batch) > self._max_pending:
+                    if self._total_pending() > self._max_pending:
                         # A bounded queue makes sustained storage loss visible
                         # instead of consuming unbounded RAM. Attempt to drain; the
                         # just-appended event is already retained, so a raise here
@@ -532,7 +633,7 @@ class EventListener:
                         except Exception as exc:
                             self._storage_error = exc
                             logger.exception("WS event storage flush failed; retaining batch")
-                        if len(self._batch) > self._max_pending:
+                        if self._total_pending() > self._max_pending:
                             raise RuntimeError("WS event storage queue is full")
                     elif len(self._batch) >= self._batch_size:
                         try:
@@ -595,6 +696,16 @@ class WsSupervisor:
         # blip that kills the listener leaves the batch stranded otherwise; the
         # supervisor retries it on the next attempt once storage recovers.
         self._pending: list[dict[str, Any]] = []
+        # P1 (normalize-read blip): raw events a dying listener consumed but could
+        # not normalize because a transient storage READ error blocked their
+        # entity lookup. They are rescued here and re-normalized on the next drain
+        # (storage may have recovered), then join ``_pending``. A raw WS event has
+        # no stat/event recovery source, so it cannot be discarded on the death of
+        # the listener that held it.
+        self._pending_raw: list[Event] = []
+        # Re-normalizer for rescued raw events. Its own entity-resolution cache is
+        # independent of any listener's; correctness does not depend on the cache.
+        self._normalizer = EventNormalizer(repo)
         # P1: count of events evicted under sustained storage failure once the
         # aggregate pending buffer hit its system-wide cap. Exposed (not just
         # logged) so the loss is observable rather than silent.
@@ -632,6 +743,11 @@ class WsSupervisor:
         teardown. Kept-or-cleared atomically: on a still-failing write the batch
         stays queued for the next attempt rather than being lost.
         """
+        # First re-normalize any RAW events rescued from a listener that died while
+        # a transient storage READ error blocked their normalization -- the read
+        # may have recovered by now. Successes join ``_pending`` and are written
+        # below; a still-failing read keeps them raw for the next attempt.
+        self._renormalize_pending_raw()
         if not self._pending:
             return
         try:
@@ -643,6 +759,33 @@ class WsSupervisor:
             )
             return
         self._pending = []
+
+    def _renormalize_pending_raw(self) -> None:
+        """Re-normalize rescued raw events once storage may have recovered (P1).
+
+        A raw event that now normalizes moves onto ``_pending`` for the drain to
+        persist; one that normalizes to ``None`` is permanently unstorable and
+        dropped; one whose entity lookup still raises a transient storage error is
+        kept (in order) for the next attempt, and processing stops there.
+        """
+        if not self._pending_raw:
+            return
+        raws = self._pending_raw
+        self._pending_raw = []
+        for i, event in enumerate(raws):
+            try:
+                record = self._normalizer.normalize(event)
+            except Exception as exc:  # noqa: BLE001 - classified below
+                if EventListener._is_transient_storage_error(exc):
+                    self._pending_raw.extend(raws[i:])
+                    break
+                logger.exception(
+                    "Dropping unstorable rescued WS event (malformed payload)"
+                )
+                continue
+            if record is not None:
+                self._pending.append(record)
+        self._enforce_pending_bound()
 
     def _rescue_pending(self, listener: EventListener) -> None:
         """Move a dead listener's uncommitted batch onto the supervisor (R2),
@@ -659,6 +802,13 @@ class WsSupervisor:
         leftover = getattr(listener, "pending_records", lambda: [])()
         if leftover:
             self._pending.extend(leftover)
+        # Also take custody of events the listener consumed but could not normalize
+        # because a transient storage READ blip blocked their entity lookup (P1).
+        # These have no stat/event recovery source either; they are re-normalized
+        # on the next drain once the read recovers.
+        raw_leftover = getattr(listener, "pending_raw_records", lambda: [])()
+        if raw_leftover:
+            self._pending_raw.extend(raw_leftover)
         self._enforce_pending_bound()
 
     def _enforce_pending_bound(self) -> None:
@@ -670,23 +820,36 @@ class WsSupervisor:
         ``_pending`` is still flushed the instant storage returns, so recovery of
         the bounded survivors is preserved.
         """
+        # Bound the normalized batch and the raw retry buffer independently: each
+        # is a distinct storage failure mode (write vs. read) and either alone must
+        # stay memory-bounded. DROP-OLDEST from each -- the newest rescued events
+        # are the likeliest to still matter for a live incident.
         overflow = len(self._pending) - self._pending_max
-        if overflow <= 0:
+        raw_overflow = len(self._pending_raw) - self._pending_max
+        if overflow <= 0 and raw_overflow <= 0:
             return
-        del self._pending[:overflow]
-        self.dropped += overflow
+        dropped_now = 0
+        if overflow > 0:
+            del self._pending[:overflow]
+            dropped_now += overflow
+        if raw_overflow > 0:
+            del self._pending_raw[:raw_overflow]
+            dropped_now += raw_overflow
+        self.dropped += dropped_now
         logger.error(
             "WS pending buffer hit system-wide cap of %d under sustained storage "
             "failure; dropped %d oldest event(s) (cumulative dropped=%d) to bound "
-            "memory. Retained %d events for recovery once storage returns.",
+            "memory. Retained %d normalized + %d raw event(s) for recovery once "
+            "storage returns.",
             self._pending_max,
-            overflow,
+            dropped_now,
             self.dropped,
             len(self._pending),
+            len(self._pending_raw),
         )
         # Surface the loss to poll_runs too (best-effort; _record is guarded, so a
         # concurrent storage outage that fails this write never breaks the rescue).
-        self._record(f"pending-overflow-dropped:{overflow}", ok=False)
+        self._record(f"pending-overflow-dropped:{dropped_now}", ok=False)
 
     def _record(self, label: str, *, ok: bool, duration_ms: Optional[int] = None) -> None:
         """R2: health accounting is best-effort observability, never the data path.
