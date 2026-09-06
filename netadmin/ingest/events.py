@@ -424,6 +424,17 @@ class EventListener:
         # queued until this listener itself dies. Best-effort, never on the data
         # path: a raising hook is swallowed.
         self.on_healthy_drain: Optional[Callable[[], None]] = None
+        # BUG#4: a predicate the SUPERVISOR points at its own rescued buffers so a
+        # heartbeat (= "the event pipeline is fully drained") is suppressed while
+        # ANY rescued event is still stuck upstream -- normalized OR raw -- or a
+        # storage error is active anywhere in the pipeline, not merely in THIS
+        # listener's local buffer. A fresh, empty replacement listener has empty
+        # local buffers and would otherwise credit coverage over a span where the
+        # supervisor still holds an undrained rescued event (e.g. one blocked by a
+        # failing entity-resolution read). Returns True while the pipeline is NOT
+        # fully drained. Best-effort: a raising/absent hook is treated
+        # conservatively (no positive liveness) rather than as "drained".
+        self.pipeline_blocked: Optional[Callable[[], bool]] = None
         # The socket listener reports state through this hook; setattr is safe on
         # both the real ws listener and the test doubles.
         setattr(self._ws, "on_state", self._relay_ws_state)
@@ -571,21 +582,40 @@ class EventListener:
             and ts - self._last_heartbeat_ts < self._heartbeat_interval
         ):
             return
-        try:
-            self._repo.record_ws_heartbeat(ts=ts)
-        except Exception:  # noqa: BLE001 - liveness accounting must never break draining
-            logger.exception("Could not record WS liveness heartbeat")
-            return
-        self._last_heartbeat_ts = ts
         # D5: this beat proves storage is healthy right now. Give the supervisor a
         # chance to hand off any events rescued from a prior listener while THIS
-        # listener is still alive, instead of stranding them until it dies.
+        # listener is still alive, instead of stranding them until it dies. BUG#4:
+        # this drain must run BEFORE the heartbeat is committed, not after -- the
+        # beat asserts the pipeline is fully drained, and committing it first would
+        # credit coverage over a span the drain then reveals is still blocked.
         hook = self.on_healthy_drain
         if hook is not None:
             try:
                 hook()
             except Exception:  # noqa: BLE001 - rescue drain must never break draining
                 logger.exception("Rescued-event drain hook failed")
+        # BUG#4: suppress the beat while the SUPERVISOR still holds an undrained
+        # rescued event (normalized OR raw) or a storage error is active anywhere
+        # upstream. A heartbeat = "the event pipeline is fully drained"; crediting
+        # coverage while any rescued event is stuck (e.g. one still blocked by a
+        # failing entity-resolution read the drain just retried) would let an
+        # event-based detector treat unprocessed events as observed and false-clear
+        # a live issue (the B4 harm), even though THIS listener's local buffers are
+        # empty. A raising check is treated conservatively as "blocked".
+        blocked = self.pipeline_blocked
+        if blocked is not None:
+            try:
+                if blocked():
+                    return
+            except Exception:  # noqa: BLE001 - be conservative: no false liveness
+                logger.exception("Pipeline-drain check failed; suppressing heartbeat")
+                return
+        try:
+            self._repo.record_ws_heartbeat(ts=ts)
+        except Exception:  # noqa: BLE001 - liveness accounting must never break draining
+            logger.exception("Could not record WS liveness heartbeat")
+            return
+        self._last_heartbeat_ts = ts
 
     async def _periodic_flush(self) -> None:
         assert self._flush_interval is not None
@@ -777,6 +807,20 @@ class WsSupervisor:
         self.state = state
         self._record("connected" if state == "connected" else "disconnected", ok=True)
 
+    def _pending_blocked(self) -> bool:
+        """BUG#4: is any rescued event still undrained anywhere on the supervisor?
+
+        A replacement listener consults this before crediting a liveness heartbeat.
+        While the supervisor still holds a rescued normalized batch (``_pending``)
+        or a rescued raw event awaiting re-normalization (``_pending_raw`` -- e.g.
+        one blocked by a failing entity-resolution read), the event pipeline is NOT
+        fully drained, so no positive-liveness beat may fire over that span. Both
+        buffers empty is the only "fully drained" state; a storage error that keeps
+        the drain from clearing them leaves at least one non-empty, so it is
+        captured here too.
+        """
+        return bool(self._pending or self._pending_raw)
+
     def _drain_pending(self) -> None:
         """R2: retry events rescued from a replaced listener.
 
@@ -861,21 +905,37 @@ class WsSupervisor:
         ``_pending`` is still flushed the instant storage returns, so recovery of
         the bounded survivors is preserved.
         """
-        # Bound the normalized batch and the raw retry buffer independently: each
-        # is a distinct storage failure mode (write vs. read) and either alone must
-        # stay memory-bounded. DROP-OLDEST from each -- the newest rescued events
-        # are the likeliest to still matter for a live incident.
-        overflow = len(self._pending) - self._pending_max
-        raw_overflow = len(self._pending_raw) - self._pending_max
-        if overflow <= 0 and raw_overflow <= 0:
+        # BUG#6: the cap is SYSTEM-WIDE and must bound the AGGREGATE of both
+        # buffers combined, never each independently -- capping them separately let
+        # cap=3 retain SIX (3 raw + 3 normalized), defeating the memory bound. And
+        # eviction must drop the genuinely OLDEST event across BOTH buffers by event
+        # time, not blindly delete a queue prefix: recovery re-normalizes rescued
+        # RAW events and appends them (older, by arrival) BEHIND newer normalized
+        # ones, so a prefix delete discarded the NEWER survivors while the old ones
+        # lived. Rank every retained event by timestamp across both buffers and
+        # evict only the oldest overflow-many, keeping the newest -- the likeliest
+        # to still matter for a live incident -- regardless of buffer or position.
+        overflow = (len(self._pending) + len(self._pending_raw)) - self._pending_max
+        if overflow <= 0:
             return
-        dropped_now = 0
-        if overflow > 0:
-            del self._pending[:overflow]
-            dropped_now += overflow
-        if raw_overflow > 0:
-            del self._pending_raw[:raw_overflow]
-            dropped_now += raw_overflow
+        ranked: list[tuple[int, int, int]] = []  # (event_ts, buffer, index)
+        for i, rec in enumerate(self._pending):
+            ts = rec.get("ts")
+            ranked.append((ts if isinstance(ts, int) else 0, 0, i))
+        for i, ev in enumerate(self._pending_raw):
+            ts = _to_epoch_s(ev)
+            ranked.append((ts if ts is not None else 0, 1, i))
+        # Oldest first; ties break by (buffer, index) so eviction is deterministic
+        # and, within a buffer, removes the earliest-arrived first.
+        ranked.sort()
+        evict = ranked[:overflow]
+        drop_norm = {idx for _ts, buf, idx in evict if buf == 0}
+        drop_raw = {idx for _ts, buf, idx in evict if buf == 1}
+        if drop_norm:
+            self._pending = [r for i, r in enumerate(self._pending) if i not in drop_norm]
+        if drop_raw:
+            self._pending_raw = [e for i, e in enumerate(self._pending_raw) if i not in drop_raw]
+        dropped_now = len(evict)
         self.dropped += dropped_now
         logger.error(
             "WS pending buffer hit system-wide cap of %d under sustained storage "
@@ -911,88 +971,108 @@ class WsSupervisor:
     async def run(self) -> None:
         backoff = self._backoff_base
         restarts = 0
-        while not self._stop.is_set():
-            self.state = "reconnecting"
-            # R2: retry any batch rescued from a prior listener before starting a
-            # fresh one -- storage may have recovered during the backoff.
-            self._drain_pending()
-            listener = self._factory()
-            # R3: report the listener's REAL connection state, not an assumption.
-            listener.on_connection_state = self._on_listener_state
-            # D5: drain rescued events DURING this listener's life. The listener
-            # fires this whenever it proves storage healthy (a heartbeat), so
-            # recovered storage persists rescued events promptly rather than
-            # leaving them queued until this replacement listener itself dies.
-            listener.on_healthy_drain = self._drain_pending
-            self._record("started", ok=True)
-            start = monotonic()
-            clean = True
-            error: Optional[str] = None
-            try:
-                # Do NOT pre-declare "connected": the handshake has not happened
-                # yet. The listener flips us to "connected" once its socket is up
-                # (a quiet-but-connected socket still reports connected), and back
-                # to "reconnecting" on a drop -- state tracks the socket, not the
-                # mere existence of this task.
-                await listener.run()
-            except asyncio.CancelledError:
-                self.state = "stopped"
-                # Clean-path observability only: record the close so the health
-                # STRING reflects the stop. B4: coverage does not depend on this
-                # -- the liveness heartbeats already stopped, so coverage ends at
-                # the last beat whether or not this row is written.
+        # BUG#5: wrap the WHOLE supervise loop so a CancelledError that lands
+        # ANYWHERE -- during ``listener.run()`` (handled inline for observability)
+        # OR during the backoff ``self._sleep`` BETWEEN listeners (outside that
+        # inline handler) -- always triggers one best-effort FINAL drain before it
+        # propagates. Production ``SupervisorTask.stop()`` cancels this task, and
+        # that cancel can arrive mid-backoff after storage has recovered; without
+        # this finally the loop unwinds straight past the post-loop drain and a
+        # rescued batch is stranded despite healthy storage at shutdown. The finally
+        # also covers the normal stop / give-up exits (the old post-loop drain).
+        try:
+            while not self._stop.is_set():
+                self.state = "reconnecting"
+                # R2: retry any batch rescued from a prior listener before starting a
+                # fresh one -- storage may have recovered during the backoff.
+                self._drain_pending()
+                listener = self._factory()
+                # R3: report the listener's REAL connection state, not an assumption.
+                listener.on_connection_state = self._on_listener_state
+                # D5: drain rescued events DURING this listener's life. The listener
+                # fires this whenever it proves storage healthy (a heartbeat), so
+                # recovered storage persists rescued events promptly rather than
+                # leaving them queued until this replacement listener itself dies.
+                listener.on_healthy_drain = self._drain_pending
+                # BUG#4: let the listener check the supervisor's rescued buffers
+                # before it credits a heartbeat, so an empty replacement listener
+                # cannot book coverage while a rescued event is still stuck upstream.
+                listener.pipeline_blocked = self._pending_blocked
+                self._record("started", ok=True)
+                start = monotonic()
+                clean = True
+                error: Optional[str] = None
                 try:
-                    self._record("disconnected", ok=True)
-                    self._rescue_pending(listener)
-                finally:
-                    # D5: a FINAL drain BEFORE propagating the cancel. Shutdown
-                    # cancels this loop mid-attempt, bypassing the post-loop
-                    # ``_drain_pending``; without a drain here the rescued events
-                    # (and this dying listener's just-rescued batch) would be
-                    # stranded even when storage is healthy at shutdown. Guarded
-                    # (``_drain_pending`` swallows its own storage errors), so the
-                    # cancel always propagates.
-                    self._drain_pending()
-                raise
-            except Exception as exc:  # noqa: BLE001 - firewall: any death is recoverable
-                clean = False
-                error = f"{type(exc).__name__}: {exc}"
-                lowered = error.lower()
-                if "storage" in lowered or "sqlite" in lowered:
-                    self.state = "storage-failed"
-                elif "auth" in lowered or "401" in lowered or "403" in lowered:
-                    self.state = "auth-failed"
-                else:
-                    self.state = "reconnecting"
-                logger.warning("WS listener died: %s", error)
-            else:
-                if getattr(listener, "terminal_state", None) == "unsupported":
-                    # The low-level listener returns cleanly only when the
-                    # controller cannot offer a usable events subscription.
-                    self.state = "unsupported"
+                    # Do NOT pre-declare "connected": the handshake has not happened
+                    # yet. The listener flips us to "connected" once its socket is up
+                    # (a quiet-but-connected socket still reports connected), and back
+                    # to "reconnecting" on a drop -- state tracks the socket, not the
+                    # mere existence of this task.
+                    await listener.run()
+                except asyncio.CancelledError:
+                    self.state = "stopped"
+                    # Clean-path observability only: record the close so the health
+                    # STRING reflects the stop. B4: coverage does not depend on this
+                    # -- the liveness heartbeats already stopped, so coverage ends at
+                    # the last beat whether or not this row is written.
+                    try:
+                        self._record("disconnected", ok=True)
+                        self._rescue_pending(listener)
+                    finally:
+                        # D5: a FINAL drain BEFORE propagating the cancel. Shutdown
+                        # cancels this loop mid-attempt, bypassing the post-loop
+                        # ``_drain_pending``; without a drain here the rescued events
+                        # (and this dying listener's just-rescued batch) would be
+                        # stranded even when storage is healthy at shutdown. Guarded
+                        # (``_drain_pending`` swallows its own storage errors), so the
+                        # cancel always propagates. (The outer finally is belt-and-
+                        # braces and covers the backoff-cancel path too.)
+                        self._drain_pending()
+                    raise
+                except Exception as exc:  # noqa: BLE001 - firewall: any death is recoverable
                     clean = False
-                    error = "unsupported"
-            duration_ms = int((monotonic() - start) * 1000)
-            # R2: take custody of anything this dying listener buffered but could
-            # not commit BEFORE writing any health accounting. The rescue must
-            # never sit behind the terminal ``_record`` -- if both the event
-            # store and the accounting write are failing, an accounting raise
-            # ahead of the rescue would strand the buffered batch. Rescue first,
-            # then account (and ``_record`` is itself guarded, belt and braces).
-            self._rescue_pending(listener)
-            self._record(error or "stopped", ok=clean, duration_ms=duration_ms)
+                    error = f"{type(exc).__name__}: {exc}"
+                    lowered = error.lower()
+                    if "storage" in lowered or "sqlite" in lowered:
+                        self.state = "storage-failed"
+                    elif "auth" in lowered or "401" in lowered or "403" in lowered:
+                        self.state = "auth-failed"
+                    else:
+                        self.state = "reconnecting"
+                    logger.warning("WS listener died: %s", error)
+                else:
+                    if getattr(listener, "terminal_state", None) == "unsupported":
+                        # The low-level listener returns cleanly only when the
+                        # controller cannot offer a usable events subscription.
+                        self.state = "unsupported"
+                        clean = False
+                        error = "unsupported"
+                duration_ms = int((monotonic() - start) * 1000)
+                # R2: take custody of anything this dying listener buffered but could
+                # not commit BEFORE writing any health accounting. The rescue must
+                # never sit behind the terminal ``_record`` -- if both the event
+                # store and the accounting write are failing, an accounting raise
+                # ahead of the rescue would strand the buffered batch. Rescue first,
+                # then account (and ``_record`` is itself guarded, belt and braces).
+                self._rescue_pending(listener)
+                self._record(error or "stopped", ok=clean, duration_ms=duration_ms)
 
-            if self._stop.is_set():
-                break
-            restarts += 1
-            if self._max_restarts is not None and restarts > self._max_restarts:
-                logger.error("WS supervisor gave up after %d restarts.", restarts - 1)
-                break
-            await self._sleep(backoff)
-            backoff = self._backoff_base if clean else min(backoff * 2, self._backoff_max)
-        # R2: a final attempt to persist rescued events (storage may have come
-        # back by the time the loop ends) so a blip + shutdown does not drop them.
-        self._drain_pending()
+                if self._stop.is_set():
+                    break
+                restarts += 1
+                if self._max_restarts is not None and restarts > self._max_restarts:
+                    logger.error("WS supervisor gave up after %d restarts.", restarts - 1)
+                    break
+                # A cancel HERE -- during the between-listeners backoff -- lands
+                # outside the inline run()-cancel handler above. The outer finally is
+                # what guarantees the final drain on that path (BUG#5).
+                await self._sleep(backoff)
+                backoff = self._backoff_base if clean else min(backoff * 2, self._backoff_max)
+        finally:
+            # R2 + BUG#5: a final attempt to persist rescued events (storage may have
+            # come back by the time the loop ends OR is cancelled) so a blip +
+            # shutdown -- wherever the cancel lands -- does not drop them.
+            self._drain_pending()
         if self._stop.is_set():
             self.state = "stopped"
 
