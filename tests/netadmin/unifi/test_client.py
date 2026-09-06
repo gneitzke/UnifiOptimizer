@@ -350,6 +350,83 @@ async def test_malformed_successful_looking_read_raises(body):
     await client.aclose()
 
 
+# --------------------------------------------------------------------------- #
+# #w13a-1: a present-but-INVALID ``meta`` must FAIL the read. The prior code used
+# ``meta_present = isinstance(meta, dict)``, so a ``meta`` KEY that is present but
+# NOT a dict (null/false/[]/"pending") was treated as ABSENT and the read accepted
+# -- fabricating complete coverage over a window never actually read. If the
+# ``meta`` key exists at all it MUST be a dict with rc=="ok".
+# --------------------------------------------------------------------------- #
+@respx.mock
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"meta": None, "data": []},        # meta key present but null
+        {"meta": False, "data": []},       # meta key present but false
+        {"meta": [], "data": []},          # meta key present but a list
+        {"meta": "pending", "data": []},   # meta key present but a string
+    ],
+    ids=["meta-null", "meta-false", "meta-list", "meta-string"],
+)
+async def test_present_but_invalid_meta_fails_the_read(body):
+    _mock_login()
+    client = _client()
+    respx.get(DEVICE).mock(return_value=httpx.Response(200, json=body))
+    # RED before the fix: each of these recorded a complete/coverage-1.0 read.
+    with pytest.raises(UnifiError, match="well-formed data list"):
+        await client.get_data("stat/device")
+    await client.aclose()
+
+
+@respx.mock
+async def test_valid_and_absent_meta_still_succeed():
+    # The control for #w13a-1: a genuine ``{"meta":{"rc":"ok"},"data":[...]}`` and a
+    # bare ``{"data":[...]}`` with NO meta key at all both stay valid reads.
+    _mock_login()
+    client = _client()
+    respx.get(DEVICE).mock(
+        return_value=httpx.Response(200, json={"meta": {"rc": "ok"}, "data": [{"ok": 1}]})
+    )
+    assert await client.get_data("stat/device") == [{"ok": 1}]
+    respx.get(DEVICE).mock(return_value=httpx.Response(200, json={"data": [{"ok": 2}]}))
+    assert await client.get_data("stat/device") == [{"ok": 2}]
+    await client.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# #w13a-5: a post-dispatch response-CLOSE error (httpx.CloseError) on a MUTATION
+# is AMBIGUOUS, not a definitive failure. The response delivered its success bytes,
+# then the socket faulted during cleanup/close -- the write may have landed. It must
+# surface as UnifiAmbiguousOutcomeError with exactly ONE dispatch (never reaching the
+# applier's generic 'failed' handler, which would permit a replay), never retried.
+# --------------------------------------------------------------------------- #
+@respx.mock
+async def test_w13a5_mutation_close_error_is_ambiguous_single_dispatch():
+    _mock_login()
+    route = respx.put(f"{HOST}/proxy/network/api/s/{SITE}/rest/device/abc").mock(
+        side_effect=httpx.CloseError("connection closed during response cleanup")
+    )
+    client = _client(max_retries=3)
+    with pytest.raises(UnifiAmbiguousOutcomeError):
+        await client.request("PUT", "rest/device/abc", json_body={"x": 1}, allow_mutation=True)
+    assert route.call_count == 1  # exactly one dispatch -- never replayed as failed
+    await client.aclose()
+
+
+@respx.mock
+async def test_w13a5_get_close_error_keeps_existing_behavior():
+    # Symmetric: a CloseError on an idempotent GET keeps its EXISTING behavior --
+    # it propagates as httpx.CloseError (never silently retried, never laundered into
+    # an ambiguous mutation outcome). GET reads are unaffected by the mutation-only rule.
+    _mock_login()
+    route = respx.get(DEVICE).mock(side_effect=httpx.CloseError("closed after body"))
+    client = _client(max_retries=3)
+    with pytest.raises(httpx.CloseError):
+        await client.get_data("stat/device")
+    assert route.call_count == 1  # a close error is not a retryable transport error
+    await client.aclose()
+
+
 @respx.mock
 async def test_genuine_empty_list_read_is_complete():
     # The control: a real ``{"meta":{"rc":"ok"},"data":[]}`` (and a bare

@@ -57,18 +57,26 @@ _RETRYABLE_EXC = (
     httpx.WriteError,
     httpx.RemoteProtocolError,
 )
-# Failures raised while READING or DECODING a response body -- i.e. AFTER the full
-# request was already sent and the controller answered (a corrupt/undecodable body:
-# bad gzip, a truncated chunked stream). httpx surfaces these as ``DecodingError``,
-# a ``RequestError`` that is deliberately NOT a ``TransportError`` and so is absent
-# from ``_RETRYABLE_EXC`` above. On a MUTATION the outcome is UNKNOWN, never a
-# definitive failure: the request landed at the controller (it replied), the reply
-# just cannot be decoded, so the write may well have taken (D6/#w10a-1). It is
-# classified exactly like a lost response / an ambiguous 5xx -- ambiguous, never
-# retried, never a clean "failed". A GET keeps its existing behavior: the error
-# propagates to the caller unchanged (a read that cannot be decoded is a read
-# failure, and a GET is safely re-issued by the caller, not silently ambiguous).
-_POST_SEND_READ_EXC = (httpx.DecodingError,)
+# Failures raised AFTER the full request was already sent and the controller
+# answered, while READING / DECODING / FINISHING (closing) the response:
+#   * ``DecodingError`` -- a corrupt/undecodable body (bad gzip, a truncated chunked
+#     stream); a ``RequestError`` that is deliberately NOT a ``TransportError`` and so
+#     is absent from ``_RETRYABLE_EXC`` above (D6/#w10a-1);
+#   * ``CloseError`` -- the response yielded its success bytes, then the socket faulted
+#     during cleanup/close (#w13a-5). A ``NetworkError`` that is deliberately kept OUT
+#     of ``_RETRYABLE_EXC`` (unlike ``ReadError``/``WriteError``) so a GET does NOT
+#     silently retry a response that already delivered its body; on a mutation it is
+#     classified here as post-send ambiguous, exactly like a decode failure.
+# In every one of these the request landed at the controller (it replied) -- only the
+# tail of receiving/finishing the reply failed -- so on a MUTATION the outcome is
+# UNKNOWN, never a definitive failure: the write may well have taken. It is classified
+# exactly like a lost response / an ambiguous 5xx -- ambiguous, never retried, never a
+# clean "failed" the applier could replay. This is the concrete arm of a general rule:
+# ANY exception raised after the request bytes were sent, without a parsed definitive
+# rejection, is ambiguous for a mutation. A GET keeps its existing behavior: the error
+# propagates to the caller unchanged (a read that cannot be finished is a read failure,
+# and a GET is safely re-issued by the caller, not silently ambiguous).
+_POST_SEND_READ_EXC = (httpx.DecodingError, httpx.CloseError)
 
 
 def envelope_error(payload: Any) -> Optional[str]:
@@ -616,11 +624,12 @@ class UnifiClient:
         err = envelope_error(data)
         if err is not None:
             raise UnifiError(f"{endpoint} -> {err}")
-        # BUG#6 / #w12a-2 (positive-proof of a real read): a 200 body counts as a
-        # well-formed SUCCESSFUL read ONLY when it POSITIVELY presents the classic
+        # BUG#6 / #w12a-2 / #w13a-1 (positive-proof of a real read): a 200 body counts
+        # as a well-formed SUCCESSFUL read ONLY when it POSITIVELY presents the classic
         # UniFi success shape -- a ``data`` field that is an ACTUAL LIST (a real,
-        # present list; possibly empty) AND, when a ``meta`` envelope is present, an
-        # explicit ``meta.rc == "ok"``. Nothing weaker is a successful read:
+        # present list; possibly empty) AND, when a ``meta`` KEY is present, a ``meta``
+        # that is a VALID dict carrying an explicit ``meta.rc == "ok"``. Nothing weaker
+        # is a successful read:
         #
         #   * ``{"meta":{"rc":"ok"}}`` with NO ``data`` -- a success envelope over
         #     no rows is not a read of zero rows; the payload the caller reads is
@@ -629,29 +638,47 @@ class UnifiClient:
         #     list; a null/false body is not an empty successful read.
         #   * ``{"meta":{"rc":"pending"},...}`` (or any meta.rc other than "ok") --
         #     a pending/other envelope is NOT a completed read even with ``data:[]``.
+        #   * ``{"meta":null,...}`` / ``{"meta":false,...}`` / ``{"meta":[],...}`` /
+        #     ``{"meta":"pending",...}`` -- the ``meta`` KEY is PRESENT but is not a
+        #     valid dict, so the controller sent SOMETHING for meta that is not a
+        #     success envelope. A present-but-non-dict meta is NOT proof of rc=ok and
+        #     must NOT be treated as an absent meta (#w13a-1): if the ``meta`` key
+        #     exists at all it MUST be a dict with rc=="ok" for the read to be a
+        #     well-formed success. (Only a genuinely ABSENT ``meta`` key, over a real
+        #     data list, is the bare ``{"data":[...]}`` success shape.)
         #
-        # Previously this accepted ``has_data OR rc_ok`` and :meth:`_data` defaulted
-        # a missing/falsy ``data`` to ``[]``, so every one of the bodies above parsed
-        # to zero rows and read as empty-but-healthy; event catch-up then credited
+        # Previously this used ``meta_present = isinstance(meta, dict)``, so a present-
+        # but-non-dict meta was treated as ABSENT and the read accepted (the #w13a-1
+        # bug: ``{"meta":null,"data":[]}`` recorded 'complete'/coverage 1.0). Earlier
+        # still it accepted ``has_data OR rc_ok`` and :meth:`_data` defaulted a
+        # missing/falsy ``data`` to ``[]``, so every malformed body above parsed to
+        # zero rows and read as empty-but-healthy; event catch-up then credited
         # ``event_history`` coverage (status 'complete', 1.0) for a window it never
         # actually read, defeating every detector coverage gate. Absent POSITIVE
         # proof of a real read this is a FAILED/UNAVAILABLE read and must raise, so
         # catch-up records a FAILED hole rather than fabricated coverage. A genuine
-        # ``{"meta":{"rc":"ok"},"data":[]}`` (or a bare ``{"data":[...]}``) still
-        # reads as complete -- normal reads (stat/device etc.) are unaffected.
+        # ``{"meta":{"rc":"ok"},"data":[]}`` (or a bare ``{"data":[...]}`` with NO
+        # meta key) still reads as complete -- normal reads are unaffected.
         data_field = data.get("data")
         data_is_list = isinstance(data_field, list)
+        meta_key_present = "meta" in data
         meta = data.get("meta")
-        meta_present = isinstance(meta, dict)
-        meta_ok = (
-            meta_present and str(meta.get("rc", "")).strip().lower() == "ok"
-        )
-        if not data_is_list or (meta_present and not meta_ok):
-            detail = data.get("error") or data.get("message") or (
-                f"data is {type(data_field).__name__}, not a list"
-                if not data_is_list
-                else f"meta.rc={meta.get('rc')!r} (not ok)"
-            )
+        meta_is_dict = isinstance(meta, dict)
+        # A present ``meta`` key is well-formed ONLY as a dict with rc=="ok". An absent
+        # meta key is fine (the bare ``{"data":[...]}`` shape); a present non-dict meta,
+        # or a dict whose rc != "ok", is not a success.
+        meta_ok = meta_is_dict and str(meta.get("rc", "")).strip().lower() == "ok"
+        if not data_is_list or (meta_key_present and not meta_ok):
+            if not data_is_list:
+                detail = data.get("error") or data.get("message") or (
+                    f"data is {type(data_field).__name__}, not a list"
+                )
+            elif not meta_is_dict:
+                detail = f"meta is {type(meta).__name__}, not a dict (rc unverifiable)"
+            else:
+                detail = data.get("error") or data.get("message") or (
+                    f"meta.rc={meta.get('rc')!r} (not ok)"
+                )
             raise UnifiError(
                 f"{endpoint} -> unrecognized response (no well-formed data list / "
                 f"meta.rc=ok): {detail}"
