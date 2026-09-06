@@ -155,6 +155,31 @@ async def test_ambiguous_mutation_dispatches_once_and_is_not_ok():
 # non-JSON/HTML mutation response is not a confirmed success.
 # --------------------------------------------------------------------------- #
 @respx.mock
+@pytest.mark.parametrize("verb", ["PUT", "POST"])
+async def test_w12a_mutation_401_with_parsed_rejection_is_definitive_not_ambiguous(verb):
+    # #w12a-1 end-to-end: a mutation 401 carrying a PARSED controller rejection
+    # (meta.rc=error) must reach the writer as a DEFINITIVE rejection (ok=False, NO
+    # 'ambiguous' marker) -- not laundered into an ambiguous outcome the applier would
+    # leave 'unknown' and let block later work. Exactly one dispatch, no re-login.
+    _mock_login()
+    endpoint = "rest/device/dev123" if verb == "PUT" else "cmd/devmgr"
+    rejection = {"meta": {"rc": "error", "msg": "api.err.LoginRequired"}, "data": []}
+    route = getattr(respx, verb.lower())(f"{API}/{endpoint}").mock(
+        return_value=httpx.Response(401, json=rejection)
+    )
+    client = await _client()
+    writer = RealControllerWriter(client)
+    call = writer.put if verb == "PUT" else writer.post
+    res = await call(endpoint, {"radio_table": []})
+    assert route.call_count == 1  # single dispatch -- the write is never replayed
+    assert res.ok is False
+    assert res.status_code == 401
+    # DEFINITIVE rejection: NOT the ambiguous shape a lost/undecodable 401 produces.
+    assert not (isinstance(res.data, dict) and res.data.get("ambiguous"))
+    await client.aclose()
+
+
+@respx.mock
 async def test_error_envelope_is_not_success_despite_http_200():
     _mock_login()
     respx.put(f"{API}/rest/device/dev123").mock(
