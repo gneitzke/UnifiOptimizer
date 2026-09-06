@@ -357,3 +357,70 @@ def test_transaction_rolls_back_inventory_when_a_later_write_fails(
     # The whole cycle rolled back: the inventory upsert did NOT survive on its own
     # (the pre-fix per-call BEGIN IMMEDIATE would have committed it independently).
     assert repo.find_entity(EntityType.AP, "aa:bb:cc:00:00:bad") is None
+
+
+# ---------------------------------------------------------------------------
+# #w19a (cursor stranding): a COMPLETE read that covers a previously-failed/
+# partial hole must reconcile/retire that hole so the contiguous-complete cursor
+# (latest_ingest_coverage_end) advances once the gap is actually covered. A
+# genuinely still-open hole must still cap the cursor.
+# ---------------------------------------------------------------------------
+def _cov(repo: Repository, start_ts: int, end_ts: int, status: str) -> None:
+    repo.record_ingest_coverage(
+        kind="event_history", scope="site", interval="retained",
+        start_ts=start_ts, end_ts=end_ts, status=status,
+    )
+
+
+def _cursor(repo: Repository):
+    return repo.latest_ingest_coverage_end(kind="event_history", scope="site")
+
+
+def _holes(repo: Repository):
+    return {
+        (int(r["start_ts"]), int(r["end_ts"]))
+        for r in repo.failed_ingest_coverage(kind="event_history", scope="site")
+    }
+
+
+def test_w19a_complete_read_retires_subsumed_failed_hole_and_advances_cursor(
+    repo: Repository,
+) -> None:
+    T = 1_000_000
+    _cov(repo, T - 3600, T, "complete")
+    assert _cursor(repo) == T
+    # A failed catch-up window opens right after the cursor and pins it at its start.
+    _cov(repo, T, T + 3600, "failed")
+    assert _holes(repo) == {(T, T + 3600)}
+    assert _cursor(repo) == T  # pinned FOREVER without reconciliation
+    # A later successful read over a LARGER/overlapping window (a DIFFERENT primary
+    # key) records complete and fully SUBSUMES the failed hole.
+    _cov(repo, T - 3600, T + 7200, "complete")
+    # The subsumed hole is retired -> no retryable hole remains -> the cursor
+    # advances to the end of the completed prefix (pre-fix it stayed stuck at T).
+    assert _holes(repo) == set()
+    assert _cursor(repo) == T + 7200
+
+
+def test_w19a_partial_overlap_splits_hole_to_remainder_which_still_caps(
+    repo: Repository,
+) -> None:
+    T = 2_000_000
+    _cov(repo, T - 3600, T, "complete")
+    _cov(repo, T, T + 7200, "failed")
+    # A complete read covers only the FIRST half of the hole.
+    _cov(repo, T, T + 3600, "complete")
+    # The covered half is retired; the still-uncovered remainder survives as a
+    # failed hole and keeps capping the cursor at the remainder's start.
+    assert _holes(repo) == {(T + 3600, T + 7200)}
+    assert _cursor(repo) == T + 3600
+
+
+def test_w19a_uncovered_hole_still_caps_cursor(repo: Repository) -> None:
+    T = 3_000_000
+    _cov(repo, T - 3600, T, "complete")
+    _cov(repo, T, T + 3600, "failed")
+    # A later complete read that does NOT reach the hole leaves it fully open.
+    _cov(repo, T - 7200, T - 3600, "complete")
+    assert _holes(repo) == {(T, T + 3600)}
+    assert _cursor(repo) == T  # a genuinely still-open hole still caps it

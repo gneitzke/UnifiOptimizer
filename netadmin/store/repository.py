@@ -1441,6 +1441,65 @@ class Repository:
                 "status=excluded.status, detail=excluded.detail, updated_ts=excluded.updated_ts",
                 (kind, scope, interval, start_ts, end_ts, status, detail, _now()),
             )
+            if status == "complete":
+                self._reconcile_holes_covered_by_complete(
+                    conn, kind=kind, scope=scope, interval=interval,
+                    start_ts=start_ts, end_ts=end_ts,
+                )
+
+    # CURSOR STRANDING (#w19a): a successful read that COVERS a previously-failed
+    # /partial hole must RECONCILE that hole, or the completion cursor
+    # (:meth:`latest_ingest_coverage_end`, capped at the earliest still-retryable
+    # hole) stays pinned at the hole's start FOREVER even after the gap is fully
+    # covered. When a later read records a COMPLETE span whose start/end differ
+    # from the failed row's (a wider/overlapping window -> a DIFFERENT primary
+    # key), the ``ON CONFLICT`` upsert above never touches the old failed row, so
+    # it survives and keeps pinning the cursor. This retires every failed/partial
+    # row the complete span fully SUBSUMES, and split-first-retires a partially
+    # overlapped one down to only its still-uncovered remainder(s) -- mirroring the
+    # backfill split/retire discipline (see ingest/backfill.py Finding #7/#3), so
+    # the contiguous-complete cursor advances the instant a hole is actually
+    # covered while a genuinely still-open hole is preserved and still caps it.
+    @staticmethod
+    def _reconcile_holes_covered_by_complete(
+        conn: sqlite3.Connection, *, kind: str, scope: str, interval: str,
+        start_ts: int, end_ts: int,
+    ) -> None:
+        holes = conn.execute(
+            "SELECT start_ts, end_ts, status, detail FROM ingest_coverage "
+            "WHERE kind=? AND scope=? AND interval=? "
+            "AND status IN ('failed','partial') AND end_ts>? AND start_ts<?",
+            (kind, scope, interval, start_ts, end_ts),
+        ).fetchall()
+        for h in holes:
+            h_lo, h_hi = int(h["start_ts"]), int(h["end_ts"])
+            h_status, h_detail = str(h["status"]), h["detail"]
+            # Split-first: re-record the uncovered remainder(s) before retiring the
+            # original, so a crash between the two never erases a still-open hole.
+            # The covered middle [max(h_lo,start_ts), min(h_hi,end_ts)] is dropped.
+            if h_lo < start_ts:
+                conn.execute(
+                    "INSERT INTO ingest_coverage "
+                    "(kind, scope, interval, start_ts, end_ts, status, detail, updated_ts) "
+                    "VALUES (?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(kind, scope, interval, start_ts, end_ts) DO UPDATE SET "
+                    "status=excluded.status, detail=excluded.detail, updated_ts=excluded.updated_ts",
+                    (kind, scope, interval, h_lo, min(h_hi, start_ts), h_status, h_detail, _now()),
+                )
+            if h_hi > end_ts:
+                conn.execute(
+                    "INSERT INTO ingest_coverage "
+                    "(kind, scope, interval, start_ts, end_ts, status, detail, updated_ts) "
+                    "VALUES (?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(kind, scope, interval, start_ts, end_ts) DO UPDATE SET "
+                    "status=excluded.status, detail=excluded.detail, updated_ts=excluded.updated_ts",
+                    (kind, scope, interval, max(h_lo, end_ts), h_hi, h_status, h_detail, _now()),
+                )
+            conn.execute(
+                "DELETE FROM ingest_coverage WHERE kind=? AND scope=? AND interval=? "
+                "AND start_ts=? AND end_ts=?",
+                (kind, scope, interval, h_lo, h_hi),
+            )
 
     # Finding #7: retire (delete) one coverage row by its exact primary key.
     # When retention clips a failed interval, the retryable window gets a NEW
