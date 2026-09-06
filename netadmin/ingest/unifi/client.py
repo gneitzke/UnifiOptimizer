@@ -416,6 +416,85 @@ class UnifiClient:
     def _backoff(self, attempt: int) -> float:
         return min(self._backoff_base * (2**attempt), self._backoff_max)
 
+    def _finish_mutation(
+        self,
+        strategy: AuthStrategy,
+        resp: httpx.Response,
+        method_u: str,
+        endpoint: str,
+    ) -> httpx.Response:
+        """Finish a MUTATION's response; any post-send failure is AMBIGUOUS (#w14a-1).
+
+        Single-dispatch by construction -- a mutation is NEVER retried or
+        re-dispatched here. Everything after the request bytes were sent runs under
+        ONE guard: cookie ``capture``, the 401 envelope parse, response close. The
+        rule is structural, not an enumerated exception list: any exception raised in
+        that window that is NOT a parsed definitive rejection means the write may have
+        landed, so it surfaces as :class:`UnifiAmbiguousOutcomeError` (never reaching
+        the applier's generic 'failed' handler, never replayed). Only a PARSED
+        controller rejection (``meta.rc=error`` -- including on a 401, #w12a-1) is a
+        DEFINITIVE failure, returned unchanged; a received 2xx/5xx is returned for the
+        writer's unified envelope classification (a mutation 5xx is a received
+        server-side failure, not a lost response, and is never retried).
+        """
+        try:
+            strategy.capture(resp, self._http.cookies)
+            if resp.status_code == 401:
+                # #w12a-1: honour the envelope. A 401 carrying a PARSED rejection
+                # (``meta.rc=error``) is a DEFINITIVE failure the controller confirmed;
+                # return it for the writer's classification, do NOT launder it into
+                # ambiguous. Only a 401 with NO parseable rejection is ambiguous: the
+                # session dropped and the write may or may not have landed.
+                try:
+                    body = resp.json()
+                except ValueError:
+                    body = None
+                if envelope_error(body) is not None:
+                    logger.warning(
+                        "%s %s -> 401 with a parsed rejection envelope; definitive "
+                        "failure (single dispatch, not re-dispatched, not ambiguous).",
+                        method_u,
+                        endpoint,
+                    )
+                    return resp
+                logger.warning(
+                    "%s %s -> 401 on a mutation with no parseable rejection; "
+                    "not re-dispatched (ambiguous).",
+                    method_u,
+                    endpoint,
+                )
+                raise UnifiAmbiguousOutcomeError(
+                    f"{method_u} {endpoint} -> 401; the session was rejected and the "
+                    "write may or may not have landed. Not re-dispatched. Reconcile "
+                    "controller state via GET before any further attempt."
+                )
+            # A received 2xx / 5xx / other status: return unchanged. A mutation is
+            # never retried on a 5xx (a received response, not a lost one); the writer
+            # classifies the envelope.
+            return resp
+        except UnifiAmbiguousOutcomeError:
+            # Already the deliberate ambiguous classification above -- do not re-wrap.
+            raise
+        except Exception as exc:  # noqa: BLE001 - structural: post-send == unknown
+            # ANY other post-send processing failure (CookieConflict,
+            # LocalProtocolError, a cleanup RuntimeError, CloseError, DecodingError,
+            # ReadError, ...) means the write may have landed. Ambiguous, single
+            # dispatch, never a clean 'failed' the applier could replay.
+            logger.warning(
+                "%s %s post-send response processing failed (%s: %s); mutation "
+                "outcome unknown, single dispatch, not replayed.",
+                method_u,
+                endpoint,
+                type(exc).__name__,
+                exc,
+            )
+            raise UnifiAmbiguousOutcomeError(
+                f"{method_u} {endpoint} post-send response processing failed "
+                f"({type(exc).__name__}: {exc}); the request was sent and the write "
+                "may have landed. Not retried, not a definitive failure. Reconcile "
+                "controller state via GET before any further attempt."
+            ) from exc
+
     async def request(
         self,
         method: str,
@@ -513,52 +592,28 @@ class UnifiClient:
                 await asyncio.sleep(delay)
                 continue
 
+            # ---- post-send response processing (capture / parse / close) ----
+            # #w14a-1 (STRUCTURAL, not enumerate-more): the request bytes are now
+            # dispatched and the controller has answered. ANY exception raised while
+            # PROCESSING that response -- cookie ``capture`` (a ``CookieConflict`` from
+            # duplicate TOKEN cookies, a ``LocalProtocolError``), a cleanup
+            # ``RuntimeError``, a ``CloseError``/``DecodingError`` finishing the body,
+            # anything -- means a MUTATION's outcome is UNKNOWN: the write may already
+            # have landed. Previously ``capture`` ran OUTSIDE the classifier, so such a
+            # post-send error escaped ``request`` and reached the applier's generic
+            # handler as a clean 'failed', permitting a REPLAY (a second PUT). For a
+            # mutation we now wrap ALL post-send processing so any exception that is NOT
+            # a PARSED definitive rejection is classified AMBIGUOUS -- single dispatch,
+            # never a clean 'failed', never replayed. This is the general rule the
+            # earlier CloseError/DecodingError fix only enumerated one arm of. A GET
+            # keeps its existing behavior: these errors propagate to the caller, which
+            # safely re-issues an idempotent read.
+            if not idempotent:
+                return self._finish_mutation(strategy, resp, method_u, endpoint)
+
             strategy.capture(resp, self._http.cookies)
 
             if resp.status_code == 401 and not relogged:
-                if not idempotent:
-                    # C2: a mutation that draws a 401 must NEVER be re-dispatched.
-                    # Re-logging in and replaying the request would send the write a
-                    # SECOND time, so a single dispatch is preserved regardless of the
-                    # classification below -- we never ``continue`` here.
-                    #
-                    # #w12a-1: the OUTCOME classification must still honour the
-                    # response envelope, exactly as the writer's own classification
-                    # does. A 401 carrying a PARSED controller rejection
-                    # (``meta.rc=error``) is a DEFINITIVE failure the controller
-                    # confirmed -- the write was rejected, not left in doubt -- so it
-                    # must surface as a definitive rejection, NOT be laundered into
-                    # "ambiguous". Return the response unchanged so the writer's
-                    # unified classification sees ``envelope_error`` and reports a
-                    # definitive ``ok=False`` rejection (which the applier resolves as
-                    # a clean 'failed', leaving no unresolved mutation). Only a 401
-                    # whose body carries NO parseable rejection envelope is genuinely
-                    # AMBIGUOUS: the session was dropped and the write may or may not
-                    # have landed -- surface that WITHOUT a second dispatch so the
-                    # caller keeps the before-state and reconciles via a GET.
-                    try:
-                        body = resp.json()
-                    except ValueError:
-                        body = None
-                    if envelope_error(body) is not None:
-                        logger.warning(
-                            "%s %s -> 401 with a parsed rejection envelope; definitive "
-                            "failure (single dispatch, not re-dispatched, not ambiguous).",
-                            method_u,
-                            endpoint,
-                        )
-                        return resp
-                    logger.warning(
-                        "%s %s -> 401 on a mutation with no parseable rejection; "
-                        "not re-dispatched (ambiguous).",
-                        method_u,
-                        endpoint,
-                    )
-                    raise UnifiAmbiguousOutcomeError(
-                        f"{method_u} {endpoint} -> 401; the session was rejected and the "
-                        "write may or may not have landed. Not re-dispatched. Reconcile "
-                        "controller state via GET before any further attempt."
-                    )
                 # A GET is idempotent: a single re-login and retry is safe.
                 logger.info("%s %s -> 401; re-logging in once.", method_u, endpoint)
                 relogged = True

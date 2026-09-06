@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
@@ -654,6 +655,77 @@ async def test_w10a1_get_response_decode_error_keeps_existing_behavior():
     with pytest.raises(httpx.DecodingError):
         await client.get_data("stat/device")
     assert route.call_count == 1  # a decode error is not a retryable transport error
+    await client.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# #w14a-1 -- ANY post-send response-processing failure on a MUTATION is AMBIGUOUS.
+# The request bytes were dispatched and the controller answered 200 meta.rc=ok, but
+# processing that response -- cookie ``capture`` -- then raises. Previously capture
+# ran OUTSIDE the classifier, so a CookieConflict (two TOKEN cookies on different
+# paths), a LocalProtocolError, a cleanup RuntimeError, or a CloseError escaped
+# ``request`` and reached the applier's generic handler as a clean 'failed',
+# permitting a REPLAY (a second PUT). The write may have landed, so it must surface
+# as UnifiAmbiguousOutcomeError, single dispatch, never replayed. Structural, not an
+# enumerated type list: every one of these classifies identically.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.CookieConflict("two TOKEN cookies on different paths"),
+        httpx.LocalProtocolError("bad protocol state after send"),
+        RuntimeError("cleanup failed after the response"),
+        httpx.CloseError("socket faulted during response cleanup"),
+    ],
+    ids=["CookieConflict", "LocalProtocolError", "RuntimeError", "CloseError"],
+)
+@respx.mock
+async def test_w14a1_mutation_post_send_capture_error_is_ambiguous_single_dispatch(exc):
+    _mock_login()
+    route = respx.put(f"{HOST}/proxy/network/api/s/{SITE}/rest/device/abc").mock(
+        return_value=httpx.Response(200, json={"meta": {"rc": "ok"}, "data": []})
+    )
+    client = _client(max_retries=3)
+    strategy = await client.connect()
+    # A post-send failure while PROCESSING the (successful) response.
+    strategy.capture = MagicMock(side_effect=exc)
+    with pytest.raises(UnifiAmbiguousOutcomeError, match="post-send"):
+        await client.request("PUT", "rest/device/abc", json_body={"x": 1}, allow_mutation=True)
+    assert route.call_count == 1  # exactly one dispatch -- never replayed as 'failed'
+    await client.aclose()
+
+
+@respx.mock
+async def test_w14a1_mutation_real_success_still_applies():
+    # Control: a genuine 200 meta.rc=ok with a healthy capture still returns the
+    # response for the writer to classify as APPLIED -- the wrap adds no false ambiguity.
+    _mock_login()
+    respx.put(f"{HOST}/proxy/network/api/s/{SITE}/rest/device/abc").mock(
+        return_value=httpx.Response(200, json={"meta": {"rc": "ok"}, "data": [{"_id": "abc"}]})
+    )
+    client = _client()
+    resp = await client.request("PUT", "rest/device/abc", json_body={"x": 1}, allow_mutation=True)
+    assert resp.status_code == 200
+    assert resp.json()["meta"]["rc"] == "ok"
+    await client.aclose()
+
+
+@respx.mock
+async def test_w14a1_mutation_parsed_rejection_still_definitive():
+    # A parsed controller rejection (meta.rc=error) is a DEFINITIVE failure -- returned
+    # for the writer's unified classification, NOT laundered into ambiguous by the wrap.
+    from netadmin.ingest.unifi.client import envelope_error
+
+    _mock_login()
+    respx.put(f"{HOST}/proxy/network/api/s/{SITE}/rest/device/abc").mock(
+        return_value=httpx.Response(
+            400, json={"meta": {"rc": "error", "msg": "api.err.InvalidObject"}}
+        )
+    )
+    client = _client()
+    resp = await client.request("PUT", "rest/device/abc", json_body={"x": 1}, allow_mutation=True)
+    assert resp.status_code == 400
+    assert envelope_error(resp.json()) == "api.err.InvalidObject"
     await client.aclose()
 
 
