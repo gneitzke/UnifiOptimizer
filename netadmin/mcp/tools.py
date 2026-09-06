@@ -970,7 +970,14 @@ def incidents(repo: Repository, params: Mapping[str, Any], now: int) -> dict[str
             "summary": f"No {scope}{kind}incidents recorded in this history store.",
             "incidents": fmt.listing([], limit),
         }
-    counts = repo.incident_member_counts([int(row["id"]) for row in rows])
+    # C5: the card counts and the grouped/standalone arithmetic must describe the
+    # incident's CURRENT shape (cleared_ts IS NULL), not the append-only
+    # historical union. Using historical counts here let a cleared symptom be
+    # counted against the currently-open issue set, so `standalone` went negative
+    # ("-1 standalone open issue(s)") once a symptom was resolved out of a group.
+    # (is_genuine_incident deliberately still uses historical counts so a resolved
+    # group stays visible; that is a separate concern from these live counts.)
+    counts = repo.current_incident_member_counts([int(row["id"]) for row in rows])
     briefs = []
     for row in rows[:limit]:
         brief = _incident_brief(row)
@@ -983,13 +990,16 @@ def incidents(repo: Repository, params: Mapping[str, Any], now: int) -> dict[str
             f"cause with its symptoms. The most recent was last seen {fmt.ago(newest, now)}."
         )
     else:
-        # The honest split: how many issues are actually grouped, versus every
-        # open issue that stands alone and never shows up here at all.
+        # The honest split: how many issues are actually grouped right now,
+        # versus every open issue that stands alone and never shows up here at
+        # all. `counts` is current membership (C5), so a resolved-out symptom no
+        # longer inflates `grouped_issues` past the open-issue total and
+        # `standalone` cannot go negative.
         grouped_issues = sum(counts.values())
         noun = "incident" if len(rows) == 1 else "incidents"
         base = f"{len(rows)} {noun} grouping {grouped_issues} issue(s)"
         if open_only:
-            standalone = len(repo.list_issues(open_only=True)) - grouped_issues
+            standalone = max(0, len(repo.list_issues(open_only=True)) - grouped_issues)
             base = f"{base}; {standalone} standalone open issue(s)"
         summary = f"{base}. The most recent group was last seen {fmt.ago(newest, now)}."
     return {
@@ -1016,13 +1026,24 @@ def _incident_detail(
     issue_rows = {int(m["issue_id"]): repo.get_issue(int(m["issue_id"])) for m in members}
     entities = _entity_map(repo, [row for row in issue_rows.values() if row is not None])
 
+    # C5: the detail lists the incident's whole history (cleared members
+    # included, so a symptom later re-attributed elsewhere still explains part of
+    # the incident's past), but each member must carry whether it is still
+    # attached. Marking cleared rows stops narration from describing a
+    # resolved-out symptom as a current one; joined/cleared timestamps mirror the
+    # REST detail contract (netadmin/server/routers/incidents.py).
     detailed: list[dict[str, Any]] = []
     for member in members[:limit]:
         row = issue_rows.get(int(member["issue_id"]))
+        cleared_ts = member["cleared_ts"]
         entry: dict[str, Any] = {
             "role": member["role"],
             "rule": member["rule"],
             "rationale": member["rationale"],
+            "current": cleared_ts is None,
+            "membership": "current" if cleared_ts is None else "cleared",
+            "joined_ts": fmt.iso(member["joined_ts"]),
+            "cleared_ts": fmt.iso(cleared_ts),
         }
         if row is not None:
             entry.update(_issue_brief(row, entities, now))
@@ -1030,10 +1051,19 @@ def _incident_detail(
             entry["issue_id"] = int(member["issue_id"])
         detailed.append(entry)
 
-    roots = sum(1 for m in members if m["role"] == "root")
+    # Counts describe the incident's CURRENT shape (cleared_ts IS NULL); the
+    # cleared rows above still appear in the member list, flagged current=False,
+    # but must not inflate the headline "groups N issues" the historical union
+    # would report.
+    current_members = [m for m in members if m["cleared_ts"] is None]
+    roots = sum(1 for m in current_members if m["role"] == "root")
+    symptoms_n = len(current_members) - roots
+    cleared_n = len(members) - len(current_members)
+    cleared_note = f" ({cleared_n} former member(s) cleared)" if cleared_n else ""
     summary = (
         f"{incident['title']} ({incident['severity'].upper()}, {incident['state']}) groups "
-        f"{len(members)} issue(s): {roots} root cause and {len(members) - roots} symptom(s)."
+        f"{len(current_members)} issue(s): {roots} root cause and {symptoms_n} symptom(s)"
+        f"{cleared_note}."
     )
     return {
         "summary": summary,

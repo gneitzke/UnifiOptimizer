@@ -141,9 +141,17 @@ export function IncidentDetailPage() {
   // is suppressed now — the same all-members rule the incidents list uses to drop
   // a fully-muted incident (Gitea #49/#50). A partially-suppressed incident still
   // offers "Suppress incident" so one action parks the whole story.
+  //
+  // C5: only CURRENT members count. The suppress endpoint mutates just the
+  // incident's current membership (`current_incident_issue_ids`, cleared_ts IS
+  // NULL) — so a cleared FORMER symptom that is not suppressed must not keep
+  // "Suppress incident" showing forever when every current member is already
+  // suppressed. `current !== false` keeps older payloads (no flag) counting as
+  // current, matching the optional-field contract in api.ts.
   const members = [...(root ? [root] : []), ...symptoms];
+  const currentMembers = members.filter((m) => m.current !== false);
   const allSuppressed =
-    members.length > 0 && members.every((m) => isSuppressedNow(m.issue, now));
+    currentMembers.length > 0 && currentMembers.every((m) => isSuppressedNow(m.issue, now));
 
   return (
     <div className="px-6 py-6 mx-auto flex flex-col gap-4" style={{ maxWidth: 1000 }}>

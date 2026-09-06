@@ -344,6 +344,105 @@ def test_unknown_incident_points_back_at_the_list_tool(demo_repo: Repository) ->
 
 
 # --------------------------------------------------------------------------- #
+# 5b. C5: current vs historical incident membership (Finding #7)
+#
+# Build a real correlatable cluster (mesh root + coverage-hole symptom on the
+# same AP), run the actual correlation engine, resolve the symptom out, and run
+# a second pass so the symptom is *cleared* (kept as history, cleared_ts set)
+# while the root and incident stay open. This is the exact scenario the round-10
+# verifier drove; it exercises the historical-vs-current mismatch directly.
+# --------------------------------------------------------------------------- #
+_C5_BASE = 1_700_000_000
+
+
+def _incident_with_cleared_symptom(tmp_db_path: Any) -> tuple[Repository, int, int, int]:
+    """Returns ``(store, incident_id, root_issue_id, symptom_issue_id)`` after the
+    symptom has been resolved out and cleared by a second correlation pass."""
+    from netadmin.correlate.engine import CorrelationEngine
+    from netadmin.correlate.store_repository import StoreCorrelationRepository
+    from netadmin.domain.entities import Entity
+    from netadmin.domain.types import EntityType
+
+    store = Repository.open(tmp_db_path)
+    ap = store.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="02:00:00:00:00:07", name="Cleared Porch"),
+        ts=_C5_BASE,
+    )
+    root = store.insert_issue(
+        fingerprint="mesh-root-clear",
+        detector_key="wifi.mesh_uplink",
+        severity="p2",
+        state="active",
+        first_seen_ts=_C5_BASE,
+        last_seen_ts=_C5_BASE + 600,
+        title="Weak mesh backhaul on Cleared Porch",
+        entity_id=ap,
+    )
+    symptom = store.insert_issue(
+        fingerprint="cov-hole-clear",
+        detector_key="net.coverage_hole",
+        severity="p2",
+        state="active",
+        first_seen_ts=_C5_BASE + 300,
+        last_seen_ts=_C5_BASE + 600,
+        title="Coverage hole on Cleared Porch",
+        entity_id=ap,
+    )
+    engine = CorrelationEngine(StoreCorrelationRepository(store))
+    engine.run(_C5_BASE + 900)
+    inc_id = int(store.list_incidents(open_only=True)[0]["id"])
+    assert store.current_incident_issue_ids(inc_id) == {root, symptom}
+
+    store.update_issue(symptom, state="resolved", resolved_ts=_C5_BASE + 700)
+    engine.run(_C5_BASE + 1000)  # reconcile pass that stamps cleared_ts
+
+    assert store.current_incident_issue_ids(inc_id) == {root}  # symptom cleared
+    assert store.incident_member_counts([inc_id])[inc_id] == 2  # historical union kept
+    return store, inc_id, root, symptom
+
+
+def test_incidents_overview_standalone_never_goes_negative_after_a_clear(tmp_db_path: Any) -> None:
+    """Finding #7 (MCP overview): the grouped/standalone arithmetic must use
+    CURRENT membership. With the historical count (2) the one remaining open issue
+    yielded ``-1 standalone open issue(s)``; current membership (1) makes it 0."""
+    store, inc_id, _root, _symptom = _incident_with_cleared_symptom(tmp_db_path)
+    try:
+        result = tools.call_tool(store, "netadmin_incidents", {}, now=_C5_BASE + 1100)
+        summary = result["summary"]
+        assert "-1" not in summary
+        assert "standalone open issue(s)" in summary
+        # The one open issue (the root) IS the grouped issue -> 0 standalone.
+        assert "grouping 1 issue(s)" in summary
+        assert "0 standalone open issue(s)" in summary
+        card = next(i for i in result["incidents"]["items"] if i["incident_id"] == inc_id)
+        assert card["member_count"] == 1  # current, not the historical union of 2
+    finally:
+        store.close()
+
+
+def test_incident_detail_marks_cleared_members_and_counts_current(tmp_db_path: Any) -> None:
+    """Finding #7 (MCP detail): cleared members must be flagged (not presented as
+    current), and the headline count must describe the current shape (1 root, 0
+    current symptoms) even though the cleared symptom still appears in the list."""
+    store, inc_id, root, symptom = _incident_with_cleared_symptom(tmp_db_path)
+    try:
+        result = tools.call_tool(
+            store, "netadmin_incidents", {"incident": inc_id}, now=_C5_BASE + 1100
+        )
+        by_role = {m["role"]: m for m in result["members"]["items"]}
+        assert by_role["root"]["current"] is True
+        assert by_role["root"]["membership"] == "current"
+        assert by_role["symptom"]["current"] is False
+        assert by_role["symptom"]["membership"] == "cleared"
+        assert by_role["symptom"]["cleared_ts"] is not None
+        # Headline reflects current membership, not the historical union of 2.
+        assert "1 issue(s): 1 root cause and 0 symptom(s)" in result["summary"]
+        assert "1 former member(s) cleared" in result["summary"]
+    finally:
+        store.close()
+
+
+# --------------------------------------------------------------------------- #
 # 6. netadmin_sle_trend
 # --------------------------------------------------------------------------- #
 def test_sle_trend_auto_buckets_by_window_length(demo_repo: Repository) -> None:
