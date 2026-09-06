@@ -69,12 +69,23 @@ def _settings(key: str, **overrides) -> SimpleNamespace:
 
 
 def seed_cov(repo: Repository, *, now: int = NOW, jobs=("fast_device", "fast_sta")) -> None:
-    """Full live coverage for the given jobs over the last 600 s (10 polls each)."""
+    """Full live coverage for the given jobs over the last 600 s (10 polls each).
+
+    Also records a completed event-source coverage interval spanning the widest
+    detector window (8 days), so B4's event-coverage gate on the event-driven
+    detectors (pingpong / roam_quality / dfs_recurring) reads a healthy feed. A
+    test modelling an event-feed *gap* seeds its own partial/absent coverage
+    instead of calling this.
+    """
     for job in jobs:
         ts = now - 600 + 60
         while ts <= now:
             repo.record_poll_run(job=job, ok=True, ts=ts)
             ts += 60
+    repo.record_ingest_coverage(
+        kind="event_history", scope="site", interval="retained",
+        start_ts=now - 8 * DAY, end_ts=now, status="complete",
+    )
 
 
 def seed_low_cov(repo: Repository, *, now: int = NOW, jobs=("fast_device", "fast_sta")) -> None:
@@ -602,6 +613,36 @@ def test_roam_quality_unknown_on_low_coverage(repo: Repository) -> None:
     assert RoamQualityDetector().evaluate(_ctx(repo)) is UNKNOWN
 
 
+def _seed_poll_only(repo: Repository, *, now: int = NOW, jobs=("fast_device", "fast_sta")) -> None:
+    """Healthy live *poll* coverage only -- no event-source coverage at all.
+
+    Lets a test drive the B4 event-coverage gate in isolation: the poll gate
+    (fast_sta / fast_device) clears, so whether the detector speaks turns purely
+    on event coverage.
+    """
+    for job in jobs:
+        ts = now - 600 + 60
+        while ts <= now:
+            repo.record_poll_run(job=job, ok=True, ts=ts)
+            ts += 60
+
+
+def test_roam_quality_unknown_on_half_covered_event_window(repo: Repository) -> None:
+    """B4(a): a 60-min window with only the last 30 min of event coverage is ~0.5
+    observed -- far below the 0.9 event floor. Bad roams that would fire on a fully
+    observed feed must FREEZE to UNKNOWN, never clear, on a half-observed one."""
+    _seed_poll_only(repo)  # polling healthy -> not a poll gap
+    # Only the most recent half of the 3600 s window has completed event coverage.
+    repo.record_ingest_coverage(
+        kind="event_history", scope="site", interval="retained",
+        start_ts=NOW - 1800, end_ts=NOW, status="complete",
+    )
+    cid = mk_client(repo, "cli-1")
+    _roam_pair(repo, cid, NOW - 1000, before=-55.0, after=-75.0)
+    _roam_pair(repo, cid, NOW - 500, before=-55.0, after=-75.0)
+    assert RoamQualityDetector().evaluate(_ctx(repo)) is UNKNOWN
+
+
 # ====================================================================== #
 # wifi.min_rssi_misconfig
 # ====================================================================== #
@@ -924,6 +965,23 @@ def test_dfs_suppressed_on_single_hit(repo: Repository) -> None:
 
 def test_dfs_unknown_on_low_coverage(repo: Repository) -> None:
     seed_low_cov(repo)
+    ap1 = mk_ap(repo, "ap-1")
+    for j in range(1, 9):
+        _radar(repo, ap1, NOW - j * DAY)
+    assert DfsRecurringDetector().evaluate(_ctx(repo)) is UNKNOWN
+
+
+def test_dfs_unknown_on_half_covered_event_window(repo: Repository) -> None:
+    """B4(a): recurring radar over the 7-day lookback, poll coverage healthy, but
+    the event feed was observed for only ~half the lookback (0.5 < 0.9 floor).
+    A DFS-plagued AP must FREEZE to UNKNOWN, not read as quiet-and-cleared."""
+    _seed_poll_only(repo)
+    window_s = 7 * DAY
+    # Only the most recent half of the lookback has completed event coverage.
+    repo.record_ingest_coverage(
+        kind="event_history", scope="site", interval="retained",
+        start_ts=NOW - window_s // 2, end_ts=NOW, status="complete",
+    )
     ap1 = mk_ap(repo, "ap-1")
     for j in range(1, 9):
         _radar(repo, ap1, NOW - j * DAY)

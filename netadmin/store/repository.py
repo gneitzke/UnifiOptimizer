@@ -1014,11 +1014,27 @@ class Repository:
         return inserted
 
     # C7: the event listener periodically replays these rows through its
-    # normalizer after inventory discovers their MACs.
+    # normalizer after inventory discovers their MACs.  The selection must return
+    # only *repairable* rows: a bare ``entity_id IS NULL OR related_entity_id IS
+    # NULL`` also matches ordinary AP / switch / gateway events, whose scope has
+    # NO related entity at all -- their ``related_entity_id`` is permanently NULL,
+    # not pending.  Left in, those unrepairable rows are re-selected every pass
+    # and, being oldest, permanently fill the ``LIMIT`` window and starve later
+    # client events whose from-AP has since been discovered (the C7 starvation
+    # bug).  A row is genuinely repairable only when either:
+    #   * ``entity_id IS NULL`` -- the primary entity (client or device) has not
+    #     resolved yet and may now exist in inventory; or
+    #   * ``related_entity_id IS NULL`` AND the resolved primary is a CLIENT --
+    #     the only scope that carries a related (from-)AP that can still resolve.
+    # Device-scoped events with a resolved primary and a NULL related are terminal
+    # and are excluded, so they can never crowd out repairable client events.
     def unresolved_events(self, *, limit: int = 500) -> list[sqlite3.Row]:
         return self._conn.execute(
-            "SELECT id, data FROM events WHERE entity_id IS NULL OR related_entity_id IS NULL "
-            "ORDER BY ts, id LIMIT ?",
+            "SELECT ev.id AS id, ev.data AS data FROM events ev "
+            "LEFT JOIN entities en ON en.entity_id = ev.entity_id "
+            "WHERE ev.entity_id IS NULL "
+            "   OR (ev.related_entity_id IS NULL AND en.entity_type = 'client') "
+            "ORDER BY ev.ts, ev.id LIMIT ?",
             (max(1, limit),),
         ).fetchall()
 
@@ -1038,10 +1054,23 @@ class Repository:
             )
             return cur.rowcount > 0
 
+    def _table_exists(self, name: str) -> bool:
+        """True when ``name`` is a real table in this database.
+
+        A read path must never issue DDL: on a read-only connection (or a reader
+        replica) ``CREATE TABLE IF NOT EXISTS`` raises ``OperationalError`` even
+        though it would be a no-op. Readers consult this instead so a missing
+        table degrades to an empty/unknown result rather than raising.
+        """
+        row = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", (name,)
+        ).fetchone()
+        return row is not None
+
     # C3/C4: completed controller-history coverage is distinct from the newest
-    # live arrival/sample.  The table is deliberately narrow and additive: it
-    # can be created safely for existing databases without changing any shared
-    # repository method or migration contract.
+    # live arrival/sample.  The ``ingest_coverage`` table is created by migration
+    # 0011; this writer-side ensure remains as a belt-and-braces guard on the
+    # WRITE connection only (never on a read path -- see :meth:`_table_exists`).
     def _ensure_ingest_coverage(self, conn: sqlite3.Connection) -> None:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS ingest_coverage ("
@@ -1078,7 +1107,8 @@ class Repository:
     def failed_ingest_coverage(
         self, *, kind: str, scope: str, interval: Optional[str] = None
     ) -> list[sqlite3.Row]:
-        self._ensure_ingest_coverage(self._conn)
+        if not self._table_exists("ingest_coverage"):
+            return []
         clauses = ["kind=?", "scope=?", "status='failed'"]
         params: list[Any] = [kind, scope]
         if interval is not None:
@@ -1091,21 +1121,65 @@ class Repository:
 
     # C4: this is a coverage cursor, never a proxy derived from samples.
     def latest_ingest_coverage_end(self, *, kind: str, scope: str) -> Optional[int]:
-        self._ensure_ingest_coverage(self._conn)
+        if not self._table_exists("ingest_coverage"):
+            return None
         row = self._conn.execute(
             "SELECT MAX(end_ts) AS end_ts FROM ingest_coverage "
             "WHERE kind=? AND scope=? AND status='complete'", (kind, scope)
         ).fetchone()
         return None if row is None or row["end_ts"] is None else int(row["end_ts"])
 
-    # B4: event-source observation coverage as a fraction of a detector window,
-    # read from the completed ``ingest_coverage`` intervals the event catch-up
-    # records (``kind='event_history'``).  This is the honest event-feed gap
-    # signal: a broken WebSocket / stat/event feed stops advancing these
-    # intervals, so a detector window drifts past the last recorded coverage and
-    # the fraction falls -- it is NEVER inferred from the presence or absence of
-    # event rows (that exact conflation is the B4 false-clear bug).  Read-only,
-    # additive: it touches only the C3/C4 ledger table and no shared method.
+    # B4: intervals during which the WS event feed was CONNECTED and observing,
+    # derived from the supervisor's ``job='ws'`` liveness rows in ``poll_runs``.
+    # The supervisor writes a ``started`` transition (error='started') when it
+    # enters the subscription and a terminal transition (stopped / error /
+    # unsupported) when the attempt ends; between the two the socket was up and
+    # observing (a quiet healthy socket writes no event rows but is still
+    # covered). A ``started`` with no terminator after it is a *currently* live
+    # connection, covered through ``end_ts``. This is the healthy-WS-only signal:
+    # a live feed reads as covered even before it has written any history-catchup
+    # coverage row, so 'no catch-up rows yet' never means 'frozen forever'.
+    def _ws_connected_intervals(self, start_ts: int, end_ts: int) -> list[tuple[int, int]]:
+        def _is_connect(row: sqlite3.Row) -> bool:
+            return (row["error"] or "") == "started"
+
+        # The single latest ws transition strictly before the window fully
+        # determines whether the feed was already connected entering it.
+        prior = self._conn.execute(
+            "SELECT ts, error FROM poll_runs "
+            "WHERE job='ws' AND source='live' AND ts<? ORDER BY ts DESC, rowid DESC LIMIT 1",
+            (start_ts,),
+        ).fetchone()
+        open_since: Optional[int] = start_ts if (prior is not None and _is_connect(prior)) else None
+        intervals: list[tuple[int, int]] = []
+        rows = self._conn.execute(
+            "SELECT ts, error FROM poll_runs "
+            "WHERE job='ws' AND source='live' AND ts>=? AND ts<? ORDER BY ts, rowid",
+            (start_ts, end_ts),
+        ).fetchall()
+        for row in rows:
+            ts = int(row["ts"])
+            if _is_connect(row):
+                if open_since is None:
+                    open_since = ts
+            elif open_since is not None:
+                if ts > open_since:
+                    intervals.append((open_since, ts))
+                open_since = None
+        if open_since is not None and end_ts > open_since:
+            intervals.append((open_since, end_ts))
+        return intervals
+
+    # B4: event-source observation coverage as a fraction of a detector window.
+    # Two honest signals are unioned: (1) completed controller-history reads the
+    # event catch-up records (``ingest_coverage`` kind='event_history'), and (2)
+    # the WS feed's own connected-and-observing intervals (see
+    # :meth:`_ws_connected_intervals`).  This is NEVER inferred from the presence
+    # or absence of event rows (that exact conflation is the B4 false-clear bug):
+    # a broken feed stops advancing BOTH signals, so a detector window drifts past
+    # the last covered slice and the fraction falls. Read-only: it issues no DDL,
+    # so it is safe on a read-only connection, and tolerates the coverage table
+    # being absent (returns only the WS-derived coverage) rather than raising.
     def observed_event_coverage(
         self,
         start_ts: int,
@@ -1114,41 +1188,50 @@ class Repository:
         kind: str = "event_history",
         scope: str = "site",
     ) -> float:
-        """Fraction in ``[0, 1]`` of ``[start_ts, end_ts)`` covered by *completed*
-        event-source reads.
+        """Fraction in ``[0, 1]`` of ``[start_ts, end_ts)`` the event source was
+        observed for.
 
-        Overlapping/adjacent complete intervals are merged so double-counting
-        cannot push the fraction over 1.0; only the portion inside the window
-        counts. Returns ``0.0`` for a non-positive window (or when nothing is
-        recorded), which a detector treats as an event-feed gap -> UNKNOWN.
+        Completed history-read intervals and live WS-connected intervals are
+        merged (overlaps counted once, clipped to the window) so double-counting
+        cannot push the fraction over 1.0. Returns ``0.0`` for a non-positive
+        window or when nothing was observed, which a detector treats as an
+        event-feed gap -> UNKNOWN.
         """
         if end_ts <= start_ts:
             return 0.0
-        self._ensure_ingest_coverage(self._conn)
-        rows = self._conn.execute(
-            "SELECT start_ts, end_ts FROM ingest_coverage "
-            "WHERE kind=? AND scope=? AND status='complete' "
-            "AND end_ts>? AND start_ts<? ORDER BY start_ts, end_ts",
-            (kind, scope, start_ts, end_ts),
-        ).fetchall()
+        segments: list[tuple[int, int]] = []
+        # (1) Completed controller-history reads (may be absent on a fresh /
+        # WS-only store, or if the table has not been migrated in yet).
+        if self._table_exists("ingest_coverage"):
+            for row in self._conn.execute(
+                "SELECT start_ts, end_ts FROM ingest_coverage "
+                "WHERE kind=? AND scope=? AND status='complete' "
+                "AND end_ts>? AND start_ts<? ORDER BY start_ts, end_ts",
+                (kind, scope, start_ts, end_ts),
+            ).fetchall():
+                seg_start = max(int(row["start_ts"]), start_ts)
+                seg_end = min(int(row["end_ts"]), end_ts)
+                if seg_end > seg_start:
+                    segments.append((seg_start, seg_end))
+        # (2) Live WS-connected observation (the healthy WS-only signal).
+        for seg_start, seg_end in self._ws_connected_intervals(start_ts, end_ts):
+            seg_start = max(seg_start, start_ts)
+            seg_end = min(seg_end, end_ts)
+            if seg_end > seg_start:
+                segments.append((seg_start, seg_end))
+        if not segments:
+            return 0.0
+        segments.sort()
         covered = 0
-        merged_start: Optional[int] = None
-        merged_end: Optional[int] = None
-        for row in rows:
-            seg_start = max(int(row["start_ts"]), start_ts)
-            seg_end = min(int(row["end_ts"]), end_ts)
-            if seg_end <= seg_start:
-                continue
-            if merged_end is None:
-                merged_start, merged_end = seg_start, seg_end
-            elif seg_start <= merged_end:
+        merged_start, merged_end = segments[0]
+        for seg_start, seg_end in segments[1:]:
+            if seg_start <= merged_end:
                 if seg_end > merged_end:
                     merged_end = seg_end
             else:
-                covered += merged_end - merged_start  # type: ignore[operator]
+                covered += merged_end - merged_start
                 merged_start, merged_end = seg_start, seg_end
-        if merged_end is not None:
-            covered += merged_end - merged_start  # type: ignore[operator]
+        covered += merged_end - merged_start
         return min(1.0, covered / (end_ts - start_ts))
 
     def read_events(

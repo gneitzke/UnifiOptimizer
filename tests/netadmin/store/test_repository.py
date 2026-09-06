@@ -1178,3 +1178,127 @@ def test_open_read_only_never_migrates(tmp_db_path: Path) -> None:
             repo.upsert_entity(Entity(entity_type=EntityType.AP, native_id="cc:00"), ts=1)
     finally:
         repo.close()
+
+
+# ---------------------------------------------------------------------------
+# B4: observed_event_coverage -- the honest event-feed gap signal
+# ---------------------------------------------------------------------------
+def test_observed_event_coverage_credits_healthy_connected_ws(repo: Repository) -> None:
+    """B4(b): a healthy WS-only deployment that is CONNECTED and observing reads as
+    covered even with NO history-catchup coverage rows -- 'no catch-up rows yet'
+    must not mean 'frozen forever'. The supervisor recorded a single 'started'
+    liveness row when it connected (before the window) and nothing since (still up).
+    """
+    now = 2_000_000
+    start = now - 3600
+    repo.record_poll_run(job="ws", ok=True, ts=start - 100, error="started", source="live")
+    assert repo.observed_event_coverage(start, now) == pytest.approx(1.0)
+
+
+def test_observed_event_coverage_ws_started_inside_window(repo: Repository) -> None:
+    """A WS that connected partway through the window covers only from that point."""
+    now = 2_000_000
+    start = now - 3600
+    repo.record_poll_run(job="ws", ok=True, ts=start + 1800, error="started", source="live")
+    assert repo.observed_event_coverage(start, now) == pytest.approx(0.5, abs=1e-6)
+
+
+def test_observed_event_coverage_large_gap_reads_as_uncovered(repo: Repository) -> None:
+    """B4(c): a real large gap still freezes. The WS connected then dropped 600 s
+    into the hour and never reconnected; no history catch-up rows exist. Coverage
+    is ~0.167, well below the sufficiency floor, so the detector will UNKNOWN."""
+    now = 2_000_000
+    start = now - 3600
+    repo.record_poll_run(job="ws", ok=True, ts=start - 100, error="started", source="live")
+    repo.record_poll_run(
+        job="ws", ok=False, ts=start + 600, error="ConnectionResetError: peer", source="live"
+    )
+    cov = repo.observed_event_coverage(start, now)
+    assert cov == pytest.approx(600 / 3600, abs=1e-6)
+    assert cov < 0.9
+
+
+def test_observed_event_coverage_unions_ws_and_history(repo: Repository) -> None:
+    """WS-connected intervals and completed history reads are merged, not double
+    counted: WS covers the first 600 s, a catch-up row the last 600 s -> ~0.33."""
+    now = 2_000_000
+    start = now - 3600
+    repo.record_poll_run(job="ws", ok=True, ts=start - 50, error="started", source="live")
+    repo.record_poll_run(job="ws", ok=False, ts=start + 600, error="died", source="live")
+    repo.record_ingest_coverage(
+        kind="event_history", scope="site", interval="retained",
+        start_ts=now - 600, end_ts=now, status="complete",
+    )
+    assert repo.observed_event_coverage(start, now) == pytest.approx(1200 / 3600, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# New-bug: no DDL on the read path; a missing coverage table reads as unknown
+# ---------------------------------------------------------------------------
+def test_observed_event_coverage_missing_table_returns_unknown(repo: Repository) -> None:
+    """The reader must tolerate an absent ingest_coverage table without raising and
+    without issuing DDL (which a read-only connection would reject)."""
+    with repo._write() as conn:
+        conn.execute("DROP TABLE IF EXISTS ingest_coverage")
+    assert not repo._table_exists("ingest_coverage")
+    assert repo.observed_event_coverage(1000, 2000) == 0.0
+    # The read issued no CREATE TABLE: the table is still absent.
+    assert not repo._table_exists("ingest_coverage")
+    # The other ledger readers degrade the same way rather than raising.
+    assert repo.failed_ingest_coverage(kind="event_history", scope="site") == []
+    assert repo.latest_ingest_coverage_end(kind="event_history", scope="site") is None
+
+
+def test_observed_event_coverage_read_only_missing_table(tmp_db_path: Path) -> None:
+    """The exact new-bug repro: on a migrated database whose coverage table is
+    absent, a READ-ONLY connection reads unknown coverage instead of raising
+    OperationalError from a lazily-issued CREATE TABLE."""
+    rw = Repository.open(tmp_db_path)
+    with rw._write() as conn:
+        conn.execute("DROP TABLE ingest_coverage")
+    rw.close()
+    ro = Repository.open(tmp_db_path, read_only=True, migrate=True)
+    try:
+        assert ro.observed_event_coverage(1000, 2000) == 0.0
+    finally:
+        ro.close()
+
+
+# ---------------------------------------------------------------------------
+# C7: reconciliation must not let unrepairable AP events starve repairable ones
+# ---------------------------------------------------------------------------
+def test_unresolved_events_ap_flood_does_not_starve_repairable_client(repo: Repository) -> None:
+    """C7: ordinary AP events legitimately have NO related entity, so their
+    related_entity_id is permanently NULL. A flood of them (oldest) must not fill
+    the LIMIT window and starve a later, genuinely-repairable client event whose
+    primary entity has not resolved yet."""
+    ap = repo.upsert_entity(Entity(entity_type=EntityType.AP, native_id="ap:mac"), ts=1000)
+    # 600 AP events: primary resolved to the AP, related permanently NULL.
+    for i in range(600):
+        repo.record_event(
+            ts=1000 + i, key="EVT_AP_Lost_Contact", entity_id=ap,
+            related_entity_id=None, native_id=f"apev-{i}",
+        )
+    # A repairable client event arriving later: its client is not yet in inventory.
+    client_ev = repo.record_event(
+        ts=9000, key="EVT_WU_Disconnected", entity_id=None,
+        related_entity_id=None, native_id="cliev",
+    )
+
+    rows = repo.unresolved_events(limit=500)
+    returned = {int(r["id"]) for r in rows}
+    # The unrepairable AP flood is excluded; the repairable client event is present.
+    assert client_ev in returned
+    assert len(rows) == 1
+
+
+def test_unresolved_events_keeps_client_with_pending_related(repo: Repository) -> None:
+    """A client event whose primary (client) resolved but whose from-AP is still
+    pending (related NULL) IS repairable and must still be selected."""
+    client = repo.upsert_entity(Entity(entity_type=EntityType.CLIENT, native_id="cli:mac"), ts=1000)
+    ev = repo.record_event(
+        ts=2000, key="EVT_WU_Roam", entity_id=client,
+        related_entity_id=None, native_id="roamev",
+    )
+    returned = {int(r["id"]) for r in repo.unresolved_events(limit=500)}
+    assert ev in returned

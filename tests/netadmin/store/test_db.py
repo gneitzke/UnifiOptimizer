@@ -45,8 +45,8 @@ def test_migration_sets_user_version(tmp_db_path: Path) -> None:
     conn = db.connect(tmp_db_path)
     assert db.schema_version(conn) == 0
     applied = db.apply_migrations(conn)
-    assert applied == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    assert db.schema_version(conn) == 10
+    assert applied == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    assert db.schema_version(conn) == 11
     conn.close()
 
 
@@ -74,6 +74,7 @@ def test_migration_creates_all_tables(tmp_db_path: Path) -> None:
         "incidents",
         "incident_members",
         "app_meta",
+        "ingest_coverage",
     }
     assert expected <= names
     conn.close()
@@ -118,10 +119,10 @@ def test_migration_idempotent(tmp_db_path: Path) -> None:
     first = db.apply_migrations(conn)
     second = db.apply_migrations(conn)
     third = db.apply_migrations(conn)
-    assert first == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    assert first == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     assert second == []  # nothing re-applied
     assert third == []
-    assert db.schema_version(conn) == 10
+    assert db.schema_version(conn) == 11
     conn.close()
 
 
@@ -150,10 +151,34 @@ def test_migration_0010_backfills_existing_incident_member_joined_ts(
     conn.execute("ALTER TABLE incident_members DROP COLUMN cleared_ts")
     conn.execute("PRAGMA user_version=9")
 
-    assert db.apply_migrations(conn) == [10]
+    assert db.apply_migrations(conn) == [10, 11]
     member = conn.execute("SELECT * FROM incident_members").fetchone()
     assert member["joined_ts"] == 100
     assert member["cleared_ts"] is None
+    conn.close()
+
+
+def test_migration_0011_creates_ingest_coverage_table(tmp_db_path: Path) -> None:
+    """New-bug: the ingest_coverage ledger is created by migration 0011, not lazily
+    on a (possibly read-only) read path. Upgrading from v10 creates the table."""
+    conn = db.connect(tmp_db_path)
+    db.apply_migrations(conn)
+    # Reconstruct a pre-0011 database: drop the table and rewind to v10.
+    conn.execute("DROP TABLE ingest_coverage")
+    conn.execute("PRAGMA user_version=10")
+    assert not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ingest_coverage'"
+    ).fetchone()
+
+    assert db.apply_migrations(conn) == [11]
+    assert conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ingest_coverage'"
+    ).fetchone() is not None
+    assert conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' "
+        "AND name='idx_ingest_coverage_lookup'"
+    ).fetchone() is not None
+    assert db.schema_version(conn) == 11
     conn.close()
 
 
@@ -190,7 +215,7 @@ def test_migration_0005_retires_legacy_rogue_ap_issues(tmp_db_path: Path) -> Non
     # along too -- it is schema-only and touches none of the rows asserted here,
     # as does 0008 (sticky_client, a third taxonomy this fixture never seeds), and
     # 0009 (suppression columns; none of these seeded rows carry a live snooze).
-    assert db.apply_migrations(conn) == [5, 6, 7, 8, 9, 10]
+    assert db.apply_migrations(conn) == [5, 6, 7, 8, 9, 10, 11]
 
     rows = conn.execute(
         "SELECT state, resolved_ts FROM issues WHERE detector_key = 'wifi.rogue_ap'"
@@ -268,7 +293,7 @@ def test_migration_0006_retires_plan_level_channel_plan_issues(tmp_db_path: Path
     # 0007 (app_meta) rides along too -- schema-only, touches none of the rows
     # asserted below -- and so does 0008, which retires a different detector, and
     # 0009 (suppression columns; none of these seeded rows carry a live snooze).
-    assert db.apply_migrations(conn) == [6, 7, 8, 9, 10]
+    assert db.apply_migrations(conn) == [6, 7, 8, 9, 10, 11]
 
     states = dict(
         conn.execute(
@@ -352,7 +377,7 @@ def test_migration_0008_retires_per_ap_sticky_client_issues(tmp_db_path: Path) -
 
     # 0009 (suppression columns) rides along; none of these seeded rows carry a
     # live snooze, so it leaves them untouched and writes no audit event.
-    assert db.apply_migrations(conn) == [8, 9, 10]
+    assert db.apply_migrations(conn) == [8, 9, 10, 11]
 
     # Every sticky fingerprint is retired: the ap dim lives only inside the hash,
     # so SQL cannot tell the two-AP rows from the legacy dims={} one, and
@@ -597,7 +622,7 @@ def test_migration_0009_carries_live_snoozes_into_suppression(tmp_db_path: Path)
     conn.execute("PRAGMA user_version=8")  # rewind to the pre-suppression schema
     _seed_snoozes_pre_0009(conn)
 
-    assert db.apply_migrations(conn) == [9, 10]
+    assert db.apply_migrations(conn) == [9, 10, 11]
 
     # The three suppression columns now exist.
     cols = {r[1] for r in conn.execute("PRAGMA table_info(issues)").fetchall()}
