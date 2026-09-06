@@ -1658,6 +1658,102 @@ async def test_bug5_cancel_during_teardown_flush_failure_still_propagates(
 
 
 # --------------------------------------------------------------------------- #
+# FINDING#5 (round-12: the cancelling()-count check is DEFEATED by an
+# already-cancelled awaited future). The round-11 fix above detected the
+# "cancelling" state from ``current_task().cancelling() > 0``. But a
+# CancelledError raised by awaiting an ALREADY-CANCELLED future carries
+# cancelling()==0 -- the task itself was never ``.cancel()``ed, the cancel is
+# merely flowing through it. With a teardown flush that also raises
+# OperationalError, the old count-based check saw cancelling()==0, let the
+# OperationalError REPLACE the CancelledError, and the supervisor returned
+# normally (task.cancelled()==False) -- the cancel was swallowed. Fix (root
+# cause): the listener catches ``asyncio.CancelledError`` in its OWN except
+# clause (never consulting the cancelling() count), swallows a teardown storage
+# error, and re-raises so the cancel ALWAYS propagates regardless of how it
+# arose. The final drain still runs and the buffered event is rescued.
+# --------------------------------------------------------------------------- #
+class _YieldOneThenAwaitCancelledFutureWs:
+    """WS double: yields ONE event, then awaits an ALREADY-CANCELLED future so the
+    next drain step raises ``CancelledError`` with the supervise task's
+    ``cancelling()`` count still 0 -- the exact FINDING#5 case that a count-based
+    check misses. No external ``task.cancel()`` is used."""
+
+    def __init__(self, event: Event) -> None:
+        self._event = event
+        self.on_state: Optional[Any] = None
+        self._stop = SimpleNamespaceStop()
+
+    async def events(self) -> AsyncIterator[Event]:
+        if self.on_state is not None:
+            self.on_state("connected")
+        yield self._event
+        # Await an already-cancelled future: raises CancelledError immediately,
+        # WITHOUT the task ever being .cancel()ed -> current_task().cancelling()==0.
+        fut: "asyncio.Future[None]" = asyncio.get_event_loop().create_future()
+        fut.cancel()
+        await fut
+        yield self._event  # pragma: no cover - never reached
+
+    def stop(self) -> None:  # pragma: no cover - parity
+        self._stop.set()
+
+
+@pytest.mark.asyncio
+async def test_finding5_already_cancelled_future_with_teardown_failure_propagates(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = repo.record_events_enriching_entities
+    calls = {"n": 0}
+
+    def flaky(rows: object) -> int:
+        calls["n"] += 1
+        # Teardown flush (call #1, during the propagating cancel) fails -- the blip
+        # that used to mask the cancel. The supervisor's final drain (call #2)
+        # succeeds, proving the drain still ran.
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real(rows)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repo, "record_events_enriching_entities", flaky)
+
+    buffered = Event.model_validate(
+        {"_id": "buffered", "key": "EVT_X", "time": 1_721_600_000_000}
+    )
+
+    factory_calls = {"n": 0}
+
+    def factory() -> EventListener:
+        factory_calls["n"] += 1
+        return EventListener(
+            _YieldOneThenAwaitCancelledFutureWs(buffered),
+            repo,
+            flush_interval=None,
+            batch_size=50,
+        )
+
+    # max_restarts=0: were the cancel masked as an ordinary death, the loop would
+    # return normally (task.cancelled()==False) rather than propagate the cancel.
+    sup = WsSupervisor(factory, repo, backoff_base=0.0, max_restarts=0)
+    task = asyncio.create_task(sup.run())
+
+    # The cancel arises from INSIDE the drain loop (the already-cancelled future),
+    # not an external task.cancel(); it must still propagate out of the task.
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # Cancellation PROPAGATED even though cancelling()==0 (no external .cancel())...
+    assert task.cancelled()
+    # ... exactly one listener was built (no restart) ...
+    assert factory_calls["n"] == 1
+    # ... the teardown flush DID fail (the masking scenario was exercised) ...
+    assert calls["n"] >= 2
+    # ... and the final drain still ran: the buffered event was rescued and
+    # persisted, not stranded.
+    assert {r["native_id"] for r in repo.read_events(0, 2_000_000_000)} == {"buffered"}
+    assert sup._pending == []
+
+
+# --------------------------------------------------------------------------- #
 # BUG#6 (an unrecognized GET response fabricates event coverage): through the real
 # UnifiClient -> Endpoints -> catchup_events, an HTTP 200 body with no well-formed
 # success payload (e.g. ``{"error": "upstream unavailable"}`` -- no "data" key)
