@@ -41,12 +41,20 @@ from .auth import (
 logger = get_logger("ingest.unifi.client")
 
 _RETRYABLE_STATUS = frozenset({500, 502, 503, 504})
+# Transport exceptions whose OUTCOME is uncertain. On an idempotent GET each is
+# retried with backoff; on a MUTATION each surfaces as an ambiguous outcome (never
+# retried, never a definitive failure). ``ReadError``/``WriteError`` are raised when
+# the socket faults AFTER the request bytes were sent -- so on a mutation the write
+# may already have landed (D6): they belong here exactly like ``ReadTimeout``, not
+# leaking out as an unhandled failure the caller records as a clean "failed".
 _RETRYABLE_EXC = (
     httpx.ConnectError,
     httpx.ConnectTimeout,
     httpx.ReadTimeout,
     httpx.WriteTimeout,
     httpx.PoolTimeout,
+    httpx.ReadError,
+    httpx.WriteError,
     httpx.RemoteProtocolError,
 )
 

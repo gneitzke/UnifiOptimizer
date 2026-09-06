@@ -401,6 +401,39 @@ async def test_mutation_not_retried_on_ambiguous_transport_error():
 
 
 @respx.mock
+async def test_d6_mutation_post_send_read_error_is_ambiguous_single_dispatch():
+    # Verifier round 9, D6: an httpx.ReadError (socket fault AFTER the request was
+    # sent) on a MUTATION means the outcome is UNKNOWN -- the write may have landed.
+    # It must surface as UnifiAmbiguousOutcomeError with exactly ONE dispatch, never
+    # leak out as an unhandled/failed exception and never be retried.
+    _mock_login()
+    route = respx.put(f"{HOST}/proxy/network/api/s/{SITE}/rest/device/abc").mock(
+        side_effect=httpx.ReadError("connection reset after send")
+    )
+    client = _client(max_retries=3)
+    with pytest.raises(UnifiAmbiguousOutcomeError, match="outcome unknown"):
+        await client.request("PUT", "rest/device/abc", json_body={"x": 1}, allow_mutation=True)
+    assert route.call_count == 1  # exactly one dispatch -- never replayed
+    await client.aclose()
+
+
+@respx.mock
+async def test_d6_get_read_error_is_still_retried():
+    # Symmetric: a ReadError on an idempotent GET is safe to retry (as for ReadTimeout).
+    _mock_login()
+    route = respx.get(DEVICE).mock(
+        side_effect=[
+            httpx.ReadError("boom"),
+            httpx.Response(200, json={"data": [{"ok": 1}]}),
+        ]
+    )
+    client = _client(max_retries=3)
+    assert await client.get_data("stat/device") == [{"ok": 1}]
+    assert route.call_count == 2
+    await client.aclose()
+
+
+@respx.mock
 async def test_get_still_retried_on_transport_error():
     # The C2 fix must not break GET retries: a GET recovers after transient errors.
     _mock_login()
