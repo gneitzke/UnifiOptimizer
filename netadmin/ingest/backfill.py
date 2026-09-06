@@ -420,11 +420,36 @@ class Backfiller:
         for interval, c_lo, c_hi in sorted(chunks, key=lambda c: (c[1], c[2], c[0])):
             res.windows += 1
             try:
-                await self._fetch_chunk(interval, scope, c_lo, c_hi, attrs, res)
-                self._repo.record_ingest_coverage(
-                    kind="report", scope=scope, interval=interval,
-                    start_ts=c_lo, end_ts=c_hi, status="complete",
-                )
+                dropped = await self._fetch_chunk(interval, scope, c_lo, c_hi, attrs, res)
+                if dropped:
+                    # #w17b: the chunk was READ (GET ok) but at least one report row
+                    # in it was UNUSABLE -- a missing/undecodable bucket timestamp, or
+                    # a row naming a device/entity not yet in inventory (unresolved).
+                    # That row is real history we could not store, so crediting the
+                    # window 'complete' with zero (or fewer) samples fabricates
+                    # observed coverage and lets the production cursor
+                    # (latest_ingest_coverage_end, factory._last_ts_by_scope) SKIP
+                    # re-collecting the lost span once the device is discovered or the
+                    # data becomes recoverable. Mirror the event catch-up 'partial'
+                    # rule (events.catchup_events, #w16a-4): record NOT complete -- a
+                    # 'partial' hole that is queryable, never counted as observed
+                    # coverage, and NEVER advances the completion cursor
+                    # (latest_ingest_coverage_end unions only 'complete'), so the
+                    # window is re-attempted on the next sweep and lands 'complete'
+                    # once every row resolves. A genuinely EMPTY-but-successful chunk
+                    # (the source returned no rows at all for a quiet window) drops
+                    # nothing and still records 'complete' below.
+                    self._repo.record_ingest_coverage(
+                        kind="report", scope=scope, interval=interval,
+                        start_ts=c_lo, end_ts=c_hi, status="partial",
+                        detail=f"{dropped} unusable/unresolved report row(s) dropped; "
+                        "window not fully reconstructed",
+                    )
+                else:
+                    self._repo.record_ingest_coverage(
+                        kind="report", scope=scope, interval=interval,
+                        start_ts=c_lo, end_ts=c_hi, status="complete",
+                    )
             except ReportUnavailable as exc:
                 # Unsupported-over-GET is permanent for this process/controller
                 # capability, not a successful empty read and not a retryable
@@ -483,7 +508,18 @@ class Backfiller:
         end_ts: int,
         attrs: list[str],
         res: ScopeResult,
-    ) -> None:
+    ) -> int:
+        """Fetch one report chunk and store its usable rows.
+
+        Returns the number of rows READ but DROPPED as unusable -- a row with a
+        missing/undecodable bucket timestamp, or one naming a device/entity not
+        yet resolvable (unknown, not in inventory). The caller uses a non-zero
+        count to record the chunk 'partial' rather than 'complete' (#w17b): a
+        dropped row is real history we failed to reconstruct, so the window must
+        stay a retryable hole instead of silently advancing the completion cursor
+        past it. A defensive range-pad skip is NOT a drop: those rows belong to an
+        adjacent chunk and are fetched there, so they are not lost history.
+        """
         rows = await self._ep.stat_report(
             interval,
             scope,
@@ -493,10 +529,14 @@ class Backfiller:
         )
         readings: list[SampleReading] = []
         bucket_ts: set[int] = set()
+        dropped = 0
         for row in rows:
             data = row.model_dump()
             time_ms = data.get("time")
             if time_ms is None:
+                # A row with no usable bucket timestamp is unstorable history, not
+                # a padding artefact: count it so the window records 'partial'.
+                dropped += 1
                 continue
             ts = int(time_ms) // 1000
             if ts < start_ts or ts >= end_ts:
@@ -504,7 +544,12 @@ class Backfiller:
             oid = data.get("oid") or data.get("o")
             entity_id = self._resolve(scope, oid if oid is None else str(oid))
             if entity_id is None:
+                # The row names a device/entity backfill cannot resolve yet (not in
+                # inventory). It is recoverable once the sync job discovers the
+                # device, so the chunk must stay retryable ('partial'), not be
+                # credited complete with this row silently missing.
                 res.skipped_unresolved += 1
+                dropped += 1
                 continue
             for attr, metric, _kind in REPORT_METRICS[scope]:
                 value = data.get(attr)
@@ -539,6 +584,7 @@ class Backfiller:
             lo, hi = min(bucket_ts), max(bucket_ts)
             res.min_ts = lo if res.min_ts is None else min(res.min_ts, lo)
             res.max_ts = hi if res.max_ts is None else max(res.max_ts, hi)
+        return dropped
 
 
 __all__ = [

@@ -624,6 +624,143 @@ async def test_finding3_success_path_preserves_round11_end_state(repo: Repositor
     assert ep.calls == []
 
 
+class RawRowsEndpoints:
+    """Returns pre-built ``ReportRow`` objects verbatim (no range filtering).
+
+    Unlike :class:`FakeEndpoints` it does not require a ``time`` key on every
+    row, so it can replay a missing-timestamp row exactly as a controller might.
+    """
+
+    def __init__(self, rows_by_key: dict[tuple[str, str], list] | None = None) -> None:
+        self._rows = rows_by_key or {}
+        self.calls: list[dict] = []
+
+    async def stat_report(self, interval, scope, *, start_ms, end_ms, attrs):
+        self.calls.append(
+            {"interval": interval, "scope": scope, "start_ms": start_ms, "end_ms": end_ms}
+        )
+        return list(self._rows.get((interval, scope), []))
+
+
+def _report_coverage(repo: Repository, scope: str = "ap") -> list[tuple]:
+    return [
+        (r["interval"], r["start_ts"], r["end_ts"], r["status"])
+        for r in repo._conn.execute(
+            "SELECT interval, start_ts, end_ts, status FROM ingest_coverage "
+            "WHERE kind='report' AND scope=? ORDER BY start_ts, end_ts",
+            (scope,),
+        ).fetchall()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_w17b_unknown_device_row_records_partial_not_complete(repo: Repository):
+    """#w17b: a chunk that DROPPED a row naming an unknown device is 'partial'.
+
+    The known AP exists, but the report row names a different, undiscovered oid.
+    Backfill drops the row (skipped_unresolved) and inserts ZERO samples -- yet
+    the window must NOT be credited 'complete', or the production cursor
+    (latest_ingest_coverage_end) SKIPS re-collecting this lost history once the
+    device is discovered. Mirror the event catch-up 'partial' rule.
+    """
+    _ap(repo, native_id="aa:bb:cc:00:00:01")
+    ts = NOW - 1800  # inside the 1 h gap -> a single 5-minute chunk
+    rows = {
+        (FIVEMIN, "ap"): [
+            {"time": ts * 1000, "oid": "ff:ff:ff:ff:ff:ff", "rx_bytes": 42.0},
+        ]
+    }
+    bf = Backfiller(FakeEndpoints(rows), repo, scopes=("ap",))
+    result = await bf.run({"ap": NOW - 3600}, now=NOW)
+
+    assert result.rows_inserted == 0
+    assert result.scopes["ap"].skipped_unresolved == 1
+    # The window is a retryable 'partial' hole, NOT complete (the bug), NOT a
+    # transport 'failed'. One chunk was requested.
+    cov = _report_coverage(repo)
+    assert len(cov) == 1
+    assert cov[0][3] == "partial"
+    # CRITICAL: the completion cursor is NOT advanced past the dropped window, so
+    # the next sweep re-attempts it rather than silently losing the history.
+    assert repo.latest_ingest_coverage_end(kind="report", scope="ap") is None
+
+
+@pytest.mark.asyncio
+async def test_w17b_missing_timestamp_row_records_partial_not_complete(repo: Repository):
+    """#w17b: a chunk that DROPPED a row with no bucket timestamp is 'partial'."""
+    ap_id = _ap(repo, native_id="aa:bb:cc:00:00:01")
+    oid = "aa:bb:cc:00:00:01"
+    # A resolvable device, but the row carries no ``time`` -> unstorable history.
+    rows = {
+        (FIVEMIN, "ap"): [ReportRow.model_validate({"oid": oid, "rx_bytes": 42.0})],
+    }
+    ep = RawRowsEndpoints(rows)
+    bf = Backfiller(ep, repo, scopes=("ap",))
+    result = await bf.run({"ap": NOW - 3600}, now=NOW)
+
+    assert result.rows_inserted == 0
+    # No sample landed for the resolvable device (its row had no timestamp)...
+    assert repo.read_raw(repo.get_series(ap_id, "rx_bytes"), 0, NOW + 1) == []
+    # ...and every chunk that saw the dropped row is 'partial', never 'complete'.
+    cov = _report_coverage(repo)
+    assert cov, "expected at least one recorded chunk"
+    assert all(status == "partial" for _i, _s, _e, status in cov)
+    assert repo.latest_ingest_coverage_end(kind="report", scope="ap") is None
+
+
+@pytest.mark.asyncio
+async def test_w17b_empty_successful_chunk_still_records_complete(repo: Repository):
+    """#w17b: a genuinely EMPTY-but-successful chunk drops nothing -> 'complete'.
+
+    The dropped-row rule must not over-fire: a quiet window where the source
+    returned no rows at all is a real, successful, empty read and still advances
+    the cursor.
+    """
+    _ap(repo)
+    ep = FakeEndpoints()  # no rows for this window at all
+    bf = Backfiller(ep, repo, scopes=("ap",))
+    result = await bf.run({"ap": NOW - 3600}, now=NOW)
+
+    assert result.errors == 0
+    cov = _report_coverage(repo)
+    assert len(cov) == 1
+    assert cov[0][3] == "complete"
+    assert repo.latest_ingest_coverage_end(kind="report", scope="ap") is not None
+
+
+@pytest.mark.asyncio
+async def test_w17b_rerun_completes_once_device_is_known(repo: Repository):
+    """#w17b: the 'partial' hole self-heals -- a re-run resolves and completes.
+
+    First run drops the unknown-device row -> 'partial', cursor unmoved. After
+    the sync job discovers the device, a re-run over the same (not-advanced)
+    window resolves the row, stores its samples, and records 'complete'.
+    """
+    ts = NOW - 1800
+    oid = "aa:bb:cc:00:00:02"  # not yet in inventory on the first run
+    rows = {(FIVEMIN, "ap"): [{"time": ts * 1000, "oid": oid, "rx_bytes": 77.0}]}
+    ep = FakeEndpoints(rows)
+    bf = Backfiller(ep, repo, scopes=("ap",))
+
+    first = await bf.run({"ap": NOW - 3600}, now=NOW)
+    assert first.rows_inserted == 0
+    assert _report_coverage(repo)[0][3] == "partial"
+    cursor_after_partial = repo.latest_ingest_coverage_end(kind="report", scope="ap")
+    assert cursor_after_partial is None  # not advanced past the hole
+
+    # The device is discovered; the production loop re-attempts the un-advanced
+    # window (cursor is still None -> the gap is re-planned and re-fetched).
+    ap_id = _ap(repo, native_id=oid)
+    second = await bf.run({"ap": NOW - 3600}, now=NOW)
+
+    assert second.rows_inserted == 1  # one bucket x one metric now resolved
+    assert repo.read_raw(repo.get_series(ap_id, "rx_bytes"), 0, NOW + 1)[0]["value"] == 77.0
+    # The window is now genuinely complete and the cursor advances.
+    statuses = {status for _i, _s, _e, status in _report_coverage(repo)}
+    assert "complete" in statuses and "partial" not in statuses
+    assert repo.latest_ingest_coverage_end(kind="report", scope="ap") is not None
+
+
 def test_user_signal_maps_to_collector_rssi_metric():
     # Report "signal" (dBm) must land on the collector's canonical "rssi" series
     # (mapping.py stores Client.signal as "rssi"), never a divergent "signal".
