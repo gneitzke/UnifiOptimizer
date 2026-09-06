@@ -42,6 +42,40 @@ def test_parse_handles_bytes_and_garbage():
     assert EventListener._parse('{"data": 5}') == []
 
 
+def test_parse_surfaces_unusable_rows_in_explicit_event_frame():
+    """#w18a-4: a row in an EXPLICIT event frame (meta.message='events') that is
+    UNUSABLE -- no 'key' and no '_id' -- must NOT be silently discarded by the
+    parser. Pre-fix the key/_id filter hid it, so the consumer never accounted the
+    drop and event-source coverage was never severed (0 stored, drop counter 0,
+    ~0.99 coverage). It is now surfaced as an Event (with no key) so the consumer's
+    normalize->None drop accounting + coverage break fire."""
+    frame = '{"meta": {"message": "events"}, "data": [{"foo": "bar"}, {"nope": 1}]}'
+    events = EventListener._parse(frame)
+    assert len(events) == 2  # surfaced, not dropped
+    assert all(e.key is None and e.id is None for e in events)  # genuinely unusable
+
+
+def test_parse_surfaces_mixed_usable_and_unusable_event_rows():
+    """#w18a-4: a usable event row and an unusable one in the same explicit event
+    frame both reach the consumer (the usable stores, the unusable is accounted)."""
+    frame = '{"meta": {"message": "events"}, "data": [{"key": "EVT_OK", "_id": "9"}, {"junk": 1}]}'
+    events = EventListener._parse(frame)
+    assert [e.key for e in events] == ["EVT_OK", None]
+
+
+def test_parse_control_frame_rows_are_not_counted_as_unusable_events():
+    """#w18a-4 guard: a genuine NON-event control frame (device sync, ...) whose
+    rows carry no event data is still skipped entirely -- its rows are NOT
+    identifiable-but-unusable EVENT rows, so they count as no loss and must not be
+    surfaced as (unusable) events."""
+    assert EventListener._parse(CONTROL_FRAME) == []
+    # A control frame carrying a NON-event row list -> nothing surfaced.
+    assert EventListener._parse('{"meta": {"message": "speed-test"}, "data": [{"progress": 42}]}') == []
+    # ...but a control frame that happens to carry a real event row still yields it.
+    mixed = '{"meta": {"message": "speed-test"}, "data": [{"progress": 42}, {"key": "EVT_X"}]}'
+    assert [e.key for e in EventListener._parse(mixed)] == ["EVT_X"]
+
+
 # --------------------------------------------------------------------------- #
 # SSL context
 # --------------------------------------------------------------------------- #

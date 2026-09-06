@@ -254,12 +254,29 @@ class EventListener:
         if not isinstance(data, list):
             return []
 
-        # Accept explicit event frames; also accept frames whose rows look like
-        # events (have a "key") when meta.message is absent.
-        if message not in (None, "events", "event"):
+        # An EXPLICIT event frame (``meta.message`` == "events"/"event") is
+        # identifiable as an events payload no matter what its rows contain. #w18a-4:
+        # a dict row in such a frame that is UNUSABLE (no ``key`` and no ``_id``)
+        # must NOT be silently discarded here -- the old ``key``/``_id`` filter hid
+        # it from the consumer, so its drop was never accounted and event-source
+        # coverage was never severed (0 stored, drop counter 0, ~0.99 coverage). We
+        # surface EVERY dict row of an explicit event frame as an ``Event``; an
+        # unusable one validates to an Event with no ``key``, which the consumer's
+        # ``normalize`` returns None for -> the #w17a-2 drop accounting + #w18a-2
+        # coverage break fire and the detector freezes. Non-dict rows are not
+        # identifiable as events and are skipped (not a drop).
+        if message in ("events", "event"):
+            return [Event.model_validate(row) for row in data if isinstance(row, dict)]
+
+        # Not an explicit event frame. A genuine non-event control frame (device
+        # sync, speed-test progress, ...) carries a different ``meta.message`` and no
+        # event rows -- skip it entirely (unchanged: its non-event rows are NOT
+        # "identifiable-but-unusable" events, so they count as no loss). When
+        # ``meta.message`` is absent, or a control frame happens to carry rows that
+        # look like events, accept only the rows that ARE events (have "key"/"_id").
+        if message is not None:
             if not any(isinstance(r, dict) and "key" in r for r in data):
                 return []
-
         events: list[Event] = []
         for row in data:
             if isinstance(row, dict) and ("key" in row or "_id" in row):

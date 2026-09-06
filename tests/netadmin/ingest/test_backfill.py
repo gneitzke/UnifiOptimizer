@@ -761,6 +761,85 @@ async def test_w17b_rerun_completes_once_device_is_known(repo: Repository):
     assert repo.latest_ingest_coverage_end(kind="report", scope="ap") is not None
 
 
+# --------------------------------------------------------------------------- #
+# #w18a-3 (partial windows are not stranded): a 'partial' chunk is a retryable
+# hole, so (a) the retry scan must re-fetch it (not only 'failed'), and (b) the
+# completion cursor must not advance PAST it just because a later chunk landed
+# 'complete' -- the cursor is the end of the contiguous COMPLETE prefix, never
+# MAX(complete). Pre-fix a partial recorded before a later complete was skipped by
+# both the retry scan and the cursor, stranding the lost span forever.
+# --------------------------------------------------------------------------- #
+def test_w18a3_partial_blocks_cursor_and_is_retryable(repo: Repository):
+    """Repo-level: a 'partial' hole caps the completion cursor at the contiguous
+    complete prefix and is returned by the retry scan; 'unrecoverable' is terminal
+    and does NOT block the cursor (round-11/12 semantics preserved)."""
+    K, S = "report", "zz-w18a3"
+    # complete [0,100], partial [100,200], complete [200,300]. A later complete
+    # must NOT bury the earlier partial.
+    repo.record_ingest_coverage(kind=K, scope=S, interval=FIVEMIN, start_ts=0, end_ts=100, status="complete")
+    repo.record_ingest_coverage(kind=K, scope=S, interval=FIVEMIN, start_ts=100, end_ts=200, status="partial")
+    repo.record_ingest_coverage(kind=K, scope=S, interval=FIVEMIN, start_ts=200, end_ts=300, status="complete")
+    # (b) cursor stops at the contiguous complete prefix (100), NOT MAX(complete)=300.
+    assert repo.latest_ingest_coverage_end(kind=K, scope=S) == 100
+    # (a) the retry scan treats the partial as a retryable hole.
+    retry = repo.failed_ingest_coverage(kind=K, scope=S)
+    assert [(int(r["start_ts"]), int(r["end_ts"]), r["status"]) for r in retry] == [(100, 200, "partial")]
+
+    # Once the partial is re-fetched and completed, the cursor jumps forward.
+    repo.record_ingest_coverage(kind=K, scope=S, interval=FIVEMIN, start_ts=100, end_ts=200, status="complete")
+    assert repo.failed_ingest_coverage(kind=K, scope=S) == []
+    assert repo.latest_ingest_coverage_end(kind=K, scope=S) == 300
+
+    # unrecoverable is terminal: it must not freeze the cursor on lost history.
+    K2, S2 = "report", "zz-w18a3-unrec"
+    repo.record_ingest_coverage(kind=K2, scope=S2, interval=FIVEMIN, start_ts=0, end_ts=100, status="complete")
+    repo.record_ingest_coverage(kind=K2, scope=S2, interval=FIVEMIN, start_ts=100, end_ts=150, status="unrecoverable")
+    repo.record_ingest_coverage(kind=K2, scope=S2, interval=FIVEMIN, start_ts=150, end_ts=200, status="complete")
+    assert repo.failed_ingest_coverage(kind=K2, scope=S2) == []
+    assert repo.latest_ingest_coverage_end(kind=K2, scope=S2) == 200
+
+
+@pytest.mark.asyncio
+async def test_w18a3_partial_then_later_complete_chunk_not_stranded(repo: Repository):
+    """End-to-end: an OLDER unknown-device chunk records 'partial' and a NEWER
+    empty chunk records 'complete'. Pre-fix the newer 'complete' advanced the
+    production cursor PAST the partial and the retry scan ignored it, so the next
+    run fetched only newer intervals and the lost span was stranded (zero samples
+    ever). Post-fix the cursor does not skip the partial and, once the device is
+    discovered, a re-run driven by the production cursor re-fetches the partial
+    window and completes it with a real sample."""
+    _ap(repo, native_id="aa:bb:cc:00:00:01")  # a KNOWN, unrelated AP exists
+    # 20-min gap -> the 5-min tier; force TWO 600 s chunks so the older one carries
+    # the unknown-device row (partial) and the newer one is empty (complete).
+    closed_end = NOW - (NOW % INTERVAL_SECONDS[FIVEMIN])
+    last_ts = closed_end - 1000  # spans two 600 s chunks up to closed_end
+    older_ts = closed_end - 900  # lands in the older chunk
+    oid = "aa:bb:cc:00:00:02"    # NOT in inventory on the first run
+    rows = {(FIVEMIN, "ap"): [{"time": older_ts * 1000, "oid": oid, "rx_bytes": 77.0}]}
+    ep = FakeEndpoints(rows)
+    bf = Backfiller(ep, repo, scopes=("ap",), chunk_seconds={FIVEMIN: 600})
+
+    first = await bf.run({"ap": last_ts}, now=NOW)
+    assert first.rows_inserted == 0
+    statuses = {s for _i, _s, _e, s in _report_coverage(repo)}
+    assert "partial" in statuses and "complete" in statuses
+    # (b) the cursor did NOT advance past the older partial onto the newer complete.
+    cursor = repo.latest_ingest_coverage_end(kind="report", scope="ap")
+    assert cursor is None or cursor <= older_ts
+    # (a) the partial is a retryable hole.
+    assert any(r["status"] == "partial" for r in repo.failed_ingest_coverage(kind="report", scope="ap"))
+
+    # The sync job discovers the device; a re-run driven by the (un-skipped) cursor
+    # re-fetches the partial window and completes it -- non-zero samples, no strand.
+    ap_id = _ap(repo, native_id=oid)
+    second = await bf.run({"ap": cursor}, now=NOW)
+    assert second.rows_inserted >= 1
+    assert repo.read_raw(repo.get_series(ap_id, "rx_bytes"), 0, NOW + 1)[0]["value"] == 77.0
+    final = {s for _i, _s, _e, s in _report_coverage(repo)}
+    assert "partial" not in final
+    assert repo.latest_ingest_coverage_end(kind="report", scope="ap") is not None
+
+
 def test_user_signal_maps_to_collector_rssi_metric():
     # Report "signal" (dBm) must land on the collector's canonical "rssi" series
     # (mapping.py stores Client.signal as "rssi"), never a divergent "signal".
