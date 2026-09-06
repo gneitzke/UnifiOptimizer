@@ -573,6 +573,18 @@ class EventListener:
         self._pending_raw: list[Event] = []
         self._max_pending = max(1_000, self._batch_size * 4)
         self._storage_error: Optional[BaseException] = None
+        # #w17a-2 (unusable-event drop earns no false coverage): count of events
+        # consumed off the socket that ``normalize`` judged structurally UNUSABLE
+        # (returned None -- e.g. a disconnect with no usable timestamp) since the
+        # last heartbeat. Such an event is dropped and can never be re-processed,
+        # but the drop still means we CANNOT vouch the event stream was observed
+        # intact over this span: a heartbeat asserts "connected AND draining USABLE
+        # events successfully". So a flush tick that dropped one or more unusable
+        # events suppresses this period's positive-liveness beat (mirrors the
+        # catch-up 'partial' rule), and coverage is not credited over a window where
+        # usable events were being discarded. Reset when a beat opportunity consumes
+        # it, so a subsequent clean tick heartbeats normally.
+        self._unusable_dropped_since_beat = 0
         self.terminal_state: Optional[str] = None
         self.written = 0
         # R3: surface the low-level socket's real connection state. The ws listener
@@ -746,6 +758,17 @@ class EventListener:
             and ts - self._last_heartbeat_ts < self._heartbeat_interval
         ):
             return
+        # #w17a-2 (unusable-event drop earns no false coverage): if any event was
+        # dropped as structurally unusable since the last beat, this period was NOT
+        # a fully-observed, cleanly-draining span -- usable events may have been
+        # discarded alongside it. A heartbeat asserts "connected AND draining USABLE
+        # events successfully", so withhold it and consume the marker; the run of
+        # liveness ends at the last truly-clean beat and a detector freezes to
+        # UNKNOWN over the drop span. A later clean tick (marker back to 0) beats
+        # again and reopens coverage, exactly like the raw-retry recovery path.
+        if self._unusable_dropped_since_beat:
+            self._unusable_dropped_since_beat = 0
+            return
         # D5: this beat proves storage is healthy right now. Give the supervisor a
         # chance to hand off any events rescued from a prior listener while THIS
         # listener is still alive, instead of stranding them until it dies. BUG#4:
@@ -845,6 +868,17 @@ class EventListener:
                         # event stays in the buffer the supervisor rescues, so a
                         # raise here loses nothing.
                         raise RuntimeError("WS event storage queue is full")
+                    continue
+                if record is None:
+                    # #w17a-2: ``normalize`` judged this event structurally
+                    # UNUSABLE (e.g. a disconnect with no usable timestamp) and
+                    # dropped it. It can never be stored or re-processed, but we can
+                    # no longer vouch the event stream was observed intact here:
+                    # record the drop so the next flush tick withholds its
+                    # positive-liveness heartbeat (see :meth:`_maybe_heartbeat`),
+                    # leaving the span over which usable events were being discarded
+                    # UNcovered rather than falsely credited.
+                    self._unusable_dropped_since_beat += 1
                     continue
                 if record is not None:
                     # Buffer the consumed event BEFORE any flush. A WS event has

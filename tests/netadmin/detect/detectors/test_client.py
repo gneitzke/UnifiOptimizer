@@ -239,6 +239,56 @@ def test_flaky_unknown_on_low_coverage(repo: Repository) -> None:
     assert FlakyClientDetector().evaluate(_ctx(repo)) is UNKNOWN
 
 
+def test_w17a1_flaky_freezes_when_same_second_disconnects_sever_ws_coverage(
+    repo: Repository,
+) -> None:
+    """#w17a-1 end to end: a WS feed CONNECTED ~30 s out of every 90 s, whose drop
+    is recorded in the SAME second as the c+30 beat, must read as mostly UNCOVERED
+    so a real client.flaky issue FREEZES. Pre-fix the same-second disconnect was
+    ignored (the sever test was strictly between beats), the 60 s c+30 -> c+90 gap
+    fell inside the cadence bridge, and ~98% fabricated coverage false-cleared the
+    issue. No ingest_coverage is seeded, so the WS heartbeats are the only
+    event-source signal."""
+    seed_coverage(repo, job="fast_sta", now=NOW, window_s=3600, interval_s=60)
+    c = NOW - 3600
+    while c < NOW:
+        repo.record_ws_heartbeat(ts=c)
+        repo.record_ws_heartbeat(ts=c + 30)
+        # The drop shares the c+30 beat's second, recorded just after it.
+        repo.record_poll_run(
+            job="ws", ok=True, ts=c + 30, error="disconnected", source="live"
+        )
+        c += 90
+    ap = _ap(repo, "ap-1")
+    cid = _client(repo, mac="ss:1", ap_id=ap)
+    for k in range(6):
+        _disconnect(repo, cid, ap, NOW - 100 - k * 10, reason=1)
+    assert FlakyClientDetector().evaluate(_ctx(repo)) is UNKNOWN
+
+
+def test_w17a1_flaky_fires_when_healthy_ws_feed_missed_one_beat(
+    repo: Repository,
+) -> None:
+    """#w17a-1 control: a healthy WS feed (one missed beat, NO disconnect) stays
+    covered, so the same disconnects fire a verdict rather than freezing -- the
+    closed-interval sever does not break the healthy single-missed-beat bridge."""
+    seed_coverage(repo, job="fast_sta", now=NOW, window_s=3600, interval_s=60)
+    ts = NOW - 3600 - 30
+    skip_at = NOW - 1800
+    while ts < NOW:
+        if ts != skip_at:
+            repo.record_ws_heartbeat(ts=ts)
+        ts += 30
+    repo.record_ws_heartbeat(ts=NOW - 1)
+    ap = _ap(repo, "ap-1")
+    cid = _client(repo, mac="ss:2", ap_id=ap)
+    for k in range(6):
+        _disconnect(repo, cid, ap, NOW - 100 - k * 10, reason=1)
+    findings = FlakyClientDetector().evaluate(_ctx(repo))
+    assert findings is not UNKNOWN
+    assert len(findings) == 1
+
+
 # ====================================================================== #
 # client.dhcp
 # ====================================================================== #

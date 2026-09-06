@@ -1445,6 +1445,98 @@ def test_d2_no_heartbeat_while_raw_event_pending_renormalization(
 
 
 # --------------------------------------------------------------------------- #
+# #w17a-2 (unusable-event drop earns no false coverage): a WS event the parser
+# consumes but ``normalize`` judges structurally UNUSABLE (returns None -- e.g. a
+# disconnect with NO usable timestamp) is dropped. Pre-fix the drop recorded no
+# loss and did not invalidate liveness, so the periodic flusher kept emitting its
+# 'healthy drain' heartbeat -- crediting observed coverage across a span where
+# usable events were being discarded, which lets an event-based detector treat the
+# span as observed and false-clear a live issue. A heartbeat asserts "connected AND
+# draining USABLE events successfully"; a tick that dropped an unusable event must
+# WITHHOLD it, so the drop span reads UNcovered and detectors freeze there.
+# --------------------------------------------------------------------------- #
+def _unusable_event(i: int) -> Event:
+    # _id/key/ap present but NO usable timestamp -> ``normalize`` returns None (see
+    # test_w16a4_unusable_event_window_not_complete for the catch-up half).
+    return Event.model_validate(
+        {"_id": f"lost{i}", "key": "EVT_AP_Lost", "ap": "02:00:99:99:99:99"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_w17a2_unusable_ws_events_store_nothing_and_count_as_dropped(
+    repo: Repository,
+) -> None:
+    """#w17a-2 (real parser+consumer): 120 missing-timestamp events drained through
+    the real listener store NOTHING and are ALL counted as unusable drops -- the
+    signal the flusher uses to withhold its liveness heartbeat."""
+    listener = EventListener(
+        FakeWs([_unusable_event(i) for i in range(120)]), repo, flush_interval=None
+    )
+    written = await listener.run()
+    assert written == 0
+    assert repo.read_events(0, 2_000_000_000) == []
+    assert listener._unusable_dropped_since_beat == 120
+
+
+def test_w17a2_unusable_drops_suppress_heartbeat_and_freeze(repo: Repository) -> None:
+    """#w17a-2: a flush tick that DROPPED an unusable event emits NO heartbeat, so
+    an hour of missing-timestamp disconnects earns ZERO coverage and client.flaky
+    FREEZES (UNKNOWN). Pre-fix the flusher heartbeated every tick regardless of the
+    drop, fabricating ~full coverage over an unobserved span."""
+    now = 3_300_000
+    start = now - 3600
+    seed_coverage(repo, job="fast_sta", now=now, window_s=3600, interval_s=60)
+    ap = repo.upsert_entity(
+        Entity(entity_type=EntityType.AP, native_id="ap-uw", site_id="default"), ts=now
+    )
+    repo.upsert_entity(
+        Entity(
+            entity_type=EntityType.CLIENT, native_id="cc:uw", site_id="default",
+            parent_id=ap, first_seen_ts=now - 100_000,
+        ),
+        ts=now,
+    )
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=0.0)
+    listener.connection_state = "connected"
+    # Every 30 s the consumer dropped an unusable event this period (as the real run
+    # loop increments the counter -- see the test above). Each flush tick then tries
+    # to beat and must be SUPPRESSED because the period was not cleanly drained.
+    t = start
+    while t < now:
+        listener._unusable_dropped_since_beat += 1  # a drop happened this period
+        listener._flush()                            # empty batch, nothing to store
+        listener._maybe_heartbeat(now=t)
+        listener._last_heartbeat_ts = None           # rate limit is not the guard here
+        t += 30
+    beats = [r for r in repo.read_poll_runs("ws", 0, 10_000_000) if r["error"] == "heartbeat"]
+    assert beats == []  # NO positive liveness while usable events were being dropped
+    assert repo.observed_event_coverage(start, now) == 0.0
+    ctx = DetectorContext(
+        repo=repo, baselines=FakeBaselines(), now_ts=now, site_id="default", settings=None
+    )
+    assert FlakyClientDetector().evaluate(ctx) is UNKNOWN
+
+
+def test_w17a2_clean_ticks_still_heartbeat_and_cover(repo: Repository) -> None:
+    """#w17a-2 control: with NO unusable drops, the connected-and-draining feed
+    heartbeats every tick and the span stays covered -- the fix leaves the healthy
+    path untouched."""
+    now = 3_400_000
+    start = now - 3600
+    listener = EventListener(FakeWs([]), repo, flush_interval=None, heartbeat_interval=0.0)
+    listener.connection_state = "connected"
+    t = start
+    while t < now:
+        listener._flush()
+        listener._maybe_heartbeat(now=t)
+        listener._last_heartbeat_ts = None
+        t += 30
+    listener._maybe_heartbeat(now=now - 1)
+    assert repo.observed_event_coverage(start, now) >= EVENT_COVERAGE_MIN
+
+
+# --------------------------------------------------------------------------- #
 # D5 (rescued events must not strand). (1) When storage recovers DURING a
 # replacement listener's life, the events rescued from a prior dead listener must
 # be persisted PROMPTLY -- not left queued until this new listener itself dies. The
