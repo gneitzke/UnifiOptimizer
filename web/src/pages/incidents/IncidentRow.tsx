@@ -40,17 +40,34 @@ export function IncidentRow({
   // the CURRENT count the cache was fetched at, and refetching whenever it
   // drifts from the live prop, keeps the cache honest without refetching on
   // every poll when membership hasn't actually changed.
-  const [symptomsFetchedAtCount, setSymptomsFetchedAtCount] = useState<number | null>(null);
-  // C5 (round 17): tracks the count a fetch most recently FAILED at, distinct
-  // from `symptomsFetchedAtCount` (which now only ever records a SUCCESS —
-  // see `fetchSymptoms` below). This exists purely to stop the passive
+  //
+  // C5 (round 18): count alone misses a membership REPLACEMENT at a constant
+  // count (symptom A clears, symptom B joins in the same reconcile pass —
+  // `member_count`/`symptom_count` doesn't move). `IncidentSummary` carries no
+  // membership identity/version, so the best available signal is
+  // `last_seen_ts`: the correlation engine sets it from
+  // `max(member.issue.last_seen_ts)` on every reconcile (`engine.py`'s
+  // `_reconcile` — see `evidence_ts` / `prev.last_seen_ts = max(...)`), so a
+  // membership change from fresh evidence (the realistic case a replacement
+  // is triggered by) advances it even when the count doesn't. The cache key
+  // is therefore the PAIR (count, last_seen_ts), not count alone.
+  const [symptomsFetchedAt, setSymptomsFetchedAt] = useState<{
+    count: number;
+    seen: number;
+  } | null>(null);
+  // C5 (round 17): tracks the signature a fetch most recently FAILED at,
+  // distinct from `symptomsFetchedAt` (which now only ever records a SUCCESS
+  // — see `fetchSymptoms` below). This exists purely to stop the passive
   // in-place effect from spinning: without it, a persistently-failing fetch
   // would leave `stale` true forever, and the effect would refire the moment
   // `loadingSymptoms` flips back to false, forever. A manual expand
   // (`toggle`) ignores this and always retries, matching "retry on next user
   // expand"; it's only the automatic effect that backs off once a given
-  // count has already failed.
-  const [symptomsFailedAtCount, setSymptomsFailedAtCount] = useState<number | null>(null);
+  // signature has already failed.
+  const [symptomsFailedAt, setSymptomsFailedAt] = useState<{
+    count: number;
+    seen: number;
+  } | null>(null);
   const [loadingSymptoms, setLoadingSymptoms] = useState(false);
 
   const isGroup = incident.symptom_count > 0;
@@ -58,31 +75,41 @@ export function IncidentRow({
   const headTitle = root?.title ?? incident.title;
   const href = isGroup ? `/incidents/${incident.id}` : `/issues/${incident.root_issue_id}`;
   const ongoing = `ongoing ${formatDuration(now - incident.first_seen_ts)}`;
-  const stale = symptoms !== null && symptomsFetchedAtCount !== incident.symptom_count;
+  const currentSignature = { count: incident.symptom_count, seen: incident.last_seen_ts };
+  const stale =
+    symptoms !== null &&
+    (symptomsFetchedAt === null ||
+      symptomsFetchedAt.count !== currentSignature.count ||
+      symptomsFetchedAt.seen !== currentSignature.seen);
+  const failedAtCurrent =
+    symptomsFailedAt !== null &&
+    symptomsFailedAt.count === currentSignature.count &&
+    symptomsFailedAt.seen === currentSignature.seen;
 
   async function fetchSymptoms() {
     setLoadingSymptoms(true);
-    const atCount = incident.symptom_count;
+    const atSignature = currentSignature;
     try {
       const detail = await getIncident(incident.id);
       setSymptoms(detail.symptoms);
-      // Only a SUCCESSFUL fetch validates the cache for this count. A failed
-      // fetch must NOT record `symptomsFetchedAtCount` — doing so would mark
-      // an empty/stale `symptoms` as satisfied for the current count, so a
-      // transient failure permanently hid real symptoms even after the
-      // server recovered (no retry on collapse/re-expand or the in-place
-      // staleness effect below, since `stale` would already read false).
-      setSymptomsFetchedAtCount(atCount);
-      setSymptomsFailedAtCount(null);
+      // Only a SUCCESSFUL fetch validates the cache for this signature. A
+      // failed fetch must NOT record `symptomsFetchedAt` — doing so would
+      // mark an empty/stale `symptoms` as satisfied for the current
+      // signature, so a transient failure permanently hid real symptoms even
+      // after the server recovered (no retry on collapse/re-expand or the
+      // in-place staleness effect below, since `stale` would already read
+      // false).
+      setSymptomsFetchedAt(atSignature);
+      setSymptomsFailedAt(null);
     } catch {
-      // Leave `symptomsFetchedAtCount` untouched so `stale` stays true (or
+      // Leave `symptomsFetchedAt` untouched so `stale` stays true (or
       // `symptoms` stays null on a first-ever attempt) — the row keeps
-      // retrying on the next expand or the next time the count changes
-      // again. Record the failed count separately so the passive effect
-      // below (not the user-driven `toggle`) can stop retrying a count
+      // retrying on the next expand or the next time the signature changes
+      // again. Record the failed signature separately so the passive effect
+      // below (not the user-driven `toggle`) can stop retrying a signature
       // that's already known to fail, avoiding a busy loop.
       setSymptoms([]);
-      setSymptomsFailedAtCount(atCount);
+      setSymptomsFailedAt(atSignature);
     } finally {
       setLoadingSymptoms(false);
     }
@@ -98,18 +125,19 @@ export function IncidentRow({
 
   // Membership can change out from under an already-expanded row (the
   // dashboard polls every 30s and keeps this component mounted across
-  // refreshes). Refetch in place so the open list stays in agreement with
-  // the fresh `incident.symptom_count` instead of waiting for a
-  // collapse/re-expand that may never come. Skips a count that has already
-  // failed (`symptomsFailedAtCount === incident.symptom_count`) so a
+  // refreshes) — including a REPLACEMENT that leaves `symptom_count`
+  // unchanged (C5 round 18), which `stale` now catches via `last_seen_ts`.
+  // Refetch in place so the open list stays in agreement with the fresh
+  // signature instead of waiting for a collapse/re-expand that may never
+  // come. Skips a signature that has already failed (`failedAtCurrent`) so a
   // persistently-failing fetch retries only on the next user expand or the
-  // next count change, rather than spinning every render.
+  // next signature change, rather than spinning every render.
   useEffect(() => {
-    if (expanded && stale && !loadingSymptoms && symptomsFailedAtCount !== incident.symptom_count) {
+    if (expanded && stale && !loadingSymptoms && !failedAtCurrent) {
       void fetchSymptoms();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [expanded, stale, loadingSymptoms, symptomsFailedAtCount, incident.symptom_count]);
+  }, [expanded, stale, loadingSymptoms, failedAtCurrent, incident.symptom_count, incident.last_seen_ts]);
 
   return (
     <li style={{ borderTop: '1px solid var(--hairline)' }}>
