@@ -185,7 +185,10 @@ function VerificationBadge({ v }: { v: FixVerification }) {
  * safe move for exactly the state that's uncertain. A `revert_unknown` row
  * (the REVERT itself was ambiguous) must NOT offer Revert again: the backend
  * permanently refuses to retry a revert on that row, so the button would only
- * promise an action that can never succeed. */
+ * promise an action that can never succeed. A `reverting` row (the revert was
+ * durably recorded as started but the send was cancelled or crashed before
+ * completing) is the same dead end — the backend refuses to retry it too —
+ * so it must not offer Revert either. */
 function canRevert(change: FixChange): boolean {
   if (!change.revertible) return false;
   const status = normalizeChangeStatus(change.status);
@@ -242,6 +245,13 @@ function AppliedChange({
           <span className="t-micro" style={{ color: 'var(--sev-p3)' }}>
             Revert outcome uncertain — the controller didn't confirm the rollback, so this change
             may or may not still be in place. Verify on the device; it can't be reverted again from
+            here.
+          </span>
+        )}
+        {status === 'reverting' && (
+          <span className="t-micro" style={{ color: 'var(--sev-p3)' }}>
+            Revert interrupted — the rollback was recorded as started but never finished sending,
+            so its outcome is unconfirmed. Verify on the device; it can't be reverted again from
             here.
           </span>
         )}

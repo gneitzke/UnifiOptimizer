@@ -663,14 +663,19 @@ export interface FixChange {
    * was dispatched but its outcome was never confirmed, so the backend
    * permanently refuses to retry a revert on this row (`applier.py`
    * `_assert_revertible_status`) — the UI must not offer Revert for it.
-   * `(string & {})` keeps the known literals as editor suggestions while
-   * accepting any daemon value. */
+   * `reverting` is written durably to the row BEFORE the revert PUT is even
+   * sent; if that send is cancelled or the daemon crashes before it
+   * completes, the row is stuck at `reverting` forever and the backend
+   * refuses to retry it, same as `revert_unknown` — the UI must not offer
+   * Revert for it either. `(string & {})` keeps the known literals as editor
+   * suggestions while accepting any daemon value. */
   status:
     | 'applying'
     | 'applied'
     | 'failed'
     | 'unknown'
     | 'reverted'
+    | 'reverting'
     | 'revert_unknown'
     | (string & {});
   reverted_ts: number | null;

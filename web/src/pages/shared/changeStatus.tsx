@@ -19,7 +19,11 @@ import { CHANGE_STATUS_META, normalizeChangeStatus, type ChangeStatus } from './
  * the rollback itself was never confirmed, and the backend permanently
  * refuses to retry it) shares that same caution tone but keeps its own label
  * and icon, so a reader can tell an uncertain apply from an uncertain revert
- * at a glance instead of both collapsing into one "Unknown" pill.
+ * at a glance instead of both collapsing into one "Unknown" pill. `reverting`
+ * (a revert durably recorded as started but never confirmed sent — crashed
+ * or cancelled mid-flight) shares the same caution tone and icon as
+ * `revert_unknown` since both are "the revert on this row can never be
+ * retried"; its own label says the revert never even completed sending.
  */
 
 const ICON: Record<ChangeStatus, React.ReactNode> = {
@@ -28,6 +32,7 @@ const ICON: Record<ChangeStatus, React.ReactNode> = {
   failed: <X size={12} strokeWidth={2.5} />,
   unknown: <CircleHelp size={12} strokeWidth={2.5} />,
   reverted: <RotateCcw size={12} strokeWidth={2.5} />,
+  reverting: <CircleHelp size={12} strokeWidth={2.5} />,
   revert_unknown: <CircleHelp size={12} strokeWidth={2.5} />,
 };
 
