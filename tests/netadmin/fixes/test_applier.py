@@ -7,7 +7,11 @@ RealControllerWriter, and one test proves the dry-run path cannot.
 
 from __future__ import annotations
 
+import asyncio
+import gc
 import json
+import threading
+import weakref
 
 import pytest
 
@@ -1025,3 +1029,111 @@ async def test_apply_refuses_step_with_irrelevant_nonempty_before_body(store):
             current_state={f"{AP_MAC}:ng": {}},
         )
     assert writer.call_count == 0
+
+
+async def test_apply_refuses_transient_dispatch_with_unrelated_valid_before(store):
+    # S2 (residual): a step that DISPATCHES a transient POST cmd/devmgr power-cycle
+    # but carries an unrelated, perfectly well-formed radio-restore before-body must
+    # be refused UP FRONT. The dispatched op has no radio_table to invert, so its
+    # derived reverse comes out empty -- and an empty reverse trivially passes every
+    # downstream rail. A gate that trusted the before-body's shape alone would let
+    # this one-way command through with applied=True and a single dispatch (the
+    # verifier's exact repro). Revertibility must be tied to the DISPATCHED
+    # endpoint+method+payload, not to "some valid before-body exists".
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+    endpoint = f"rest/device/{AP_ID}"
+    step = FixStep(
+        action=ActionType.CHANNEL_CHANGE,
+        target_entity_type=EntityType.RADIO,
+        target_native_id=f"{AP_MAC}:ng",
+        description="transient dispatch, unrelated valid before",
+        risk=RiskLevel.LOW,
+        method="POST",
+        endpoint="cmd/devmgr",
+        payload={"cmd": "power-cycle", "mac": AP_MAC},
+        precondition=Precondition(target_native_id=f"{AP_MAC}:ng", expected={}),
+        # A valid radio-config PUT before-body -- but it inverts a DIFFERENT
+        # operation than the cmd/devmgr power-cycle the step actually dispatches.
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": "auto"}]},
+        },
+        after={"method": "POST", "endpoint": "cmd/devmgr", "body": {"cmd": "power-cycle"}},
+        revertible=True,
+    )
+    plan = FixPlan("wired.port_flapping", f"{AP_MAC}:ng", "forged", steps=[step])
+    with pytest.raises(SafetyViolation):
+        await applier.apply(
+            plan,
+            dry_run=False,
+            confirm_token=plan_confirm_token(plan),
+            current_state={f"{AP_MAC}:ng": {}},
+        )
+    # Refused before any dispatch: nothing sent, no ledger row.
+    assert writer.call_count == 0
+    assert store.list_changes() == []
+
+
+# --------------------------------------------------------------------------- #
+# P3: the process-wide device-lock registry must not retain closed event loops
+# --------------------------------------------------------------------------- #
+async def test_closed_event_loops_are_not_retained_by_the_lock_registry(store):
+    # A stored asyncio.Lock, once used, holds a strong reference to the loop that
+    # ran it. Leaving its registry entry in place after that loop closes pins the
+    # dead loop forever -- one leaked loop per finished loop. The registry must drop
+    # the lock entries of closed/collected loops so the loops become collectable,
+    # while two live appliers on the same device+loop still share one lock.
+    from netadmin.fixes import applier as applier_mod
+
+    applier = Applier(store, FakeControllerWriter())
+
+    def _run_on_fresh_loop() -> "weakref.ref":
+        loop = asyncio.new_event_loop()
+        ref = weakref.ref(loop)
+
+        async def _use_lock() -> None:
+            async with applier._serialize(["dev-loop-leak"]):
+                pass
+
+        try:
+            loop.run_until_complete(_use_lock())
+        finally:
+            loop.close()
+        return ref
+
+    refs: list["weakref.ref"] = []
+    for _ in range(12):
+        box: dict[str, "weakref.ref"] = {}
+
+        def _worker() -> None:
+            box["ref"] = _run_on_fresh_loop()
+
+        # Run each child loop in its own thread so this async test's own loop is
+        # never nested; each thread's loop gets a distinct id in the registry.
+        th = threading.Thread(target=_worker)
+        th.start()
+        th.join()
+        refs.append(box["ref"])
+
+    # One more op on a fresh loop, to trigger the prune of the last straggler
+    # (pruning runs on the NEXT lock lookup after a loop closes).
+    th = threading.Thread(target=lambda: _run_on_fresh_loop())
+    th.start()
+    th.join()
+
+    gc.collect()
+
+    # Every one of the 12 closed loops must have been collected -- none retained by
+    # the registry. Before the fix, each loop's lock lingers and pins its loop, so
+    # all 12 weakrefs stay alive.
+    alive = [r for r in refs if r() is not None]
+    assert alive == [], f"{len(alive)} closed event loop(s) still retained by the lock registry"
+
+    # And the registry does not grow with the number of finished loops: pruning
+    # bounds it to at most the current live loop's entry (here the single, just-run
+    # straggler that the next lookup would itself prune) -- never one-per-loop.
+    # Before the fix this device key accumulates one entry for every loop (13).
+    entries = [k for k in applier_mod._PROCESS_DEVICE_LOCKS if k[1] == "dev-loop-leak"]
+    assert len(entries) <= 1, f"lock registry accumulated {len(entries)} entries for finished loops"

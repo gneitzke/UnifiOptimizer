@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import weakref
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Callable, Iterable, Mapping, Optional
 
@@ -86,8 +87,41 @@ _STATUS_UNKNOWN = "unknown"
 # request serializes against an apply/revert issued by another. Keyed by
 # ``(event-loop id, device key)``: an :class:`asyncio.Lock` is bound to the loop
 # that created it, so a lock is never shared across event loops (each test's loop,
-# the daemon's single long-lived loop). Bounded by the device count on a given loop.
+# the daemon's single long-lived loop).
+#
+# Lifecycle (P3): a stored :class:`asyncio.Lock`, once used, holds a strong
+# reference to the loop that ran it, so leaving its entry in this dict after that
+# loop closes would pin the (now dead) loop forever -- an unbounded leak of one
+# loop per finished loop (each test loop, each ``asyncio.run``). To prevent that,
+# :data:`_LOOP_REFS` tracks each loop-id by a *weak* reference, and
+# :func:`_prune_dead_loops` -- run on every lock lookup -- drops the lock entries
+# of any tracked loop that has closed or been collected (and any stale entry whose
+# loop-id a new loop has since reused). The current, live loop is never pruned, so
+# two live appliers on the same device+loop still share one lock.
 _PROCESS_DEVICE_LOCKS: dict[tuple[int, str], "asyncio.Lock"] = {}
+# loop-id -> weakref to that event loop, for closed/collected-loop pruning (P3).
+_LOOP_REFS: dict[int, "weakref.ref[asyncio.AbstractEventLoop]"] = {}
+
+
+def _prune_dead_loops(current_loop: "asyncio.AbstractEventLoop") -> None:
+    """Drop lock entries for every tracked loop that is not the current live one and
+    has closed or been garbage-collected (P3).
+
+    A closed loop runs nothing, so removing its locks cannot interrupt an in-flight
+    mutation; it merely releases the loop the retained lock would otherwise pin.
+    Also clears a stale entry whose loop-id the *current* loop has reused (the old
+    loop at that address is dead/closed), which would otherwise hand the new loop a
+    lock bound to a defunct one.
+    """
+    for loop_id in list(_LOOP_REFS):
+        ref = _LOOP_REFS.get(loop_id)
+        loop = ref() if ref is not None else None
+        if loop is current_loop:
+            continue
+        if loop is None or loop.is_closed():
+            _LOOP_REFS.pop(loop_id, None)
+            for key in [k for k in _PROCESS_DEVICE_LOCKS if k[0] == loop_id]:
+                _PROCESS_DEVICE_LOCKS.pop(key, None)
 
 
 class Applier:
@@ -495,7 +529,13 @@ class Applier:
         appliers serialize against each other, and keyed by the running loop so a
         lock is never reused across event loops (each is bound to its creator loop).
         """
-        loop_id = id(asyncio.get_running_loop())
+        loop = asyncio.get_running_loop()
+        # Release the locks (and thus the loops) of any loop that has since closed,
+        # so this registry never pins a dead loop (P3). Done here so a long-lived
+        # process reclaims each finished loop as soon as any further mutation runs.
+        _prune_dead_loops(loop)
+        loop_id = id(loop)
+        _LOOP_REFS.setdefault(loop_id, weakref.ref(loop))
         reg_key = (loop_id, key)
         lock = _PROCESS_DEVICE_LOCKS.get(reg_key)
         if lock is None:
@@ -554,7 +594,40 @@ class Applier:
             self._assert_step_reverse_ok(step, is_mesh)
 
     def _assert_step_reverse_ok(self, step: FixStep, is_mesh_uplink: bool) -> None:
-        """Dry-run this step's reverse through the real revert rails; raise if refused."""
+        """Dry-run this step's reverse through the real revert rails; raise if refused.
+
+        Revertibility is a property of THE DISPATCHED operation, not merely of some
+        stored before-body. The gate derives the inverse from the step's own
+        endpoint+method+payload and confirms it actually reverses THEM -- otherwise a
+        step that dispatches a one-way command (a transient ``POST cmd/devmgr``
+        power-cycle, say) but happens to carry an unrelated, valid-looking
+        radio-restore before-body would sail through: its derived reverse table comes
+        out empty (the dispatched payload has no ``radio_table`` to invert) and an
+        empty reverse trivially passes every downstream rail. Three things must hold:
+        the dispatched op is itself a restorable radio-config PUT; the stored before
+        restores that SAME endpoint; and the derived reverse is non-empty.
+        """
+        # (1) The dispatched op must itself be a restorable whole-``radio_table``
+        # config PUT to ``rest/device/<id>``. This is the thing a revert would have
+        # to invert; a transient command (``POST cmd/devmgr``) or any non-rest/device
+        # write is one-way REGARDLESS of what before-body it carries -- tie the
+        # judgement to endpoint+method+payload, never to "some before-body exists".
+        dispatched_method = str(step.method or "").upper()
+        dispatched_radios = (
+            step.payload.get("radio_table") if isinstance(step.payload, Mapping) else None
+        )
+        if (
+            dispatched_method != "PUT"
+            or not _is_rest_device_endpoint(step.endpoint)
+            or not dispatched_radios
+        ):
+            raise SafetyViolation(
+                f"step '{step.description}' dispatches a "
+                f"{dispatched_method or 'non-PUT'} to '{step.endpoint}' with no restorable "
+                "radio config; a stored before-body cannot invert it -- refusing to apply "
+                "a one-way change"
+            )
+
         before = step.before
         if not isinstance(before, dict):
             raise SafetyViolation(
@@ -579,12 +652,21 @@ class Applier:
                 f"step '{step.description}' before-state is not a restorable radio-config "
                 "PUT; refusing to apply a change with no genuine revert"
             )
+        # (2) The before must restore the SAME endpoint the apply mutates. A before
+        # that targets a different device restores no prior config for THIS dispatch,
+        # so it cannot make this step revertible.
+        if str(endpoint) != str(step.endpoint):
+            raise SafetyViolation(
+                f"step '{step.description}' before-state restores '{endpoint}', not the "
+                f"dispatched endpoint '{step.endpoint}'; it reverses a different op -- "
+                "refusing to apply a change with no genuine revert"
+            )
         # Dry-run the reverse exactly as :meth:`revert` builds and gates it, using
         # the payload this apply writes as the "current live" state a revert issued
         # right afterwards would read.
         current_radios = {
             str(r.get("radio")): dict(r)
-            for r in ((step.payload or {}).get("radio_table") or [])
+            for r in (dispatched_radios or [])
             if isinstance(r, dict) and r.get("radio") is not None
         }
         after_body = step.after.get("body") if isinstance(step.after, dict) else None
@@ -592,6 +674,14 @@ class Applier:
             fresh_table = self._fresh_restore_table(
                 -1, body, after_body if isinstance(after_body, dict) else {}, current_radios
             )
+            # (3) The derived inverse must actually reverse the dispatched op. An
+            # empty reverse table inverts nothing and would trivially pass every rail
+            # below -- treat it as no genuine revert, not as a free pass.
+            if not fresh_table:
+                raise SafetyViolation(
+                    f"step '{step.description}' derived reverse is empty; it inverts "
+                    "nothing -- refusing to apply a change with no genuine revert"
+                )
             self._assert_revert_min_rssi_safe(-1, fresh_table, current_radios, is_mesh_uplink)
         except SafetyViolation:
             raise

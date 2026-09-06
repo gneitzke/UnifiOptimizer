@@ -16,6 +16,7 @@ import pytest
 
 from netadmin.domain.entities import Entity
 from netadmin.domain.types import EntityType
+from netadmin.fixes.models import WriteResult
 from netadmin.fixes.reader import FakeDeviceReader
 from netadmin.fixes.service import FixSeams
 from netadmin.fixes.writer import FakeControllerWriter
@@ -302,6 +303,57 @@ async def test_revert_controller_failure_returns_502(fix_env) -> None:
         )
     assert resp.status_code == 502
     # The change was NOT marked reverted -- reality is preserved.
+    assert fix_env.store.get_change(change_id)["status"] == "applied"
+
+
+async def test_revert_ambiguous_outcome_is_reported_unknown_not_a_definitive_rejection(
+    fix_env,
+) -> None:
+    """C2 (residual): an AMBIGUOUS revert outcome is not a definitive rejection.
+
+    When the restore write's outcome is ambiguous (a lost response, or a 401 the
+    write may have landed under) the writer returns ok=False with an ``ambiguous``
+    marker. Collapsing that into 502 "the change was not rolled back" asserts a
+    falsehood -- the rollback MAY have landed. The router must instead report it as
+    unknown/ambiguous with detail, mirroring the apply path, and must NOT claim the
+    change definitively still stands.
+    """
+    async with await _client(fix_env.app) as c:
+        plan = (await c.get(f"/api/issues/{fix_env.issue_id}/fix-plan")).json()
+        applied = (
+            await c.post(
+                f"/api/issues/{fix_env.issue_id}/fix/apply",
+                json={"confirm": True, "confirm_token": plan["confirm_token"]},
+            )
+        ).json()
+        change_id = applied["change_ids"][0]
+        # The restore write's outcome is now AMBIGUOUS (lost response / 401), exactly
+        # as the real RealControllerWriter surfaces a UnifiAmbiguousOutcomeError.
+        fix_env.app.state.fix_seams = FixSeams(
+            reader=fix_env.reader,
+            writer=FakeControllerWriter(
+                response=WriteResult(
+                    ok=False,
+                    status_code=None,
+                    data={"ambiguous": True, "error": "lost response after PUT"},
+                )
+            ),
+        )
+        resp = await c.post(
+            f"/api/issues/{fix_env.issue_id}/fix/revert",
+            json={"change_id": change_id},
+        )
+
+    # NOT a definitive 502 "not rolled back": the outcome is unknown, reported so.
+    assert resp.status_code != 502
+    body = resp.json()
+    assert body["status"] == "unknown"
+    assert body["ambiguous"] is True
+    assert "lost response after PUT" in body["detail"]
+    # The detail must NOT assert the change definitively still stands.
+    assert "was not rolled back" not in body["detail"]
+    # The ledger row was not flipped to "reverted" (the write was unconfirmed), but
+    # nor is it a clean failure the operator can ignore -- reconcile via a read.
     assert fix_env.store.get_change(change_id)["status"] == "applied"
 
 
