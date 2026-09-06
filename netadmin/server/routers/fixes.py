@@ -225,9 +225,19 @@ def _apply_payload(
         "steps": [
             {
                 "action": s.step.action.value,
+                # ``status`` is "applied" | "failed" | "unknown". An ambiguous
+                # mutation (a lost response, or a 401 the write may have landed
+                # under) is reported as "unknown" with ``ambiguous: true`` and the
+                # detail, NOT collapsed into a generic "failed" (C2) -- the operator
+                # must reconcile via a read rather than assume the change never took.
                 "status": s.status,
                 "change_id": s.change_id,
                 "status_code": s.write.status_code if s.write is not None else None,
+                "ambiguous": bool(
+                    s.write is not None
+                    and isinstance(s.write.data, dict)
+                    and s.write.data.get("ambiguous")
+                ),
                 "error": s.error,
             }
             for s in result.steps

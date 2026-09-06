@@ -820,3 +820,208 @@ async def test_apply_and_revert_are_serialized_per_device(store):
     )
 
     assert writer.events == ["start", "end", "start", "end"]
+
+
+async def test_concurrent_reverts_read_committed_state_no_stale_overwrite(store):
+    # C1: two reverts on the SAME device, each rolling back a DIFFERENT field. The
+    # read-modify-write is atomic under the shared per-device lock -- the fresh live
+    # state is read INSIDE the lock (via state_reader), so the second revert reads
+    # the first's committed write instead of a snapshot taken before either. With a
+    # stale snapshot the second silently undoes the first; here BOTH survive.
+    import asyncio as _asyncio
+
+    from netadmin.fixes.models import WriteResult
+
+    endpoint = f"rest/device/{AP_ID}"
+    # Shared mutable "live" device state that both reverts read and write through.
+    live = {"ng": {"radio": "ng", "channel": 1, "tx_power_mode": "low"}}
+
+    class _LiveWriter:
+        async def put(self, ep, body):
+            await _asyncio.sleep(0)  # a chance to interleave, if the lock let it
+            for r in body["radio_table"]:
+                live[r["radio"]] = dict(r)
+            return WriteResult(ok=True, status_code=200, data={"meta": {"rc": "ok"}})
+
+        async def post(self, ep, body):  # pragma: no cover - unused
+            return await self.put(ep, body)
+
+    # Change A restored the CHANNEL (before ch3 -> after ch1); B restored TX-POWER
+    # (before high -> after low). Their touched fields are disjoint.
+    id_a = store.insert_change(
+        action="wifi.channel_change",
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 3, "tx_power_mode": "low"}]},
+        },
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 1, "tx_power_mode": "low"}]},
+        },
+        status="applied",
+        ts=1,
+    )
+    id_b = store.insert_change(
+        action="wifi.tx_power_step_down",
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 1, "tx_power_mode": "high"}]},
+        },
+        after={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {"radio_table": [{"radio": "ng", "channel": 1, "tx_power_mode": "low"}]},
+        },
+        status="applied",
+        ts=1,
+    )
+
+    applier = Applier(store, _LiveWriter())
+
+    async def _reader():
+        # Fresh read of live state; the applier calls this INSIDE the device lock.
+        return {k: dict(v) for k, v in live.items()}, False
+
+    await _asyncio.gather(
+        applier.revert(id_a, state_reader=_reader),
+        applier.revert(id_b, state_reader=_reader),
+    )
+
+    # A restored channel -> 3, B restored tx-power -> high. A stale second read would
+    # have written the OTHER field back to its pre-revert value, undoing the first.
+    assert live["ng"]["channel"] == 3
+    assert live["ng"]["tx_power_mode"] == "high"
+    assert store.get_change(id_a)["status"] == "reverted"
+    assert store.get_change(id_b)["status"] == "reverted"
+
+
+async def test_serialize_releases_acquired_locks_on_cancellation_mid_acquire(store):
+    # NEW-BUG: cancelling a task while it acquires a SECOND device lock must release
+    # the FIRST lock it already holds. Acquisition is inside try/finally, so no lock
+    # leaks -- otherwise every later operation on that device would hang forever.
+    import asyncio as _asyncio
+
+    applier = Applier(store, FakeControllerWriter())
+    lock_b = applier._lock_for("b")  # pre-hold "b" so _serialize parks acquiring it
+    await lock_b.acquire()
+
+    async def _op():
+        async with applier._serialize(["a", "b"]):  # takes "a", then blocks on "b"
+            pass  # pragma: no cover - never reached (cancelled while parked on "b")
+
+    task = _asyncio.create_task(_op())
+    await _asyncio.sleep(0)
+    await _asyncio.sleep(0)  # let it grab "a" and park on "b"
+    task.cancel()
+    with pytest.raises(_asyncio.CancelledError):
+        await task
+
+    # "a" was released despite the cancellation mid-acquire (the process-wide lock is
+    # free for the next operation, not leaked).
+    assert not applier._lock_for("a").locked()
+    lock_b.release()
+
+
+# --------------------------------------------------------------------------- #
+# C2: an ambiguous mutation outcome is reported as "unknown", never "failed"
+# --------------------------------------------------------------------------- #
+async def test_apply_ambiguous_write_reports_unknown_not_failed(store, ap_device):
+    from netadmin.fixes.models import WriteResult
+
+    ambiguous = WriteResult(
+        ok=False, status_code=None, data={"ambiguous": True, "error": "outcome unknown; not retried"}
+    )
+    writer = FakeControllerWriter(response=ambiguous)
+    applier = Applier(store, writer)
+    plan = _channel_plan(ap_device)
+    result = await applier.apply(
+        plan, dry_run=False, confirm_token=plan_confirm_token(plan), current_state=_state_ok()
+    )
+    assert result.applied is False
+    # The step is "unknown" (ambiguous), NOT collapsed into generic "failed".
+    assert result.steps[0].status == "unknown"
+    assert "unknown" in (result.steps[0].error or "")
+    # The ledger row is "unknown" too -- the change may be live and must not read as
+    # a clean failure the operator can ignore.
+    assert store.list_changes()[0]["status"] == "unknown"
+
+
+# --------------------------------------------------------------------------- #
+# S2: the revertibility gate dry-runs the REAL reverse through the same rails
+# --------------------------------------------------------------------------- #
+async def test_channel_fix_on_mesh_min_rssi_ap_is_refused_up_front(store, ap_device):
+    # ap_device's ng radio has min-RSSI enabled. On an AP that is a mesh uplink, the
+    # revert's min-RSSI rail would refuse to restore (mesh min-RSSI is removal-only),
+    # so a fix whose revert would later be barred is refused UP FRONT (S2) -- never
+    # applied-then-unrevertable. The SAME plan applies fine when the AP is not mesh.
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+    plan = _channel_plan(ap_device)  # ng channel 3 -> 1, min-RSSI untouched (stays on)
+    with pytest.raises(SafetyViolation):
+        await applier.apply(
+            plan,
+            dry_run=False,
+            confirm_token=plan_confirm_token(plan),
+            current_state=_state_ok(),
+            mesh_uplinks={AP_ID},
+        )
+    assert writer.call_count == 0
+    assert store.list_changes() == []
+
+
+async def test_apply_refuses_step_whose_reverse_fails_min_rssi_rail(store):
+    # A forged step whose BEFORE would re-enable min-RSSI (off -> on) on revert. The
+    # reverse dry-run fails the min-RSSI rail, so the apply is refused at apply time.
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+    endpoint = f"rest/device/{AP_ID}"
+    step = _forged_step(
+        before={
+            "method": "PUT",
+            "endpoint": endpoint,
+            "body": {
+                "radio_table": [{"radio": "ng", "channel": 3, "min_rssi_enabled": True, "min_rssi": -70}]
+            },
+        },
+        payload={"radio_table": [{"radio": "ng", "channel": 1, "min_rssi_enabled": False, "min_rssi": -70}]},
+        revertible=True,
+    )
+    plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "forged", steps=[step])
+    with pytest.raises(SafetyViolation):
+        await applier.apply(
+            plan,
+            dry_run=False,
+            confirm_token=plan_confirm_token(plan),
+            current_state={f"{AP_MAC}:ng": {"channel": 1}},
+        )
+    assert writer.call_count == 0
+
+
+async def test_apply_refuses_step_with_irrelevant_nonempty_before_body(store):
+    # A transient command dressed up with a nonempty-but-IRRELEVANT before-body (a
+    # POST to cmd/devmgr) restores no prior config, so it is not genuinely
+    # revertible. The gate refuses it despite the full-looking before-state (S2).
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+    step = _forged_step(
+        before={
+            "method": "POST",
+            "endpoint": "cmd/devmgr",
+            "body": {"cmd": "power-cycle", "mac": AP_MAC},
+        },
+        payload={"cmd": "power-cycle", "mac": AP_MAC},
+        revertible=True,
+        endpoint="cmd/devmgr",
+    )
+    plan = FixPlan("wired.port_flapping", f"{AP_MAC}:ng", "forged", steps=[step])
+    with pytest.raises(SafetyViolation):
+        await applier.apply(
+            plan,
+            dry_run=False,
+            confirm_token=plan_confirm_token(plan),
+            current_state={f"{AP_MAC}:ng": {}},
+        )
+    assert writer.call_count == 0

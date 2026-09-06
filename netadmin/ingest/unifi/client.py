@@ -415,7 +415,10 @@ class UnifiClient:
         auto-retried on an ambiguous transport failure: a lost response could
         otherwise dispatch the same write several times. Such a mutation raises
         :class:`UnifiAmbiguousOutcomeError` after a single attempt so the caller
-        keeps the before-state and reconciles via a GET before trying again.
+        keeps the before-state and reconciles via a GET before trying again. The
+        same rule governs a 401 on a mutation (C2): only a GET is re-dispatched
+        after the single re-login; a non-GET that draws a 401 raises
+        :class:`UnifiAmbiguousOutcomeError` without a second dispatch.
         """
         method_u = method.upper()
         idempotent = method_u == "GET"
@@ -469,8 +472,26 @@ class UnifiClient:
             strategy.capture(resp, self._http.cookies)
 
             if resp.status_code == 401 and not relogged:
-                # A 401 is an unambiguous rejection: the request was not applied,
-                # so a single re-login and retry is safe even for a mutation.
+                if not idempotent:
+                    # C2: a mutation that draws a 401 must NEVER be re-dispatched.
+                    # Re-logging in and replaying the request would send the write a
+                    # SECOND time, and a 401 does not prove the first attempt was
+                    # rejected before it landed -- the session could have been
+                    # invalidated after the controller accepted the change. Only a
+                    # GET (idempotent) may be re-dispatched after a re-login. Surface
+                    # an ambiguous outcome WITHOUT a second dispatch so the caller
+                    # keeps the before-state and reconciles via a GET.
+                    logger.warning(
+                        "%s %s -> 401 on a mutation; not re-dispatched (ambiguous).",
+                        method_u,
+                        endpoint,
+                    )
+                    raise UnifiAmbiguousOutcomeError(
+                        f"{method_u} {endpoint} -> 401; the session was rejected and the "
+                        "write may or may not have landed. Not re-dispatched. Reconcile "
+                        "controller state via GET before any further attempt."
+                    )
+                # A GET is idempotent: a single re-login and retry is safe.
                 logger.info("%s %s -> 401; re-logging in once.", method_u, endpoint)
                 relogged = True
                 await self._relogin(login_epoch)
