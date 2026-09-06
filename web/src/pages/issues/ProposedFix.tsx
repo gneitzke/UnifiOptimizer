@@ -2,6 +2,7 @@ import { useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
+  CircleHelp,
   RotateCcw,
   Wrench,
   X,
@@ -344,12 +345,19 @@ function RevertConfirmModal({
   change,
   busy,
   error,
+  notice,
   onCancel,
   onConfirm,
 }: {
   change: FixChange;
   busy: boolean;
   error: string | null;
+  /** An ambiguous revert outcome (HTTP 200, `status: "unknown"`): the
+   * controller never confirmed the restore landed. This is deliberately kept
+   * separate from `error` (a definitive failure, e.g. a 502) — it renders
+   * with the same caution treatment as an ambiguous apply, not the red
+   * failure tone. */
+  notice: string | null;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
@@ -406,6 +414,15 @@ function RevertConfirmModal({
           )}
         </div>
 
+        {notice && (
+          <div className="flex items-start gap-2">
+            <CircleHelp size={14} style={{ color: 'var(--sev-p3)', marginTop: 1, flexShrink: 0 }} />
+            <span className="t-caption" style={{ color: 'var(--sev-p3)' }}>
+              {notice}
+            </span>
+          </div>
+        )}
+
         {error && (
           <span className="t-caption" style={{ color: 'var(--sev-p1)' }}>
             {error}
@@ -414,12 +431,14 @@ function RevertConfirmModal({
 
         <div className="flex items-center justify-end gap-2">
           <Button variant="ghost" size="sm" disabled={busy} onClick={onCancel}>
-            Cancel
+            {notice ? 'Close' : 'Cancel'}
           </Button>
-          <Button variant="primary" size="sm" disabled={busy} onClick={onConfirm}>
-            <RotateCcw size={13} />
-            {busy ? 'Reverting…' : 'Revert this change'}
-          </Button>
+          {!notice && (
+            <Button variant="primary" size="sm" disabled={busy} onClick={onConfirm}>
+              <RotateCcw size={13} />
+              {busy ? 'Reverting…' : 'Revert this change'}
+            </Button>
+          )}
         </div>
       </div>
     </div>
@@ -664,6 +683,11 @@ export function ProposedFix({
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [revertTarget, setRevertTarget] = useState<FixChange | null>(null);
+  // An ambiguous revert outcome (HTTP 200, `status: "unknown"`) is not a
+  // failure and not a success -- separate from `actionError` (a definitive
+  // failure like a 502) so it can render with the caution treatment instead
+  // of the red error tone.
+  const [revertNotice, setRevertNotice] = useState<string | null>(null);
 
   if (historyLoading && !history) {
     return <Skeleton className="h-24 w-full" />;
@@ -684,10 +708,24 @@ export function ProposedFix({
   async function doRevert(changeId: number) {
     setBusy(true);
     setActionError(null);
+    setRevertNotice(null);
     try {
-      await revertFix(issueId, changeId);
+      const resp = await revertFix(issueId, changeId);
       reloadHistory();
       onChanged();
+      // An AMBIGUOUS outcome (HTTP 200, status "unknown"/ambiguous: true) is
+      // NOT a confirmed revert -- the controller never confirmed the restore
+      // landed. Reporting this as reverted/settled would tell the operator
+      // something that isn't known to be true (the mirror-image of the bug
+      // this guards against on the apply side). Keep the confirmation open
+      // and surface the same caution treatment the apply path uses for an
+      // ambiguous send, rather than closing it as done.
+      if (resp.status === 'unknown' || resp.ambiguous) {
+        setRevertNotice(
+          "Revert outcome uncertain — the controller didn't confirm; verify on the device before retrying.",
+        );
+        return;
+      }
       setRevertTarget(null);
     } catch (e) {
       setActionError((e as Error).message || 'Revert failed');
@@ -715,6 +753,7 @@ export function ProposedFix({
         verification={history.verification}
         onRevert={(change) => {
           setActionError(null);
+          setRevertNotice(null);
           setRevertTarget(change);
         }}
         busy={busy}
@@ -732,9 +771,11 @@ export function ProposedFix({
           change={revertTarget}
           busy={busy}
           error={actionError}
+          notice={revertNotice}
           onCancel={() => {
             setRevertTarget(null);
             setActionError(null);
+            setRevertNotice(null);
           }}
           onConfirm={() => doRevert(revertTarget.id)}
         />
