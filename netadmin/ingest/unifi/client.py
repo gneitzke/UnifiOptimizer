@@ -592,6 +592,30 @@ class UnifiClient:
         err = envelope_error(data)
         if err is not None:
             raise UnifiError(f"{endpoint} -> {err}")
+        # BUG#6 (positive-proof of a real read): a 200 body only counts as a
+        # successful read when it POSITIVELY presents a well-formed success
+        # payload -- either a ``data`` field (the list, or the single-object form
+        # the API also uses) or an explicit ``meta.rc == "ok"``. A body that
+        # presents NEITHER -- e.g. an error envelope like
+        # ``{"error": "upstream unavailable"}`` the transport happened to answer
+        # 200 for -- is NOT a successful empty read. Previously :meth:`_data`
+        # defaulted a missing ``data`` key to ``[]``, so such a body parsed to
+        # zero rows and read as empty-but-healthy; event catch-up then credited
+        # ``event_history`` coverage for a window it never actually read, defeating
+        # every detector coverage gate. Mirror the positive-proof principle used
+        # for the error envelope: absent positive proof of success, this is a
+        # FAILED/UNAVAILABLE read and must raise, not return empty.
+        has_data = isinstance(data.get("data"), (list, dict))
+        meta = data.get("meta")
+        rc_ok = (
+            isinstance(meta, dict)
+            and str(meta.get("rc", "")).strip().lower() == "ok"
+        )
+        if not has_data and not rc_ok:
+            detail = data.get("error") or data.get("message") or "no success payload"
+            raise UnifiError(
+                f"{endpoint} -> unrecognized response (no data/meta.rc=ok): {detail}"
+            )
         return data
 
     @staticmethod
