@@ -158,6 +158,26 @@ def _field(event: Event, name: str) -> Any:
     return extra.get(name)
 
 
+def _usable_mac(value: Any) -> Optional[str]:
+    """A controller MAC field is a usable identifier ONLY when it is a NON-EMPTY str.
+
+    #w20a-3 (ap_from usability, mirrored byte-for-byte by the repository SQL): a MAC
+    field that is a non-string or a falsy/empty value -- ``None``, ``False``, ``0``,
+    ``[]``, ``""`` -- carries no address and MUST be treated as ABSENT, never used as
+    an entity-resolution key. The old code leaned on Python truthiness
+    (``ap_from or ap``): that accidentally skipped the falsy set, but it would ACCEPT
+    a truthy non-string (``1``, a non-empty ``list``) and then either mis-resolve it
+    or crash the dict-keyed resolution cache (a ``list`` is unhashable), and -- the
+    real defect -- it does not describe a rule the SQL side can mirror. The exact,
+    well-defined rule is: **a MAC is usable IFF it is a non-empty ``str``**. Its SQL
+    twin is ``typeof(x)='text' AND length(x)>0`` -- so json ``false``/``0``/``[]``/
+    ``""`` (which SQLite renders as a non-text or zero-length value) is rejected
+    identically on both sides, and a stored attribution never disagrees with the
+    SQL-derived resolvability predicate.
+    """
+    return value if isinstance(value, str) and value else None
+
+
 class EventNormalizer:
     """Turn a parsed :class:`Event` into ``Repository.record_event`` kwargs.
 
@@ -210,7 +230,11 @@ class EventNormalizer:
         ap_mac = _field(event, "ap")
         sw_mac = _field(event, "sw")
         gw_mac = _field(event, "gw")
-        ap_from = _field(event, "ap_from")
+        # #w20a-3: only a non-empty STRING is a usable ``ap_from`` mac. A falsy /
+        # non-string ap_from (``False``/``0``/``[]``/``""``) is normalized to None
+        # here so the roam fall-back to ``ap`` is exact and byte-identical to what
+        # the repository's resolvability SQL computes (see :func:`_usable_mac`).
+        ap_from = _usable_mac(_field(event, "ap_from"))
 
         if "Roam" in key and user_mac:
             entity_id = self._resolve(EntityType.CLIENT, user_mac)
@@ -1126,6 +1150,35 @@ class WsSupervisor:
         """
         return bool(self._pending or self._pending_raw)
 
+    def _sever_coverage(self, *, reason: str) -> None:
+        """Record a durable WS coverage discontinuity that survives listener
+        replacement (#w20a-1 / #w20a-2).
+
+        The invariant: any EXCEPTIONAL listener termination (a death that is NOT a
+        clean stop) -- a parser ``pydantic.ValidationError`` out of ``_parse``, a
+        storage/queue-full ``RuntimeError``, ANY non-cancel exception that unwinds
+        ``listener.run()`` -- means the feed died ABNORMALLY: events may have been
+        unusable or lost right up to the death, so coverage must NOT bridge across
+        it. The terminal error row the supervisor writes carries the exception text
+        (``error='<ExcType>: ...'``), which is NOT one of the recognized sever
+        labels, so a fresh replacement listener's heartbeat chain would BRIDGE
+        straight over the death and over-credit coverage (round-20 #1/#2: ~0.989
+        across an abnormally-terminated span -> a false clear).
+        record_ws_break lands a durable ``job='ws'`` break row (``error='unusable'``
+        -- a recognized sever) at the death time, so the discontinuity OUTLIVES the
+        in-memory listener: :meth:`Repository._ws_observed_intervals` ends the covered
+        run at the last clean beat before the death and only resumes at the first
+        clean beat after the replacement drains cleanly.
+
+        Best-effort: coverage accounting must never break the supervise loop or the
+        event hand-off (same rule as :meth:`_record`), so a failed write is logged,
+        not raised.
+        """
+        try:
+            self._repo.record_ws_break()
+        except Exception:  # noqa: BLE001 - accounting must never break the data path
+            logger.exception("Could not record WS coverage break (%s); continuing", reason)
+
     def _drain_pending(self) -> None:
         """R2: retry events rescued from a replaced listener.
 
@@ -1200,6 +1253,18 @@ class WsSupervisor:
         if raw_leftover:
             self._pending_raw.extend(raw_leftover)
         self._enforce_pending_bound()
+        # #w20a-1: carry the dying listener's PENDING BREAK OBLIGATION forward too,
+        # not just its event buffers. A listener that dropped one or more unusable
+        # events since its last clean beat owes a durable coverage break (see
+        # :meth:`EventListener._maybe_heartbeat`); that obligation lives ONLY in the
+        # in-memory ``_unusable_dropped_since_beat`` marker, which is discarded when
+        # the listener is replaced. If the death raced the break write, the marker --
+        # and the sever -- vanished, and a fresh replacement's beats bridged the drop
+        # span (round-20 #1: 0.989). Make the obligation durable HERE, at the moment
+        # of rescue, so it survives listener generations regardless of whether the
+        # death itself was exceptional.
+        if getattr(listener, "_unusable_dropped_since_beat", 0):
+            self._sever_coverage(reason="carried unusable-drop obligation")
 
     def _enforce_pending_bound(self) -> None:
         """Clamp the aggregate rescued buffer to the system-wide cap (P1).
@@ -1377,6 +1442,13 @@ class WsSupervisor:
                     else:
                         self.state = "reconnecting"
                     logger.warning("WS listener died: %s", error)
+                    # #w20a-1 / #w20a-2: an EXCEPTIONAL death (not a clean stop, not a
+                    # masked cancel) is a durable coverage discontinuity. The terminal
+                    # error row below is NOT a sever label, so without this the next
+                    # listener's heartbeats bridge the death and over-credit coverage
+                    # (0.989). Land a durable break at the death time so coverage
+                    # severs there and survives the replacement.
+                    self._sever_coverage(reason="exceptional listener termination")
                 else:
                     if getattr(listener, "terminal_state", None) == "unsupported":
                         # The low-level listener returns cleanly only when the
