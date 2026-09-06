@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ChevronRight, ChevronDown } from 'lucide-react';
 import { SeverityPill, SeverityGlyph } from '../../components/ui/SeverityPill';
@@ -32,6 +32,15 @@ export function IncidentRow({
 }) {
   const [expanded, setExpanded] = useState(false);
   const [symptoms, setSymptoms] = useState<IncidentMember[] | null>(null);
+  // C5 (round 16): the detail fetch is cached per-row, but the parent polls
+  // every 30s and preserves this row's component identity by incident id — so
+  // a poll that changes current membership left the cached `symptoms` stale
+  // (still carrying a now-cleared member as current:true) while the "+N
+  // related" count above read the fresh `incident.symptom_count`. Tracking
+  // the CURRENT count the cache was fetched at, and refetching whenever it
+  // drifts from the live prop, keeps the cache honest without refetching on
+  // every poll when membership hasn't actually changed.
+  const [symptomsFetchedAtCount, setSymptomsFetchedAtCount] = useState<number | null>(null);
   const [loadingSymptoms, setLoadingSymptoms] = useState(false);
 
   const isGroup = incident.symptom_count > 0;
@@ -39,22 +48,41 @@ export function IncidentRow({
   const headTitle = root?.title ?? incident.title;
   const href = isGroup ? `/incidents/${incident.id}` : `/issues/${incident.root_issue_id}`;
   const ongoing = `ongoing ${formatDuration(now - incident.first_seen_ts)}`;
+  const stale = symptoms !== null && symptomsFetchedAtCount !== incident.symptom_count;
+
+  async function fetchSymptoms() {
+    setLoadingSymptoms(true);
+    const atCount = incident.symptom_count;
+    try {
+      const detail = await getIncident(incident.id);
+      setSymptoms(detail.symptoms);
+    } catch {
+      setSymptoms([]);
+    } finally {
+      setSymptomsFetchedAtCount(atCount);
+      setLoadingSymptoms(false);
+    }
+  }
 
   async function toggle() {
     const next = !expanded;
     setExpanded(next);
-    if (next && symptoms === null && !loadingSymptoms) {
-      setLoadingSymptoms(true);
-      try {
-        const detail = await getIncident(incident.id);
-        setSymptoms(detail.symptoms);
-      } catch {
-        setSymptoms([]);
-      } finally {
-        setLoadingSymptoms(false);
-      }
+    if (next && !loadingSymptoms && (symptoms === null || stale)) {
+      await fetchSymptoms();
     }
   }
+
+  // Membership can change out from under an already-expanded row (the
+  // dashboard polls every 30s and keeps this component mounted across
+  // refreshes). Refetch in place so the open list stays in agreement with
+  // the fresh `incident.symptom_count` instead of waiting for a
+  // collapse/re-expand that may never come.
+  useEffect(() => {
+    if (expanded && stale && !loadingSymptoms) {
+      void fetchSymptoms();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [expanded, stale, loadingSymptoms]);
 
   return (
     <li style={{ borderTop: '1px solid var(--hairline)' }}>
@@ -91,7 +119,7 @@ export function IncidentRow({
 
       {isGroup && expanded && (
         <ul className="flex flex-col pb-2 pl-6" style={{ gap: 2 }}>
-          {loadingSymptoms && symptoms === null ? (
+          {symptoms === null || (loadingSymptoms && stale) ? (
             <Skeleton className="h-5 w-2/3" />
           ) : (
             // C5: `getIncident` returns the incident's full historical symptom
