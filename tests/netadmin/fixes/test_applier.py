@@ -964,16 +964,16 @@ async def test_concurrent_reverts_read_committed_state_no_stale_overwrite(store)
     assert store.get_change(id_b)["status"] == "reverted"
 
 
-async def test_concurrent_applies_second_fails_drift_not_stale_clobber(store):
-    # P1 (apply race): two concurrent applies to the SAME device. Apply A retunes the
-    # CHANNEL (3 -> 1); apply B steps DOWN tx-power but its payload -- a whole-table
-    # PUT built from a snapshot taken before A committed -- still carries the STALE
-    # channel 3. With state capture/validation done before the lock, B's PUT lands
-    # after A's and silently undoes it while both ledger rows read 'applied'. The fix
-    # reads fresh state and runs the precondition + whole-table clobber guard INSIDE
-    # the per-device lock, so B (running second) sees A's committed channel 1, detects
-    # that its payload would overwrite it, and fails drift -- it never dispatches, and
-    # A's change survives. The two appliers share the PROCESS-wide device lock.
+async def test_concurrent_applies_second_merges_onto_committed_no_stale_clobber(store):
+    # P1 (apply race), merge-at-dispatch: two concurrent applies to the SAME device.
+    # Apply A retunes the CHANNEL (3 -> 1); apply B steps DOWN tx-power. B's plan-time
+    # payload -- a whole-table snapshot taken before A committed -- still carries the
+    # STALE channel 3, so re-sending it would silently undo A. The fix builds B's PUT
+    # body INSIDE the per-device lock by merging B's intended tx-power delta onto the
+    # FRESH live table (which now carries A's committed channel 1). So B does NOT
+    # re-send the stale channel: it dispatches {channel 1, tx medium} and BOTH changes
+    # coexist -- A's channel survives and B's tx-power lands, both rows 'applied'. The
+    # two appliers share the PROCESS-wide device lock, so B runs strictly after A.
     import asyncio as _asyncio
 
     from netadmin.fixes.applier import _endpoint_device
@@ -1059,17 +1059,24 @@ async def test_concurrent_applies_second_fails_drift_not_stale_clobber(store):
     gate.set()  # release A's write; A commits, releases the lock, then B proceeds
 
     res_a = await task_a
-    with pytest.raises(PreconditionDrift):
-        await task_b  # B refuses rather than overwrite A's committed channel
+    res_b = await task_b  # B merges onto A's committed table rather than clobbering it
 
     assert res_a.applied is True
+    assert res_b.applied is True
     assert writer_a.puts and writer_a.puts[0]["radio_table"]  # A dispatched once
-    assert writer_b.puts == []  # B never dispatched a stale PUT
-    assert live["ng"]["channel"] == 1  # A's change stands; B did not undo it
-    # Ledger is honest: only A recorded a change, and it is 'applied'.
+    assert writer_b.puts  # B dispatched once too
+    # B's dispatched body carried A's committed channel 1 (merge preserved it), NOT the
+    # stale channel 3 from B's plan-time snapshot.
+    b_ng = next(r for r in writer_b.puts[0]["radio_table"] if r["radio"] == "ng")
+    assert b_ng["channel"] == 1
+    assert b_ng["tx_power_mode"] == "medium"
+    # Live state carries BOTH changes: A's channel and B's tx-power.
+    assert live["ng"]["channel"] == 1
+    assert live["ng"]["tx_power_mode"] == "medium"
+    # Ledger is honest: both changes recorded, both 'applied'.
     changes = store.list_changes()
-    assert len(changes) == 1
-    assert changes[0]["status"] == "applied"
+    assert len(changes) == 2
+    assert [c["status"] for c in changes] == ["applied", "applied"]
 
 
 async def test_concurrent_reverts_dispatch_the_mutation_exactly_once(store):
@@ -1504,3 +1511,322 @@ async def test_closed_event_loops_are_not_retained_by_the_lock_registry(store):
     # Before the fix this device key accumulates one entry for every loop (13).
     entries = [k for k in applier_mod._PROCESS_DEVICE_LOCKS if k[1] == "dev-loop-leak"]
     assert len(entries) <= 1, f"lock registry accumulated {len(entries)} entries for finished loops"
+
+
+# --------------------------------------------------------------------------- #
+# Merge-at-dispatch: the whole-radio_table PUT is built from FRESH live at write
+# time, not a plan-time snapshot. Root-cause fix for #5 (multi-step self-clobber),
+# #1 (untouched field removed / radio added), and #6 (deleted-radio revert).
+# --------------------------------------------------------------------------- #
+def _radio_pre(native_id, expected):
+    return Precondition(target_native_id=native_id, expected=expected)
+
+
+async def test_multistep_same_device_plan_does_not_self_clobber(store):
+    # #5: a plan with TWO steps on the SAME 2-radio device -- step 1 moves ng's channel
+    # (3 -> 1), step 2 moves na's channel (36 -> 40). Each step's plan-time payload is a
+    # WHOLE-table snapshot: step 2's snapshot still carries ng at its ORIGINAL 3. Sent
+    # verbatim, step 2's PUT re-sends ng=3 and UNDOES step 1 (both rows still 'applied',
+    # ng ends at 3). Merge-at-dispatch builds step 2's body by applying only its na
+    # delta onto the live table carried forward from step 1, so ng stays 1. Both
+    # changes persist; neither clobbers the other.
+    from netadmin.fixes.models import WriteResult
+
+    endpoint = f"rest/device/{AP_ID}"
+    dev_key = AP_ID
+    live = {
+        "ng": {"radio": "ng", "channel": 3, "tx_power_mode": "high", "ht": 20},
+        "na": {"radio": "na", "channel": 36, "tx_power_mode": "auto", "ht": 80},
+    }
+
+    class _LiveWriter:
+        def __init__(self):
+            self.puts = []
+
+        async def put(self, ep, body):
+            self.puts.append(body)
+            for r in body["radio_table"]:
+                live[r["radio"]] = dict(r)
+            return WriteResult(ok=True, status_code=200, data={"meta": {}})
+
+        async def post(self, ep, body):  # pragma: no cover - unused
+            return await self.put(ep, body)
+
+    def _step(native, radio, old_ch, new_ch, full_snapshot):
+        # full_snapshot is the plan-time whole table (with only THIS radio changed).
+        before_table = [
+            {"radio": "ng", "channel": 3, "tx_power_mode": "high", "ht": 20},
+            {"radio": "na", "channel": 36, "tx_power_mode": "auto", "ht": 80},
+        ]
+        return FixStep(
+            action=ActionType.CHANNEL_CHANGE,
+            target_entity_type=EntityType.RADIO,
+            target_native_id=native,
+            description=f"{radio} {old_ch}->{new_ch}",
+            risk=RiskLevel.MEDIUM,
+            method="PUT",
+            endpoint=endpoint,
+            payload={"radio_table": full_snapshot},
+            precondition=_radio_pre(native, {"channel": old_ch}),
+            before={"method": "PUT", "endpoint": endpoint, "body": {"radio_table": before_table}},
+            after={"method": "PUT", "endpoint": endpoint, "body": {"radio_table": full_snapshot}},
+            revertible=True,
+        )
+
+    # Step 1 snapshot: ng->1, na still 36. Step 2 snapshot: na->40 but ng STILL 3.
+    step1 = _step(
+        f"{AP_MAC}:ng", "ng", 3, 1,
+        [{"radio": "ng", "channel": 1, "tx_power_mode": "high", "ht": 20},
+         {"radio": "na", "channel": 36, "tx_power_mode": "auto", "ht": 80}],
+    )
+    step2 = _step(
+        f"{AP_MAC}:na", "na", 36, 40,
+        [{"radio": "ng", "channel": 3, "tx_power_mode": "high", "ht": 20},
+         {"radio": "na", "channel": 40, "tx_power_mode": "auto", "ht": 80}],
+    )
+    plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "two-radio", steps=[step1, step2])
+
+    writer = _LiveWriter()
+    applier = Applier(store, writer)
+
+    async def _reader():
+        cur = {
+            f"{AP_MAC}:ng": {"channel": live["ng"]["channel"]},
+            f"{AP_MAC}:na": {"channel": live["na"]["channel"]},
+        }
+        full = {dev_key: {k: dict(v) for k, v in live.items()}}
+        return cur, full, set()
+
+    result = await applier.apply(
+        plan, dry_run=False, confirm_token=plan_confirm_token(plan), state_reader=_reader
+    )
+
+    assert result.applied is True
+    assert len(writer.puts) == 2
+    # Step 1's ng move SURVIVES step 2 (merge carried it forward); na moved too.
+    assert live["ng"]["channel"] == 1
+    assert live["na"]["channel"] == 40
+    # Step 2's dispatched body carried ng at 1 (merged), not the stale snapshot 3.
+    step2_ng = next(r for r in writer.puts[1]["radio_table"] if r["radio"] == "ng")
+    assert step2_ng["channel"] == 1
+    assert [c["status"] for c in store.list_changes()] == ["applied", "applied"]
+
+
+async def test_untouched_field_removed_from_live_is_not_restored(store):
+    # #1: a concurrent operator has REMOVED tx_power_mode from ng in live since the
+    # plan was built. The plan-time payload still carries tx_power_mode=high (an
+    # untouched field). Sent verbatim, the whole-table PUT would RESTORE that stale
+    # value. Merge-at-dispatch builds the body from fresh live (which no longer has
+    # tx_power_mode) plus only the channel delta, so the stale field is NOT re-added.
+    from netadmin.fixes.models import WriteResult
+
+    endpoint = f"rest/device/{AP_ID}"
+    live = {"ng": {"radio": "ng", "channel": 3, "ht": 20}}  # tx_power_mode GONE in live
+
+    class _LiveWriter:
+        def __init__(self):
+            self.puts = []
+
+        async def put(self, ep, body):
+            self.puts.append(body)
+            return WriteResult(ok=True, status_code=200, data={"meta": {}})
+
+        async def post(self, ep, body):  # pragma: no cover - unused
+            return await self.put(ep, body)
+
+    # Plan snapshot HAD tx_power_mode=high; only channel is the intended change.
+    step = FixStep(
+        action=ActionType.CHANNEL_CHANGE,
+        target_entity_type=EntityType.RADIO,
+        target_native_id=f"{AP_MAC}:ng",
+        description="ng 3->1",
+        risk=RiskLevel.MEDIUM,
+        method="PUT",
+        endpoint=endpoint,
+        payload={"radio_table": [{"radio": "ng", "channel": 1, "tx_power_mode": "high", "ht": 20}]},
+        precondition=_radio_pre(f"{AP_MAC}:ng", {"channel": 3}),
+        before={"method": "PUT", "endpoint": endpoint,
+                "body": {"radio_table": [{"radio": "ng", "channel": 3, "tx_power_mode": "high", "ht": 20}]}},
+        after={"method": "PUT", "endpoint": endpoint,
+               "body": {"radio_table": [{"radio": "ng", "channel": 1, "tx_power_mode": "high", "ht": 20}]}},
+        revertible=True,
+    )
+    plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "one", steps=[step])
+    writer = _LiveWriter()
+    applier = Applier(store, writer)
+
+    async def _reader():
+        cur = {f"{AP_MAC}:ng": {"channel": live["ng"]["channel"]}}
+        full = {AP_ID: {k: dict(v) for k, v in live.items()}}
+        return cur, full, set()
+
+    result = await applier.apply(
+        plan, dry_run=False, confirm_token=plan_confirm_token(plan), state_reader=_reader
+    )
+    assert result.applied is True
+    dispatched_ng = next(r for r in writer.puts[0]["radio_table"] if r["radio"] == "ng")
+    assert dispatched_ng["channel"] == 1  # the intended change landed
+    assert "tx_power_mode" not in dispatched_ng  # the stale untouched field was NOT restored
+
+
+async def test_radio_added_to_live_is_preserved_not_deleted(store):
+    # #1: a radio '6e' has appeared in live since the plan was built (the plan snapshot
+    # knew only ng+na). A whole-table PUT that omits 6e would DELETE it. Merge-at-
+    # dispatch rebuilds the table from fresh live, so 6e is carried through untouched.
+    from netadmin.fixes.models import WriteResult
+
+    endpoint = f"rest/device/{AP_ID}"
+    live = {
+        "ng": {"radio": "ng", "channel": 3, "ht": 20},
+        "na": {"radio": "na", "channel": 36, "ht": 80},
+        "6e": {"radio": "6e", "channel": 100, "ht": 160},  # appeared in live
+    }
+
+    class _LiveWriter:
+        def __init__(self):
+            self.puts = []
+
+        async def put(self, ep, body):
+            self.puts.append(body)
+            return WriteResult(ok=True, status_code=200, data={"meta": {}})
+
+        async def post(self, ep, body):  # pragma: no cover - unused
+            return await self.put(ep, body)
+
+    step = FixStep(
+        action=ActionType.CHANNEL_CHANGE,
+        target_entity_type=EntityType.RADIO,
+        target_native_id=f"{AP_MAC}:ng",
+        description="ng 3->1",
+        risk=RiskLevel.MEDIUM,
+        method="PUT",
+        endpoint=endpoint,
+        payload={"radio_table": [{"radio": "ng", "channel": 1, "ht": 20},
+                                 {"radio": "na", "channel": 36, "ht": 80}]},
+        precondition=_radio_pre(f"{AP_MAC}:ng", {"channel": 3}),
+        before={"method": "PUT", "endpoint": endpoint,
+                "body": {"radio_table": [{"radio": "ng", "channel": 3, "ht": 20},
+                                         {"radio": "na", "channel": 36, "ht": 80}]}},
+        after={"method": "PUT", "endpoint": endpoint,
+               "body": {"radio_table": [{"radio": "ng", "channel": 1, "ht": 20},
+                                        {"radio": "na", "channel": 36, "ht": 80}]}},
+        revertible=True,
+    )
+    plan = FixPlan("wifi.channel_plan", f"{AP_MAC}:ng", "one", steps=[step])
+    writer = _LiveWriter()
+    applier = Applier(store, writer)
+
+    async def _reader():
+        cur = {f"{AP_MAC}:ng": {"channel": live["ng"]["channel"]}}
+        full = {AP_ID: {k: dict(v) for k, v in live.items()}}
+        return cur, full, set()
+
+    result = await applier.apply(
+        plan, dry_run=False, confirm_token=plan_confirm_token(plan), state_reader=_reader
+    )
+    assert result.applied is True
+    dispatched_codes = {r["radio"] for r in writer.puts[0]["radio_table"]}
+    assert "6e" in dispatched_codes  # the live-only radio was preserved, not deleted
+    dispatched_6e = next(r for r in writer.puts[0]["radio_table"] if r["radio"] == "6e")
+    assert dispatched_6e["channel"] == 100
+
+
+async def test_revert_of_a_change_that_deleted_a_radio_is_refused_not_falsely_reverted(store):
+    # #6: the ledgered change's DISPATCHED after dropped radio 'na' (present in before).
+    # Its inverse iterates only after-entries, so na never enters the touched set and a
+    # naive revert restores ng, leaves na absent, and marks the row 'reverted' -- a
+    # dishonest, incomplete rollback. The revert must instead DETECT the deleted radio
+    # and refuse; the row must NOT read 'reverted' and nothing is dispatched.
+    from netadmin.fixes.models import WriteResult
+
+    endpoint = f"rest/device/{AP_ID}"
+
+    class _CountingWriter:
+        def __init__(self):
+            self.calls = 0
+
+        async def put(self, ep, body):
+            self.calls += 1
+            return WriteResult(ok=True, status_code=200, data={"meta": {}})
+
+        async def post(self, ep, body):  # pragma: no cover - unused
+            return await self.put(ep, body)
+
+    change_id = store.insert_change(
+        action="wifi.channel_change",
+        before={"method": "PUT", "endpoint": endpoint,
+                "body": {"radio_table": [{"radio": "ng", "channel": 3}, {"radio": "na", "channel": 36}]}},
+        # Dispatched after DROPPED na (only ng survives the whole-table PUT).
+        after={"method": "PUT", "endpoint": endpoint,
+               "body": {"radio_table": [{"radio": "ng", "channel": 1}]}},
+        status="applied",
+        ts=1,
+    )
+    writer = _CountingWriter()
+    applier = Applier(store, writer)
+    live = {"ng": {"radio": "ng", "channel": 1}}
+
+    with pytest.raises(SafetyViolation):
+        await applier.revert(change_id, current_radios=live)
+    assert writer.calls == 0  # nothing dispatched
+    assert store.get_change(change_id)["status"] != "reverted"  # never falsely reverted
+
+
+async def test_concurrent_reverts_first_ambiguous_blocks_the_second_from_replaying(store):
+    # #2: two concurrent reverts of the SAME change. The FIRST restore's outcome is
+    # AMBIGUOUS (lost response). Before the fix, revert only refused status=='reverted'
+    # and recorded no ambiguous/in-progress state, so the row stayed 'applied' and the
+    # SECOND revert dispatched AGAIN -- two PUTs. The fix records the ambiguous revert
+    # as terminal-uncertain under the lock, so the second re-reads it and refuses. The
+    # mutation is dispatched exactly ONCE.
+    import asyncio as _asyncio
+
+    from netadmin.fixes.models import WriteResult
+
+    endpoint = f"rest/device/{AP_ID}"
+    change_id = store.insert_change(
+        action="wifi.channel_change",
+        before={"method": "PUT", "endpoint": endpoint,
+                "body": {"radio_table": [{"radio": "ng", "channel": 3}]}},
+        after={"method": "PUT", "endpoint": endpoint,
+               "body": {"radio_table": [{"radio": "ng", "channel": 1}]}},
+        status="applied",
+        ts=1,
+    )
+
+    class _AmbiguousWriter:
+        def __init__(self):
+            self.puts = 0
+
+        async def put(self, ep, body):
+            self.puts += 1
+            await _asyncio.sleep(0)
+            return WriteResult(
+                ok=False, status_code=None,
+                data={"ambiguous": True, "error": "lost response after PUT"},
+            )
+
+        async def post(self, ep, body):  # pragma: no cover - unused
+            return await self.put(ep, body)
+
+    writer = _AmbiguousWriter()
+    applier = Applier(store, writer)
+    live = {"ng": {"radio": "ng", "channel": 1}}
+
+    async def _reader():
+        return {k: dict(v) for k, v in live.items()}, False
+
+    results = await _asyncio.gather(
+        applier.revert(change_id, state_reader=_reader),
+        applier.revert(change_id, state_reader=_reader),
+        return_exceptions=True,
+    )
+
+    assert writer.puts == 1  # dispatched exactly once -- the ambiguous first blocks a replay
+    ambiguous = [r for r in results if isinstance(r, WriteResult)]
+    refused = [r for r in results if isinstance(r, FixError)]
+    assert len(ambiguous) == 1 and ambiguous[0].data.get("ambiguous") is True
+    assert len(refused) == 1
+    assert "already" in str(refused[0]) or "unknown" in str(refused[0]) or "ambiguous" in str(refused[0])
+    # The row is terminal-uncertain, not 'reverted' and not plain 'applied'.
+    assert store.get_change(change_id)["status"] == "revert_unknown"
