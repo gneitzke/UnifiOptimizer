@@ -360,23 +360,42 @@ class Backfiller:
             # clipped retry 'complete' would leave the ORIGINAL [c_lo, c_hi)
             # 'failed' row untouched -- a stale hole that regenerates a redundant
             # refetch on every subsequent run even though everything retrievable
-            # has been retrieved. Retire the original and split it here: the
-            # now-unrecoverable pre-clip portion [c_lo, clip_start) is recorded
-            # unrecoverable and the original 'failed' row is deleted, so the only
-            # residual rows are the (new) unrecoverable pre-clip slice plus the
-            # clipped retry (which becomes 'complete' on success, or a fresh,
-            # correctly-bounded 'failed' row on another failure -- a genuinely
-            # still-missing within-retention hole is thus still retried).
+            # has been retrieved. The original is therefore retired and split into
+            # its pre-clip [c_lo, clip_start) (unrecoverable) and still-fetchable
+            # [clip_start, c_hi) parts.
+            #
+            # Finding #3 (round-12 durability ordering): the split-and-retire must
+            # be crash/cancel-safe. Retiring the original BEFORE the clipped fetch
+            # completes (the prior wave's ordering) meant a cancellation between
+            # retire and fetch-completion left NO row for the recoverable
+            # [clip_start, c_hi) window -- the original 'failed' row was gone and
+            # its 'complete' replacement never written -- so the hole vanished from
+            # the ledger and the next run made ZERO requests. Fix: SPLIT-FIRST,
+            # durably. Record BOTH replacement rows -- the pre-clip slice as
+            # 'unrecoverable' AND the recoverable slice [clip_start, c_hi) as a
+            # 'failed' hole -- each in its own transaction, THEN retire the
+            # now-redundant original. A cancellation/crash at ANY point therefore
+            # leaves [clip_start, c_hi) still marked 'failed' (retried next run),
+            # never lost. The clipped slice becomes 'complete' on a successful
+            # fetch below (or stays 'failed' on another failure), so the round-11
+            # end state -- unrecoverable + complete, no residual failed row, no
+            # redundant refetch -- is preserved on the success path, and a
+            # genuinely still-missing within-retention hole is still retried.
             clip_start = max(c_lo, retention_floor)
             if clip_start > c_lo:
-                self._repo.retire_ingest_coverage(
-                    kind="report", scope=scope, interval=interval,
-                    start_ts=c_lo, end_ts=c_hi,
-                )
                 self._repo.record_ingest_coverage(
                     kind="report", scope=scope, interval=interval,
                     start_ts=c_lo, end_ts=clip_start, status="unrecoverable",
                     detail="controller report retention elapsed before retry",
+                )
+                self._repo.record_ingest_coverage(
+                    kind="report", scope=scope, interval=interval,
+                    start_ts=clip_start, end_ts=c_hi, status="failed",
+                    detail="retention-clipped retry pending",
+                )
+                self._repo.retire_ingest_coverage(
+                    kind="report", scope=scope, interval=interval,
+                    start_ts=c_lo, end_ts=c_hi,
                 )
             key = (interval, clip_start, c_hi)
             chunks.append(key)
