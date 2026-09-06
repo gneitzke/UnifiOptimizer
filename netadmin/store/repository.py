@@ -1338,6 +1338,25 @@ class Repository:
                 (kind, scope, interval, start_ts, end_ts, status, detail, _now()),
             )
 
+    # Finding #7: retire (delete) one coverage row by its exact primary key.
+    # When retention clips a failed interval, the retryable window gets a NEW
+    # start_ts and therefore a NEW primary key (kind, scope, interval, start_ts,
+    # end_ts); the original failed row cannot be updated in place (its start_ts
+    # no longer matches) and would otherwise survive as a stale 'failed' hole
+    # that regenerates redundant retries forever. The caller splits it: the
+    # pre-clip portion is recorded 'unrecoverable' and this drops the original
+    # row so nothing beside the new complete/failed clipped row keeps re-firing.
+    def retire_ingest_coverage(
+        self, *, kind: str, scope: str, interval: str, start_ts: int, end_ts: int
+    ) -> None:
+        with self._write() as conn:
+            self._ensure_ingest_coverage(conn)
+            conn.execute(
+                "DELETE FROM ingest_coverage WHERE kind=? AND scope=? AND interval=? "
+                "AND start_ts=? AND end_ts=?",
+                (kind, scope, interval, start_ts, end_ts),
+            )
+
     # C4: failed report chunks remain first-class holes and are retried even
     # after a later successful chunk advances sample timestamps.
     def failed_ingest_coverage(

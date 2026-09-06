@@ -354,7 +354,31 @@ class Backfiller:
             closed_end = now - (now % INTERVAL_SECONDS[interval])
             if c_hi > closed_end:
                 continue
-            key = (interval, max(c_lo, retention_floor), c_hi)
+            # Finding #7: retention may have advanced into this failed interval,
+            # so only [clip_start, c_hi) is still fetchable. Clipping the retry to
+            # a new start CHANGES the coverage primary key, so recording the
+            # clipped retry 'complete' would leave the ORIGINAL [c_lo, c_hi)
+            # 'failed' row untouched -- a stale hole that regenerates a redundant
+            # refetch on every subsequent run even though everything retrievable
+            # has been retrieved. Retire the original and split it here: the
+            # now-unrecoverable pre-clip portion [c_lo, clip_start) is recorded
+            # unrecoverable and the original 'failed' row is deleted, so the only
+            # residual rows are the (new) unrecoverable pre-clip slice plus the
+            # clipped retry (which becomes 'complete' on success, or a fresh,
+            # correctly-bounded 'failed' row on another failure -- a genuinely
+            # still-missing within-retention hole is thus still retried).
+            clip_start = max(c_lo, retention_floor)
+            if clip_start > c_lo:
+                self._repo.retire_ingest_coverage(
+                    kind="report", scope=scope, interval=interval,
+                    start_ts=c_lo, end_ts=c_hi,
+                )
+                self._repo.record_ingest_coverage(
+                    kind="report", scope=scope, interval=interval,
+                    start_ts=c_lo, end_ts=clip_start, status="unrecoverable",
+                    detail="controller report retention elapsed before retry",
+                )
+            key = (interval, clip_start, c_hi)
             chunks.append(key)
             seen.add(key)
         for interval, window in plan.items():
