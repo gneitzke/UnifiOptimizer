@@ -39,7 +39,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from netadmin.detect.engine import COVERAGE_MIN, UNKNOWN, EvalResult
+from netadmin.detect.engine import COVERAGE_MIN, UNKNOWN, DetectorResult, EvalResult
 from netadmin.domain.entities import Entity, Finding
 from netadmin.domain.types import Cadence, EntityType, Severity
 from netadmin.logging import get_logger
@@ -162,12 +162,23 @@ class DeviceDownDetector:
         stale_s = int(ctx.threshold(self.key, "stale_last_seen_s", 300))
         event_window_s = int(ctx.threshold(self.key, "event_window_s", 3600))
 
+        # B4: device_down mixes POLL arms (recorded ``state``, stale ``last_seen``)
+        # with an EVENT arm (``*_Lost_Contact``). The poll arms are covered by the
+        # fast_device coverage gate above. The event arm is not: when the event
+        # feed was not substantially observed, a lost-contact event that established
+        # an active outage can age out of the window while polling stays healthy,
+        # and "no lost-contact event" then reads as a reconnect and false-clears.
+        # So the event arm is gated on event-source coverage, and a device with no
+        # poll-arm verdict on an unobserved window is frozen (UNKNOWN), not cleared.
+        event_ok = ctx.event_coverage_ok(event_window_s)
+
         findings: list[Finding] = []
+        unknown_devices: set[int] = set()
         for etype in DEVICE_TYPES:
             for entity in ctx.entities(etype):
                 if entity.entity_id is None:
                     continue
-                evidence = self._down_evidence(
+                evidence, event_frozen = self._down_evidence(
                     ctx,
                     entity,
                     down_states=down_states,
@@ -175,11 +186,13 @@ class DeviceDownDetector:
                     transitional_states=transitional_states,
                     stale_s=stale_s,
                     event_window_s=event_window_s,
+                    event_ok=event_ok,
                 )
-                if evidence is None:
-                    continue
-                findings.append(self._finding(entity, evidence))
-        return findings
+                if evidence is not None:
+                    findings.append(self._finding(entity, evidence))
+                elif event_frozen:
+                    unknown_devices.add(entity.entity_id)
+        return DetectorResult.of(findings, unknown_devices)
 
     def _down_evidence(
         self,
@@ -191,14 +204,25 @@ class DeviceDownDetector:
         transitional_states: set[str],
         stale_s: int,
         event_window_s: int,
-    ) -> Optional[dict[str, Any]]:
+        event_ok: bool,
+    ) -> tuple[Optional[dict[str, Any]], bool]:
+        """Return ``(evidence, freeze)``.
+
+        ``evidence`` is the down finding's evidence, or ``None`` when the device is
+        not down. ``freeze`` is ``True`` when there is no poll-arm verdict *and* the
+        event feed was not observed, so the (unusable) lost-contact arm cannot be
+        trusted to clear -- the engine freezes such a device's open issue instead of
+        resolving it by absence.
+        """
         state = ctx.repo.current_state(entity.entity_id, "state")
         state_str = None if state is None else str(state)
         state_offline = state_str is not None and state_str in down_states
 
         since_ts = ctx.now_ts - event_window_s
         events = ctx.events(entity_id=entity.entity_id, since_ts=since_ts)
-        lost_active, last_lost_ts = _lost_contact_active(events)
+        lost_active_raw, last_lost_ts = _lost_contact_active(events)
+        # Event arm usable only when the feed was substantially observed.
+        lost_active = lost_active_raw and event_ok
 
         last_seen = entity.last_seen_ts
         seconds_since_seen = None if last_seen is None else ctx.now_ts - last_seen
@@ -213,7 +237,10 @@ class DeviceDownDetector:
             triggers.append("stale_last_seen")
 
         if not triggers:
-            return None
+            # No finding. The poll arms (state/last_seen) had their say under the
+            # fast_device gate. If the event feed had a gap, the lost-contact arm is
+            # unproven, so freeze rather than clear an event-driven outage.
+            return None, not event_ok
 
         # A stale-only trigger is suppressed when the device's last recorded state
         # is online (or transitional). A device the controller still reports as up
@@ -229,7 +256,9 @@ class DeviceDownDetector:
             and state_str is not None
             and (state_str in transitional_states or state_str in online_states)
         ):
-            return None
+            # Suppressed as a collection/sync gap -- no poll-arm verdict. Freeze if
+            # the event feed was also unobserved, for the same reason as above.
+            return None, not event_ok
 
         return {
             "state": state_str,
@@ -237,7 +266,7 @@ class DeviceDownDetector:
             "last_seen_ts": last_seen,
             "seconds_since_seen": seconds_since_seen,
             "last_lost_contact_ts": last_lost_ts,
-        }
+        }, False
 
     def _finding(self, entity: Entity, evidence: dict[str, Any]) -> Finding:
         label = entity.name or entity.native_id
