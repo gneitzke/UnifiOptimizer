@@ -41,6 +41,16 @@ export function IncidentRow({
   // drifts from the live prop, keeps the cache honest without refetching on
   // every poll when membership hasn't actually changed.
   const [symptomsFetchedAtCount, setSymptomsFetchedAtCount] = useState<number | null>(null);
+  // C5 (round 17): tracks the count a fetch most recently FAILED at, distinct
+  // from `symptomsFetchedAtCount` (which now only ever records a SUCCESS —
+  // see `fetchSymptoms` below). This exists purely to stop the passive
+  // in-place effect from spinning: without it, a persistently-failing fetch
+  // would leave `stale` true forever, and the effect would refire the moment
+  // `loadingSymptoms` flips back to false, forever. A manual expand
+  // (`toggle`) ignores this and always retries, matching "retry on next user
+  // expand"; it's only the automatic effect that backs off once a given
+  // count has already failed.
+  const [symptomsFailedAtCount, setSymptomsFailedAtCount] = useState<number | null>(null);
   const [loadingSymptoms, setLoadingSymptoms] = useState(false);
 
   const isGroup = incident.symptom_count > 0;
@@ -56,10 +66,24 @@ export function IncidentRow({
     try {
       const detail = await getIncident(incident.id);
       setSymptoms(detail.symptoms);
-    } catch {
-      setSymptoms([]);
-    } finally {
+      // Only a SUCCESSFUL fetch validates the cache for this count. A failed
+      // fetch must NOT record `symptomsFetchedAtCount` — doing so would mark
+      // an empty/stale `symptoms` as satisfied for the current count, so a
+      // transient failure permanently hid real symptoms even after the
+      // server recovered (no retry on collapse/re-expand or the in-place
+      // staleness effect below, since `stale` would already read false).
       setSymptomsFetchedAtCount(atCount);
+      setSymptomsFailedAtCount(null);
+    } catch {
+      // Leave `symptomsFetchedAtCount` untouched so `stale` stays true (or
+      // `symptoms` stays null on a first-ever attempt) — the row keeps
+      // retrying on the next expand or the next time the count changes
+      // again. Record the failed count separately so the passive effect
+      // below (not the user-driven `toggle`) can stop retrying a count
+      // that's already known to fail, avoiding a busy loop.
+      setSymptoms([]);
+      setSymptomsFailedAtCount(atCount);
+    } finally {
       setLoadingSymptoms(false);
     }
   }
@@ -76,13 +100,16 @@ export function IncidentRow({
   // dashboard polls every 30s and keeps this component mounted across
   // refreshes). Refetch in place so the open list stays in agreement with
   // the fresh `incident.symptom_count` instead of waiting for a
-  // collapse/re-expand that may never come.
+  // collapse/re-expand that may never come. Skips a count that has already
+  // failed (`symptomsFailedAtCount === incident.symptom_count`) so a
+  // persistently-failing fetch retries only on the next user expand or the
+  // next count change, rather than spinning every render.
   useEffect(() => {
-    if (expanded && stale && !loadingSymptoms) {
+    if (expanded && stale && !loadingSymptoms && symptomsFailedAtCount !== incident.symptom_count) {
       void fetchSymptoms();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [expanded, stale, loadingSymptoms]);
+  }, [expanded, stale, loadingSymptoms, symptomsFailedAtCount, incident.symptom_count]);
 
   return (
     <li style={{ borderTop: '1px solid var(--hairline)' }}>
