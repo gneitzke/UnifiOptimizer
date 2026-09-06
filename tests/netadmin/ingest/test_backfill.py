@@ -421,6 +421,80 @@ async def test_stat_report_unsupported_is_distinct_from_supported_empty():
     assert await supported.stat_report(FIVEMIN, "ap", start_ms=0, end_ms=300_000) == []
 
 
+@pytest.mark.asyncio
+async def test_finding7_clipped_failed_retry_retires_original_no_redundant_refetch(
+    repo: Repository,
+):
+    """A retention-clipped retry must retire/split the original failed row.
+
+    Finding #7: an actual failed fetch [4800,6000) is recorded 'failed'; then
+    retention advances so only [5400,6000) is still fetchable. The successful
+    clipped retry records 'complete' for [5400,6000), but the ORIGINAL
+    [4800,6000) 'failed' row must NOT survive -- clipping changes the coverage
+    primary key, so leaving it would regenerate a redundant refetch every run.
+    The fix retires the original and splits it: [4800,5400) -> unrecoverable,
+    [5400,6000) -> complete. A subsequent run must NOT refetch the satisfied
+    window, while a genuinely still-missing within-retention hole still retries.
+    """
+    tnow = 6000  # a closed 5-minute bucket boundary (6000 % 300 == 0)
+    # retention_floor = now - retention = 6000 - 600 = 5400, landing inside the
+    # failed interval so the retry is clipped.
+    ret = 600
+
+    def cov_rows():
+        return repo._conn.execute(
+            "SELECT interval, start_ts, end_ts, status FROM ingest_coverage "
+            "WHERE kind='report' AND scope='ap' ORDER BY start_ts, end_ts"
+        ).fetchall()
+
+    # An actual failed fetch, recorded first-class as a hole.
+    repo.record_ingest_coverage(
+        kind="report", scope="ap", interval=FIVEMIN,
+        start_ts=4800, end_ts=6000, status="failed", detail="boom",
+    )
+
+    ep = FakeEndpoints()  # empty-but-successful retry
+    bf = Backfiller(ep, repo, scopes=("ap",), fivemin_retention_s=ret)
+    # last_ts == now -> the incremental plan opens no new windows; only the
+    # failed-coverage retry drives this run.
+    await bf.run({"ap": tnow}, now=tnow)
+
+    rows = [
+        (r["interval"], r["start_ts"], r["end_ts"], r["status"]) for r in cov_rows()
+    ]
+    # Original [4800,6000) failed row is gone; it is split into an unrecoverable
+    # pre-retention slice and a complete clipped slice.
+    assert rows == [
+        (FIVEMIN, 4800, 5400, "unrecoverable"),
+        (FIVEMIN, 5400, 6000, "complete"),
+    ]
+    assert repo.failed_ingest_coverage(kind="report", scope="ap") == []
+    # The retry actually clipped to the still-fetchable window.
+    assert [(c["start_ms"], c["end_ms"]) for c in ep.calls] == [
+        (5400 * 1000, 6000 * 1000)
+    ]
+
+    # A SUBSEQUENT run must not redundantly refetch the already-satisfied window.
+    ep.calls.clear()
+    await bf.run({"ap": tnow}, now=tnow)
+    assert ep.calls == []  # nothing left generating retry work
+
+    # A genuinely still-missing hole WITHIN retention is still retried.
+    repo.record_ingest_coverage(
+        kind="report", scope="ap", interval=FIVEMIN,
+        start_ts=5460, end_ts=6000, status="failed", detail="still open",
+    )
+    ep.calls.clear()
+    await bf.run({"ap": tnow}, now=tnow)
+    assert [(c["start_ms"], c["end_ms"]) for c in ep.calls] == [
+        (5460 * 1000, 6000 * 1000)
+    ]
+    # ...and it lands as complete (no residual failed row).
+    assert repo.failed_ingest_coverage(kind="report", scope="ap") == []
+    statuses = {(r["start_ts"], r["end_ts"]): r["status"] for r in cov_rows()}
+    assert statuses[(5460, 6000)] == "complete"
+
+
 def test_user_signal_maps_to_collector_rssi_metric():
     # Report "signal" (dBm) must land on the collector's canonical "rssi" series
     # (mapping.py stores Client.signal as "rssi"), never a divergent "signal".
