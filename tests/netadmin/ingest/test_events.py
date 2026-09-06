@@ -773,6 +773,60 @@ async def test_p1_overflow_boundary_event_survives_storage_blip_and_restart(
     assert sup._pending == []
 
 
+# --------------------------------------------------------------------------- #
+# P1 (normalize-READ blip): normalize() does entity-resolution DB READS, and a
+# WS event is appended to the batch only AFTER a successful normalize. A transient
+# storage read error during that lookup raised straight out of the consumer loop,
+# dropping the just-consumed event on the floor -- it never reached the batch the
+# supervisor rescues, and a WS event has NO stat/event recovery source. The event
+# must instead be retained and, once the read recovers, normalized and persisted:
+# zero silently lost. A genuinely malformed payload may still be dropped.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_p1_normalize_read_blip_retains_and_recovers_event(
+    repo: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    N = 5
+    events = [
+        Event.model_validate(
+            {
+                "_id": f"n{i}",
+                "key": "EVT_WU_Connected",
+                "time": 1_721_600_000_000 + i,
+                "user": CLIENT_MAC,  # forces an entity-resolution lookup
+            }
+        )
+        for i in range(N)
+    ]
+
+    # The FIRST entity lookup during normalization raises (a transient read blip);
+    # every later lookup succeeds. Mirrors the verifier exactly.
+    real_find = repo.find_entity
+    calls = {"n": 0}
+
+    def flaky_find(etype: EntityType, mac: str) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_find(etype, mac)
+
+    monkeypatch.setattr(repo, "find_entity", flaky_find)
+
+    listener = EventListener(FakeWs(events), repo, flush_interval=None, batch_size=100)
+    # Must NOT raise out: the read blip is recoverable, not fatal.
+    await listener.run()
+
+    # Zero loss: the event whose first lookup blipped is retained, re-normalized
+    # once the read recovers, and persisted with all the rest.
+    stored = repo.read_events(0, 2_000_000_000)
+    assert len(stored) == N
+    assert {r["native_id"] for r in stored} == {f"n{i}" for i in range(N)}
+    # Nothing stranded in the raw retry buffer.
+    assert listener.pending_raw_records() == []
+
+
 @pytest.mark.asyncio
 async def test_r2_pending_survives_when_health_accounting_also_fails(
     repo: Repository, monkeypatch: pytest.MonkeyPatch
