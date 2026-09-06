@@ -30,6 +30,7 @@ transaction ride it rather than nesting.
 
 from __future__ import annotations
 
+import bisect
 import json
 import sqlite3
 import time
@@ -80,6 +81,21 @@ _WS_HEARTBEAT_LABEL = "heartbeat"
 # false-clear a real event-based issue. Keep this a small multiple of the
 # heartbeat interval in events.py; do not widen it back toward the window size.
 _WS_HEARTBEAT_MAX_GAP_S = 75
+
+# #w16a-1 (disconnect-aware bridge): the ``job='ws'`` connection-state transition
+# rows the supervisor writes (``EventListener._on_listener_state`` -> ``_record``)
+# when the socket drops or backs off. The cadence bridge above may join two beats
+# no more than ``_WS_HEARTBEAT_MAX_GAP_S`` apart, but a beat before a recorded
+# disconnect and one after the reconnect were NOT one continuous observation --
+# the feed was DOWN between them. So a recorded disconnect that falls between two
+# heartbeats SEVERS the chain regardless of the beat gap: coverage ends at the
+# beat before the disconnect and only resumes at the first beat after reconnect.
+# (A missed beat within a still-connected span carries no such row and still
+# bridges.) Match the health-string labels the supervisor emits for "the feed is
+# not connected": ``disconnected`` (``_on_listener_state`` when state !=
+# 'connected'; and the clean cancel/stop close) and ``reconnecting`` (belt-and-
+# braces, should the state word itself ever be recorded).
+_WS_DISCONNECT_LABELS = ("disconnected", "reconnecting")
 
 # C7/P2: how many reconcile passes a row may be *selected without being filled*
 # before it is parked (stops consuming the oldest-first LIMIT window). It is a
@@ -1175,7 +1191,7 @@ class Repository:
         # The port set is imported from the normalizer itself (single source of
         # truth -- no drift). The import is lazy: netadmin.ingest.events imports
         # Repository, so a module-level import here would be circular.
-        from netadmin.ingest.events import _PORT_SCOPED_SW_EVENT_KEYS
+        from netadmin.ingest.events import _MAX_PORT_INDEX, _PORT_SCOPED_SW_EVENT_KEYS
 
         port_keys_sql = ",".join(
             "'" + k.replace("'", "''") + "'" for k in sorted(_PORT_SCOPED_SW_EVENT_KEYS)
@@ -1201,12 +1217,23 @@ class Repository:
         # native_id is byte-identical on both sides. A rejected value yields NULL, so
         # the resolvability CASE falls to the switch branch (``port_idx IS NOT NULL``
         # is false), matching the normalizer.
+        # #w16a-5: accept the integer ONLY when it is also within the sane port
+        # range [0, _MAX_PORT_INDEX], mirroring the normalizer. An integer outside
+        # SQLite's signed-64-bit range is rendered by ``json_extract`` as a FLOAT
+        # (json_type still reports 'integer'), so ``json_type='integer'`` alone
+        # would accept it and build "<sw>:9.2...e+18" while the normalizer builds
+        # the full-decimal id -- a permanent native_id desync. The extracted value
+        # for such an integer is > _MAX_PORT_INDEX, so the BETWEEN bound rejects it
+        # to NULL and it routes to the switch, exactly as the normalizer does.
+        port_hi = int(_MAX_PORT_INDEX)
         port_idx = (
             "CASE"
             "  WHEN json_extract(ev.data,'$.port') IS NOT NULL"
             "    THEN CASE WHEN json_type(ev.data,'$.port')='integer'"
+            f"              AND json_extract(ev.data,'$.port') BETWEEN 0 AND {port_hi}"
             "              THEN json_extract(ev.data,'$.port') END"
             "  ELSE CASE WHEN json_type(ev.data,'$.port_idx')='integer'"
+            f"            AND json_extract(ev.data,'$.port_idx') BETWEEN 0 AND {port_hi}"
             "            THEN json_extract(ev.data,'$.port_idx') END"
             " END"
         )
@@ -1465,12 +1492,32 @@ class Repository:
     # heartbeat up to one max-gap before the window bridges into it, so a window
     # entered mid-run starts covered.
     def _ws_observed_intervals(self, start_ts: int, end_ts: int) -> list[tuple[int, int]]:
+        lower = start_ts - _WS_HEARTBEAT_MAX_GAP_S
         rows = self._conn.execute(
             "SELECT ts FROM poll_runs "
             "WHERE job='ws' AND source='live' AND error=? AND ts>=? AND ts<? "
             "ORDER BY ts, rowid",
-            (_WS_HEARTBEAT_LABEL, start_ts - _WS_HEARTBEAT_MAX_GAP_S, end_ts),
+            (_WS_HEARTBEAT_LABEL, lower, end_ts),
         ).fetchall()
+        # #w16a-1: recorded WS disconnect transitions in the same span. A
+        # disconnect that lands BETWEEN two heartbeats severs their chain even
+        # when they are within the cadence bridge -- the feed was down, so that
+        # span is a real hole, not continuous observation.
+        placeholders = ",".join("?" for _ in _WS_DISCONNECT_LABELS)
+        disc_rows = self._conn.execute(
+            "SELECT ts FROM poll_runs "
+            f"WHERE job='ws' AND source='live' AND error IN ({placeholders}) "
+            "AND ts>=? AND ts<? ORDER BY ts",
+            (*_WS_DISCONNECT_LABELS, lower, end_ts),
+        ).fetchall()
+        disconnects = [int(r["ts"]) for r in disc_rows]
+
+        def _disconnect_between(a: int, b: int) -> bool:
+            # Any recorded disconnect strictly inside (a, b) means the feed went
+            # down between these two beats, so the covered run must break here.
+            i = bisect.bisect_right(disconnects, a)
+            return i < len(disconnects) and disconnects[i] < b
+
         intervals: list[tuple[int, int]] = []
         run_start: Optional[int] = None
         prev: Optional[int] = None
@@ -1478,9 +1525,11 @@ class Repository:
             ts = int(row["ts"])
             if prev is None:
                 run_start = ts
-            elif ts - prev <= _WS_HEARTBEAT_MAX_GAP_S:
+            elif ts - prev <= _WS_HEARTBEAT_MAX_GAP_S and not _disconnect_between(prev, ts):
                 pass  # same continuous run of liveness
             else:
+                # Either the cadence gap is too large OR a disconnect was recorded
+                # between the two beats: close the run at ``prev`` and start anew.
                 assert run_start is not None
                 if prev > run_start:
                     intervals.append((run_start, prev))

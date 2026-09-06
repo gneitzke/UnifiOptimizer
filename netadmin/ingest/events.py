@@ -72,6 +72,20 @@ _CATCHUP_MAX_WITHIN_HOURS = 30 * 24  # events are pruned at ~30 days locally
 # scope, not the mere presence of a ``port`` field.
 _PORT_SCOPED_SW_EVENT_KEYS = frozenset({"EVT_SW_StpPortBlocking"})
 
+# #w16a-5 (out-of-range int port): a port index is a PORT native_id segment only
+# when it is a small, sane switch-port ordinal. Real UniFi switches top out well
+# under this; the ceiling exists to reject a garbage/huge integer that would
+# otherwise DESYNC the two native_ids. json_extract renders an integer outside
+# SQLite's signed-64-bit range as a FLOAT (e.g. 9223372036854775808 ->
+# 9.223372036854776e+18), so the SQL resolvability predicate builds
+# "<sw>:9.22...e+18" while this normalizer builds the full-decimal
+# "<sw>:9223372036854775808": the native_ids DISAGREE, the row reads
+# forever-"resolvable" against an entity that never exists, and starves newer
+# repairable rows. Bounding an accepted port to [0, _MAX_PORT_INDEX] in BOTH the
+# normalizer and the SQL means an out-of-range value is never accepted-then-
+# mismatched: it is rejected identically on both sides and routes to the SWITCH.
+_MAX_PORT_INDEX = 4095
+
 # P1: a SYSTEM-WIDE ceiling on the events the supervisor holds in memory while
 # storage is down. The per-listener ``_max_pending`` bounds ONE listener's batch,
 # but the supervisor rescues each dead listener's batch onto ``_pending`` and then
@@ -238,8 +252,16 @@ class EventNormalizer:
             port_raw = _field(event, "port")
             if port_raw is None:
                 port_raw = _field(event, "port_idx")
+            # #w16a-5: accept only a genuine int (never a bool) AND within the sane
+            # port range, so an out-of-range integer -- which the SQL renders as a
+            # float, desyncing the native_id -- is rejected here too and routes to
+            # the switch on BOTH sides.
             port_idx = (
-                port_raw if isinstance(port_raw, int) and not isinstance(port_raw, bool) else None
+                port_raw
+                if isinstance(port_raw, int)
+                and not isinstance(port_raw, bool)
+                and 0 <= port_raw <= _MAX_PORT_INDEX
+                else None
             )
             if key in _PORT_SCOPED_SW_EVENT_KEYS and port_idx is not None:
                 port_nid = f"{sw_mac}:{port_idx}"
@@ -428,18 +450,49 @@ async def catchup_events(
         logger.warning("Catch-up event read failed; window recorded failed: %s", exc)
         raise
     records: list[dict[str, Any]] = []
-    for event in events:
-        record = normalizer.normalize(event)
-        if record is None:
-            continue
-        # An explicit cursor is an API caller's volume constraint.  The normal
-        # coverage cursor is deliberately not an insertion filter: overlap is
-        # deduped by event identity, and filtering it recreates the C3 loss.
-        if explicit_cursor and since_ts is not None and record["ts"] < since_ts:
-            continue
-        records.append(record)
-    inserted = repo.record_events_enriching_entities(records)
-    normalizer.reconcile_unresolved()
+    # #w16a-4: count events that were READ but could NOT be stored because they
+    # are structurally unusable (normalize -> None: no key, or no usable
+    # timestamp). These are real history we failed to persist, so a window that
+    # dropped any of them must NOT later be credited fully-'complete' with an
+    # observed-empty (or under-filled) history -- that fabrication lets an
+    # event-based detector false-clear. A genuinely EMPTY read drops nothing and
+    # still records complete.
+    unusable_dropped = 0
+    try:
+        for event in events:
+            record = normalizer.normalize(event)
+            if record is None:
+                unusable_dropped += 1
+                continue
+            # An explicit cursor is an API caller's volume constraint.  The normal
+            # coverage cursor is deliberately not an insertion filter: overlap is
+            # deduped by event identity, and filtering it recreates the C3 loss.
+            if explicit_cursor and since_ts is not None and record["ts"] < since_ts:
+                continue
+            records.append(record)
+        inserted = repo.record_events_enriching_entities(records)
+        normalizer.reconcile_unresolved()
+    except Exception as exc:  # noqa: BLE001 - record the hole for a normalize/store failure
+        # #w16a-3: normalization (entity-resolution DB READS) and the persist step
+        # run HERE, OUTSIDE the HTTP-read guard above. A storage error -- e.g. a
+        # ``sqlite3.OperationalError`` from an entity lookup during normalize, or a
+        # failed insert -- would otherwise re-raise leaving ``ingest_coverage``
+        # EMPTY for this window (neither complete NOR failed: silently never
+        # retried nor observed, the exact hole the read-guard closes for HTTP). The
+        # window is 'complete' only if its events were successfully read AND
+        # normalized AND persisted; a normalize/persist failure means it was NOT,
+        # so record a durable FAILED hole (queryable, retried next sweep, never
+        # counted by ``observed_event_coverage``) then RE-RAISE so the collector's
+        # per-job firewall marks this poll failed rather than clean.
+        repo.record_ingest_coverage(
+            kind="event_history", scope="site", interval="retained",
+            start_ts=coverage_start, end_ts=now_s, status="failed",
+            detail=f"event normalize/store failed: {type(exc).__name__}: {exc}"[:200],
+        )
+        logger.warning(
+            "Catch-up event normalize/store failed; window recorded failed: %s", exc
+        )
+        raise
     if getattr(endpoints, "_event_disabled", False):
         # C3/R3: absence of the permitted history read is a durable,
         # queryable unrecoverable gap, not a successful empty collection.
@@ -447,6 +500,20 @@ async def catchup_events(
             kind="event_history", scope="site", interval="retained",
             start_ts=coverage_start, end_ts=now_s, status="unrecoverable",
             detail="controller event-history endpoint unsupported",
+        )
+    elif unusable_dropped:
+        # #w16a-4: the window was read (HTTP ok) but at least one event in it was
+        # structurally unusable and could not be stored. Crediting 'complete' here
+        # would fabricate observed history with ZERO (or fewer) stored events over
+        # a real span and let event-based detectors false-clear. Record it NOT
+        # complete -- a 'partial' hole that is queryable, never credited as
+        # observed coverage, and never advances the history cursor -- so the honest
+        # gap stands. It self-heals once the undecodable event ages out of the read
+        # window and a later fully-usable read of the span records complete.
+        repo.record_ingest_coverage(
+            kind="event_history", scope="site", interval="retained",
+            start_ts=coverage_start, end_ts=now_s, status="partial",
+            detail=f"{unusable_dropped} unusable event(s) dropped; window not fully observed",
         )
     elif max_events is None:
         # A successful unbounded/fully-paged GET establishes coverage.  A caller

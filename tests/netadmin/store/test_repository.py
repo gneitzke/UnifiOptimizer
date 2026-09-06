@@ -1328,6 +1328,122 @@ def test_observed_event_coverage_stale_disconnect_write_cannot_overcredit(
     assert cov < 0.9
 
 
+def test_w16a1_recorded_disconnect_severs_heartbeat_bridge(repo: Repository) -> None:
+    """#w16a-1 (B4 re-opening): the heartbeat cadence bridge must NOT span a
+    recorded WS DISCONNECT.
+
+    Repro: the feed connects ~32 s out of every 90 s (beats at c+0 and c+30) and
+    is DISCONNECTED the other ~58 s (a disconnect row at c+32, reconnect before the
+    next cycle). The last beat of a cycle (c+30) and the first of the next (c+90)
+    are 60 s apart -- inside the 75 s cadence bridge -- so the pure-cadence bridge
+    joined them and fabricated ~98% coverage over a feed that was actually down
+    most of the time. With the disconnect-aware bridge, the recorded disconnect at
+    c+32 severs the chain: coverage is only the ~30 s connected slice per 90 s
+    cycle (~0.33), far below the 0.9 event-gap sufficiency floor, so event-based
+    detectors correctly FREEZE (UNKNOWN) over the disconnected spans.
+    """
+    now = 2_000_000
+    start = now - 3600
+    c = start
+    while c < now:
+        repo.record_ws_heartbeat(ts=c)
+        repo.record_ws_heartbeat(ts=c + 30)
+        # The supervisor records a disconnect transition when the socket drops.
+        repo.record_poll_run(
+            job="ws", ok=True, ts=c + 32, error="disconnected", source="live"
+        )
+        c += 90
+    cov = repo.observed_event_coverage(start, now)
+    # ~30 covered out of every 90 -> ~0.33, WELL below the 0.9 floor.
+    assert cov < 0.5
+    assert cov == pytest.approx(30 / 90, abs=0.05)
+
+
+def test_w16a1_missed_beat_still_bridges_without_a_disconnect(repo: Repository) -> None:
+    """#w16a-1 control: a healthy, continuously-CONNECTED feed with one missed beat
+    (a 60 s gap and NO disconnect row) still bridges -- the cadence bridge is
+    preserved for a genuinely-connected span. Only a recorded disconnect severs."""
+    now = 2_000_000
+    start = now - 3600
+    # Beats every 30 s across the whole window, EXCEPT one dropped beat mid-window
+    # (a single 60 s gap). No disconnect transition is ever recorded.
+    ts = start - 30
+    skip_at = start + 1800
+    while ts < now:
+        if ts != skip_at:
+            repo.record_ws_heartbeat(ts=ts)
+        ts += 30
+    repo.record_ws_heartbeat(ts=now - 1)
+    cov = repo.observed_event_coverage(start, now)
+    # The 60 s gap is bridged (<=75 s, no disconnect), so coverage stays ~full.
+    assert cov >= 0.99
+
+
+def test_w16a5_out_of_range_int_port_not_accepted_then_mismatched(
+    repo: Repository,
+) -> None:
+    """#w16a-5: an out-of-SQLite-signed-range integer port must NOT be
+    accepted-then-mismatched.
+
+    ``json_extract`` renders an integer above 2**63-1 as a FLOAT (json_type still
+    reports 'integer'), so the pre-fix SQL built a scientific-notation port
+    native_id (``"<sw>:9.22...e+18"``) while the normalizer built the full decimal
+    (``"<sw>:9223372036854775808"``). With a PORT entity matching the SQL's
+    rendering present, the row read forever-'resolvable' yet reconcile could NEVER
+    fill it, floating to the head of the window and starving newer repairable rows.
+    After the bound, both sides reject an out-of-range port (route to the SWITCH);
+    with the switch absent the row is correctly unresolvable and never starves the
+    newer, genuinely-repairable row.
+    """
+    from netadmin.ingest.events import EventNormalizer
+    from netadmin.store.repository import _EVENT_RECONCILE_MAX_ATTEMPTS
+
+    huge = 9223372036854775808  # 2**63, above SQLite's signed-int range
+    unknown_sw = "02:00:de:ad:be:ef"  # switch deliberately NOT in inventory
+    # A PORT entity whose native_id matches exactly what the buggy SQL derived.
+    repo.upsert_entity(
+        Entity(entity_type=EntityType.PORT, native_id=f"{unknown_sw}:9.22337203685478e+18"),
+        ts=500,
+    )
+    huge_ev = repo.record_event(
+        ts=1000, key="EVT_SW_StpPortBlocking", entity_id=None, related_entity_id=None,
+        native_id="stp-huge",
+        data={"key": "EVT_SW_StpPortBlocking", "time": 1000 * 1000,
+              "sw": unknown_sw, "port": huge},
+    )
+    assert huge_ev is not None
+    for _ in range(_EVENT_RECONCILE_MAX_ATTEMPTS):
+        repo.bump_event_reconcile_attempts([huge_ev])
+
+    # A newer, genuinely repairable STP row: its normal INTEGER port IS in inventory.
+    good_sw = "02:00:11:22:33:aa"
+    good_port = repo.upsert_entity(
+        Entity(entity_type=EntityType.PORT, native_id=f"{good_sw}:2"), ts=8000
+    )
+    newer = repo.record_event(
+        ts=9000, key="EVT_SW_StpPortBlocking", entity_id=None, related_entity_id=None,
+        native_id="stp-good",
+        data={"key": "EVT_SW_StpPortBlocking", "time": 9000 * 1000,
+              "sw": good_sw, "port": 2},
+    )
+    assert newer is not None
+
+    # The out-of-range row is NOT falsely resolvable, so with limit=1 only the
+    # genuinely-resolvable newer row is selected (pre-fix, the huge row won the slot).
+    selected = {int(r["id"]) for r in repo.unresolved_events(limit=1)}
+    assert selected == {newer}
+
+    # End-to-end: reconcile fills the newer row's real port; the huge row stays NULL.
+    repaired = EventNormalizer(repo).reconcile_unresolved(limit=500)
+    assert repaired == 1
+    assert repo._conn.execute(
+        "SELECT entity_id FROM events WHERE id=?", (newer,)
+    ).fetchone()["entity_id"] == good_port
+    assert repo._conn.execute(
+        "SELECT entity_id FROM events WHERE id=?", (huge_ev,)
+    ).fetchone()["entity_id"] is None
+
+
 # ---------------------------------------------------------------------------
 # New-bug: no DDL on the read path; a missing coverage table reads as unknown
 # ---------------------------------------------------------------------------
