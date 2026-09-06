@@ -19,7 +19,7 @@ from netadmin.detect.detectors.infra import (
     DeviceDownDetector,
     DeviceOverheatingDetector,
 )
-from netadmin.detect.engine import UNKNOWN
+from netadmin.detect.engine import UNKNOWN, DetectorResult
 from netadmin.domain.entities import Entity
 from netadmin.domain.types import Cadence, EntityType, IssueState, Severity
 from netadmin.store.repository import Repository, SampleReading
@@ -30,9 +30,19 @@ from tests.netadmin.detect.support import (
     make_finding,
     seed_coverage,
     seed_device,
+    seed_event_coverage,
 )
 
 NOW = 4_000_000
+
+
+def healthy_event_feed(repo: Repository, window_s: int = 3600) -> None:
+    """A substantially-complete event-source coverage interval over the window.
+
+    device_down's lost-contact arm gates on event coverage; a clear/fire verdict
+    from that arm needs the feed proven observed, else the device freezes UNKNOWN.
+    """
+    seed_event_coverage(repo, now=NOW, window_s=window_s)
 
 
 def _ctx(repo: Repository, *, settings=None, now: int = NOW, baselines=None) -> DetectorContext:
@@ -154,12 +164,14 @@ def test_device_down_fires_on_offline_state(repo: Repository) -> None:
 
 def test_device_down_quiet_for_online_fresh_device(repo: Repository) -> None:
     seed_coverage(repo, now=NOW)
+    healthy_event_feed(repo)  # observed feed -> a real clean clear, not a freeze
     seed_device(repo, native_id="sw-1", state="1", last_seen_ts=NOW)
     assert DeviceDownDetector().evaluate(_ctx(repo)) == []
 
 
 def test_device_down_fires_on_unresolved_lost_contact(repo: Repository) -> None:
     seed_coverage(repo, now=NOW)
+    healthy_event_feed(repo)  # observed feed -> the lost-contact event may fire
     eid = seed_device(repo, native_id="sw-1", state="1", last_seen_ts=NOW)
     repo.record_event(ts=NOW - 100, key="EVT_SW_Lost_Contact", entity_id=eid)
 
@@ -171,6 +183,7 @@ def test_device_down_fires_on_unresolved_lost_contact(repo: Repository) -> None:
 
 def test_device_down_reconnect_after_lost_clears(repo: Repository) -> None:
     seed_coverage(repo, now=NOW)
+    healthy_event_feed(repo)  # observed feed -> the reconnect is a real clear
     eid = seed_device(repo, native_id="sw-1", state="1", last_seen_ts=NOW)
     repo.record_event(ts=NOW - 200, key="EVT_SW_Lost_Contact", entity_id=eid)
     repo.record_event(ts=NOW - 100, key="EVT_SW_Connected", entity_id=eid)
@@ -179,6 +192,7 @@ def test_device_down_reconnect_after_lost_clears(repo: Repository) -> None:
 
 def test_device_down_stale_only_online_state_suppressed(repo: Repository) -> None:
     seed_coverage(repo, now=NOW)
+    healthy_event_feed(repo)  # observed feed -> suppression is a real clear
     # Online state but silent for 1000 s. This is the controller dropping the
     # device from stat/device for a few cycles (poll_runs stay ok=1), NOT a downed
     # device: staleness alone against a recorded-online state must not fire.
@@ -204,6 +218,7 @@ def test_device_down_stale_online_cascade_does_not_fire(repo: Repository) -> Non
     # goes stale while state stays online, coverage stays high (poll_runs ok=1) so
     # controller_down never inhibits. None of these may fire device_down.
     seed_coverage(repo, now=NOW)
+    healthy_event_feed(repo)  # observed feed -> the suppression is a real clear
     for i in range(9):
         seed_device(
             repo,
@@ -219,6 +234,7 @@ def test_device_down_stale_online_cascade_does_not_fire(repo: Repository) -> Non
 
 def test_device_down_transitional_state_suppresses_stale_only(repo: Repository) -> None:
     seed_coverage(repo, now=NOW)
+    healthy_event_feed(repo)  # observed feed -> suppression is a real clear
     # Provisioning (state 5) + silence is expected, not a failure.
     seed_device(
         repo, native_id="ap-1", entity_type=EntityType.AP, state="5", last_seen_ts=NOW - 1000
@@ -240,12 +256,45 @@ def test_device_down_offline_transitional_still_fires(repo: Repository) -> None:
 
 def test_device_down_ignores_clients(repo: Repository) -> None:
     seed_coverage(repo, now=NOW)
+    healthy_event_feed(repo)  # observed feed -> the healthy switch is a real clear
     seed_device(repo, native_id="sw-1", state="1", last_seen_ts=NOW)  # healthy switch
     # A client that looks "offline" must be ignored: clients are not devices.
     seed_device(
         repo, native_id="client-mac", entity_type=EntityType.CLIENT, state="0", last_seen_ts=NOW
     )
     assert DeviceDownDetector().evaluate(_ctx(repo)) == []
+
+
+# --- B4 (#5): the lost-contact EVENT arm freezes on an event-feed gap --------- #
+def test_device_down_freezes_when_lost_contact_ages_out_on_gap(repo: Repository) -> None:
+    """#5: a lost-contact event establishes an outage, then ages out on a gap.
+
+    Device polling stays healthy (state online, last_seen fresh) but the event feed
+    has fallen to 0.0 -- the *_Lost_Contact event has aged out of the window. Before
+    the fix the detector returned [] (a clear) and the device_down issue
+    false-resolved after six clear cycles. Now, with no poll-arm verdict and the
+    lost-contact arm unusable, the device FREEZES (UNKNOWN) so its issue holds.
+    """
+    seed_coverage(repo, now=NOW)  # poll arm healthy
+    # No healthy_event_feed -> event_coverage == 0.0; the lost event has aged out.
+    eid = seed_device(repo, native_id="sw-1", state="1", last_seen_ts=NOW)
+    result = DeviceDownDetector().evaluate(_ctx(repo))
+    assert isinstance(result, DetectorResult)
+    assert result.findings == []  # does NOT resolve
+    assert result.unknown_entities == {eid}  # frozen instead
+
+
+def test_device_down_poll_arms_unaffected_by_event_gap(repo: Repository) -> None:
+    """#5: the state/last_seen (poll) arms still fire P1 with no event feed."""
+    seed_coverage(repo, now=NOW)
+    # No event coverage: the offline-STATE (poll) arm must be untouched.
+    eid = seed_device(repo, native_id="sw-1", state="0", last_seen_ts=NOW)
+    result = DeviceDownDetector().evaluate(_ctx(repo))
+    findings = result.findings if isinstance(result, DetectorResult) else result
+    assert len(findings) == 1
+    assert findings[0].severity is Severity.P1
+    assert findings[0].evidence["triggers"] == ["state_offline"]
+    assert findings[0].entity.entity_id == eid
 
 
 def test_device_down_fires_per_device(repo: Repository) -> None:
