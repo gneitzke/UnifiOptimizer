@@ -97,6 +97,7 @@ const STATUS_OPTIONS: { value: string; label: string }[] = [
   { value: '', label: 'All statuses' },
   { value: 'failed', label: 'Failed' },
   { value: 'unknown', label: 'Unknown' },
+  { value: 'revert_unknown', label: 'Revert unknown' },
   { value: 'applying', label: 'Applying' },
   { value: 'applied', label: 'Applied' },
   { value: 'reverted', label: 'Reverted' },
@@ -216,7 +217,7 @@ function GroupHeaderRow({
     devices.size === 1 ? deviceLabel(group.items[0]) : `${devices.size} devices`;
   const failedOrUnknown = group.items.filter((c) => {
     const s = normalizeChangeStatus(c.status);
-    return s === 'failed' || s === 'unknown';
+    return s === 'failed' || s === 'unknown' || s === 'revert_unknown';
   }).length;
 
   return (
