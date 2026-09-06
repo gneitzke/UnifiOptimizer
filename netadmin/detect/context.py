@@ -57,6 +57,18 @@ _DEFAULT_JOB_INTERVALS: dict[str, int] = {
 # rather than to be relied on.
 _FALLBACK_INTERVAL_S = 60
 
+# B4: the sufficiency floor for *event-source* coverage, deliberately far higher
+# than the engine's poll-coverage ``COVERAGE_MIN`` (0.5).  A poll gap only blurs a
+# gauge trend, but an event-feed gap silently *drops* discrete disconnect / roam /
+# radar events, and an event-built verdict reads a dropped event as "nothing
+# happened" -- i.e. it false-clears.  A window only ~50% observed could hide half
+# a disconnect storm, so a clear verdict there is not defensible.  0.9 requires the
+# feed to be substantially complete: at most a ~10% unobserved slice (~6 min of a
+# 60-min window) -- small enough that a real event burst cannot hide in it, yet
+# tolerant of a single missed catch-up/heartbeat tick.  Below this an event-based
+# detector freezes to UNKNOWN rather than clearing.
+EVENT_COVERAGE_MIN = 0.9
+
 
 def _row_get(row: Any, key: str) -> Any:
     """Read ``key`` from a ``sqlite3.Row`` or a plain mapping, or ``None``.
@@ -274,6 +286,18 @@ class DetectorContext:
         start_ts = self.now_ts - int(window_seconds)
         return self.repo.observed_event_coverage(start_ts, self.now_ts)
 
+    def event_coverage_ok(self, window_seconds: int) -> bool:
+        """The factored B4 gate: is the event feed substantially complete here?
+
+        Every event-based verdict routes its "may I speak?" decision through this
+        one predicate so the sufficiency floor (:data:`EVENT_COVERAGE_MIN`) is
+        applied identically -- ``client.flaky``, ``wifi.pingpong_roamer``,
+        ``wifi.roam_quality`` and ``wifi.dfs_recurring`` alike. Returns ``False``
+        (detector must return ``UNKNOWN``) when :meth:`event_coverage` reads below
+        the floor, freezing -- never clearing -- issues across an event-feed gap.
+        """
+        return self.event_coverage(window_seconds) >= EVENT_COVERAGE_MIN
+
     # ------------------------------------------------------------------ #
     # Tunables
     # ------------------------------------------------------------------ #
@@ -291,4 +315,4 @@ class DetectorContext:
         return default
 
 
-__all__ = ["DetectorContext"]
+__all__ = ["DetectorContext", "EVENT_COVERAGE_MIN"]

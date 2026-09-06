@@ -762,6 +762,13 @@ class PingpongRoamerDetector:
             return UNKNOWN
 
         window_s = int(ctx.threshold(self.key, "window_s", 3600))
+        # B4: this verdict is built entirely from EVT_WU_Roam *events*. A healthy
+        # client poll (gated above) does not prove the event feed ran; if the WS /
+        # stat/event source had a gap, aged-out roams read as "no roams" and a real
+        # ping-pong is false-cleared. Freeze to UNKNOWN until event coverage is
+        # substantially complete.
+        if not ctx.event_coverage_ok(window_s):
+            return UNKNOWN
         min_roams = int(ctx.threshold(self.key, "burst_min_roams", 4))
         gap_s = int(ctx.threshold(self.key, "burst_max_gap_s", 10))
         suspicious_rate = float(ctx.threshold(self.key, "suspicious_rate_per_h", 5))
@@ -867,6 +874,12 @@ class RoamQualityDetector:
             return UNKNOWN
 
         window_s = int(ctx.threshold(self.key, "window_s", 3600))
+        # B4: the roam set that seeds every comparison comes from the event feed.
+        # A gap in that feed drops roams, so a client that roamed badly reads as
+        # "no roams to judge" and the issue false-clears. Freeze to UNKNOWN unless
+        # event coverage is substantially complete over the window.
+        if not ctx.event_coverage_ok(window_s):
+            return UNKNOWN
         worse_db = float(ctx.threshold(self.key, "worse_than_db", 10))
         settle_s = int(ctx.threshold(self.key, "settle_s", 120))
         min_bad = int(ctx.threshold(self.key, "min_bad_roams", 2))
@@ -1289,6 +1302,12 @@ class DfsRecurringDetector:
         per_day_min = float(ctx.threshold(self.key, "events_per_day_min", 1.0))
         same_hour_frac = float(ctx.threshold(self.key, "same_hour_fraction", 0.6))
         window_s = lookback_days * 86_400
+        # B4: the radar count is a pure event tally. An event-feed gap over the
+        # multi-day window drops EVT_AP_RadarDetected rows, so a DFS-plagued AP
+        # reads as quiet and the issue false-clears. Freeze to UNKNOWN unless the
+        # event feed was substantially complete across the lookback.
+        if not ctx.event_coverage_ok(window_s):
+            return UNKNOWN
         start = ctx.now_ts - window_s
 
         findings: list[Finding] = []
