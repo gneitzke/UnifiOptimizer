@@ -234,12 +234,14 @@ class EventNormalizer:
         WS-only deployments, where there may never be a stat/event replay.
         """
         repaired = 0
+        unfilled: list[int] = []
         for row in self._repo.unresolved_events(limit=limit):
             try:
                 payload = json.loads(row["data"])
                 event = Event.model_validate(payload)
             except Exception:  # malformed retained payload is not recoverable
                 logger.warning("Cannot reconcile malformed event payload id=%s", row["id"])
+                unfilled.append(int(row["id"]))
                 continue
             record = self.normalize(event)
             if record is not None and self._repo.fill_event_entity_refs(
@@ -248,6 +250,14 @@ class EventNormalizer:
                 related_entity_id=record["related_entity_id"],
             ):
                 repaired += 1
+            else:
+                unfilled.append(int(row["id"]))
+        # Bump the attempt counter on rows we selected but could not fill, so a
+        # candidate whose AP never appears is eventually parked out of the LIMIT
+        # window (repository fair-progress mechanism 2) and cannot starve newer
+        # repairable rows. A row that later becomes resolvable is un-parked by the
+        # resolvable-first ordering regardless of its attempt count.
+        self._repo.bump_event_reconcile_attempts(unfilled)
         return repaired
 
 
