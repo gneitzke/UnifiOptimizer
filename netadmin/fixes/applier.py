@@ -545,7 +545,8 @@ class Applier:
             raise WriterRequired("revert requires an injected ControllerWriter")
 
         method = str(before.get("method") or "PUT")
-        async with self._serialize([_endpoint_device(str(endpoint))]):
+        device_key = _endpoint_device(str(endpoint))
+        async with self._serialize([device_key]):
             # Eligibility re-check UNDER the lock (P2): the status read before the lock
             # is stale the instant a concurrent revert of this same row commits. Two
             # reverts both saw 'applied' outside the lock, so both would dispatch --
@@ -558,6 +559,19 @@ class Applier:
                 raise FixError(f"no change with id {change_id}")
             prior_status = fresh_row["status"]
             self._assert_revertible_status(change_id, prior_status)
+            # Device-wide uncertainty guard on the REVERT path (#w13a-3), the mirror of
+            # the apply-side guard's per-device arm (:meth:`_assert_no_uncertain_change`
+            # (c)). A revert is ITSELF a whole-``radio_table`` PUT to ``rest/device/<id>``
+            # -- it replaces the ENTIRE device -- so it must serialize behind resolution
+            # of EVERY uncertain change on that physical device, not merely re-check its
+            # own row's eligibility. If ANY OTHER change on the same AP is unresolved-
+            # uncertain (an ambiguous apply, an in-flight/ambiguous revert), restoring
+            # this row's before-table would re-send that sibling's still-unresolved radio
+            # at a stale value, and a delayed sibling PUT could later undo the restore.
+            # Refuse; the operator reconciles the sibling first. Runs UNDER THE DEVICE
+            # LOCK. This change is EXCLUDED so its own 'unknown'/'reverting' state never
+            # blocks its own revert.
+            self._assert_no_other_uncertain_change_on_device(device_key, change_id)
             # Read-modify-write is atomic under the lock (C1): read fresh live state
             # HERE, not before acquiring it, so a concurrent revert's committed write
             # is visible and cannot be clobbered by a stale table.
@@ -729,6 +743,46 @@ class Applier:
                     "device, so refusing to apply a new mutation to any radio on it -- "
                     "reconcile the live state via a read and resolve that change first, "
                     "do not replay an uncertain outcome"
+                )
+
+    def _assert_no_other_uncertain_change_on_device(
+        self, device_key: str, exclude_change_id: int
+    ) -> None:
+        """Refuse a REVERT while any OTHER unresolved uncertain change stands on the
+        same physical device (#w13a-3).
+
+        The revert-path mirror of the apply guard's per-device arm
+        (:meth:`_assert_no_uncertain_change` (c)). A ``rest/device/<id>`` PUT replaces
+        the ENTIRE device (its whole ``radio_table``), and a revert is exactly such a
+        PUT -- so it may not be dispatched while ANY uncertain change on that device is
+        still unresolved (:data:`_UNCERTAIN_STATUSES` -- an ambiguous apply, an
+        in-flight/interrupted or ambiguous revert). Restoring this row's before-table
+        would re-send the sibling's still-unresolved radio at a stale value, and a
+        delayed upstream PUT for that sibling could later undo the restore. The change
+        being reverted (``exclude_change_id``) is skipped: its own ``unknown`` apply or
+        ``reverting`` interim must never block its own revert -- that is the province of
+        :meth:`_assert_revertible_status`. Runs UNDER THE DEVICE LOCK (its caller holds
+        it), so a concurrent apply/revert's just-recorded uncertain row is visible here.
+        """
+        for change in self._store.list_changes():
+            try:
+                cid = int(change["id"])
+            except Exception:  # noqa: BLE001 - a row without a usable id is unkeyable
+                continue
+            if cid == exclude_change_id:
+                continue
+            status = change["status"] if "status" in change.keys() else None
+            if status not in _UNCERTAIN_STATUSES:
+                continue
+            dev = _change_device_endpoint(change)
+            if dev is not None and dev == device_key:
+                raise FixError(
+                    f"device '{dev}' has another unresolved change "
+                    f"(id {cid}, status '{status}') whose outcome was never confirmed; a "
+                    "revert is a whole-radio_table PUT that replaces the entire device, so "
+                    "refusing to dispatch it while any other uncertain change on the device "
+                    "stands -- reconcile the live state via a read and resolve that change "
+                    "first, do not replay over an uncertain outcome"
                 )
 
     @staticmethod

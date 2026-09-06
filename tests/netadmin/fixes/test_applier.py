@@ -270,6 +270,80 @@ async def test_revert_restores_before_state(store, ap_device):
     assert row["reverted_ts"] is not None
 
 
+# --------------------------------------------------------------------------- #
+# #w13a-3: a REVERT must run the SAME device-wide uncertainty guard an apply does.
+# A revert is itself a whole-radio_table PUT to rest/device/<id> (it replaces the
+# ENTIRE device), so it must serialize behind resolution of EVERY uncertain change
+# on that physical device -- not merely re-check its own row. Two real plans on one
+# AP: apply ng channel (ok), then na power is ambiguous ('unknown'); reverting the
+# ng change while the na 'unknown' still stands would dispatch a whole-table PUT and
+# a delayed na PUT could undo the restore. Refuse until the sibling is resolved.
+# --------------------------------------------------------------------------- #
+async def test_revert_refused_while_sibling_uncertain_change_on_device(store, ap_device):
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+    plan = _channel_plan(ap_device)
+    result = await applier.apply(
+        plan, dry_run=False, confirm_token=plan_confirm_token(plan), current_state=_state_ok()
+    )
+    ng_change_id = result.change_ids[0]
+    assert store.get_change(ng_change_id)["status"] == "applied"
+
+    # A SIBLING ambiguous ('unknown') change on the SAME physical device (a different
+    # radio, na), exactly what an ambiguous na-power apply leaves behind. It records
+    # its dispatch endpoint as rest/device/<id>, so the device-wide guard keys on it.
+    na_change_id = store.insert_change(
+        action="wifi.tx_power",
+        before={
+            "method": "PUT",
+            "endpoint": f"rest/device/{AP_ID}",
+            "body": {"radio_table": [{"radio": "na", "tx_power_mode": "high"}]},
+        },
+        after={
+            "method": "PUT",
+            "endpoint": f"rest/device/{AP_ID}",
+            "body": {"radio_table": [{"radio": "na", "tx_power_mode": "low"}]},
+        },
+        status="unknown",
+        ts=1,
+    )
+
+    live_radios = {
+        "ng": {"radio": "ng", "channel": 3, "min_rssi_enabled": False, "min_rssi": 0},
+        "na": {"radio": "na", "channel": 36, "min_rssi_enabled": False, "min_rssi": 0},
+    }
+    calls_before = writer.call_count
+    # RED before the fix: the revert dispatched a whole-table PUT and marked 'reverted'
+    # while the na change stayed 'unknown'. It must now REFUSE with zero dispatch.
+    with pytest.raises(FixError, match="unresolved change"):
+        await applier.revert(ng_change_id, current_radios=live_radios)
+    assert writer.call_count == calls_before  # nothing dispatched
+    assert store.get_change(ng_change_id)["status"] == "applied"  # not reverted
+
+    # Once the operator reconciles the sibling to a terminal, resolved state, the
+    # revert of the ng change is allowed and succeeds.
+    store.update_change_status(na_change_id, "applied")
+    revert = await applier.revert(ng_change_id, current_radios=live_radios)
+    assert revert.ok
+    assert store.get_change(ng_change_id)["status"] == "reverted"
+
+
+async def test_lone_revert_not_blocked_by_its_own_state(store, ap_device):
+    # A genuine lone revert (no sibling uncertain change on the device) still works:
+    # the change's own in-flight/unknown state must never block its own revert.
+    writer = FakeControllerWriter()
+    applier = Applier(store, writer)
+    plan = _channel_plan(ap_device)
+    result = await applier.apply(
+        plan, dry_run=False, confirm_token=plan_confirm_token(plan), current_state=_state_ok()
+    )
+    change_id = result.change_ids[0]
+    live_radios = {"ng": {"radio": "ng", "channel": 3, "min_rssi_enabled": False, "min_rssi": 0}}
+    revert = await applier.revert(change_id, current_radios=live_radios)
+    assert revert.ok
+    assert store.get_change(change_id)["status"] == "reverted"
+
+
 async def test_revert_of_nonrevertible_change_is_refused(store):
     writer = FakeControllerWriter()
     applier = Applier(store, writer)
