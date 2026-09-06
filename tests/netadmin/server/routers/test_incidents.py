@@ -497,3 +497,40 @@ async def test_bulk_suppress_only_mutes_current_members(settings, tmp_db_path) -
         symptom_detail = (await c.get(f"/api/issues/{symptom}")).json()
         assert symptom_detail["issue"]["suppressed_ts"] is None  # untouched
     store.close()
+
+
+async def test_issue_surface_symptom_count_is_current_not_historical(
+    settings, tmp_db_path
+) -> None:
+    """Finding #11 (C5): after a symptom clears, the incident CARD reports 0
+    symptoms (its present state) but the ISSUE surface -- both the root's detail
+    ``GET /api/issues/{root}`` incident brief and the ``GET /api/issues`` list's
+    ``incident_brief`` -- was reporting 1, because it derived the count from the
+    append-only historical member union (``incident_member_count - 1``) rather
+    than current membership. The two surfaces must agree: current symptoms == 0.
+    """
+    store, inc_id, root, _symptom = await _seed_and_clear_symptom(settings, tmp_db_path)
+    app = create_app(settings=settings, store=store, components=DaemonComponents())
+    async with await _client(app) as c:
+        # The incident card: present state, root-only, 0 symptoms.
+        card = next(
+            i for i in (await c.get("/api/incidents")).json()["incidents"]
+            if int(i["id"]) == inc_id
+        )
+        assert card["symptom_count"] == 0
+
+        # The root issue detail's incident brief must MATCH the card, not report
+        # the stale historical count of 1.
+        detail = (await c.get(f"/api/issues/{root}")).json()
+        assert detail["incident"] is not None
+        assert detail["incident"]["id"] == inc_id
+        assert detail["incident"]["symptom_count"] == 0
+
+        # The issues list's incident_brief on the root must agree too. The group
+        # is still genuine (historical union of 2 keeps is_genuine_incident true),
+        # so the brief is present -- and now reads 0 current symptoms.
+        issues = (await c.get("/api/issues")).json()["issues"]
+        root_row = next(i for i in issues if int(i["id"]) == root)
+        assert root_row["incident_brief"] is not None
+        assert root_row["incident_brief"]["symptom_count"] == 0
+    store.close()

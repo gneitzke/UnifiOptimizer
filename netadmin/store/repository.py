@@ -1108,6 +1108,14 @@ class Repository:
     # cap), leaving the resolvability preference -- the actual anti-starvation fix
     # -- fully in force. No DDL is issued on this read path.
     def unresolved_events(self, *, limit: int = 500) -> list[sqlite3.Row]:
+        # Read path degrades safely: on a database whose ``events`` table is
+        # absent (dropped, or a query-only replica that never provisioned it) the
+        # reconcile selection returns nothing rather than raising OperationalError
+        # ("no such table"). ``_column_exists`` below already tolerates a missing
+        # column, but a missing TABLE would still blow up the main SELECT; guard it
+        # here so the whole read degrades to empty (no DDL, safe read-only).
+        if not self._table_exists("events"):
+            return []
         attempts = (
             "ev.reconcile_attempts"
             if self._column_exists("events", "reconcile_attempts")
@@ -1115,10 +1123,25 @@ class Repository:
         )
         site = self.site_id
         # resolvable: a currently-NULL reference the normalizer could fill this
-        # pass because the payload's named MAC is already an entity. Mirrors
-        # EventNormalizer._entities routing: primary picks user/client -> ap -> sw
-        # -> gw by precedence; a client-scoped row (user/client named) can also
-        # fill its from-AP even before its own client entity exists.
+        # pass because the payload's named MAC is already an entity. It must mirror
+        # EventNormalizer._entities routing EXACTLY -- including its single-winner
+        # PRECEDENCE -- not merely "some candidate MAC exists". The normalizer picks
+        # ONE source per column and does not fall back if that source's MAC is
+        # absent from inventory, so a predicate that flags a row resolvable because
+        # a DIFFERENT (never-consulted) MAC exists produces a false "resolvable"
+        # that resolves nothing yet floats to the head of the LIMIT window forever,
+        # starving genuinely-repairable newer rows (P2 finding #9).
+        #
+        # Precedence, from _entities:
+        #   * primary (entity_id): user/client -> ap -> sw -> gw; first present
+        #     field wins and the row resolves iff THAT field's MAC is in inventory.
+        #   * related (related_entity_id), client-scoped only:
+        #       - roam key ("Roam" in key): related_mac = ap_from OR ap, resolved
+        #         as an AP (never a switch);
+        #       - otherwise: if ``ap`` present -> AP(ap); elif ``sw`` present ->
+        #         SWITCH(sw). ``ap`` present but not yet in inventory does NOT fall
+        #         through to ``sw`` -- so a row whose only in-inventory MAC is its
+        #         switch, while it names an (absent) ap, is NOT resolvable.
         resolvable = (
             "CASE"
             # primary reference fillable
@@ -1135,12 +1158,22 @@ class Repository:
             "        THEN egw.entity_id IS NOT NULL"
             "      ELSE 0"
             "    END) THEN 1"
-            # related (from-AP / switch) reference fillable -- only client-scoped
+            # related (from-AP / switch) reference fillable -- client-scoped only,
+            # mirroring the normalizer's per-key precedence rather than OR-ing every
+            # candidate. A row is resolvable ONLY when the SPECIFIC MAC the
+            # normalizer would consult for this NULL column is already in inventory.
             "  WHEN ev.related_entity_id IS NULL"
             "   AND COALESCE(json_extract(ev.data,'$.user'),"
             "               json_extract(ev.data,'$.client')) IS NOT NULL"
-            "   AND (eapf.entity_id IS NOT NULL OR esw.entity_id IS NOT NULL)"
-            "     THEN 1"
+            "    THEN CASE"
+            "      WHEN ev.key LIKE '%Roam%'"
+            "        THEN (CASE WHEN eapf.entity_id IS NOT NULL THEN 1 ELSE 0 END)"
+            "      WHEN json_extract(ev.data,'$.ap') IS NOT NULL"
+            "        THEN (CASE WHEN eap.entity_id IS NOT NULL THEN 1 ELSE 0 END)"
+            "      WHEN json_extract(ev.data,'$.sw') IS NOT NULL"
+            "        THEN (CASE WHEN esw.entity_id IS NOT NULL THEN 1 ELSE 0 END)"
+            "      ELSE 0"
+            "    END"
             "  ELSE 0 END"
         )
         sql = (
