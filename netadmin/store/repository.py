@@ -1494,49 +1494,60 @@ class Repository:
     def _ws_observed_intervals(self, start_ts: int, end_ts: int) -> list[tuple[int, int]]:
         lower = start_ts - _WS_HEARTBEAT_MAX_GAP_S
         rows = self._conn.execute(
-            "SELECT ts FROM poll_runs "
+            "SELECT ts, rowid FROM poll_runs "
             "WHERE job='ws' AND source='live' AND error=? AND ts>=? AND ts<? "
             "ORDER BY ts, rowid",
             (_WS_HEARTBEAT_LABEL, lower, end_ts),
         ).fetchall()
-        # #w16a-1: recorded WS disconnect transitions in the same span. A
-        # disconnect that lands BETWEEN two heartbeats severs their chain even
-        # when they are within the cadence bridge -- the feed was down, so that
-        # span is a real hole, not continuous observation.
+        # #w16a-1 / #w17a-1: recorded WS disconnect transitions in the same span. A
+        # disconnect that lands between two heartbeats severs their chain even when
+        # they are within the cadence bridge -- the feed was down, so that span is a
+        # real hole, not continuous observation. Timestamps are integer-second, so a
+        # disconnect frequently SHARES a heartbeat's second; the earlier
+        # strictly-between test (a < ts < b) silently ignored those same-second
+        # disconnects and let the bridge span a real outage. The sever test is now
+        # the CLOSED interval [beat_i, beat_{i+1}] and ties are broken by poll_runs
+        # ``rowid`` (insertion order): a disconnect recorded in the same second as,
+        # but AFTER, a beat orders after that beat and severs the NEXT bridge, so
+        # coverage ends at that beat. Endpoints are (ts, rowid) tuples throughout so
+        # the ordering is total and deterministic.
         placeholders = ",".join("?" for _ in _WS_DISCONNECT_LABELS)
         disc_rows = self._conn.execute(
-            "SELECT ts FROM poll_runs "
+            "SELECT ts, rowid FROM poll_runs "
             f"WHERE job='ws' AND source='live' AND error IN ({placeholders}) "
-            "AND ts>=? AND ts<? ORDER BY ts",
+            "AND ts>=? AND ts<? ORDER BY ts, rowid",
             (*_WS_DISCONNECT_LABELS, lower, end_ts),
         ).fetchall()
-        disconnects = [int(r["ts"]) for r in disc_rows]
+        disconnects = [(int(r["ts"]), int(r["rowid"])) for r in disc_rows]
 
-        def _disconnect_between(a: int, b: int) -> bool:
-            # Any recorded disconnect strictly inside (a, b) means the feed went
-            # down between these two beats, so the covered run must break here.
-            i = bisect.bisect_right(disconnects, a)
-            return i < len(disconnects) and disconnects[i] < b
+        def _disconnect_between(a: tuple[int, int], b: tuple[int, int]) -> bool:
+            # A recorded disconnect whose (ts, rowid) lands in the CLOSED interval
+            # [a, b] -- including one sharing either beat's integer second, ordered
+            # deterministically by rowid -- means the feed went down between (or
+            # exactly at) these two beats, so the covered run must break here.
+            i = bisect.bisect_left(disconnects, a)
+            return i < len(disconnects) and disconnects[i] <= b
 
         intervals: list[tuple[int, int]] = []
         run_start: Optional[int] = None
-        prev: Optional[int] = None
+        prev: Optional[tuple[int, int]] = None
         for row in rows:
-            ts = int(row["ts"])
+            key = (int(row["ts"]), int(row["rowid"]))
+            ts = key[0]
             if prev is None:
                 run_start = ts
-            elif ts - prev <= _WS_HEARTBEAT_MAX_GAP_S and not _disconnect_between(prev, ts):
+            elif ts - prev[0] <= _WS_HEARTBEAT_MAX_GAP_S and not _disconnect_between(prev, key):
                 pass  # same continuous run of liveness
             else:
                 # Either the cadence gap is too large OR a disconnect was recorded
                 # between the two beats: close the run at ``prev`` and start anew.
                 assert run_start is not None
-                if prev > run_start:
-                    intervals.append((run_start, prev))
+                if prev[0] > run_start:
+                    intervals.append((run_start, prev[0]))
                 run_start = ts
-            prev = ts
-        if prev is not None and run_start is not None and prev > run_start:
-            intervals.append((run_start, prev))
+            prev = key
+        if prev is not None and run_start is not None and prev[0] > run_start:
+            intervals.append((run_start, prev[0]))
         return intervals
 
     # B4: event-source observation coverage as a fraction of a detector window.

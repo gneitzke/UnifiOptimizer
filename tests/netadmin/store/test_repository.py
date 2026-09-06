@@ -1379,6 +1379,56 @@ def test_w16a1_missed_beat_still_bridges_without_a_disconnect(repo: Repository) 
     assert cov >= 0.99
 
 
+def test_w17a1_same_second_disconnect_severs_heartbeat_bridge(repo: Repository) -> None:
+    """#w17a-1: a disconnect that shares a heartbeat's SECOND must still sever.
+
+    Timestamps are integer-second, so a recorded disconnect very often lands in the
+    exact same second as a beat. The old sever test was STRICTLY between two beats
+    (a < ts < b), so a disconnect at c+30 -- the same second as the c+30 beat,
+    recorded just after it -- was ignored: the 60 s c+30 -> c+90 gap fell inside the
+    75 s cadence bridge and fabricated ~98% coverage over a feed that was actually
+    down ~2/3 of every cycle. The closed-interval, rowid-ordered sever counts that
+    same-second disconnect (it orders after the c+30 beat and at/inside the
+    c+30..c+90 bridge), so coverage is only the ~30 s connected slice per 90 s cycle
+    (~0.33), far below the 0.9 floor -> detectors FREEZE over the down spans."""
+    now = 2_500_000
+    start = now - 3600
+    c = start
+    while c < now:
+        repo.record_ws_heartbeat(ts=c)
+        repo.record_ws_heartbeat(ts=c + 30)
+        # The disconnect lands in the SAME second as the c+30 beat, recorded just
+        # after it (a higher poll_runs rowid). Pre-fix this was NOT strictly between
+        # c+30 and c+90 and so never severed the bridge.
+        repo.record_poll_run(
+            job="ws", ok=True, ts=c + 30, error="disconnected", source="live"
+        )
+        c += 90
+    cov = repo.observed_event_coverage(start, now)
+    # ~30 covered out of every 90 -> ~0.33, WELL below the 0.9 floor.
+    assert cov < 0.9
+    assert cov == pytest.approx(30 / 90, abs=0.05)
+
+
+def test_w17a1_healthy_feed_with_one_missed_beat_still_covered(repo: Repository) -> None:
+    """#w17a-1 control: the closed-interval sever must NOT break the healthy bridge.
+
+    A continuously-connected feed with a single missed beat (a 60 s gap, NO
+    disconnect row at all) still bridges to ~full coverage: the sever only fires on
+    a recorded disconnect, never on cadence alone."""
+    now = 2_500_000
+    start = now - 3600
+    ts = start - 30
+    skip_at = start + 1800
+    while ts < now:
+        if ts != skip_at:
+            repo.record_ws_heartbeat(ts=ts)
+        ts += 30
+    repo.record_ws_heartbeat(ts=now - 1)
+    cov = repo.observed_event_coverage(start, now)
+    assert cov >= 0.99
+
+
 def test_w16a5_out_of_range_int_port_not_accepted_then_mismatched(
     repo: Repository,
 ) -> None:
