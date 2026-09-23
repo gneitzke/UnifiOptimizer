@@ -6,4 +6,4 @@
 # read by the package, not shipped in the wheel, not touched by CI.
 name: UnifiOptimizer
 url: https://github.com/gneitzke/UnifiOptimizer
-maintainer: Gary Neitzke <gneitzke123@gmail.com>
+maintainer: Gary Neitzke <6740929+gneitzke@users.noreply.github.com>

@@ -14,7 +14,7 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
-authors = [{ name = "Gary Neitzke", email = "gneitzke123@gmail.com" }]
+authors = [{ name = "Gary Neitzke", email = "6740929+gneitzke@users.noreply.github.com" }]
 keywords = [
     "unifi",
     "ubiquiti",
