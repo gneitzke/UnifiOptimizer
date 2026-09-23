@@ -4,6 +4,13 @@ All notable changes to UnifiOptimizer are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.2] — 2026-09-23
+
+### Changed
+
+- The package author and add-on maintainer contact is now a GitHub noreply
+  address. No code changes.
+
 ## [0.8.1] — 2026-09-06
 
 A reliability release. Six failures found by running the daemon against a real
@@ -111,4 +118,6 @@ Accuracy
   membership history, the event-source coverage ledger, per-AP SLE attribution, and
   event-repair fairness). Upgrades are forward-only and preserve existing data.
 
+[0.8.2]: https://github.com/gneitzke/UnifiOptimizer/releases/tag/v0.8.2
+[0.8.1]: https://github.com/gneitzke/UnifiOptimizer/releases/tag/v0.8.1
 [0.8.0]: https://github.com/gneitzke/UnifiOptimizer/releases/tag/v0.8.0
